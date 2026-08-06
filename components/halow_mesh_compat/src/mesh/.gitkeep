@@ -1,0 +1,4 @@
+# Mesh-specific driver code lives here. Three categories:
+#  - mesh_compat.c   — host glue (init/enable/disable + RX dispatch)
+#  - mesh_compat_cmd.c — chip command builders (mesh-specific)
+#  - vendored mesh.c / mesh.h chunks from morse_driver (GPL-2.0+)

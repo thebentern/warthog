@@ -1,0 +1,23 @@
+## Warthog — managed component dependencies.
+##
+## Pulled from https://components.espressif.com on first build.
+dependencies:
+  idf:
+    version: ">=5.4"
+  morsemicro/halow:
+    # Both published versions (2.9.7-esp32-3 and 2.10.4-esp32-1) require
+    # IDF >= 5.4.2. We satisfy that via the pioarduino platform fork pinned in
+    # platformio.ini. Track the newer of the two by default.
+    version: "2.10.4-esp32-1"
+    # Local fork: adds an 802.11s mesh mode (umac/mesh/) the registry build
+    # lacks. The fork is the 2.10.4-esp32-1 tree with non-ESP32 BSPs + docs
+    # stripped. See docs/mesh-port-scope.md / mesh-port-audit.md. The version
+    # above is kept for provenance; override_path is what actually builds.
+    # Directory is named `halow` (the dependency short name) so the IDF
+    # component graph resolves `main`'s `REQUIRES halow` to the fork.
+    override_path: "../components/halow"
+  morsemicro/firmware:
+    # Provides the firmware_binary_start/end + bcf_binary_start/end symbols
+    # the halow shim looks up at link time. Version-match the halow component.
+    version: "2.10.4-esp32-1"
+  espressif/esp_tinyusb: "*"

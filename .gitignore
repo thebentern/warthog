@@ -1,0 +1,50 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# ESP-IDF managed components (pulled from registry on build)
+managed_components/
+dependencies.lock
+
+# Generated sdkconfig (we commit sdkconfig.defaults instead)
+sdkconfig
+sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
+
+# Per-developer overrides
+platformio_override.ini
+*.local.ini
+
+# CMake / build artifacts
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Compiler / linker outputs anywhere outside the build dir
+*.o
+*.a
+*.elf
+*.bin
+*.map
+
+# IDE / tooling
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+.cproject
+.project
+# trunk.io stores its caches and symlinks under .trunk/; keep only the config
+# file (.trunk/trunk.yaml) if one is added later.
+.trunk/*
+!.trunk/trunk.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

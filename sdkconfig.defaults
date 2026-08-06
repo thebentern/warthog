@@ -1,0 +1,91 @@
+# Warthog default sdkconfig values. These get merged into every per-env
+# sdkconfig the first time PlatformIO/IDF builds.
+#
+# CAUTION: this file is named sdkconfig.defaults — `rm sdkconfig.*` will eat it.
+# Use `rm sdkconfig.warthog-*` or similar narrow globs when scrubbing per-env
+# generated sdkconfigs.
+
+# --- Partition layout ---------------------------------------------------------
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# --- Flash size ---------------------------------------------------------------
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+
+# --- ESP32-S3 native USB OTG --------------------------------------------------
+# Required for TinyUSB RNDIS net device. USB-OTG only takes over the USB pins
+# once tinyusb_driver_install() runs, so until then USB-Serial-JTAG carries the
+# console.
+CONFIG_USB_OTG_SUPPORTED=y
+
+# --- Console -----------------------------------------------------------------
+# Route the IDF console to USB-Serial-JTAG so `pio device monitor` picks up
+# every ESP_LOG line until TinyUSB claims the bus.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
+
+# --- TinyUSB net device (ECM) + CDC console ----------------------------------
+# esp_tinyusb 2.x only supports a single configuration descriptor, so we can't
+# offer a dual RNDIS/ECM composite for Windows + macOS like the upstream
+# tinyusb net_lwip_webserver example does. ECM works natively on macOS and
+# Linux; Windows is deferred. CDC rides alongside so we still have a serial
+# console after USB-OTG takes over from USB-Serial-JTAG.
+CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=y
+CONFIG_TINYUSB_TASK_STACK_SIZE=8192
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+
+# --- lwIP NAT -----------------------------------------------------------------
+# Phase 4: NAT downstream USB + Wi-Fi-AP traffic out via HaLow STA.
+CONFIG_LWIP_IPV4_NAPT=y
+CONFIG_LWIP_IPV4_NAPT_PORTMAP=y
+CONFIG_LWIP_IP_FORWARD=y
+
+# --- Morse Micro shim pin map (XIAO + Seeed Wi-Fi HaLow add-on) --------------
+CONFIG_MM_RESET_N=1
+CONFIG_MM_WAKE=2
+CONFIG_MM_BUSY=5
+CONFIG_MM_SPI_SCK=7
+CONFIG_MM_SPI_MISO=8
+CONFIG_MM_SPI_MOSI=9
+CONFIG_MM_SPI_CS=4
+CONFIG_MM_SPI_IRQ=3
+
+# --- Morse firmware / chip selection ------------------------------------------
+CONFIG_MMHAL_CHIP_TYPE_MM6108=y
+# Quectel FGH100M-H specific BCF for rated TX power.
+CONFIG_MM_BCF_FILE="bcf_fgh100mhaamd.mbin"
+CONFIG_MM_FW_FILE="mm6108.mbin"
+
+# --- HaLow regulatory --------------------------------------------------------
+# Without this mmhalow_init defaults to "??" → mmwlan_set_channel_list fails →
+# mmwlan_boot fails → version reads come back as uninitialized garbage.
+CONFIG_HALOW_COUNTRY_CODE="US"
+
+# --- Morse packet memory pool sizes ------------------------------------------
+CONFIG_MMPKTMEM_TX_POOL_N_BLOCKS=20
+CONFIG_MMPKTMEM_RX_POOL_N_BLOCKS=23
+
+# --- FreeRTOS / Morse SDK timing requirements --------------------------------
+# Every Seeed mm-iot-esp32 example sets these. They are NOT optional for the
+# Morse driver:
+#  * FREERTOS_HZ=1000 — MMOSAL assumes a 1 ms tick. At the IDF default of 100
+#    every mmosal_task_sleep()/timeout rounds to a 10 ms granularity, which
+#    coarsens the chip reset pulse timing and SAE handshake timers.
+#  * FREERTOS_TIMER_TASK_PRIORITY=10 — the FreeRTOS timer service task must
+#    outrank every MMOSAL thread (i.e. > MMOSAL_TASK_PRI_HIGH). At the IDF
+#    default of 1 it sits BELOW MMOSAL's high-priority threads, so MMOSAL
+#    software timers (SAE retransmit/timeout) get starved during association.
+#    See the "Timers" section of the Morse Micro mmosal API docs.
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_TIMER_TASK_PRIORITY=10
+
+# --- mbedTLS: AES key wrap (SAE / WPA3) --------------------------------------
+# Seeed's sta_connect example pins this explicitly; keep it pinned so a future
+# config change can't silently drop it out from under SAE association.
+CONFIG_MBEDTLS_NIST_KW_C=y
+
+# --- Log level ---------------------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL=3

@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # inject_version.py runs `git describe --tags`; shallow clones break it.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Cache PlatformIO toolchain + packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Smoke build (warthog-us)
+        # One region is enough for CI — the others differ only in the
+        # WARTHOG_REGION_XX define and the BCF/country pick that drives.
+        run: pio run -e warthog-us
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: warthog-us-${{ github.sha }}
+          path: |
+            .pio/build/warthog-us/firmware.bin
+            .pio/build/warthog-us/firmware.factory.bin
+            .pio/build/warthog-us/firmware.elf
+            .pio/build/warthog-us/bootloader.bin
+            .pio/build/warthog-us/partitions.bin
+          retention-days: 14
+          if-no-files-found: error

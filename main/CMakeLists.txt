@@ -1,0 +1,22 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "halow.c"
+        "mesh.c"
+        "usb_net.c"
+        "wifi_ap.c"
+        "nat.c"
+        "led.c"
+        "cfg.c"
+        "at.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        halow
+        esp_netif
+        esp_wifi
+        esp_event
+        lwip
+        nvs_flash
+        esp_tinyusb
+)

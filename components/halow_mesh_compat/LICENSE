@@ -1,0 +1,16 @@
+This component vendors source code from MorseMicro/morse_driver
+(https://github.com/MorseMicro/morse_driver) which is licensed under
+GPL-2.0-or-later. Vendored files retain their original SPDX-License-
+Identifier headers.
+
+The Warthog-authored shim and glue code (src/shim/, src/mesh/mesh_compat*.c,
+include/halow_mesh.h) is also released under GPL-2.0-or-later to maintain
+license consistency with the vendored Linux kernel sources.
+
+When this component is linked into the Warthog firmware (via the
+WARTHOG_MESH_COMPAT Kconfig option), the resulting binary is licensed
+GPL-2.0-or-later as a whole. The default Warthog build (mesh disabled)
+remains under the project's primary license without GPL propagation.
+
+For the full GPL-2.0-or-later license text, see:
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.html

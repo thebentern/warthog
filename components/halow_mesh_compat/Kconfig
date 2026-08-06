@@ -1,0 +1,23 @@
+menu "Warthog halow_mesh_compat (Linux driver port)"
+
+config WARTHOG_MESH_COMPAT
+    bool "Enable Linux morse_driver port for mesh"
+    default n
+    help
+      Enables the Linux GPL morse_driver compatibility layer that provides
+      mesh-capable host-side driving of the MM6108 chip. Gated by default
+      because:
+        - License (GPL-2.0+) propagates to the firmware binary
+        - Currently scaffold-only; needs Morse Micro to deliver a
+          mesh-capable MMFW firmware before the port can complete
+      See components/halow_mesh_compat/README.md for status.
+
+config WARTHOG_MESH_COMPAT_DEBUG
+    bool "Verbose logging in mesh compat layer"
+    depends on WARTHOG_MESH_COMPAT
+    default n
+    help
+      Routes the ported driver's pr_debug / dot11ah_dbg / MORSE_INFO
+      logging through ESP_LOGI. Voluminous; only enable for bring-up.
+
+endmenu

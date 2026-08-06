@@ -1,0 +1,117 @@
+name: release
+
+# Trigger: tag pushes matching v*.*.* (with optional -rcN / -alpha / -beta suffix
+# for pre-releases). Annotated tags carry their message into the release notes;
+# lightweight tags use the auto-generated commit log.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write   # softprops/action-gh-release needs this to publish
+
+jobs:
+  build:
+    name: build ${{ matrix.region }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        region: [us, eu, jp, kr, au]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Cache PlatformIO toolchain + packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Build warthog-${{ matrix.region }}
+        env:
+          # Bakes the tag into the firmware so AT+VERSION? reports e.g. "v0.1.0".
+          WARTHOG_VERSION: ${{ github.ref_name }}
+        run: pio run -e warthog-${{ matrix.region }}
+
+      - name: Bundle region artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          TAG="${GITHUB_REF_NAME}"
+          REGION="${{ matrix.region }}"
+          BUILD=".pio/build/warthog-${REGION}"
+          STEM="warthog-${TAG}-${REGION}"
+          cp "$BUILD/firmware.bin"         "dist/${STEM}.bin"
+          cp "$BUILD/firmware.factory.bin" "dist/${STEM}.factory.bin"
+          cp "$BUILD/firmware.elf"         "dist/${STEM}.elf"
+          cp "$BUILD/bootloader.bin"       "dist/${STEM}-bootloader.bin"
+          cp "$BUILD/partitions.bin"       "dist/${STEM}-partitions.bin"
+          ( cd dist && sha256sum ${STEM}* > "${STEM}.SHA256SUMS" )
+          ls -la dist/
+
+      - name: Upload region bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: warthog-${{ matrix.region }}
+          path: dist/
+          retention-days: 3
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all region bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Add flash.sh and consolidated SHA256SUMS
+        run: |
+          set -euo pipefail
+          cp scripts/flash.sh dist/
+          chmod +x dist/flash.sh
+          ( cd dist && cat warthog-*.SHA256SUMS > SHA256SUMS.txt && rm warthog-*.SHA256SUMS )
+          ls -la dist/
+
+      - name: Detect pre-release
+        id: prerel
+        run: |
+          # Tag has a `-` suffix (e.g. v0.1.0-rc1) → mark as pre-release.
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          prerelease: ${{ steps.prerel.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

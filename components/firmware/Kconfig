@@ -1,0 +1,48 @@
+# Copyright 2024-2026 Morse Micro
+# SPDX-License-Identifier: Apache-2.0
+menu "Morse Micro Firmware Configuration"
+    config MM_BCF_FILE
+        string "Morse Micro Board Configuration File"
+        default "bcf_fgh100mhaamd.mbin"
+        help
+            Set the name of the BCF (Board Configuration File) to use.
+            Example valid filenames include:
+              - bcf_mf08651_us.mbin
+              - bcf_mf08551.mbin
+              - bcf_mf08251.mbin
+              - bcf_mf03120.mbin
+
+            This file provides board-specific configuration data for the Morse Micro chip/module.
+
+            The build system will search for the specified file in the following locations:
+              1. firmware/ in the root of the application being built
+
+            If the file is not found in either location, a warning will be reported during
+            configuration.
+
+    config MM_FW_FILE
+        string "Morse Micro Firmware File"
+        default "mm6108.mbin"
+        help
+            This is the firmware file for the Morse Micro chip/module.
+
+            The build system will search for the specified file in the following locations:
+              1. firmware/ in the root of the application being built
+
+            If the file is not found in either location, a warning will be reported during
+            configuration.
+
+    choice MMHAL_CHIP_TYPE
+        bool "Morse Micro Chip Variant"
+        default MMHAL_CHIP_TYPE_MM6108
+        help
+            This specifies which chip function ops should be used by morselib.
+
+        config MMHAL_CHIP_TYPE_MM6108
+            bool "mmhal_mm6108"
+        config MMHAL_CHIP_TYPE_MM8108
+            bool "mmhal_mm8108"
+    endchoice
+
+endmenu
+

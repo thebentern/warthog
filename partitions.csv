@@ -1,0 +1,6 @@
+# Single-app 8 MB layout. The firmware blob + libmorse run ~1.8 MB; the IDF
+# default 1 MB app partition refuses to boot it.
+# Name,   Type, SubType, Offset,   Size, Flags
+nvs,      data, nvs,     0x9000,   24K,
+phy_init, data, phy,     0xf000,   4K,
+factory,  app,  factory, 0x10000,  4M,
