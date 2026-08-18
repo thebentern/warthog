@@ -349,26 +349,46 @@ _Static_assert(sizeof(s_desc_fs_config) == CONFIG_TOTAL_LEN,
 
 bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
 {
-    /* Return-value semantics in TinyUSB's network class:
-     *   true  → "I'm holding the buffer asynchronously, do NOT renew the
-     *           OUT endpoint" (caller is responsible for tud_network_recv_renew)
-     *   false → "Synchronously processed (or dropped). Renew the OUT endpoint
-     *           NOW so the next packet can come in"
-     * We copy immediately and hand off to esp_netif_receive synchronously, so
-     * we are NOT holding _netd_epbuf.rx. Return false — otherwise TinyUSB never
-     * renews and we never receive another packet after the first. */
+    /* The return value means OPPOSITE things in the two network classes, and
+     * getting it wrong fails silently in a way that looks like dead hardware.
+     *
+     * ECM (ecm_rndis_device.c:354, `if (!tud_network_recv_cb(...))`):
+     *   false = "processed synchronously, renew the OUT endpoint now"
+     *   true  = "I am holding the buffer; I will renew it myself"
+     *
+     * NCM (ncm_device.c:702, `if (tud_network_recv_cb(...))`):
+     *   true  = "datagram accepted" -- and ONLY then does the driver advance to
+     *           the next datagram in the NTB or release the NTB back to the
+     *           free list.
+     *   false = nothing advances. The receive path stalls on the first
+     *           datagram forever and the NTB is never freed.
+     *
+     * So a callback written for ECM stalls NCM after one frame: the interface
+     * comes up, the host sends its DHCP DISCOVER, and nothing is ever received
+     * again. Under NCM we therefore return true even when we drop the frame --
+     * the driver must advance either way, and a dropped datagram is free
+     * (the peer retransmits) whereas a jammed NTB pipeline is not.
+     *
+     * We copy and hand to esp_netif_receive synchronously, so we never hold
+     * the driver's buffer in either class. */
+#if defined(CFG_TUD_NCM) && CFG_TUD_NCM
+    const bool consumed = true;   /* advance the NTB regardless */
+#else
+    const bool consumed = false;  /* ECM: renew the OUT endpoint now */
+#endif
+
     if (!s_usb_netif || size == 0) {
-        return false;
+        return consumed;
     }
     void *copy = malloc(size);
     if (!copy) {
-        return false;
+        return consumed;
     }
     memcpy(copy, src, size);
     if (esp_netif_receive(s_usb_netif, copy, size, NULL) != ESP_OK) {
         free(copy);
     }
-    return false;
+    return consumed;
 }
 
 uint16_t tud_network_xmit_cb(uint8_t *dst, void *ref, uint16_t arg)
@@ -405,10 +425,20 @@ bool tud_network_default_link_state_cb(void) { return false; }
 static esp_err_t l2_transmit(void *h, void *buffer, size_t len)
 {
     (void)h;
-    /* tud_network_can_xmit becomes true after the host has sent SET_INTERFACE
-     * alt 1 on the ECM data interface — that's the only correct "can TX" signal.
-     * Do not gate on a separate flag wired from tud_network_init_cb; TinyUSB's
-     * ECM path never calls that callback. */
+    /* tud_network_can_xmit becomes true once the host has selected alt 1 on the
+     * network data interface -- the only correct "can TX" signal in either
+     * class. Do not gate on a flag wired from tud_network_init_cb; neither the
+     * ECM nor the NCM path calls that callback.
+     *
+     * KNOWN ISSUE: this runs on the lwIP tcpip thread and touches TinyUSB's
+     * transmit state directly. Under ECM that state was one buffer and a flag,
+     * so the window was negligible. Under NCM it is a multi-buffer NTB ring
+     * that the TinyUSB task also mutates from netd_xfer_cb, so the two can
+     * race. esp_tinyusb avoids this by bouncing every send into the TinyUSB
+     * task with usbd_defer_func() (tinyusb_net.c:80). The loop below also
+     * blocks the tcpip thread for up to 50 ms, which is its own problem.
+     * Neither has been observed to misbehave in testing, but both should be
+     * fixed by deferring the send rather than doing it inline. */
     for (int i = 0; i < 50; i++) {
         if (tud_network_can_xmit(len)) {
             tud_network_xmit(buffer, len);

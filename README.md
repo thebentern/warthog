@@ -69,70 +69,48 @@ exclusive and selected at build time.
 
 ## Connecting phones and tablets
 
-Short version: **use the Wi-Fi AP for phones and tablets, and USB for laptops.**
-
-The USB surface presents **CDC-ECM**, which macOS and Linux support natively.
-Phones are a different story, and the class matters more than the cable:
+The USB surface presents **CDC-NCM**, which every current host binds with an
+in-box driver — macOS, Linux, Windows 10+ and iOS/iPadOS. The class matters far
+more than the cable:
 
 | Client | Over USB | Over the Wi-Fi AP |
 |---|---|---|
-| macOS laptop | ✅ verified — appears as a USB Ethernet adapter | ✅ |
-| Linux laptop | ✅ `cdc_ether` is in-tree | ✅ |
-| Windows laptop | ❌ needs RNDIS, not implemented (see below) | ✅ |
-| Android phone/tablet | ⚠️ untested — needs USB host mode and a kernel with `cdc_ether`; also has to power the board | ✅ recommended |
-| iPhone / iPad | 🚧 needs the NCM build (`warthog-us-ncm`) — in progress, see below | ✅ recommended today |
+| macOS laptop | ✅ verified — DHCP lease, 300/300 at 1400 B, ~1.5 ms | ✅ |
+| Linux laptop | ✅ expected — `cdc_ncm` in-tree since 2.6.38 (not re-verified) | ✅ |
+| Windows laptop | ✅ expected — `usbncm.sys` in box on Windows 10+ (untested) | ✅ |
+| iPhone / iPad | ✅ expected — Apple's in-box NCM driver, no dext or MFi (untested here) | ✅ |
+| Android phone/tablet | ⚠️ untested — needs USB host mode; also has to power the board | ✅ recommended |
 
-### Why USB is the wrong tool for a phone
+### Why an iPad works over USB now
 
-Three reasons, in order of how likely they are to stop you:
+warthog used to present CDC-ECM, which macOS and Linux bind and iOS does not —
+so a cable to an iPad did nothing. It now presents **CDC-NCM**, the class Apple
+binds with its own driver: no dext, no MFi, and it works in airplane mode
+because the link is not a radio.
 
-1. **Class mismatch.** iOS and iPadOS drive USB Ethernet through CDC-NCM.
-   Warthog presents ECM, so an iPhone or iPad will not bring the interface up
-   no matter which adapter you use. Android is more permissive — most kernels
-   carry `cdc_ether` — but it is not guaranteed, and it varies by vendor.
-2. **The phone has to be the USB host.** That means OTG mode and a suitable
-   adapter, and it means the phone supplies the power.
-3. **Power.** The HaLow PA draws a substantial inrush on transmit. This board
-   needs a bulk capacitor even from a laptop port (see
-   [`docs/power-notes.md`](docs/power-notes.md)); a phone port is a worse
-   supply, and browning out mid-association looks like a firmware fault.
+Two things that made this work, both easy to get wrong:
 
-The Wi-Fi AP has none of these problems. It is the same uplink, the same NAT,
-and the same DNS — a phone joins `warthog` and shares the HaLow link exactly
-as a USB host does.
+- **TinyUSB must resolve to >= 0.21.0**, pinned in `main/idf_component.yml`.
+  `esp_tinyusb` alone only asks for `>= 0.17.0~2`, so the resolve was landing
+  on 0.19.0 by luck; below 0.21.0 the NCM control requests are unreliable.
+- **The configuration descriptor is built by `esp_tinyusb`, not by hand.** A
+  hand-rolled composite serves ECM fine and is rejected outright for NCM, in a
+  way that looks like dead hardware: the device still answers its device and
+  string descriptors, so it appears in a hub listing with the right name while
+  the host never creates a device for it.
 
-### USB to an iPad or iPhone — the NCM build
+Two caveats that remain:
 
-iOS and iPadOS bind **CDC-NCM**, not ECM, using Apple's in-box driver — no
-dext, no MFi. That is a different USB class, not a different cable, which is
-why the default build does nothing when you plug an iPad in.
+1. **The phone has to be the USB host** — OTG mode, a suitable adapter, and the
+   phone supplies the power. The HaLow PA needs a bulk capacitor even from a
+   laptop port ([`docs/power-notes.md`](docs/power-notes.md)); a phone port is a
+   worse supply.
+2. **Two warthogs on one host collide.** Both vend `192.168.4.1/24`, so a host
+   with two attached configures only one and the other falls back to a
+   link-local address. Fine on a bench, worth knowing.
 
-`warthog-us-ncm` builds the NCM variant:
-
-```bash
-pio run -e warthog-us-ncm -t upload
-```
-
-**Status: not finished.** On the development bench the gadget enumerates, macOS
-attaches a driver and brings the interface up, and the CDC-ACM console still
-works beside it — but the host falls back to a link-local `169.254.x.x`
-address, so the DHCP exchange is not completing. It has not yet been tried
-against an actual iPad, which is the case it exists for and where the
-link-up/DHCP timing differs.
-
-Two things learned getting that far, both worth keeping:
-
-- The hand-rolled composite descriptor that served ECM is rejected outright for
-  NCM: the device answers its device and string descriptors, so it shows up in
-  a hub listing with the right name, while the host never creates a device for
-  it. Letting `esp_tinyusb` build the configuration descriptor fixes it.
-- TinyUSB must resolve to **>= 0.21.0** (pinned in `main/idf_component.yml`).
-  `esp_tinyusb` alone only asks for `>= 0.17.0~2`, and below 0.21.0 the NCM
-  control requests do not work reliably on iOS/iPadOS.
-
-Windows needs RNDIS, which would require a second USB configuration that
-`esp_tinyusb` does not expose. NCM should also cover Windows 10+ via
-`usbncm.sys` once the NCM build is finished.
+If you meet a host that binds ECM and not NCM, `warthog-us-ecm` builds the old
+class as a fallback.
 
 ## How Warthog compares
 

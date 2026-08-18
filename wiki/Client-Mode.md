@@ -3,12 +3,10 @@
 Not everything can take a USB host. Warthog runs a 2.4 GHz Wi-Fi access point
 beside the USB surface so phones, cameras and IoT clients reach the same uplink.
 
-**This is the right path for phones and tablets.** The USB surface is CDC-ECM,
-which iPhones and iPads do not drive (they expect CDC-NCM) and which Android
-supports only in USB host mode with the right kernel module — and the phone
-would have to power the board as well. Over Wi-Fi none of that applies: any
-phone that can join an access point gets the HaLow uplink, with the same NAT
-and DNS a USB host gets.
+**Still the simplest path for phones and tablets**, though no longer the only
+one: warthog's USB surface is now CDC-NCM, which iOS and iPadOS bind natively
+(see [Host Mode](Host-Mode)). Wi-Fi needs no cable, no OTG adapter, and does not
+ask the phone to power the board.
 
 Both surfaces are live simultaneously and share the uplink through NAPT.
 

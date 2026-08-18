@@ -3,17 +3,15 @@
 Plug a Warthog into a laptop and the laptop gains a USB Ethernet adapter whose
 uplink is a kilometre-class HaLow link. No drivers on macOS or Linux.
 
-**This is a laptop feature.** Warthog presents CDC-ECM. Windows wants RNDIS and
-iOS/iPadOS want CDC-NCM, neither of which is implemented, and a phone acting as
-USB host also has to power a board with a hungry PA. For phones and tablets use
-[Client Mode](Client-Mode) — same uplink, none of the problems.
+**Works with laptops, tablets and phones.** warthog presents **CDC-NCM**, which
+macOS, Linux, Windows 10+ and iOS/iPadOS all bind with an in-box driver.
 
 | Client | USB | Wi-Fi AP |
 |---|---|---|
 | macOS / Linux laptop | ✅ | ✅ |
-| Windows laptop | ❌ needs RNDIS | ✅ |
-| Android | ⚠️ untested; needs host mode + `cdc_ether` | ✅ |
-| iPhone / iPad | ❌ needs CDC-NCM | ✅ |
+| Windows laptop | ✅ (`usbncm.sys`, Win10+) | ✅ |
+| iPhone / iPad | ✅ Apple's in-box NCM driver | ✅ |
+| Android | ⚠️ needs USB host mode and board power | ✅ |
 
 ## What the host sees
 

@@ -31,13 +31,15 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # tinyusb net_lwip_webserver example does. ECM works natively on macOS and
 # Linux; Windows is deferred. CDC rides alongside so we still have a serial
 # console after USB-OTG takes over from USB-Serial-JTAG.
-# USB network class. ECM is the default because it is what macOS and Linux
-# bind here today. NCM -- which is what iOS/iPadOS require -- is available as
-# an opt-in build (see the warthog-*-ncm envs in platformio.ini); it enumerates
-# and keeps the CDC console, but macOS did not attach a network driver to it on
-# this bench, so it is not yet the default.
-CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=y
-CONFIG_TINYUSB_NET_MODE_NCM=n
+# USB network class: CDC-NCM.
+#
+# NCM is bound in-box by macOS, Linux (cdc_ncm), Windows 10+ (usbncm.sys) and
+# iOS/iPadOS (Apple's own driver -- no dext, no MFi). ECM reached only macOS
+# and Linux, which left iPads and Windows machines with no way in over the
+# cable. Kconfig choice members must BOTH be written: setting only the new one
+# leaves the old =y line in place and the later line wins.
+CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=n
+CONFIG_TINYUSB_NET_MODE_NCM=y
 CONFIG_TINYUSB_TASK_STACK_SIZE=8192
 CONFIG_TINYUSB_CDC_ENABLED=y
 CONFIG_TINYUSB_CDC_COUNT=1
