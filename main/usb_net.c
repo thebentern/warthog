@@ -1,14 +1,17 @@
 /*
- * TinyUSB CDC-ACM + CDC-ECM composite, backed by an esp_netif.
+ * TinyUSB CDC-ACM + CDC-NCM composite, backed by an esp_netif.
  *
  * esp_tinyusb 2.x ships default descriptors only for CDC/MSC/NCM; selecting
- * CONFIG_TINYUSB_NET_MODE_ECM_RNDIS without a custom descriptor leaves the
+ * CONFIG_TINYUSB_NET_MODE_* without a custom descriptor leaves the
  * device with no functional interface, so the host enumerates nothing. We
- * supply our own composite (CDC-ACM + CDC-ECM) configuration descriptor here.
+ * supply our own composite (CDC-ACM + CDC-NCM) configuration descriptor here.
  *
- * - ECM gives macOS/Linux a USB Ethernet adapter natively. Windows would need
- *   RNDIS, which requires a two-configuration composite that esp_tinyusb
- *   doesn't expose (the driver hard-codes "only 1 configuration"). Deferred.
+ * - NCM gives macOS, Linux, Windows 10+ (usbncm.sys) and iOS/iPadOS a USB
+ *   Ethernet adapter with the host's own in-box driver -- no dext, no MFi.
+ *   It replaced ECM, which only macOS and Linux would bind, and which left
+ *   iPads and Windows machines with no way in over the cable. RNDIS is still
+ *   not offered: it would need a second USB configuration, which esp_tinyusb
+ *   does not expose, and NCM covers Windows anyway.
  * - CDC-ACM rides alongside so we have a serial console after USB-OTG takes
  *   over from USB-Serial-JTAG. The ESP console is rerouted to CDC after the
  *   stack is up.
@@ -242,7 +245,7 @@ enum {
     STRID_COUNT,
 };
 
-static char s_mac_str[13];      /* 12 hex chars MAC, used by CDC-ECM (STRID_MAC) */
+static char s_mac_str[13];      /* 12 hex chars MAC, used by CDC-NCM (STRID_MAC) */
 static char s_serial_str[19];   /* "WTHG-<12 hex>" used by USB device iSerial */
 
 /* iSerialNumber is set to s_serial_str ("WTHG-<MAC>" populated at runtime).
@@ -257,7 +260,7 @@ static char s_serial_str[19];   /* "WTHG-<12 hex>" used by USB device iSerial */
  *   3) Stable across re-enumerations of the SAME board so devloop scripts
  *      can track a board by port path.
  *
- * STRID_MAC keeps s_mac_str (12 hex chars, no separators) because the CDC-ECM
+ * STRID_MAC keeps s_mac_str (12 hex chars, no separators) because the CDC-NCM
  * class spec requires that exact format for the MAC string. */
 static const char *s_string_desc[STRID_COUNT] = {
     [STRID_LANGID]        = (const char[]){0x09, 0x04},
@@ -288,9 +291,13 @@ static const tusb_desc_device_t s_desc_device = {
 };
 
 enum {
+#if !WARTHOG_USB_NCM_ONLY
     ITF_NUM_CDC_CTRL = 0,
     ITF_NUM_CDC_DATA,
     ITF_NUM_NET_CTRL,
+#else
+    ITF_NUM_NET_CTRL = 0,
+#endif
     ITF_NUM_NET_DATA,
     ITF_NUM_TOTAL,
 };
@@ -304,22 +311,45 @@ enum {
 #define EPNUM_NET_OUT   0x04
 #define EPNUM_NET_IN    0x84
 
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_CDC_ECM_DESC_LEN)
+/* WARTHOG_USB_NCM_ONLY drops the CDC-ACM console from the composite, leaving a
+ * single NCM function. Used to bisect host-side enumeration problems: it is the
+ * exact shape a known-good NCM gadget presents, so if this enumerates and the
+ * composite does not, the fault is in combining the two functions rather than
+ * in NCM itself. Costs the AT console, so it is a diagnostic, not a default. */
+#ifndef WARTHOG_USB_NCM_ONLY
+#define WARTHOG_USB_NCM_ONLY 0
+#endif
+
+#if WARTHOG_USB_NCM_ONLY
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_NCM_DESC_LEN)
+#else
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_CDC_NCM_DESC_LEN)
+#endif
 
 static const uint8_t s_desc_fs_config[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0, 100),
+#if !WARTHOG_USB_NCM_ONLY
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC_CTRL, STRID_CDC_INTERFACE,
                        EPNUM_CDC_NOTIF, 8,
                        EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
-    TUD_CDC_ECM_DESCRIPTOR(ITF_NUM_NET_CTRL, STRID_NET_INTERFACE, STRID_MAC,
+#endif
+    TUD_CDC_NCM_DESCRIPTOR(ITF_NUM_NET_CTRL, STRID_NET_INTERFACE, STRID_MAC,
                            EPNUM_NET_NOTIF, 64,
                            EPNUM_NET_OUT, EPNUM_NET_IN, 64,
                            CFG_TUD_NET_MTU),
 };
 
+/* The host aborts enumeration if the config descriptor's declared wTotalLength
+ * does not match the bytes actually emitted, and the symptom is indirect: the
+ * device answers device/string descriptors (so it appears in a hub listing
+ * with the right name) while the OS never creates a device for it. Catch a
+ * mismatch at build time instead. */
+_Static_assert(sizeof(s_desc_fs_config) == CONFIG_TOTAL_LEN,
+               "USB config descriptor length does not match CONFIG_TOTAL_LEN");
+
 bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
 {
-    /* Return-value semantics in TinyUSB ECM:
+    /* Return-value semantics in TinyUSB's network class:
      *   true  → "I'm holding the buffer asynchronously, do NOT renew the
      *           OUT endpoint" (caller is responsible for tud_network_recv_renew)
      *   false → "Synchronously processed (or dropped). Renew the OUT endpoint
@@ -351,11 +381,26 @@ uint16_t tud_network_xmit_cb(uint8_t *dst, void *ref, uint16_t arg)
 }
 
 /* These two are declared (non-weak) in TinyUSB's net_device.h, so we must
- * define them even though TinyUSB's ECM path never calls them. LED state on
+ * define them even though TinyUSB's NCM path never calls them. LED state on
  * host attach/detach is driven via the tinyusb_event_cb_t hook on the
  * tinyusb_config_t instead. */
 void tud_network_init_cb(void) {}
 void tud_network_link_state_cb(uint8_t rhport, bool state) { (void)rhport; (void)state; }
+
+/* NCM link state.
+ *
+ * ECM came up implicitly; NCM does not. The host leaves the interface down
+ * until the device reports the link up on the notification endpoint, so
+ * without this the gadget enumerates, binds a driver, and then sits there with
+ * no address -- which reads as a broken cable rather than a missing
+ * notification.
+ *
+ * Start DOWN and raise it only once the device is configured. iOS runs DHCP
+ * exactly once on link-up and never retries, so the netif and its DHCP server
+ * must already be running when this fires -- they are, because
+ * warthog_usb_net_start() brings the netif up before installing the driver. */
+bool tud_network_default_link_state_cb(void) { return false; }
+
 
 static esp_err_t l2_transmit(void *h, void *buffer, size_t len)
 {
@@ -379,12 +424,19 @@ static void on_tinyusb_event(tinyusb_event_t *event, void *arg)
     (void)arg;
     switch (event->id) {
     case TINYUSB_EVENT_ATTACHED:
-        ESP_LOGI(TAG, "host attached");
+        ESP_LOGI(TAG, "host attached; raising NCM link");
         warthog_led_set_usb(true);
+        /* esp_tinyusb owns tud_mount_cb/tud_umount_cb, so the link is raised
+         * from its event hook instead. The netif and DHCP server are already
+         * running by now -- warthog_usb_net_start() brings them up before
+         * installing the driver -- which matters because iOS runs DHCP exactly
+         * once on link-up and never retries. */
+        tud_network_link_state(0, true);
         break;
     case TINYUSB_EVENT_DETACHED:
-        ESP_LOGI(TAG, "host detached");
+        ESP_LOGI(TAG, "host detached; dropping NCM link");
         warthog_led_set_usb(false);
+        tud_network_link_state(0, false);
         break;
     default:
         break;
@@ -497,9 +549,21 @@ esp_netif_t *warthog_usb_net_start(void)
             .priority = 5,
             .xCoreID = 0,
         },
+        /* Let esp_tinyusb build the CONFIGURATION descriptor.
+         *
+         * It already composes CDC + NCM from CFG_TUD_CDC / CFG_TUD_NCM with
+         * the interface, endpoint and IAD layout the class drivers expect
+         * (usb_descriptors.c). The hand-rolled composite this replaced worked
+         * for ECM and was rejected outright for NCM -- the device answered its
+         * device and string descriptors, so a hub listing showed the right
+         * name, while the host never created a device for it.
+         *
+         * The DEVICE descriptor and strings stay ours, so VID/PID, product
+         * name and the MAC-derived serial are unchanged; only the config
+         * descriptor is handed back. */
         .descriptor = {
             .device = &s_desc_device,
-            .full_speed_config = s_desc_fs_config,
+            .full_speed_config = NULL,
             .string = s_string_desc,
             .string_count = STRID_COUNT,
         },

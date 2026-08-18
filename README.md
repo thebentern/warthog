@@ -80,7 +80,7 @@ Phones are a different story, and the class matters more than the cable:
 | Linux laptop | ✅ `cdc_ether` is in-tree | ✅ |
 | Windows laptop | ❌ needs RNDIS, not implemented (see below) | ✅ |
 | Android phone/tablet | ⚠️ untested — needs USB host mode and a kernel with `cdc_ether`; also has to power the board | ✅ recommended |
-| iPhone / iPad | ❌ iOS/iPadOS expect **CDC-NCM**, not ECM | ✅ recommended |
+| iPhone / iPad | 🚧 needs the NCM build (`warthog-us-ncm`) — in progress, see below | ✅ recommended today |
 
 ### Why USB is the wrong tool for a phone
 
@@ -101,13 +101,38 @@ The Wi-Fi AP has none of these problems. It is the same uplink, the same NAT,
 and the same DNS — a phone joins `warthog` and shares the HaLow link exactly
 as a USB host does.
 
-### If you specifically need USB to a phone
+### USB to an iPad or iPhone — the NCM build
 
-Windows and iOS both need a USB network class warthog does not implement
-(RNDIS and NCM respectively). Neither is a small change: `esp_tinyusb` exposes
-only one USB configuration, and offering a second class alongside ECM means a
-composite descriptor the component does not currently support. Both are
-tracked as unimplemented rather than planned — see [Status](#status).
+iOS and iPadOS bind **CDC-NCM**, not ECM, using Apple's in-box driver — no
+dext, no MFi. That is a different USB class, not a different cable, which is
+why the default build does nothing when you plug an iPad in.
+
+`warthog-us-ncm` builds the NCM variant:
+
+```bash
+pio run -e warthog-us-ncm -t upload
+```
+
+**Status: not finished.** On the development bench the gadget enumerates, macOS
+attaches a driver and brings the interface up, and the CDC-ACM console still
+works beside it — but the host falls back to a link-local `169.254.x.x`
+address, so the DHCP exchange is not completing. It has not yet been tried
+against an actual iPad, which is the case it exists for and where the
+link-up/DHCP timing differs.
+
+Two things learned getting that far, both worth keeping:
+
+- The hand-rolled composite descriptor that served ECM is rejected outright for
+  NCM: the device answers its device and string descriptors, so it shows up in
+  a hub listing with the right name, while the host never creates a device for
+  it. Letting `esp_tinyusb` build the configuration descriptor fixes it.
+- TinyUSB must resolve to **>= 0.21.0** (pinned in `main/idf_component.yml`).
+  `esp_tinyusb` alone only asks for `>= 0.17.0~2`, and below 0.21.0 the NCM
+  control requests do not work reliably on iOS/iPadOS.
+
+Windows needs RNDIS, which would require a second USB configuration that
+`esp_tinyusb` does not expose. NCM should also cover Windows 10+ via
+`usbncm.sys` once the NCM build is finished.
 
 ## How Warthog compares
 
