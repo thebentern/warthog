@@ -115,7 +115,7 @@ esp_err_t warthog_halow_start(void)
 #ifdef WARTHOG_MESH_SMOKE
     /* Diagnostic build (warthog-mesh-smoke env): probe whether the chip
      * firmware accepts a mesh VIF, then stop — skip STA association so the
-     * mesh attempt owns the single VIF. See docs/mesh-port-scope.md. */
+     * mesh attempt owns the single VIF. See docs/history/mesh-port-scope.md. */
     warthog_mesh_smoke_test();
     /* No STA association in this build — don't let app_main stall waiting. */
     xEventGroupSetBits(s_halow_events, HALOW_LINK_BIT);

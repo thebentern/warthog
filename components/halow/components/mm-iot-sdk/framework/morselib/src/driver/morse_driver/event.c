@@ -2,7 +2,7 @@
  * Copyright 2022-2024 Morse Micro
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
  */
-/* Phase 4f probe — raise this file to INF so the default-case fallthrough
+/* Raise this file to INF so the default-case fallthrough
  * `Mac EVT 0x%04x LEN %u` line surfaces unknown chip events. We need to see
  * whether the chip emits any mesh-related events (peer discovered, PLINK
  * state change, etc.) before deciding whether to build a passive RX-dispatch
@@ -80,7 +80,7 @@ int morse_mac_event_recv(struct driver_data *driverd, struct mmpktview *view)
     event_iid = le16toh(hdr->vif_id);
     event_len = le16toh(hdr->len);
 
-    /* Phase 4l — total-event counter. Logs every event id the chip emits,
+    /* Total-event counter. Logs every event id the chip emits,
      * including known ones (the default-case log below only catches unknown
      * ids). Decisive companion to the RX channel histogram: if the chip
      * emits zero events AND zero RX pages in mesh mode, fullmac has no
@@ -190,7 +190,7 @@ int morse_mac_event_recv(struct driver_data *driverd, struct mmpktview *view)
         }
 
         default:
-            /* Phase 4f-step21 — bumped to ERR so unknown chip events show up
+            /* bumped to ERR so unknown chip events show up
              * regardless of monitor log-level filtering. In mesh mode the
              * chip might be emitting events for peer beacon RX or beacon TX
              * fails that we'd otherwise blackhole. */

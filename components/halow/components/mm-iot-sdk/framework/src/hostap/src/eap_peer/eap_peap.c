@@ -44,7 +44,7 @@ struct eap_peap_data {
 	struct eap_method_type *phase2_types;
 	size_t num_phase2_types;
 
-	int peap_outer_success; /* 0 = PEAP terminated on Phase 2 inner
+	int peap_outer_success; /* 0 = PEAP terminated on inner
 				 * EAP-Success
 				 * 1 = reply with tunneled EAP-Success to inner
 				 * EAP-Success and expect AS to send outer
@@ -118,15 +118,15 @@ static void eap_peap_parse_phase1(struct eap_peap_data *data,
 	if (os_strstr(phase1, "phase2_auth=0")) {
 		data->phase2_auth = NO_AUTH;
 		wpa_printf(MSG_DEBUG,
-			   "EAP-PEAP: Do not require Phase 2 authentication");
+			   "EAP-PEAP: Do not require authentication");
 	} else if (os_strstr(phase1, "phase2_auth=1")) {
 		data->phase2_auth = FOR_INITIAL;
 		wpa_printf(MSG_DEBUG,
-			   "EAP-PEAP: Require Phase 2 authentication for initial connection");
+			   "EAP-PEAP: Require authentication for initial connection");
 	} else if (os_strstr(phase1, "phase2_auth=2")) {
 		data->phase2_auth = ALWAYS;
 		wpa_printf(MSG_DEBUG,
-			   "EAP-PEAP: Require Phase 2 authentication for all cases");
+			   "EAP-PEAP: Require authentication for all cases");
 	}
 #ifdef EAP_TNC
 	if (os_strstr(phase1, "tnc=soh2")) {
@@ -251,7 +251,7 @@ static int eap_peap_get_isk(struct eap_sm *sm, struct eap_peap_data *data,
 	    (key = data->phase2_method->getKey(sm, data->phase2_priv,
 					       &key_len)) == NULL) {
 		wpa_printf(MSG_DEBUG, "EAP-PEAP: Could not get key material "
-			   "from Phase 2");
+			   "from ");
 		return -1;
 	}
 
@@ -594,12 +594,12 @@ static int eap_tlv_process(struct eap_sm *sm, struct eap_peap_data *data,
 				   "- EAP-TLV/Phase2 Completed");
 			if (force_failure) {
 				wpa_printf(MSG_INFO, "EAP-TLV: Earlier failure"
-					   " - force failed Phase 2");
+					   " - force failed ");
 				resp_status = EAP_TLV_RESULT_FAILURE;
 				ret->decision = DECISION_FAIL;
 			} else if (!peap_phase2_sufficient(sm, data)) {
 				wpa_printf(MSG_INFO,
-					   "EAP-PEAP: Server indicated Phase 2 success, but sufficient Phase 2 authentication has not been completed");
+					   "EAP-PEAP: Server indicated success, but sufficient authentication has not been completed");
 				resp_status = EAP_TLV_RESULT_FAILURE;
 				ret->decision = DECISION_FAIL;
 			} else {
@@ -642,11 +642,11 @@ static int eap_peap_phase2_request(struct eap_sm *sm,
 
 	if (len <= sizeof(struct eap_hdr)) {
 		wpa_printf(MSG_INFO, "EAP-PEAP: too short "
-			   "Phase 2 request (len=%lu)", (unsigned long) len);
+			   "request (len=%lu)", (unsigned long) len);
 		return -1;
 	}
 	pos = (u8 *) (hdr + 1);
-	wpa_printf(MSG_DEBUG, "EAP-PEAP: Phase 2 Request: type=%d", *pos);
+	wpa_printf(MSG_DEBUG, "EAP-PEAP: Request: type=%d", *pos);
 	switch (*pos) {
 	case EAP_TYPE_IDENTITY:
 		*resp = eap_sm_buildIdentity(sm, hdr->identifier, 1);
@@ -708,7 +708,7 @@ static int eap_peap_phase2_request(struct eap_sm *sm,
 		if (method == EAP_TYPE_EXPANDED) {
 			if (len < sizeof(struct eap_hdr) + 8) {
 				wpa_printf(MSG_INFO,
-					   "EAP-PEAP: Too short Phase 2 request (expanded header) (len=%lu)",
+					   "EAP-PEAP: Too short request (expanded header) (len=%lu)",
 					   (unsigned long) len);
 				return -1;
 			}
@@ -729,7 +729,7 @@ static int eap_peap_phase2_request(struct eap_sm *sm,
 				data->phase2_type.method =
 					data->phase2_types[i].method;
 				wpa_printf(MSG_DEBUG, "EAP-PEAP: Selected "
-					   "Phase 2 EAP vendor %d method %d",
+					   "EAP vendor %d method %d",
 					   data->phase2_type.vendor,
 					   data->phase2_type.method);
 				break;
@@ -758,7 +758,7 @@ static int eap_peap_phase2_request(struct eap_sm *sm,
 		}
 		if (data->phase2_priv == NULL || data->phase2_method == NULL) {
 			wpa_printf(MSG_INFO, "EAP-PEAP: failed to initialize "
-				   "Phase 2 EAP method %d", *pos);
+				   "EAP method %d", *pos);
 			ret->methodState = METHOD_DONE;
 			ret->decision = DECISION_FAIL;
 			return -1;
@@ -802,10 +802,10 @@ static int eap_peap_decrypt(struct eap_sm *sm, struct eap_peap_data *data,
 	size_t len;
 
 	wpa_printf(MSG_DEBUG, "EAP-PEAP: received %lu bytes encrypted data for"
-		   " Phase 2", (unsigned long) wpabuf_len(in_data));
+		   " ", (unsigned long) wpabuf_len(in_data));
 
 	if (data->pending_phase2_req) {
-		wpa_printf(MSG_DEBUG, "EAP-PEAP: Pending Phase 2 request - "
+		wpa_printf(MSG_DEBUG, "EAP-PEAP: Pending request - "
 			   "skip decryption and use old data");
 		/* Clear TLS reassembly state. */
 		eap_peer_tls_reset_input(&data->ssl);
@@ -823,7 +823,7 @@ static int eap_peap_decrypt(struct eap_sm *sm, struct eap_peap_data *data,
 		 */
 		wpa_printf(MSG_DEBUG, "EAP-PEAP: Received TLS ACK, but "
 			   "expected data - acknowledge with TLS ACK since "
-			   "Phase 2 has been completed");
+			   "has been completed");
 		ret->decision = DECISION_COND_SUCC;
 		ret->methodState = METHOD_DONE;
 		return 1;
@@ -843,7 +843,7 @@ static int eap_peap_decrypt(struct eap_sm *sm, struct eap_peap_data *data,
 	}
 
 continue_req:
-	wpa_hexdump_buf(MSG_DEBUG, "EAP-PEAP: Decrypted Phase 2 EAP",
+	wpa_hexdump_buf(MSG_DEBUG, "EAP-PEAP: Decrypted EAP",
 			in_decrypted);
 
 	hdr = wpabuf_mhead(in_decrypted);
@@ -880,7 +880,7 @@ continue_req:
 
 	hdr = wpabuf_mhead(in_decrypted);
 	if (wpabuf_len(in_decrypted) < sizeof(*hdr)) {
-		wpa_printf(MSG_INFO, "EAP-PEAP: Too short Phase 2 "
+		wpa_printf(MSG_INFO, "EAP-PEAP: Too short "
 			   "EAP frame (len=%lu)",
 			   (unsigned long) wpabuf_len(in_decrypted));
 		wpabuf_clear_free(in_decrypted);
@@ -889,20 +889,20 @@ continue_req:
 	len = be_to_host16(hdr->length);
 	if (len > wpabuf_len(in_decrypted)) {
 		wpa_printf(MSG_INFO, "EAP-PEAP: Length mismatch in "
-			   "Phase 2 EAP frame (len=%lu hdr->length=%lu)",
+			   "EAP frame (len=%lu hdr->length=%lu)",
 			   (unsigned long) wpabuf_len(in_decrypted),
 			   (unsigned long) len);
 		wpabuf_clear_free(in_decrypted);
 		return 0;
 	}
 	if (len < wpabuf_len(in_decrypted)) {
-		wpa_printf(MSG_INFO, "EAP-PEAP: Odd.. Phase 2 EAP header has "
+		wpa_printf(MSG_INFO, "EAP-PEAP: Odd.. EAP header has "
 			   "shorter length than full decrypted data "
 			   "(%lu < %lu)",
 			   (unsigned long) len,
 			   (unsigned long) wpabuf_len(in_decrypted));
 	}
-	wpa_printf(MSG_DEBUG, "EAP-PEAP: received Phase 2: code=%d "
+	wpa_printf(MSG_DEBUG, "EAP-PEAP: received : code=%d "
 		   "identifier=%d length=%lu", hdr->code, hdr->identifier,
 		   (unsigned long) len);
 	switch (hdr->code) {
@@ -916,15 +916,15 @@ continue_req:
 		}
 		break;
 	case EAP_CODE_SUCCESS:
-		wpa_printf(MSG_DEBUG, "EAP-PEAP: Phase 2 Success");
+		wpa_printf(MSG_DEBUG, "EAP-PEAP: Success");
 		if (data->peap_version == 1) {
 			/* EAP-Success within TLS tunnel is used to indicate
 			 * shutdown of the TLS channel. The authentication has
 			 * been completed. */
 			if (!peap_phase2_sufficient(sm, data)) {
-				wpa_printf(MSG_DEBUG, "EAP-PEAP: Phase 2 "
+				wpa_printf(MSG_DEBUG, "EAP-PEAP: "
 					   "Success used to indicate success, "
-					   "but Phase 2 EAP was not yet "
+					   "but EAP was not yet "
 					   "completed successfully");
 				ret->methodState = METHOD_DONE;
 				ret->decision = DECISION_FAIL;
@@ -954,7 +954,7 @@ continue_req:
 						host_to_be16(sizeof(*rhdr));
 				}
 			} else {
-				/* No EAP-Success expected for Phase 1 (outer,
+				/* No EAP-Success expected for (outer,
 				 * unencrypted auth), so force EAP state
 				 * machine to SUCCESS state. */
 				sm->peap_done = true;
@@ -964,7 +964,7 @@ continue_req:
 		}
 		break;
 	case EAP_CODE_FAILURE:
-		wpa_printf(MSG_DEBUG, "EAP-PEAP: Phase 2 Failure");
+		wpa_printf(MSG_DEBUG, "EAP-PEAP: Failure");
 		ret->decision = DECISION_FAIL;
 		ret->methodState = METHOD_MAY_CONT;
 		ret->allowNotifications = false;
@@ -980,7 +980,7 @@ continue_req:
 		break;
 	default:
 		wpa_printf(MSG_INFO, "EAP-PEAP: Unexpected code=%d in "
-			   "Phase 2 EAP header", hdr->code);
+			   "EAP header", hdr->code);
 		break;
 	}
 
@@ -991,7 +991,7 @@ continue_req:
 		struct wpabuf *rmsg, buf;
 
 		wpa_hexdump_buf_key(MSG_DEBUG,
-				    "EAP-PEAP: Encrypting Phase 2 data", resp);
+				    "EAP-PEAP: Encrypting data", resp);
 		/* PEAP version changes */
 		if (wpabuf_len(resp) >= 5 &&
 		    wpabuf_head_u8(resp)[0] == EAP_CODE_RESPONSE &&
@@ -1009,7 +1009,7 @@ continue_req:
 					 data->peap_version, req->identifier,
 					 rmsg, out_data)) {
 			wpa_printf(MSG_INFO, "EAP-PEAP: Failed to encrypt "
-				   "a Phase 2 frame");
+				   "a frame");
 		}
 		wpabuf_clear_free(resp);
 	}
@@ -1124,7 +1124,7 @@ static struct wpabuf * eap_peap_process(struct eap_sm *sm, void *priv,
 			size_t context_len = 0;
 
 			wpa_printf(MSG_DEBUG,
-				   "EAP-PEAP: TLS done, proceed to Phase 2");
+				   "EAP-PEAP: TLS done, proceed to ");
 			eap_peap_free_key(data);
 			/* draft-josefsson-ppext-eap-tls-eap-05.txt
 			 * specifies that PEAPv1 would use "client PEAP

@@ -14,7 +14,7 @@ extern const struct wpa_driver_ops mmwlan_wpas_ops;
 extern const struct wpa_driver_ops mmwlan_wpas_ops_ap;
 
 #ifdef CONFIG_MESH
-/** Warthog fork — driver_ops for 802.11s mesh (Phase 4d). */
+/** Warthog fork — driver_ops for 802.11s mesh . */
 extern const struct wpa_driver_ops mmwlan_wpas_ops_mesh;
 #endif
 
@@ -36,7 +36,7 @@ extern const struct mmwlan_supp_config_entry mmwlan_wpa_config_dpp;
 /** Morse WPA Supplicant configuration descriptor for AP mode. */
 extern const struct mmwlan_supp_config_entry mmwlan_wpa_config_ap;
 #ifdef CONFIG_MESH
-/** Warthog fork — config descriptor for 802.11s mesh (Phase 4d). */
+/** Warthog fork — config descriptor for 802.11s mesh . */
 extern const struct mmwlan_supp_config_entry mmwlan_wpa_config_mesh;
 #endif
 

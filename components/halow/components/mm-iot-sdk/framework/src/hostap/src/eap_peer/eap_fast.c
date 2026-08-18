@@ -385,7 +385,7 @@ static int eap_fast_select_phase2_method(struct eap_fast_data *data,
 	if (vendor == EAP_VENDOR_IETF && type == EAP_TYPE_TNC) {
 		data->phase2_type.vendor = EAP_VENDOR_IETF;
 		data->phase2_type.method = EAP_TYPE_TNC;
-		wpa_printf(MSG_DEBUG, "EAP-FAST: Selected Phase 2 EAP "
+		wpa_printf(MSG_DEBUG, "EAP-FAST: Selected EAP "
 			   "vendor %d method %d for TNC",
 			   data->phase2_type.vendor,
 			   data->phase2_type.method);
@@ -400,7 +400,7 @@ static int eap_fast_select_phase2_method(struct eap_fast_data *data,
 
 		data->phase2_type.vendor = data->phase2_types[i].vendor;
 		data->phase2_type.method = data->phase2_types[i].method;
-		wpa_printf(MSG_DEBUG, "EAP-FAST: Selected Phase 2 EAP "
+		wpa_printf(MSG_DEBUG, "EAP-FAST: Selected EAP "
 			   "vendor %d method %d",
 			   data->phase2_type.vendor,
 			   data->phase2_type.method);
@@ -432,7 +432,7 @@ static int eap_fast_phase2_request(struct eap_sm *sm,
 
 	if (len <= sizeof(struct eap_hdr)) {
 		wpa_printf(MSG_INFO, "EAP-FAST: too short "
-			   "Phase 2 request (len=%lu)", (unsigned long) len);
+			   "request (len=%lu)", (unsigned long) len);
 		return -1;
 	}
 	pos = (u8 *) (hdr + 1);
@@ -440,14 +440,14 @@ static int eap_fast_phase2_request(struct eap_sm *sm,
 	if (method == EAP_TYPE_EXPANDED) {
 		if (len < sizeof(struct eap_hdr) + 8) {
 			wpa_printf(MSG_INFO,
-				   "EAP-FAST: Too short Phase 2 request (expanded header) (len=%lu)",
+				   "EAP-FAST: Too short request (expanded header) (len=%lu)",
 				   (unsigned long) len);
 			return -1;
 		}
 		vendor = WPA_GET_BE24(pos + 1);
 		method = WPA_GET_BE32(pos + 4);
 	}
-	wpa_printf(MSG_DEBUG, "EAP-FAST: Phase 2 Request: type=%u:%u",
+	wpa_printf(MSG_DEBUG, "EAP-FAST: Request: type=%u:%u",
 		   vendor, method);
 	if (vendor == EAP_VENDOR_IETF && method == EAP_TYPE_IDENTITY) {
 		*resp = eap_sm_buildIdentity(sm, hdr->identifier, 1);
@@ -457,7 +457,7 @@ static int eap_fast_phase2_request(struct eap_sm *sm,
 	if (data->phase2_priv && data->phase2_method &&
 	    (vendor != data->phase2_type.vendor ||
 	     method != data->phase2_type.method)) {
-		wpa_printf(MSG_DEBUG, "EAP-FAST: Phase 2 EAP sequence - "
+		wpa_printf(MSG_DEBUG, "EAP-FAST: EAP sequence - "
 			   "deinitialize previous method");
 		data->phase2_method->deinit(sm, data->phase2_priv);
 		data->phase2_method = NULL;
@@ -480,7 +480,7 @@ static int eap_fast_phase2_request(struct eap_sm *sm,
 	     eap_fast_init_phase2_method(sm, data) < 0) ||
 	    data->phase2_method == NULL) {
 		wpa_printf(MSG_INFO,
-			   "EAP-FAST: Failed to initialize Phase 2 EAP method %u:%u",
+			   "EAP-FAST: Failed to initialize EAP method %u:%u",
 			   vendor, method);
 		ret->methodState = METHOD_DONE;
 		ret->decision = DECISION_FAIL;
@@ -599,7 +599,7 @@ static struct wpabuf * eap_fast_process_eap_payload_tlv(
 
 	if (hdr->code != EAP_CODE_REQUEST) {
 		wpa_printf(MSG_INFO, "EAP-FAST: Unexpected code=%d in "
-			   "Phase 2 EAP header", hdr->code);
+			   "EAP header", hdr->code);
 		return NULL;
 	}
 
@@ -675,7 +675,7 @@ static int eap_fast_get_phase2_key(struct eap_sm *sm,
 	os_memset(isk, 0, isk_len);
 
 	if (data->phase2_method == NULL || data->phase2_priv == NULL) {
-		wpa_printf(MSG_DEBUG, "EAP-FAST: Phase 2 method not "
+		wpa_printf(MSG_DEBUG, "EAP-FAST: method not "
 			   "available");
 		return -1;
 	}
@@ -688,7 +688,7 @@ static int eap_fast_get_phase2_key(struct eap_sm *sm,
 	    (key = data->phase2_method->getKey(sm, data->phase2_priv,
 					       &key_len)) == NULL) {
 		wpa_printf(MSG_DEBUG, "EAP-FAST: Could not get key material "
-			   "from Phase 2");
+			   "from ");
 		return -1;
 	}
 
@@ -1103,7 +1103,7 @@ static int eap_fast_parse_decrypted(struct wpabuf *decrypted,
 
 	os_memset(tlv, 0, sizeof(*tlv));
 
-	/* Parse TLVs from the decrypted Phase 2 data */
+	/* Parse TLVs from the decrypted data */
 	pos = wpabuf_mhead(decrypted);
 	end = pos + wpabuf_len(decrypted);
 	while (end - pos > 4) {
@@ -1116,7 +1116,7 @@ static int eap_fast_parse_decrypted(struct wpabuf *decrypted,
 			wpa_printf(MSG_INFO, "EAP-FAST: TLV overflow");
 			return -1;
 		}
-		wpa_printf(MSG_DEBUG, "EAP-FAST: Received Phase 2: "
+		wpa_printf(MSG_DEBUG, "EAP-FAST: Received : "
 			   "TLV type %d length %u%s",
 			   tlv_type, (unsigned int) len,
 			   mandatory ? " (mandatory)" : "");
@@ -1152,12 +1152,12 @@ static int eap_fast_encrypt_response(struct eap_sm *sm,
 	if (resp == NULL)
 		return 0;
 
-	wpa_hexdump_buf(MSG_DEBUG, "EAP-FAST: Encrypting Phase 2 data",
+	wpa_hexdump_buf(MSG_DEBUG, "EAP-FAST: Encrypting data",
 			resp);
 	if (eap_peer_tls_encrypt(sm, &data->ssl, EAP_TYPE_FAST,
 				 data->fast_version, identifier,
 				 resp, out_data)) {
-		wpa_printf(MSG_INFO, "EAP-FAST: Failed to encrypt a Phase 2 "
+		wpa_printf(MSG_INFO, "EAP-FAST: Failed to encrypt a "
 			   "frame");
 	}
 	wpabuf_clear_free(resp);
@@ -1306,10 +1306,10 @@ static int eap_fast_decrypt(struct eap_sm *sm, struct eap_fast_data *data,
 	int res;
 
 	wpa_printf(MSG_DEBUG, "EAP-FAST: Received %lu bytes encrypted data for"
-		   " Phase 2", (unsigned long) wpabuf_len(in_data));
+		   " ", (unsigned long) wpabuf_len(in_data));
 
 	if (data->pending_phase2_req) {
-		wpa_printf(MSG_DEBUG, "EAP-FAST: Pending Phase 2 request - "
+		wpa_printf(MSG_DEBUG, "EAP-FAST: Pending request - "
 			   "skip decryption and use old data");
 		/* Clear TLS reassembly state. */
 		eap_peer_tls_reset_input(&data->ssl);
@@ -1331,11 +1331,11 @@ static int eap_fast_decrypt(struct eap_sm *sm, struct eap_fast_data *data,
 		return res;
 
 continue_req:
-	wpa_hexdump_buf(MSG_MSGDUMP, "EAP-FAST: Decrypted Phase 2 TLV(s)",
+	wpa_hexdump_buf(MSG_MSGDUMP, "EAP-FAST: Decrypted TLV(s)",
 			in_decrypted);
 
 	if (wpabuf_len(in_decrypted) < 4) {
-		wpa_printf(MSG_INFO, "EAP-FAST: Too short Phase 2 "
+		wpa_printf(MSG_INFO, "EAP-FAST: Too short "
 			   "TLV frame (len=%lu)",
 			   (unsigned long) wpabuf_len(in_decrypted));
 		wpabuf_clear_free(in_decrypted);
@@ -1631,7 +1631,7 @@ static struct wpabuf * eap_fast_process(struct eap_sm *sm, void *priv,
 		if (tls_connection_established(sm->ssl_ctx, data->ssl.conn)) {
 			char cipher[80];
 			wpa_printf(MSG_DEBUG,
-				   "EAP-FAST: TLS done, proceed to Phase 2");
+				   "EAP-FAST: TLS done, proceed to ");
 			if (data->provisioning &&
 			    (!(data->provisioning_allowed &
 			       EAP_FAST_PROV_AUTH) ||

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
  */
 
-/* Phase 4f diagnostic — surface every call to umac_supp_process_mgmt_frame
+/* Diagnostic: surface every call to umac_supp_process_mgmt_frame
  * so we can see whether the chip is delivering mesh peer frames to the
  * supplicant at all. Without this, MPM-debug lines are the only signal,
  * and we can't distinguish "frames never arrived" from "frames arrived but
@@ -393,7 +393,7 @@ void umac_supp_process_mgmt_frame(struct umac_data *umacd, struct mmpktview *rxb
 
     wpa_event_data.rx_mgmt.freq = (mmpkt_get_metadata(mmpkt).rx->freq_100khz * 100);
 
-    /* Phase 4f diagnostic: log the first two octets of the management frame
+    /* Diagnostic: log the first two octets of the management frame
      * header (frame control field) — that gives us the type (mgmt/ctrl/data)
      * + subtype (beacon=8, action=13, etc.). Mesh PLINK frames are action
      * frames (subtype 13, category 15 SELF_PROTECTED). If we never see any
@@ -407,7 +407,7 @@ void umac_supp_process_mgmt_frame(struct umac_data *umacd, struct mmpktview *rxb
               data->mesh_driver_ctx != NULL);
 
 
-    /* Phase 4f — at most one of {AP, STA, mesh} is active at a time. The
+    /* at most one of {AP, STA, mesh} is active at a time. The
      * existing assert covers AP-vs-STA; mesh is allowed concurrent with
      * neither (the chip only has one VIF, and umac_mesh / umac_ap / umac_sta
      * are mutually exclusive). */
@@ -426,7 +426,7 @@ void umac_supp_process_mgmt_frame(struct umac_data *umacd, struct mmpktview *rxb
          * action frames (PLINK Open/Confirm/Close, category SELF_PROTECTED)
          * into mesh_mpm_action_rx. Other frame types go to the generic
          * supplicant management-frame path. ifmsh must be allocated for the
-         * dispatch to find anywhere to land — Phase 4f's passive_init_ifmsh
+         * dispatch to find anywhere to land — the passive_init_ifmsh
          * is the prerequisite. */
         umac_supp_event(data->mesh_driver_ctx, EVENT_RX_MGMT, &wpa_event_data);
     }

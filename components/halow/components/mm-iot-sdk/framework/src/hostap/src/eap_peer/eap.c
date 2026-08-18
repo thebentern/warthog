@@ -2698,7 +2698,7 @@ static int eap_allowed_phase2_type(int vendor, int type)
  * Returns: EAP method type or %EAP_TYPE_NONE if not found
  *
  * This function maps EAP type names into EAP type numbers that are allowed for
- * Phase 2, i.e., for tunneled authentication. Phase 2 is used, e.g., with
+ * , i.e., for tunneled authentication. is used, e.g., with
  * EAP-PEAP, EAP-TTLS, and EAP-FAST.
  */
 u32 eap_get_phase2_type(const char *name, int *vendor)

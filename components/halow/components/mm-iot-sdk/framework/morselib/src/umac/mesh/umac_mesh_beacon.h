@@ -2,7 +2,7 @@
  * Copyright 2026 Warthog contributors
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
  *
- * Phase 4f-step13 — mesh beacon constructor.
+ * mesh beacon constructor.
  *
  * The MM6108 chip's mesh mode asks the host for a beacon template via
  * mmdrv_host_get_beacon() exactly once during MESH_CONFIG(START) processing

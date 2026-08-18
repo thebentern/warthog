@@ -84,7 +84,7 @@ struct eap_mschapv2_data {
 	int passwd_change_challenge_valid;
 	int passwd_change_version;
 
-	/* Optional challenge values generated in EAP-FAST Phase 1 negotiation
+	/* Optional challenge values generated in EAP-FAST negotiation
 	 */
 	u8 *peer_challenge;
 	u8 *auth_challenge;
@@ -112,7 +112,7 @@ static void * eap_mschapv2_init(struct eap_sm *sm)
 		   sm->eap_fast_mschapv2 ? "FAST-" : "",
 		   sm->peer_challenge && sm->auth_challenge ?
 		   " with preset challenges" : "",
-		   sm->init_phase2 ? " for Phase 2" : "");
+		   sm->init_phase2 ? " for " : "");
 
 	if (sm->peer_challenge) {
 		data->peer_challenge = os_memdup(sm->peer_challenge,
@@ -195,7 +195,7 @@ static struct wpabuf * eap_mschapv2_challenge_reply(
 	peer_challenge = r->peer_challenge;
 	if (data->peer_challenge) {
 		wpa_printf(MSG_DEBUG, "EAP-MSCHAPV2: peer_challenge generated "
-			   "in Phase 1");
+			   "in ");
 		peer_challenge = data->peer_challenge;
 		os_memset(r->peer_challenge, 0, MSCHAPV2_CHAL_LEN);
 	} else if (random_get_bytes(peer_challenge, MSCHAPV2_CHAL_LEN)) {
@@ -205,7 +205,7 @@ static struct wpabuf * eap_mschapv2_challenge_reply(
 	os_memset(r->reserved, 0, 8);
 	if (data->auth_challenge) {
 		wpa_printf(MSG_DEBUG, "EAP-MSCHAPV2: auth_challenge generated "
-			   "in Phase 1");
+			   "in ");
 		auth_challenge = data->auth_challenge;
 	}
 	if (mschapv2_derive_response(identity, identity_len, password,

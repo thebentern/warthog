@@ -15,7 +15,7 @@
 
 static const char *TAG = "warthog.mesh";
 
-/* Phase 4f-step30 — periodic probe-request burst.
+/* periodic probe-request burst.
  *
  * Step 29 confirmed the chip TX path works in mesh mode (one-shot probe req
  * triggered mmdrv_tx_frame#1 + mmdrv_host_process_tx_status#1). But peer
@@ -95,7 +95,7 @@ static void mesh_probe_burst_task(void *arg)
     }
 }
 
-/* Phase 4f-step33 — chip opcode probe.
+/* chip opcode probe.
  *
  * Send every opcode in [0x0000, 0x00FF] with empty payload + log responses.
  * Goal: discover undocumented opcodes that affect mesh RX behavior. Runs
@@ -319,7 +319,7 @@ void warthog_mesh_smoke_test(void)
 
     enum mmwlan_status st = mmwlan_mesh_enable(&args);
 
-    /* Phase 3: mmwlan_mesh_enable() returns SUCCESS only when BOTH
+    /* : mmwlan_mesh_enable() returns SUCCESS only when BOTH
      * ADD_INTERFACE(type=MESH) and MESH_CONFIG(START) were accepted by the
      * chip — see umac_mesh_enable_mesh(). The per-step "mesh: ..." lines
      * above (visible via the per-file MMLOG_LEVEL_OVRD in umac_mesh.c)
@@ -327,9 +327,9 @@ void warthog_mesh_smoke_test(void)
     if (st == MMWLAN_SUCCESS) {
         ESP_LOGW(TAG, "RESULT: PASS — mesh VIF added AND MESH_CONFIG(START) accepted.");
         ESP_LOGW(TAG, "        The chip is beaconing as an 802.11s mesh STA.");
-        ESP_LOGW(TAG, "        Phase 3 done; next is Phase 4 (PLINK peering).");
+        ESP_LOGW(TAG, "        done; next is (PLINK peering).");
 
-        /* Phase 4f-step30 — start the periodic probe-request burst task. */
+        /* start the periodic probe-request burst task. */
         BaseType_t tret = xTaskCreate(mesh_probe_burst_task,
                                        "mesh-probe",
                                        MESH_PROBE_BURST_TASK_STACK,
@@ -343,7 +343,7 @@ void warthog_mesh_smoke_test(void)
             ESP_LOGE(TAG, "[step30] xTaskCreate(mesh-probe) failed: %d", (int)tret);
         }
 
-        /* Phase 4f-step33 — opcode probe disabled now that Phase 4i swapped
+        /* opcode probe disabled now that swapped
          * in the Linux 1.17.9 softmac firmware. The probe was useful for
          * exploring the SDK fullmac firmware's command surface but adds
          * boot-time noise that obscures steady-state RX activity. Leave
@@ -352,6 +352,6 @@ void warthog_mesh_smoke_test(void)
     } else {
         ESP_LOGE(TAG, "RESULT: FAIL — mmwlan_mesh_enable() returned status=%d.", (int)st);
         ESP_LOGE(TAG, "        See the 'mesh: ...' lines above for the failing step");
-        ESP_LOGE(TAG, "        (ADD_INTERFACE vs MESH_CONFIG) and docs/mesh-port-scope.md.");
+        ESP_LOGE(TAG, "        (ADD_INTERFACE vs MESH_CONFIG) and docs/history/mesh-port-scope.md.");
     }
 }

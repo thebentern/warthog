@@ -6,7 +6,7 @@ What's local, what's upstream, and what each piece exists to work around. Everyt
 
 **Source:** [https://github.com/MorseMicro/esp-halow](https://github.com/MorseMicro/esp-halow), tag `2.10.4-esp32-1`.
 
-**Why forked:** the registry version doesn't expose the chip's 802.11s mesh mode — it ships only STA + AP shims. We need umac mesh (`umac_mesh.h`/`umac_mesh.c`-style additions) for the multi-board topologies. See `docs/mesh-port-scope.md` for the scope analysis and `docs/mesh-port-audit.md` for the umac API audit that informed it.
+**Why forked:** the registry version doesn't expose the chip's 802.11s mesh mode — it ships only STA + AP shims. We need umac mesh (`umac_mesh.h`/`umac_mesh.c`-style additions) for the multi-board topologies. See `docs/history/mesh-port-scope.md` for the scope analysis and `docs/history/mesh-port-audit.md` for the umac API audit that informed it.
 
 **What's changed relative to upstream:**
 

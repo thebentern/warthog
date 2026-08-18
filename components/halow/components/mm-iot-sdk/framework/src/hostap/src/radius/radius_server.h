@@ -63,7 +63,7 @@ struct radius_server_conf {
 	 * @ctx: Context data from conf_ctx
 	 * @identity: User identity
 	 * @identity_len: identity buffer length in octets
-	 * @phase2: Whether this is for Phase 2 identity
+	 * @phase2: Whether this is for identity
 	 * @user: Data structure for filling in the user information
 	 * Returns: 0 on success, -1 on failure
 	 *

@@ -33,7 +33,7 @@ void umac_datapath_configure_sta_mode(struct umac_data *umacd);
 void umac_datapath_configure_ap_mode(struct umac_data *umacd);
 
 
-/* warthog mesh-support fork (Phase 4f-step7). Installs datapath_ops_mesh
+/* warthog mesh-support fork. Installs datapath_ops_mesh
  * from umac_datapath_mesh.c — mesh-aware TX/RX with safe stubs for the
  * empty-peer-table case. Called from umac_mesh_enable_mesh() after the
  * chip-side ADD_INTERFACE(MESH) + MESH_CONFIG(START) sequence succeeds. */

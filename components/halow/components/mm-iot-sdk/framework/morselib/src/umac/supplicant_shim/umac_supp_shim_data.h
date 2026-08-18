@@ -64,12 +64,12 @@ struct umac_supp_shim_data
     struct wpa_global *global;
     struct wpa_supplicant *sta_wpa_s;
     struct wpa_supplicant *ap_wpa_s;
-    /* Phase 4b — supplicant context for an 802.11s mesh interface. Owned by
+    /* supplicant context for an 802.11s mesh interface. Owned by
      * supplicant_core_mesh.c, mirrors ap_wpa_s for AP mode. */
     struct wpa_supplicant *mesh_wpa_s;
 
     void *ap_driver_ctx;
-    /* Phase 4d — driver context for the mesh interface, symmetric with
+    /* driver context for the mesh interface, symmetric with
      * ap_driver_ctx. mmwpas_init_mesh stashes it here. */
     void *mesh_driver_ctx;
 

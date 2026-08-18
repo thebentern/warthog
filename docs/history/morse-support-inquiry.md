@@ -291,7 +291,7 @@ could be silently dropping these.
 ## Branch artifacts (if you want to inspect our embedded port)
 
 Open-source firmware at `github.com/<warthog repo>`. The branch
-`mesh-support` has the full Phase 4 work (see `docs/mesh-port-scope.md` for
+`mesh-support` has the full Phase 4 work (see `mesh-port-scope.md` for
 a detailed bring-up log of what worked vs. what didn't).
 
 The relevant call sites in our fork (paths under `components/halow/`):
@@ -379,7 +379,7 @@ mesh bring-up against the same firmware build; or any preconditions
 (e.g., regdomain-specific channels, MCS overrides) the chip's mesh
 path requires before the beacon timer arms.
 
-The full diagnostic chain is in `docs/mesh-port-scope.md` Phase 4f
+The full diagnostic chain is in `mesh-port-scope.md` Phase 4f
 Final Report.
 
 ---

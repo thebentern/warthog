@@ -11,7 +11,7 @@ dependencies:
     version: "2.10.4-esp32-1"
     # Local fork: adds an 802.11s mesh mode (umac/mesh/) the registry build
     # lacks. The fork is the 2.10.4-esp32-1 tree with non-ESP32 BSPs + docs
-    # stripped. See docs/mesh-port-scope.md / mesh-port-audit.md. The version
+    # stripped. See docs/history/mesh-port-scope.md / mesh-port-audit.md. The version
     # above is kept for provenance; override_path is what actually builds.
     # Directory is named `halow` (the dependency short name) so the IDF
     # component graph resolves `main`'s `REQUIRES halow` to the fork.

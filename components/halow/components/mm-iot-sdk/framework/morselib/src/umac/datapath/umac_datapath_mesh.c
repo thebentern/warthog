@@ -177,7 +177,7 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
 
 /* --- Peer table ---------------------------------------------------------- *
  *
- * One umac_sta_data per established mesh peer. This is the keystone of the
+ * One umac_sta_data per established mesh peer. This is the core of the
  * data plane: every generic path in umac_datapath.c -- RX filter, reorder,
  * 802.3 conversion, the TX enqueue/dequeue cycle -- resolves the far end
  * through lookup_stad_by_peer_addr()/lookup_stad_by_tx_dest_addr() and does
@@ -502,7 +502,7 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
     umac_sta_data_set_aid(stad, aid);
     mesh_chip_register_sta_(vif_id, aid, peer_addr);
 
-    /* Keys. Phase 1: a fixed shared MTK (pairwise, key 0) and MGTK (group,
+    /* Keys. For now, a fixed shared MTK (pairwise, key 0) and MGTK (group,
      * key 1), identical on every node -- the same "static/shared" phase the
      * reference port shipped before SAE. Installed on the PEER's stad, so
      * they are keyed to the peer's AID: that is how the chip selects the key

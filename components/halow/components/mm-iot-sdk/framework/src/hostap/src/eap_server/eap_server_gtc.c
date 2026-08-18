@@ -131,7 +131,7 @@ static void eap_gtc_process(struct eap_sm *sm, void *priv,
 		if (sm->identity && sm->require_identity_match &&
 		    (pos2 - pos != (int) sm->identity_len ||
 		     os_memcmp(pos, sm->identity, sm->identity_len))) {
-			wpa_printf(MSG_DEBUG, "EAP-GTC: Phase 2 Identity did "
+			wpa_printf(MSG_DEBUG, "EAP-GTC: Identity did "
 				   "not match with required Identity");
 			wpa_hexdump_ascii(MSG_MSGDUMP, "EAP-GTC: Expected "
 					  "identity",

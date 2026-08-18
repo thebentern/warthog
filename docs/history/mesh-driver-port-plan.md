@@ -7,7 +7,7 @@
 
 ## Why this exists
 
-After 33 iterations of chip-command-level experimentation (`docs/mesh-port-scope.md`
+After 33 iterations of chip-command-level experimentation (`mesh-port-scope.md`
 Phase 4f, all completed tasks #14–52), we definitively established:
 
 - ✅ Chip TX works in mesh mode (probe requests go on-air, TX_STATUS fires)
@@ -158,7 +158,7 @@ straightforward (`-DWARTHOG_BUILD_TYPE=mesh` vs default).
 ## Concrete next steps (when prerequisite met)
 
 1. **Get a mesh-enabled MMFW firmware from Morse Micro support** (filed
-   ticket; see `docs/morse-support-inquiry.md`)
+   ticket; see `morse-support-inquiry.md`)
 2. **Create `components/halow_mesh_compat/` directory** with this
    structure:
    ```

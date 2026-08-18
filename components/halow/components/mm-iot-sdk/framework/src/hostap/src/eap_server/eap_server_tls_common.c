@@ -136,7 +136,7 @@ u8 * eap_server_tls_derive_key(struct eap_sm *sm, struct eap_ssl_data *data,
  * eap_server_tls_derive_session_id - Derive a Session-Id based on TLS data
  * @sm: Pointer to EAP state machine allocated with eap_peer_sm_init()
  * @data: Data for TLS processing
- * @eap_type: EAP method used in Phase 1 (EAP_TYPE_TLS/PEAP/TTLS/FAST)
+ * @eap_type: EAP method used in (EAP_TYPE_TLS/PEAP/TTLS/FAST)
  * @len: Pointer to length of the session ID generated
  * Returns: Pointer to allocated Session-Id on success or %NULL on failure
  *
@@ -517,7 +517,7 @@ struct wpabuf * eap_server_tls_encrypt(struct eap_sm *sm,
 
 	buf = tls_connection_encrypt(sm->cfg->ssl_ctx, data->conn, plain);
 	if (buf == NULL) {
-		wpa_printf(MSG_INFO, "SSL: Failed to encrypt Phase 2 data");
+		wpa_printf(MSG_INFO, "SSL: Failed to encrypt data");
 		return NULL;
 	}
 

@@ -2,7 +2,7 @@
 # Warthog dev loop: build → trigger ROM download → flash → cold-cycle → verify AT.
 #
 # Captures the working sequence validated in 2026-05-25 session (see Phase 5a in
-# docs/mesh-port-scope.md). Assumes:
+# docs/history/mesh-port-scope.md). Assumes:
 #
 #   - The board(s) are running firmware that has the cdc_line_coding_cb 1200bps
 #     watchdog AND/OR the AT+DLMODE command. If you're flashing a board that

@@ -12,7 +12,7 @@
 #include "umac/offload/umac_offload.h"
 #include "umac/regdb/umac_regdb.h"
 #include "umac/stats/umac_stats.h"
-/* Phase 4f-step13 — mesh-mode beacon template path. When mesh is active,
+/* mesh-mode beacon template path. When mesh is active,
  * route the chip's beacon-template request to umac_mesh_get_beacon instead
  * of umac_ap_get_beacon (which asserts when no AP context exists). */
 #include "umac/mesh/umac_mesh_beacon.h"
@@ -30,7 +30,7 @@ void mmdrv_host_process_rx_frame(struct mmpkt *rxbuf, uint16_t channel)
     MMOSAL_DEV_ASSERT(channel == 0);
     struct umac_data *umacd = umac_data_get_umacd();
 
-    /* Phase 4f-step14 diagnostic — log every chip-delivered frame at the
+    /* Diagnostic: log every chip-delivered frame at the
      * absolute earliest point in the host stack. Earlier `rx#` logs live
      * inside umac_datapath_rx_frame which is downstream of multiple filter
      * gates. If this log fires but those don't, the chip IS delivering
@@ -65,7 +65,7 @@ void mmdrv_host_process_tx_status(struct mmpkt *mmpkt)
 {
     struct umac_data *umacd = umac_data_get_umacd();
 
-    /* Phase 4f-step20 diagnostic — log every TX_STATUS notification from
+    /* Diagnostic: log every TX_STATUS notification from
      * the chip. We've never instrumented this. If our mesh beacon is
      * actually being TXed on-air, we should see TX_STATUS events for
      * each beacon (every 100ms at 100 TU beacon interval). If we see
@@ -263,7 +263,7 @@ extern volatile uint32_t g_warthog_bcn_inactive;
 struct mmpkt *mmdrv_host_get_beacon(void)
 {
     struct umac_data *umacd = umac_data_get_umacd();
-    /* Phase 4f-step11 diagnostic — log every call so we can confirm whether
+    /* Diagnostic: log every call so we can confirm whether
      * the chip is asking the host for beacon templates while in mesh mode.
      * If we never see this line in mesh-smoke output, the chip generates
      * mesh beacons internally (without the Mesh ID IE the other side needs)
@@ -286,7 +286,7 @@ struct mmpkt *mmdrv_host_get_beacon(void)
      * the host handed back. */
     g_warthog_bcn_req = s_beacon_req_count;
 
-    /* Phase 4f-step13 — when mesh is active, hand the chip a proper mesh
+    /* when mesh is active, hand the chip a proper mesh
      * beacon template (with Mesh ID IE 114, Mesh Configuration IE 113, S1G
      * Capabilities + Operation IEs). Without this the chip falls back to an
      * internally-generated beacon that lacks the Mesh ID IE — and that's

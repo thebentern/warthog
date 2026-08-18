@@ -68,7 +68,7 @@ extern mmtrace_channel sup_channel_handle;
 #define UMAC_SUPP_AP_DRIVER_NAME "AP"
 
 
-/* Phase 4b — name keys for the mesh interface's config + driver lookups
+/* name keys for the mesh interface's config + driver lookups
  * inside wpa_supplicant_add_iface. Symmetric with the AP names above. */
 #define UMAC_SUPP_MESH_CONFIG_NAME "MESH"
 #define UMAC_SUPP_MESH_DRIVER_NAME "MESH"

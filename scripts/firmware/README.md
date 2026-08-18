@@ -1,7 +1,7 @@
 # Firmware tooling — Phase 4i artifacts
 
 Tools and prepared firmware blobs from the Phase 4i reverse-engineering
-session (`docs/mesh-port-scope.md` Phase 4i).
+session (`docs/history/mesh-port-scope.md` Phase 4i).
 
 ## What's here
 

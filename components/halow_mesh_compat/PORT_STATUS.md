@@ -1,4 +1,4 @@
-# Softmac mesh port — status & roadmap (Phase 5m)
+# Softmac mesh port — status & roadmap ()
 
 Living tracker for porting the Linux GPL `morse_driver` softmac + mac80211
 mesh stack so the MM6108 can run as a softmac radio (thin-LMAC firmware) with
@@ -9,7 +9,7 @@ host-side 802.11s mesh. Updated as each unit lands.
 The MM6108 **fullmac** firmware + morselib (what the warthog STA build uses)
 cannot do mesh — confirmed by 58 phases of investigation plus Morse Micro's
 own docs (their ESP32 SDK is STA-only; mesh is a softmac/mac80211 feature).
-See `../../docs/mesh-port-scope.md`.
+See `../../docs/history/mesh-port-scope.md`.
 
 The softmac route: load thin-LMAC firmware (chip becomes a "dumb" radio that
 delivers raw 802.11 frames), and run the MAC + mesh logic on the ESP32 host —

@@ -38,7 +38,7 @@ struct s1g_ht_chan_pair {
 	int bw;
 };
 
-/* Phase 4a — forward decls. These are defined later in this file but called
+/* forward decls. These are defined later in this file but called
  * above; the embedded toolchain (gcc 14.x with -Werror=implicit-function-
  * declaration) fails the build without these. */
 int morse_ht_chan_offset_jp(int chan, int primary_chan, int ht);

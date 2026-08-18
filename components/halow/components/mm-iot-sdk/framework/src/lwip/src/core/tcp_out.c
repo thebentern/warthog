@@ -490,7 +490,7 @@ tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
     space = mss_local - (last_unsent->len + unsent_optlen);
 
     /*
-     * Phase 1: Copy data directly into an oversized pbuf.
+     * : Copy data directly into an oversized pbuf.
      *
      * The number of bytes copied is recorded in the oversize_used
      * variable. The actual copying is done at the bottom of the
@@ -517,7 +517,7 @@ tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
 
 #if !LWIP_NETIF_TX_SINGLE_PBUF
     /*
-     * Phase 2: Chain a new pbuf to the end of pcb->unsent.
+     * : Chain a new pbuf to the end of pcb->unsent.
      *
      * As an exception when NOT copying the data, if the given data buffer
      * directly follows the last unsent data buffer in memory, extend the last
@@ -592,7 +592,7 @@ tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
   }
 
   /*
-   * Phase 3: Create new segments.
+   * : Create new segments.
    *
    * The new segments are chained together in the local 'queue'
    * variable, ready to be appended to pcb->unsent.
@@ -707,7 +707,7 @@ tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
 #endif /* TCP_OVERSIZE_DBGCHECK */
 
   /*
-   * Phase 1: If data has been added to the preallocated tail of
+   * : If data has been added to the preallocated tail of
    * last_unsent, we update the length fields of the pbuf chain.
    */
 #if TCP_OVERSIZE
@@ -732,7 +732,7 @@ tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
 #endif /* TCP_OVERSIZE */
 
   /*
-   * Phase 2: concat_p can be concatenated onto last_unsent->p, unless we
+   * : concat_p can be concatenated onto last_unsent->p, unless we
    * determined that the last ROM pbuf can be extended to include the new data.
    */
   if (concat_p != NULL) {
@@ -767,7 +767,7 @@ tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
 #endif /* TCP_CHECKSUM_ON_COPY */
 
   /*
-   * Phase 3: Append queue to pcb->unsent. Queue may be NULL, but that
+   * : Append queue to pcb->unsent. Queue may be NULL, but that
    * is harmless
    */
   if (last_unsent == NULL) {

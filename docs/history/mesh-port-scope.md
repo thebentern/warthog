@@ -580,7 +580,7 @@ gap closes.
 
   1. Wait for / request newer `mm6108.mbin` firmware from Morse that
      exposes the missing RX / event paths. The support inquiry in
-     `docs/morse-support-inquiry.md` is ready to send.
+     `morse-support-inquiry.md` is ready to send.
   2. Or attach a Wi-Fi sniffer to capture what the chip is actually
      transmitting on-air in mesh mode — that tells us whether the chip's
      internal beacons are valid 802.11s frames or junk. If they're valid,
@@ -641,7 +641,7 @@ gap closes.
   that opens the mesh RX path on `mm6108.mbin`, or (b) reverse-engineering
   the chip ABI for the missing "admit mesh RX" command, neither of which
   is in scope for v0.1.0. The support inquiry at
-  `docs/morse-support-inquiry.md` now has the strongest possible data
+  `morse-support-inquiry.md` now has the strongest possible data
   point: we have an experiment that isolates the RX wall to firmware,
   with the host stack ready to consume frames from the moment the chip
   provides them.
@@ -752,7 +752,7 @@ gap closes.
   Either way the closure verdict ("architecturally infeasible") was
   too strong. It's not infeasible — it's a defined unit of work, the
   size of which depends on which of the two outcomes the experiment
-  reveals. The morse-support inquiry (`docs/morse-support-inquiry.md`)
+  reveals. The morse-support inquiry (`morse-support-inquiry.md`)
   has been refined to ask the specific questions whose answers gate
   this work; sending it costs nothing and may save days of reverse-
   engineering.
@@ -791,7 +791,7 @@ gap closes.
   every region build (`warthog-us` etc.) compiled the mesh code paths into
   `wpa_supplicant.c`. `warthog-us` went 1.7 MB → 1.86 MB. After flashing,
   the production target boot-looped at HaLow association — symptom matches
-  PA inrush brownout (`docs/power-notes.md`) but the size jump + global
+  PA inrush brownout (`../power-notes.md`) but the size jump + global
   `CONFIG_MESH` make it plausible that the mesh code paths regressed STA
   bring-up too. Reverting the whole spike rather than partial-undoing it
   keeps the production path stable. Detailed inventory of every fork-of-
@@ -1149,7 +1149,7 @@ ships publicly (limited) vs. internally (mesh-functional).
    supports mesh on MM6108, (b) the missing chip command(s) if any,
    (c) a firmware build with mesh enabled if a separate variant exists.
    The full bring-up sequence we send is documented in
-   `docs/morse-support-inquiry.md`.
+   `morse-support-inquiry.md`.
 4. **Pivot to a non-mesh peer-to-peer model**: HaLow STA-to-AP+STA
    bridging (multiple STAs associating to a common AP that acts as a
    hub). Less elegant than mesh but the chip already supports it.
@@ -1449,7 +1449,7 @@ RX, peering should immediately succeed.
 
 **Path E + Path A in parallel.** The codebase is in a "ready to peer" state
 — ship the STA-only release as Warthog v0.x, file a Morse support ticket
-with `docs/morse-support-inquiry.md`, and integrate mesh activation as a
+with `morse-support-inquiry.md`, and integrate mesh activation as a
 v0.(x+1) feature once Morse provides the missing piece.
 
 ---

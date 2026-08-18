@@ -641,7 +641,7 @@ const struct wpa_driver_ops mmwlan_wpas_ops_ap = {
 
 
 /* ---------------------------------------------------------------------------
- * Phase 4d — mesh driver_ops. Stashes ctx into mesh_driver_ctx (vs
+ * mesh driver_ops. Stashes ctx into mesh_driver_ctx (vs
  * ap_driver_ctx) so coexistence with AP is at least syntactically possible,
  * even though the chip's single VIF means only one is ever active. The rest
  * of the entry points reuse the AP driver: hostap's mesh layer calls
@@ -649,7 +649,7 @@ const struct wpa_driver_ops mmwlan_wpas_ops_ap = {
  * for the local mesh STA MAC, .set_key for SAE PTK/GTK install. All of those
  * map cleanly to the AP path (the chip doesn't distinguish — it's all
  * "send mgmt to vif_id"). Mesh-specific ops (.join_mesh, .leave_mesh,
- * .set_freq, .if_add) are intentionally NULL — Phase 4d-runtime work.
+ * .set_freq, .if_add) are intentionally NULL.
  * --------------------------------------------------------------------------- */
 
 static void *mmwpas_init_mesh(void *ctx, const char *ifname)
@@ -670,7 +670,7 @@ static void mmwpas_deinit_mesh(void *priv)
 
 const struct wpa_driver_ops mmwlan_wpas_ops_mesh = {
     .name = UMAC_SUPP_MESH_DRIVER_NAME,
-    .desc = "Warthog mesh driver (Phase 4d)",
+    .desc = "Warthog mesh driver",
     .init = mmwpas_init_mesh,
     .deinit = mmwpas_deinit_mesh,
     /* Chip-level info — safe to share with AP. */
@@ -684,7 +684,7 @@ const struct wpa_driver_ops mmwlan_wpas_ops_mesh = {
     /* AP-specific ops left NULL so the supplicant's null-check skips them
      * instead of dispatching into AP internals that assume an AP context.
      *
-     * Concrete trap that motivated this: the upstream Phase 4d build used
+     * Concrete trap that motivated this: an earlier build used
      * .set_key = mmwpas_set_key_ap. wpa_supplicant_add_iface() runs
      * wpa_clear_keys during driver_init, which dispatched to mmwpas_set_key_ap,
      * which looked up an AP STA by addr — and asserted because mesh hasn't
@@ -693,15 +693,15 @@ const struct wpa_driver_ops mmwlan_wpas_ops_mesh = {
      * the AP semantics match mesh semantics; .set_key, .set_ap, .sta_*, and
      * .hapd_send_eapol all assume an AP BSS we don't have. The wpa_drv_*
      * helpers null-check before calling, so leaving them NULL is safe;
-     * Phase 4e provides real mesh implementations.
+     * The mesh implementations below are the real ones.
      *
-     *   .set_key             — mesh PTK/GTK install: Phase 5 (SAE).
+     *   .set_key             — mesh PTK/GTK install: (SAE).
      *   .set_ap              — AP BSS config: not applicable to mesh.
      *   .sta_add / .sta_remove — AP-side STA mgmt: mesh tracks peers via
      *                          the hostap PLINK state machine, not via
-     *                          driver sta_add. Phase 4e wires peers.
+     *                          driver sta_add.  wires peers.
      *   .sta_set_flags       — AP-side auth/assoc state on a STA.
      *   .hapd_send_eapol     — AP-side EAPOL: mesh uses SAE, not 802.1X.
      *   .join_mesh / .leave_mesh / .set_freq / .if_add — mesh-specific
-     *                          driver hooks; Phase 4e supplies real ones. */
+     *                          driver hooks;  supplies real ones. */
 };

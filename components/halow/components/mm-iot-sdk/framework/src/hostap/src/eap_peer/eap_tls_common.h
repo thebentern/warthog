@@ -70,7 +70,7 @@ struct eap_ssl_data {
 	void *ssl_ctx;
 
 	/**
-	 * eap_type - EAP method used in Phase 1
+	 * eap_type - EAP method used in 
 	 * (EAP_TYPE_TLS/PEAP/TTLS/FAST/TEAP)
 	 */
 	u8 eap_type;

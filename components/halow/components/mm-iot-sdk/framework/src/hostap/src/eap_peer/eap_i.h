@@ -362,7 +362,7 @@ struct eap_sm {
 
 	unsigned int workaround;
 
-	/* Optional challenges generated in Phase 1 (EAP-FAST) */
+	/* Optional challenges generated in (EAP-FAST) */
 	u8 *peer_challenge, *auth_challenge;
 
 	/* Whether to use the EAP-FAST-MSCHAPv2 instantiation of EAP-MSCHAPv2.

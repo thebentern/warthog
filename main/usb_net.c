@@ -109,21 +109,21 @@ static int cdc_vprintf(const char *fmt, va_list args)
  * and line-state (DTR/RTS) callbacks honor this period. */
 #define CDC_BAUD_WATCHDOG_GRACE_MS 5000
 
-/* Phase 5c — DTR/RTS state-change → ROM download mode (esptool-compatible).
+/* — DTR/RTS state-change → ROM download mode (esptool-compatible).
  *
  * esptool's `--before default_reset` (default mode for serial bridges and the
  * mode we want to support) issues this sequence on the CDC ACM endpoint via
  * SET_CONTROL_LINE_STATE:
- *   Phase 1:  DTR=0, RTS=1   "EN low"   — chip held in reset
+ *   :  DTR=0, RTS=1   "EN low"   — chip held in reset
  *   sleep 100 ms
- *   Phase 2:  DTR=1, RTS=0   "EN high, BOOT low"  — boot with BOOT held
+ *   :  DTR=1, RTS=0   "EN high, BOOT low"  — boot with BOOT held
  *   sleep 50 ms
- *   Phase 3:  DTR=0          "BOOT high"  — release BOOT
+ *   :  DTR=0          "BOOT high"  — release BOOT
  *
  * On a board where DTR and RTS are physically wired to EN/IO0 (FTDI/CP2102
- * with the auto-reset cap network), Phase 2 puts the chip into ROM download
+ * with the auto-reset cap network), puts the chip into ROM download
  * mode. We emulate that behaviour entirely in firmware: when we see the
- * Phase 1 → Phase 2 transition (i.e. RTS goes from 1 → 0 while DTR went
+ * → transition (i.e. RTS goes from 1 → 0 while DTR went
  * from 0 → 1), we set FORCE_DOWNLOAD_BOOT and esp_restart(). After the
  * restart the ROM bootloader skips the app and enters USB-Serial-JTAG
  * download mode where esptool can talk to it directly.
@@ -146,7 +146,7 @@ static void cdc_line_state_cb(int itf, cdcacm_event_t *event)
     bool rts = event->line_state_changed_data.rts;
     ESP_LOGD(TAG, "CDC line state: dtr=%d rts=%d", (int)dtr, (int)rts);
 
-    /* Phase 1 detection: DTR=0 + RTS=1 → EN low (reset asserted). Latch a
+    /* detection: DTR=0 + RTS=1 → EN low (reset asserted). Latch a
      * flag so subsequent line-state changes can be interpreted relative to
      * this point. */
     if (!dtr && rts) {
@@ -154,7 +154,7 @@ static void cdc_line_state_cb(int itf, cdcacm_event_t *event)
         return;
     }
 
-    /* Phase 2 detection: after Phase 1 was seen, DTR=1 + RTS=0 → EN high
+    /* detection: after was seen, DTR=1 + RTS=0 → EN high
      * + BOOT low. This is the bootloader-entry signal. Honor the same
      * startup grace period the 1200bps path uses, since macOS may replay
      * the last session's DTR/RTS state on enumeration. */
@@ -173,13 +173,13 @@ static void cdc_line_state_cb(int itf, cdcacm_event_t *event)
 
     /* Any other transition clears the phase latch — esptool may have given
      * up, or the host opened/closed the port with a different DTR/RTS
-     * combination. Re-arm only on a fresh Phase 1. */
+     * combination. Re-arm only on a fresh . */
     if (!(!dtr && rts)) {
         s_saw_reset_phase = false;
     }
 }
 
-/* Phase 5a — 1200bps-touch → ROM download mode.
+/* — 1200bps-touch → ROM download mode.
  *
  * Fires on the host's SET_LINE_CODING control transfer. If the new baud is
  * exactly 1200 (the de-facto signal across Arduino/Adafruit/RP2040 stacks),
@@ -200,7 +200,7 @@ static void cdc_line_coding_cb(int itf, cdcacm_event_t *event)
         return;
     }
     uint32_t baud = event->line_coding_changed_data.p_line_coding->bit_rate;
-    /* Phase 5a diagnostic — log every line-coding change at WARN level until
+    /* diagnostic — log every line-coding change at WARN level until
      * we've verified the callback is being invoked at all. Drop to DEBUG once
      * the 1200bps path is confirmed working. */
     ESP_LOGW(TAG, "CDC line coding cb fired: baud=%u", (unsigned)baud);
@@ -519,12 +519,12 @@ esp_netif_t *warthog_usb_net_start(void)
     const tinyusb_config_cdcacm_t cdc_cfg = {
         .cdc_port = TINYUSB_CDC_ACM_0,
 #if defined(WARTHOG_DEVLOOP) && WARTHOG_DEVLOOP
-        /* Phase 5a — 1200bps-touch reset to ROM download mode. Dev-only:
+        /* — 1200bps-touch reset to ROM download mode. Dev-only:
          * production builds compile out this callback so accidental 1200-baud
          * port opens can't kick the device into bootloader. */
         .callback_line_coding_changed = &cdc_line_coding_cb,
 #if defined(WARTHOG_DEVLOOP_DTRRTS) && WARTHOG_DEVLOOP_DTRRTS
-        /* Phase 5c — DTR/RTS state-machine matches esptool's `--before
+        /* — DTR/RTS state-machine matches esptool's `--before
          * default_reset` so that `pio run -t upload` triggers bootloader
          * entry on its own. Currently gated OFF — registering this callback
          * causes USB-OTG init to fail (chip stays in ROM USB-Serial-JTAG

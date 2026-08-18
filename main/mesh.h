@@ -8,7 +8,7 @@
  * ABI header carries the MESH interface-type enum value but none of the mesh
  * commands, so firmware mesh support is unverifiable from source. Flashing the
  * `warthog-mesh-smoke` env and reading the serial log answers it. See
- * docs/mesh-port-scope.md ("Decision gate").
+ * docs/history/mesh-port-scope.md ("Decision gate").
  *
  * Built unconditionally; only invoked from warthog_halow_start() when
  * WARTHOG_MESH_SMOKE is defined (the warthog-mesh-smoke PlatformIO env).

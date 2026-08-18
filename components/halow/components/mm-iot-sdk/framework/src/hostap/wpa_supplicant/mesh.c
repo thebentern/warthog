@@ -27,7 +27,7 @@
 #include "mesh_mpm.h"
 #include "mesh_rsn.h"
 #include "mesh.h"
-/* Phase 4a — mesh.c's morse_mbca_conf / morse_set_mesh_config /
+/* mesh.c's morse_mbca_conf / morse_set_mesh_config /
  * morse_set_mesh_dynamic_peering callsites need prototypes from utils/morse.h;
  * the upstream Linux mesh.c didn't include it. */
 #include "utils/morse.h"
@@ -84,7 +84,7 @@ void wpa_supplicant_mesh_iface_deinit(struct wpa_supplicant *wpa_s,
 }
 
 
-/* Phase 4f — un-static'd so supplicant_core_mesh.c can build the mesh_conf
+/* un-static'd so supplicant_core_mesh.c can build the mesh_conf
  * without calling wpa_supplicant_mesh_init (which triggers the chip cold-init
  * crash). The function itself is pure host-side state. */
 struct mesh_conf * mesh_config_create(struct wpa_supplicant *wpa_s,
@@ -269,7 +269,7 @@ static int wpas_mesh_update_freq_params(struct wpa_supplicant *wpa_s)
 		    ifmsh->conf->ieee80211n,
 		    ifmsh->conf->ieee80211ac,
 		    ifmsh->conf->ieee80211ax,
-		    /* Phase 4a — embedded fork's signature has eht_enabled between
+		    /* embedded fork's signature has eht_enabled between
 		     * he_enabled and s1g_enabled; upstream mesh.c predates EHT. */
 		    false,
 		    ifmsh->conf->ieee80211ah,

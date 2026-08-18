@@ -46,8 +46,8 @@ void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta)
  * Bring the mesh interface up: ADD_INTERFACE(type=MESH), BSS config, then
  * MESH_CONFIG(START) to begin beaconing.
  *
- * Skeleton: currently logs and returns MMWLAN_UNAVAILABLE. The chip command
- * sequence is the next implementation milestone (Phase 2-3 of the scope doc).
+ * Brings up the interface, starts beaconing, and registers the wpa_supplicant
+ * mesh interface so peering runs against this VIF.
  */
 enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
                                          const struct mmwlan_mesh_args *args);
@@ -62,7 +62,7 @@ uint8_t umac_mesh_get_peer_count(struct umac_data *umacd);
 
 
 /**
- * Phase 4d — retrieve the mesh args saved by the last successful
+ * retrieve the mesh args saved by the last successful
  * umac_mesh_enable_mesh() call. Used by wpa_config_read_mesh() to seed the
  * wpa_ssid (mesh_id, security_type) when the supplicant interface comes up.
  * Returns NULL if mesh isn't currently enabled.
@@ -74,7 +74,7 @@ uint8_t umac_mesh_get_peer_count(struct umac_data *umacd);
 const struct mmwlan_mesh_args *umac_mesh_get_args(void);
 
 /**
- * Phase 4f-step32 — return the shared mesh BSSID derived from the mesh_id
+ * return the shared mesh BSSID derived from the mesh_id
  * CRC32 hash. NULL if mesh is not active. Used by the beacon constructor
  * to stamp Addr3 with the same value as the chip's RX filter, so peer
  * chips configured with the same shared BSSID will admit our beacon.

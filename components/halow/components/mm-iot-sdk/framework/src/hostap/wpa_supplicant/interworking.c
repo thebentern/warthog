@@ -1494,7 +1494,7 @@ static int interworking_set_eap_params(struct wpa_ssid *ssid,
 	if (ttls && cred->username && cred->username[0]) {
 		const char *pos;
 		char *anon;
-		/* Use anonymous NAI in Phase 1 */
+		/* Use anonymous NAI in */
 		pos = os_strchr(cred->username, '@');
 		if (pos) {
 			size_t buflen = 9 + os_strlen(pos) + 1;

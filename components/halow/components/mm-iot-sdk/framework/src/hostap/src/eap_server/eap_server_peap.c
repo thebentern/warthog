@@ -242,7 +242,7 @@ static struct wpabuf * eap_peap_build_phase2_req(struct eap_sm *sm,
 	size_t req_len;
 
 	if (data->phase2_method == NULL || data->phase2_priv == NULL) {
-		wpa_printf(MSG_DEBUG, "EAP-PEAP: Phase 2 method not ready");
+		wpa_printf(MSG_DEBUG, "EAP-PEAP: method not ready");
 		return NULL;
 	}
 	buf = data->phase2_method->buildReq(sm, data->phase2_priv, id);
@@ -251,7 +251,7 @@ static struct wpabuf * eap_peap_build_phase2_req(struct eap_sm *sm,
 
 	req = wpabuf_head(buf);
 	req_len = wpabuf_len(buf);
-	wpa_hexdump_key(MSG_DEBUG, "EAP-PEAP: Encrypting Phase 2 data",
+	wpa_hexdump_key(MSG_DEBUG, "EAP-PEAP: Encrypting data",
 			req, req_len);
 
 	if (data->peap_version == 0 &&
@@ -293,7 +293,7 @@ static struct wpabuf * eap_peap_build_phase2_soh(struct eap_sm *sm,
 	req = wpabuf_head(buf);
 	req_len = wpabuf_len(buf);
 
-	wpa_hexdump_key(MSG_DEBUG, "EAP-PEAP: Encrypting Phase 2 SOH data",
+	wpa_hexdump_key(MSG_DEBUG, "EAP-PEAP: Encrypting SOH data",
 			req, req_len);
 
 	req += sizeof(struct eap_hdr);
@@ -482,7 +482,7 @@ static struct wpabuf * eap_peap_build_phase2_tlv(struct eap_sm *sm,
 		data->crypto_binding_sent = 1;
 	}
 
-	wpa_hexdump_buf_key(MSG_DEBUG, "EAP-PEAP: Encrypting Phase 2 TLV data",
+	wpa_hexdump_buf_key(MSG_DEBUG, "EAP-PEAP: Encrypting TLV data",
 			    buf);
 
 	encr_req = eap_server_tls_encrypt(sm, &data->ssl, buf);
@@ -509,7 +509,7 @@ static struct wpabuf * eap_peap_build_phase2_term(struct eap_sm *sm,
 	hdr->identifier = id;
 	hdr->length = host_to_be16(req_len);
 
-	wpa_hexdump_key(MSG_DEBUG, "EAP-PEAP: Encrypting Phase 2 data",
+	wpa_hexdump_key(MSG_DEBUG, "EAP-PEAP: Encrypting data",
 			(u8 *) hdr, req_len);
 
 	wpabuf_set(&msgbuf, hdr, req_len);
@@ -567,9 +567,9 @@ static struct wpabuf * eap_peap_buildReq(struct eap_sm *sm, void *priv, u8 id)
 				/* This can happen with TLS 1.3 when a new
 				 * session ticket is not generated and the
 				 * Finished message from the peer terminates
-				 * Phase 1. */
+				 * . */
 				wpa_printf(MSG_DEBUG,
-					   "EAP-PEAP: No pending data to send - move directly to Phase 2 ID query");
+					   "EAP-PEAP: No pending data to send - move directly to ID query");
 				eap_peap_state(data, PHASE2_ID);
 				eap_peap_phase2_init(sm, data, EAP_VENDOR_IETF,
 						     EAP_TYPE_IDENTITY);
@@ -1114,10 +1114,10 @@ static void eap_peap_process_phase2(struct eap_sm *sm,
 	size_t len;
 
 	wpa_printf(MSG_DEBUG, "EAP-PEAP: received %lu bytes encrypted data for"
-		   " Phase 2", (unsigned long) wpabuf_len(in_buf));
+		   " ", (unsigned long) wpabuf_len(in_buf));
 
 	if (data->pending_phase2_resp) {
-		wpa_printf(MSG_DEBUG, "EAP-PEAP: Pending Phase 2 response - "
+		wpa_printf(MSG_DEBUG, "EAP-PEAP: Pending response - "
 			   "skip decryption and use old data");
 		eap_peap_process_phase2_response(sm, data,
 						 data->pending_phase2_resp);
@@ -1129,13 +1129,13 @@ static void eap_peap_process_phase2(struct eap_sm *sm,
 	in_decrypted = tls_connection_decrypt(sm->cfg->ssl_ctx, data->ssl.conn,
 					      in_buf);
 	if (in_decrypted == NULL) {
-		wpa_printf(MSG_INFO, "EAP-PEAP: Failed to decrypt Phase 2 "
+		wpa_printf(MSG_INFO, "EAP-PEAP: Failed to decrypt "
 			   "data");
 		eap_peap_state(data, FAILURE);
 		return;
 	}
 
-	wpa_hexdump_buf_key(MSG_DEBUG, "EAP-PEAP: Decrypted Phase 2 EAP",
+	wpa_hexdump_buf_key(MSG_DEBUG, "EAP-PEAP: Decrypted EAP",
 			    in_decrypted);
 
 	if (data->peap_version == 0 && data->state != PHASE2_TLV) {
@@ -1163,7 +1163,7 @@ static void eap_peap_process_phase2(struct eap_sm *sm,
 
 	hdr = wpabuf_head(in_decrypted);
 	if (wpabuf_len(in_decrypted) < (int) sizeof(*hdr)) {
-		wpa_printf(MSG_INFO, "EAP-PEAP: Too short Phase 2 "
+		wpa_printf(MSG_INFO, "EAP-PEAP: Too short "
 			   "EAP frame (len=%lu)",
 			   (unsigned long) wpabuf_len(in_decrypted));
 		wpabuf_free(in_decrypted);
@@ -1173,14 +1173,14 @@ static void eap_peap_process_phase2(struct eap_sm *sm,
 	len = be_to_host16(hdr->length);
 	if (len > wpabuf_len(in_decrypted)) {
 		wpa_printf(MSG_INFO, "EAP-PEAP: Length mismatch in "
-			   "Phase 2 EAP frame (len=%lu hdr->length=%lu)",
+			   "EAP frame (len=%lu hdr->length=%lu)",
 			   (unsigned long) wpabuf_len(in_decrypted),
 			   (unsigned long) len);
 		wpabuf_free(in_decrypted);
 		eap_peap_req_failure(sm, data);
 		return;
 	}
-	wpa_printf(MSG_DEBUG, "EAP-PEAP: received Phase 2: code=%d "
+	wpa_printf(MSG_DEBUG, "EAP-PEAP: received : code=%d "
 		   "identifier=%d length=%lu", hdr->code, hdr->identifier,
 		   (unsigned long) len);
 	switch (hdr->code) {
@@ -1188,19 +1188,19 @@ static void eap_peap_process_phase2(struct eap_sm *sm,
 		eap_peap_process_phase2_response(sm, data, in_decrypted);
 		break;
 	case EAP_CODE_SUCCESS:
-		wpa_printf(MSG_DEBUG, "EAP-PEAP: Phase 2 Success");
+		wpa_printf(MSG_DEBUG, "EAP-PEAP: Success");
 		if (data->state == SUCCESS_REQ) {
 			eap_peap_state(data, SUCCESS);
 			eap_peap_valid_session(sm, data);
 		}
 		break;
 	case EAP_CODE_FAILURE:
-		wpa_printf(MSG_DEBUG, "EAP-PEAP: Phase 2 Failure");
+		wpa_printf(MSG_DEBUG, "EAP-PEAP: Failure");
 		eap_peap_state(data, FAILURE);
 		break;
 	default:
 		wpa_printf(MSG_INFO, "EAP-PEAP: Unexpected code=%d in "
-			   "Phase 2 EAP header", hdr->code);
+			   "EAP header", hdr->code);
 		break;
 	}
 

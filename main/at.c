@@ -308,7 +308,7 @@ static void cmd_reset(void)
     while (1) { }
 }
 
-/* Phase 5a — alternate download-mode entry independent of the 1200bps shim.
+/* — alternate download-mode entry independent of the 1200bps shim.
  * Use this when the host needs to flash and the CDC line-coding trick isn't
  * working (e.g., macOS not propagating SET_LINE_CODING in some configurations).
  * Sets the same RTC bit the 1200bps path sets, then restarts. ROM bootloader

@@ -11,7 +11,7 @@
  * (mmwlan_ap_enable() does this via the file-static
  * umac_stop_core_if_no_interface) is deferred until umac_mesh_enable_mesh()
  * actually drives the chip — at which point the start/stop belongs inside the
- * umac event handler, not here. See docs/mesh-port-scope.md.
+ * umac event handler, not here. See docs/history/mesh-port-scope.md.
  */
 
 /* Per-file MMLOG override to INF — see the note in umac_mesh.c. Must precede
@@ -95,14 +95,14 @@ uint8_t mmwlan_mesh_get_peer_count(void)
     return umac_mesh_get_peer_count(umacd);
 }
 
-/* Phase 4f-step30 — public wrapper for the host-driven probe-request burst. */
+/* Public wrapper for the host-driven probe-request burst. */
 extern int umac_mesh_tx_broadcast_probe(void);
 int mmwlan_mesh_tx_broadcast_probe(void)
 {
     return umac_mesh_tx_broadcast_probe();
 }
 
-/* Phase 4f-step33 — public wrapper for the opcode probe. */
+/* Public wrapper for the opcode probe. */
 extern int umac_mesh_probe_opcode(uint16_t opcode);
 int mmwlan_mesh_probe_opcode(uint16_t opcode)
 {

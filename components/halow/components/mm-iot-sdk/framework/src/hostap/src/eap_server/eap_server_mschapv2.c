@@ -68,7 +68,7 @@ static void * eap_mschapv2_init(struct eap_sm *sm)
 		   sm->eap_fast_mschapv2 ? "FAST-" : "",
 		   sm->peer_challenge && sm->auth_challenge ?
 		   " with preset challenges" : "",
-		   sm->init_phase2 ? " for Phase 2" : "");
+		   sm->init_phase2 ? " for " : "");
 
 	if (sm->auth_challenge) {
 		os_memcpy(data->auth_challenge, sm->auth_challenge,

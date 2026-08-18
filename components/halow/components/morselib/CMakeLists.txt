@@ -30,7 +30,7 @@ set(SRCS
     ${ROOT_DIR}/src/umac/datapath/datapath_defrag.c
     ${ROOT_DIR}/src/umac/datapath/umac_datapath.c
     ${ROOT_DIR}/src/umac/datapath/umac_datapath_ap.c
-    # warthog mesh-support fork (Phase 4f-step7)
+    # warthog mesh-support fork 
     ${ROOT_DIR}/src/umac/datapath/umac_datapath_mesh.c
     ${ROOT_DIR}/src/umac/frames/action.c
     ${ROOT_DIR}/src/umac/frames/association.c
@@ -50,7 +50,7 @@ set(SRCS
     ${ROOT_DIR}/src/umac/ies/wmm.c
     ${ROOT_DIR}/src/umac/ies/morse_ie.c
     ${ROOT_DIR}/src/umac/interface/umac_interface.c
-    # warthog mesh-support fork: 802.11s mesh mode (see docs/mesh-port-scope.md)
+    # warthog mesh-support fork: 802.11s mesh mode (see docs/history/mesh-port-scope.md)
     ${ROOT_DIR}/src/umac/mesh/umac_mesh.c
     ${ROOT_DIR}/src/umac/mesh/mmwlan_mesh.c
     ${ROOT_DIR}/src/umac/mesh/umac_mesh_beacon.c
@@ -79,7 +79,7 @@ set(SRCS
     ${ROOT_DIR}/src/umac/supplicant_shim/random.c
     ${ROOT_DIR}/src/umac/supplicant_shim/supplicant_core.c
     ${ROOT_DIR}/src/umac/supplicant_shim/supplicant_core_ap.c
-    # Phase 4b — warthog mesh-support fork
+    # warthog mesh-support fork
     ${ROOT_DIR}/src/umac/supplicant_shim/supplicant_core_mesh.c
     ${ROOT_DIR}/src/umac/twt/umac_twt.c
     ${ROOT_DIR}/src/umac/umac.c

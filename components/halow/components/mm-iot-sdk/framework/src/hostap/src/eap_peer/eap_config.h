@@ -389,22 +389,22 @@ struct eap_peer_config {
 	size_t machine_password_len;
 
 	/**
-	 * cert - Certificate parameters for Phase 1
+	 * cert - Certificate parameters for 
 	 */
 	struct eap_peer_cert_config cert;
 
 	/**
-	 * phase2_cert - Certificate parameters for Phase 2
+	 * phase2_cert - Certificate parameters for 
 	 *
-	 * This is like cert, but used for Phase 2 (inside
+	 * This is like cert, but used for (inside
 	 * EAP-TTLS/PEAP/FAST/TEAP tunnel) authentication.
 	 */
 	struct eap_peer_cert_config phase2_cert;
 
 	/**
-	 * machine_cert - Certificate parameters for Phase 2 machine credential
+	 * machine_cert - Certificate parameters for machine credential
 	 *
-	 * This is like cert, but used for Phase 2 (inside EAP-TEAP tunnel)
+	 * This is like cert, but used for (inside EAP-TEAP tunnel)
 	 * authentication with machine credentials (while phase2_cert is used
 	 * for user credentials).
 	 */
@@ -419,7 +419,7 @@ struct eap_peer_config {
 	struct eap_method_type *eap_methods;
 
 	/**
-	 * phase1 - Phase 1 (outer authentication) parameters
+	 * phase1 - (outer authentication) parameters
 	 *
 	 * String with field-value pairs, e.g., "peapver=0" or
 	 * "peapver=1 peaplabel=1".
@@ -471,13 +471,13 @@ struct eap_peer_config {
 	 * 1 = use cryptobinding if server supports it
 	 * 2 = require cryptobinding
 	 *
-	 * phase2_auth option can be used to control Phase 2 (i.e., within TLS
+	 * phase2_auth option can be used to control (i.e., within TLS
 	 * tunnel) behavior for PEAP:
-	 * 0 = do not require Phase 2 authentication
-	 * 1 = require Phase 2 authentication when client certificate
+	 * 0 = do not require authentication
+	 * 1 = require authentication when client certificate
 	 *  (private_key/client_cert) is no used and TLS session resumption was
 	 *  not used (default)
-	 * 2 = require Phase 2 authentication in all cases
+	 * 2 = require authentication in all cases
 	 *
 	 * EAP-WSC (WPS) uses following options: pin=Device_Password and
 	 * uuid=Device_UUID

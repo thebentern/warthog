@@ -298,7 +298,7 @@ void morse_skbq_process_rx(struct driver_data *driverd, struct mmpkt *mmpkt)
         (struct morse_buff_skb_header *)mmpkt_remove_from_start(view, sizeof(*hdr));
     uint8_t channel = hdr->channel;
 
-    /* Phase 4l — bus-level RX channel histogram. Counts every page the chip
+    /* Bus-level RX channel histogram. Counts every page the chip
      * pushes to the host, by channel. Decisive test for mesh RX: if we only
      * ever see COMMAND (0xFE) + TX_STATUS (0xFF) in mesh mode, the chip is
      * delivering ZERO RX frames (chip-side gating). If we see DATA (0x0),

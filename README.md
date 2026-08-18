@@ -357,10 +357,6 @@ That switches on:
 
 The CDC console (`/dev/cu.usbmodemXXXX`) carries all ESP-IDF logs after USB-OTG takes over, and `AT+STATUS?` gives a one-shot view of every netif's IP plus the currently-offered DNS. See `docs/` for diagnoses of the gotchas we've already hit (`power-notes.md`, `napt-notes.md`).
 
-## ⚠️ Regulatory
-
-**Pick the release asset matching your country.** Operating outside your country's allocated Wi-Fi HaLow band is illegal in most jurisdictions. There is no default — every build is region-locked at compile time.
-
 ## Status
 
 | Phase | Description | Status |
@@ -370,9 +366,45 @@ The CDC console (`/dev/cu.usbmodemXXXX`) carries all ESP-IDF logs after USB-OTG 
 | 2 | USB net device (CDC-ECM, macOS/Linux) | ✅ DHCP + ping verified on macOS |
 | 3 | 2.4 GHz Wi-Fi AP | ✅ SSID `warthog` visible |
 | 4 | lwIP NAPT bridge | ✅ end-to-end internet verified (Mac → USB → HaLow → upstream → 8.8.8.8) |
-| 5 | Polish (LEDs, AT, NVS) | ✅ partial — LED state machine, AT commands, NVS persistence shipped. Windows RNDIS, NCM (iOS), iperf3, web UI deferred. |
-| — | Mesh mode | 🚧 exploratory — see `docs/mesh-port-scope.md`. Awaits a multi-board test bench. |
+| 5 | Polish (LEDs, AT, NVS) | ✅ partial — LED state machine, AT commands, NVS persistence shipped. Windows RNDIS, NCM (iOS) and a web UI deferred. |
+| 6 | 802.11s mesh over HaLow | ✅ peering, data plane and HWMP path selection; 3-node mesh verified |
+| 7 | OpenMANET / OpenWrt interop | ✅ 0–3% loss, 8–19 ms against OpenMANET 1.8.0 — see [`docs/mesh-openmanet.md`](docs/mesh-openmanet.md) |
 
-## License
+Not implemented: mesh forwarding (a node answers path requests aimed at it and
+relays nothing), SAE/AMPE key derivation (the keyed mesh uses one shared key),
+Windows RNDIS, and a web UI.
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+## Licensing
+
+Warthog's own code is **GPL-3.0-or-later** (see [`LICENSE`](LICENSE)).
+
+It vendors the Morse Micro IoT SDK under `components/halow/`, which is **not**
+all GPL and is not warthog's to relicense. What is in the tree:
+
+| Component | Licence | Notes |
+|---|---|---|
+| Warthog firmware (`main/`, mesh port, tests) | GPL-3.0-or-later | This project |
+| Morse Micro SDK sources | `GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial` | Dual; distributed here under the GPL branch |
+| Third-party SDK components | Apache-2.0, MIT, BSD-3-Clause, GPL-2.0-or-later, Zlib | Per-file SPDX headers |
+| HaLow firmware and board-config blobs (`*.mbin`) | `LicenseRef-MorseMicroBDL` | Binary Distribution Licence |
+
+Full licence texts are in
+[`components/halow/components/mm-iot-sdk/LICENSES/`](components/halow/components/mm-iot-sdk/LICENSES/).
+
+The firmware blobs are redistributed **complete and unmodified**, which is what
+the Morse Micro Binary Distribution Licence permits, and solely for use with
+hardware containing a Morse Micro HaLow chip. If you fork this repository, keep
+them unmodified and keep the `LICENSES/` directory with them. Do not assume the
+GPL applies to the blobs — it does not.
+
+## Regulatory
+
+The radio's regulatory domain is fixed at build time by the region env you
+choose (`warthog-us`, `-eu`, `-jp`, `-kr`, `-au`), which selects both the board
+config and the channel list. **Build the env for the jurisdiction you are
+operating in.** Transmitting on another region's channel plan is very likely
+illegal where you are, and sub-GHz spectrum differs sharply between regions.
+
+Warthog is an experimental project. You are responsible for operating it within
+your local rules, including duty-cycle and transmit-power limits.
+

@@ -25,7 +25,7 @@ int wpas_mesh_peer_remove(struct wpa_supplicant *wpa_s, const u8 *addr);
 int wpas_mesh_peer_add(struct wpa_supplicant *wpa_s, const u8 *addr,
 		       int duration);
 
-/* Phase 4f — un-static'd in mesh.c so the warthog supplicant_core_mesh shim
+/* un-static'd in mesh.c so the warthog supplicant_core_mesh shim
  * can build the mesh_conf without going through wpa_supplicant_mesh_init
  * (which triggers a chip cold-init crash). */
 struct mesh_conf;

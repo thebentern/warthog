@@ -53,7 +53,7 @@ int morse_raw_priority_enable(const char *ifname,
 }
 
 /* ---------------------------------------------------------------------------
- * Phase 4a (mesh) — wpa_supplicant.c mesh paths and mesh.c call these CLI
+ * wpa_supplicant.c mesh paths and mesh.c call these CLI
  * helpers expecting a Linux userspace `morse_cli` tool over nl80211 vendor
  * commands. On embedded, real config goes through the morselib host driver
  * (mmdrv_mesh_config sends MESH_CONFIG opcode 0x0039 directly to the chip).

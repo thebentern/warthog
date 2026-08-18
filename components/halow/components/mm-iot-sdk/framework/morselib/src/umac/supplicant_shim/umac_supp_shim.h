@@ -34,7 +34,7 @@ enum mmwlan_status umac_supp_remove_sta_interface(struct umac_data *umacd);
 enum mmwlan_status umac_supp_remove_ap_interface(struct umac_data *umacd);
 
 
-/* Phase 4b — mesh equivalent of umac_supp_{add,remove}_ap_interface. Creates
+/* mesh equivalent of umac_supp_{add,remove}_ap_interface. Creates
  * / destroys a wpa_supplicant interface configured for 802.11s mesh peering.
  * The PLINK state machine (hostap mesh_mpm.c) runs inside that supplicant
  * context. */

@@ -390,14 +390,14 @@ struct wpa_cred {
 	struct eap_method_type *eap_method;
 
 	/**
-	 * phase1 - Phase 1 (outer authentication) parameters
+	 * phase1 - (outer authentication) parameters
 	 *
 	 * Pre-configured EAP parameters or %NULL.
 	 */
 	char *phase1;
 
 	/**
-	 * phase2 - Phase 2 (inner authentication) parameters
+	 * phase2 - (inner authentication) parameters
 	 *
 	 * Pre-configured EAP parameters or %NULL.
 	 */

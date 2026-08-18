@@ -33,7 +33,7 @@ static int server_get_eap_user(void *ctx, const u8 *identity,
 	os_memset(user, 0, sizeof(*user));
 
 	if (!phase2) {
-		/* Only allow EAP-PEAP as the Phase 1 method */
+		/* Only allow EAP-PEAP as the method */
 		user->methods[0].vendor = EAP_VENDOR_IETF;
 		user->methods[0].method = EAP_TYPE_PEAP;
 		return 0;
@@ -45,7 +45,7 @@ static int server_get_eap_user(void *ctx, const u8 *identity,
 		return -1;
 	}
 
-	/* Only allow EAP-MSCHAPv2 as the Phase 2 method */
+	/* Only allow EAP-MSCHAPv2 as the method */
 	user->methods[0].vendor = EAP_VENDOR_IETF;
 	user->methods[0].method = EAP_TYPE_MSCHAPV2;
 	user->password = (u8 *) os_strdup("password");

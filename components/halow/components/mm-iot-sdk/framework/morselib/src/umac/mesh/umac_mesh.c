@@ -15,7 +15,7 @@
  *   4. MESH_CONFIG     (0x0039) opcode START — begin beaconing + MBCA
  * plus INSTALL_KEY (0x000A) when security_type == MMWLAN_SAE.
  * Opcodes per morse_commands.h (semver 56.17.0) from the GPL Linux driver.
- * See docs/mesh-port-scope.md.
+ * See docs/history/mesh-port-scope.md.
  */
 
 /* Per-file MMLOG override: morselib defaults to ERR level, which blackholes
@@ -36,23 +36,23 @@
 #include "umac/core/umac_core.h"
 #include "umac/data/umac_data.h"
 #include "umac/interface/umac_interface.h"
-#include "umac/config/umac_config.h"   /* Phase 4f-step19: default QoS params */
-/* Phase 4c — call the supplicant shim after MESH_CONFIG(START). */
+#include "umac/config/umac_config.h"   /* default QoS params */
+/* Call the supplicant shim after MESH_CONFIG(START). */
 #include "umac/supplicant_shim/umac_supp_shim.h"
-/* Phase 4f-step7 — install mesh-mode datapath ops on mesh startup so frames
+/* install mesh-mode datapath ops on mesh startup so frames
  * pass the data->ops NULL check in umac_datapath_rx_frame_filter. */
 #include "umac/datapath/umac_datapath.h"
-/* Phase 4f-step10 — set the per-VIF operating channel via regdb. */
+/* set the per-VIF operating channel via regdb. */
 #include "umac/regdb/umac_regdb.h"
 #include "umac/ies/s1g_capabilities.h"
 #include "umac/mesh/umac_mesh_hwmp.h"
-/* Phase 4f-step13 — mesh beacon constructor. Replaces the NULL return in
+/* mesh beacon constructor. Replaces the NULL return in
  * mmdrv_host_get_beacon() when the chip asks for a mesh beacon template. */
 #include "umac_mesh_beacon.h"
 #include "umac_mesh_ies.h"
 /* For mmwlan_get_mac_addr() — we need own_addr to stamp into addr2/addr3. */
 #include "mmwlan.h"
-/* Phase 4f-step29 — manual probe-request burst to test chip TX path. */
+/* manual probe-request burst to test chip TX path. */
 #include "umac/frames/frames_common.h"     /* build_mgmt_frame, mgmt_frame_builder_t */
 #include "umac/frames/probe_request.h"     /* frame_probe_request_build, frame_data_probe_request */
 #include "umac/frames/probe_response.h"    /* frame_probe_response_build, frame_data_probe_response */
@@ -60,19 +60,19 @@
 #include "umac/rc/umac_rc.h"               /* umac_rc_init_rate_table_mgmt */
 #include "common/mac_address.h"            /* mac_addr_broadcast */
 #include "mmdrv.h"                          /* mmdrv_tx_frame, mmdrv_get_tx_metadata */
-/* Phase 4f-step30 — for ESP_LOGW from non-umac task contexts where the
+/* for ESP_LOGW from non-umac task contexts where the
  * MMLOG path silently drops. */
 #include "esp_log.h"
-/* Phase 4f-step33 — raw chip command header definitions for opcode probe. */
+/* raw chip command header definitions for opcode probe. */
 #include "common/morse_commands.h"
 
-/* Phase 4f-step9 — declared as extern in umac_ap.c too; the hostap library
+/* declared as extern in umac_ap.c too; the hostap library
  * defines it. CRC32 of mesh_id → CSSID for the chip's RX BSS filter. */
 extern uint32_t ieee80211_crc32(const uint8_t *frame, size_t frame_len);
 
 #include <string.h>
 
-/* Phase 4d — save the args from the last successful enable so
+/* save the args from the last successful enable so
  * wpa_config_read_mesh() can read them. File-static because the MM6108 only
  * has one VIF (mesh and STA/AP are mutually exclusive). s_mesh_args_valid
  * gates the getter — if mesh isn't enabled, the supplicant shouldn't be
@@ -80,7 +80,7 @@ extern uint32_t ieee80211_crc32(const uint8_t *frame, size_t frame_len);
 static struct mmwlan_mesh_args s_mesh_args;
 static bool s_mesh_args_valid;
 
-/* Phase 4f-step30 — state for the periodic probe-request burst. The host-
+/* state for the periodic probe-request burst. The host-
  * side mesh-probe task in main/mesh.c calls umac_mesh_tx_broadcast_probe()
  * which uses these to construct + submit each probe. We stash them once
  * during mesh enable so the task doesn't need to re-discover them. */
@@ -121,7 +121,7 @@ static struct umac_data *s_mesh_umacd = NULL;
 static uint16_t s_mesh_vif_id = 0;
 static uint8_t s_mesh_own_addr[6] = {0};
 
-/* Phase 4f-step32 — shared mesh BSSID derived from CRC32(mesh_id). Both
+/* shared mesh BSSID derived from CRC32(mesh_id). Both
  * peers on the same mesh_id compute the same value. The beacon constructor
  * uses this as addr3 (BSSID field) so peer chips with the same shared
  * BSSID set as their Addr3 RX filter will admit our beacon. */
@@ -169,7 +169,7 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
               args->mesh_id_len,
               (args->security_type == MMWLAN_SAE) ? "SAE" : "OPEN");
 
-    /* Phase 2: ADD_INTERFACE(type=MESH). Passing NULL for the MAC lets the
+    /* ADD_INTERFACE(type=MESH). Passing NULL for the MAC lets the
      * interface layer use the chip's device MAC. This call is also the
      * diagnostic for whether the bundled mm6108.mbin firmware supports a
      * mesh VIF at all — morselib's morse_commands.h carries the
@@ -201,13 +201,13 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
     umac_datapath_configure_mesh_mode(umacd);
     MMLOG_INF("mesh: datapath ops installed early (before any RX can arrive)\n");
 
-    /* Phase 4f-step10 — set the per-VIF operating channel. AP mode does this
+    /* set the per-VIF operating channel. AP mode does this
      * via umac_interface_set_channel before BSS_CONFIG (umac_ap.c:245). The
      * chip uses this to know which radio channel the VIF lives on; without
      * it, the chip likely doesn't tune the RX path for the mesh VIF even if
      * the global channel list is populated. Pick the first channel from the
      * regdb — both boards on the same region get the same first channel, so
-     * they auto-coordinate. Phase 6+ can let the user specify a channel. */
+     * they auto-coordinate. A future revision can let the user specify a channel. */
     const struct mmwlan_s1g_channel *mesh_chan = umac_regdb_get_channel_at_index(umacd, 0);
     if (mesh_chan != NULL)
     {
@@ -231,13 +231,13 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
     }
 
     /* ===================================================================
-     * Phase 4f-step27 — REORDER chip commands to match Linux exactly.
+     * REORDER chip commands to match Linux exactly.
      *
      * Until step 26 our sequence after ADD_INTERFACE was:
      *   SET_CHANNEL → BSS_CONFIG → BSSID_SET → SCAN_CONFIG → QoS×4 →
      *   BSS_BEACON_CONFIG → MESH_CONFIG START → start_beaconing
      *
-     * But agent-driven trace of /tmp/morse_driver shows Linux fires its
+     * But the Linux morse driver fires its
      * chip commands during mesh start in this order:
      *   add_interface() :    ADD_INTERFACE, GET_CAPABILITIES
      *   config callback :    SET_CHANNEL
@@ -286,7 +286,7 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
         }
     }
 
-    /* Phase 4f-step28 — enable NDP (Null Data Packet) probe support for the
+    /* enable NDP (Null Data Packet) probe support for the
      * mesh VIF.
      *
      * Linux enables this UNCONDITIONALLY for all AP-type interfaces
@@ -352,7 +352,7 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
      * The ordering is load-bearing: configure the BSS, then make the host able
      * to serve a beacon, and only then tell the firmware to start. */
 
-    /* Phase 4f-step32 — derive a SHARED mesh BSSID from the mesh_id hash.
+    /* derive a SHARED mesh BSSID from the mesh_id hash.
      *
      * Prior steps 15 + 26 set BSSID to per-board values (own_addr / broadcast).
      * Neither opened chip RX. mac80211 mesh peers EVENTUALLY all share the
@@ -367,8 +367,8 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
      *
      * Both boards on the SAME mesh_id will produce the SAME 6-byte BSSID.
      * The chip's Addr3 (BSSID) RX filter, set to this value, will pass any
-     * mesh frame from a peer that also uses it as its BSSID — finally
-     * unblocking the RX path that Phase 4f steps 1-31 couldn't open.
+     * mesh frame from a peer that also uses it as its BSSID, which is what
+     * lets peer frames reach the host at all.
      */
     uint32_t cssid = ieee80211_crc32(args->mesh_id, args->mesh_id_len);
     uint16_t beacon_int = args->beacon_interval_tu ? args->beacon_interval_tu : 100;
@@ -448,7 +448,7 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
               "(after MESH_CONFIG, matching Linux)\n",
               beacon_int, (unsigned long)cssid);
 
-    /* Phase 4f-step13 — initialize the mesh beacon constructor BEFORE
+    /* initialize the mesh beacon constructor BEFORE
      * enabling the beacon IRQ. The chip's first beacon-template request
      * fires inside mmdrv_start_beaconing (or even during MESH_CONFIG(START)
      * itself per step12 observations), and we need umac_mesh_get_beacon()
@@ -465,7 +465,7 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
     }
     umac_mesh_beacon_init(args, own_addr);
 
-    /* Phase 4f-step12 — discriminating experiment for the chip's mesh
+    /* discriminating experiment for the chip's mesh
      * beacon model. AP mode calls mmdrv_start_beaconing(vif_id) right
      * after BSS_CONFIG (umac_ap.c:267) — that's what enables the per-VIF
      * beacon IRQ (MORSE_INT_BEACON_BASE_NUM + vif_id). Without it, the
@@ -530,7 +530,7 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
     MMLOG_INF("mesh: MESH_CONFIG(START) accepted LAST (after BSSID/BSS_CONFIG/"
               "beacon-engine) — firmware TBTT scan ~2s, then beacon IRQs\n");
 
-    /* Phase 4f-step7 — install mesh-aware datapath ops. This unblocks the
+    /* install mesh-aware datapath ops. This unblocks the
      * RX filter (data->ops != NULL gate) so the chip's delivered frames
      * actually reach umac_datapath_process_rx_mgmt_frame → action-frame
      * switch → SELF_PROTECTED case → supplicant → mesh_mpm. The TX-side
@@ -546,7 +546,7 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
     MMLOG_INF("mesh: datapath ops set to mesh — RX filter will now pass frames\n");
 
     /* ===================================================================
-     * Phase 4f-step29 — DIRECT CHIP-TX-PATH VERIFICATION via manual probe req.
+     * DIRECT CHIP-TX-PATH VERIFICATION via manual probe req.
      *
      * After 28 iterations the chip is silent on mesh: beacon_irq fires once
      * at startup, no further IRQs, no TX_STATUS notifications, no RX. The
@@ -611,24 +611,20 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
         }
     }
 
-    /* Phase 4d — stash the args before calling the shim. wpa_config_read_mesh()
+    /* stash the args before calling the shim. wpa_config_read_mesh()
      * runs inside wpa_supplicant_add_iface() and pulls these out via
      * umac_mesh_get_args() to populate the wpa_ssid (mesh_id + security). */
     memcpy(&s_mesh_args, args, sizeof(s_mesh_args));
     s_mesh_args_valid = true;
 
-    /* Phase 4f-step30 — stash state for the periodic probe-request burst. */
+    /* stash state for the periodic probe-request burst. */
     s_mesh_umacd = umacd;
     s_mesh_vif_id = vif_id;
     memcpy(s_mesh_own_addr, own_addr, 6);
 
-    /* Phase 4c: register a wpa_supplicant mesh interface so hostap's PLINK
-     * state machine (mesh_mpm.c) runs against this VIF. Mirrors how umac_ap
-     * calls umac_supp_add_ap_interface() after the chip's BSS_CONFIG.
-     *
-     * Phase 4d hooked up the MESH config reader + driver_ops, so add_iface
-     * should now succeed and hostap's mesh layer is actually reached. PLINK
-     * peering still needs runtime exercise with two boards. */
+    /* Register a wpa_supplicant mesh interface so hostap's PLINK state
+     * machine (mesh_mpm.c) runs against this VIF. Mirrors how umac_ap calls
+     * umac_supp_add_ap_interface() after the chip's BSS_CONFIG. */
     enum mmwlan_status supp_status = umac_supp_add_mesh_interface(umacd);
     if (supp_status == MMWLAN_SUCCESS)
     {
@@ -642,7 +638,6 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
         s_mesh_args_valid = false;
     }
 
-    /* TODO Phase 6: mesh datapath (4-address frames). */
     return MMWLAN_SUCCESS;
 }
 
@@ -652,7 +647,7 @@ enum mmwlan_status umac_mesh_disable_mesh(struct umac_data *umacd)
     return MMWLAN_UNAVAILABLE;
 }
 
-/* Phase 4f-step30 — host-driven periodic broadcast probe request.
+/* host-driven periodic broadcast probe request.
  *
  * Called from the mesh-probe FreeRTOS task in main/mesh.c every 2s after
  * mesh_enable returns SUCCESS. Each call builds a fresh probe-request frame

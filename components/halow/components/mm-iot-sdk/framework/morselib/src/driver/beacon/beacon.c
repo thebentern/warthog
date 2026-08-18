@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
  */
 
-/* Phase 4f-step24 — raise file log level to INF so beacon-IRQ counters
+/* raise file log level to INF so beacon-IRQ counters
  * surface at default. Same trick as event.c and umac_mesh.c. */
 #define MMLOG_LEVEL_OVRD 5
 
@@ -18,7 +18,7 @@ void morse_beacon_irq_handle(struct driver_data *driverd, uint32_t status1_reg)
 
     if (status1_reg & 1ul << beacon_irq_num)
     {
-        /* Phase 4f-step24 diagnostic — count beacon IRQs. In mesh mode we
+        /* Diagnostic: count beacon IRQs. In mesh mode we
          * see mmdrv_host_get_beacon fire exactly once (initial template
          * request) and never again. If THIS IRQ never fires for the mesh
          * VIF after init, the chip is not requesting beacon templates at
@@ -52,7 +52,7 @@ static int morse_beacon_work_(struct driver_data *driverd)
 {
     if (driver_task_notification_check_and_clear(driverd, DRV_EVT_BEACON_REQ_PEND))
     {
-        /* Phase 4f-step24 — log every beacon IRQ. Should fire every 100ms
+        /* log every beacon IRQ. Should fire every 100ms
          * (one TBTT) if chip is correctly running its beacon timer. */
         static uint32_t s_bcn_irq_count = 0;
         s_bcn_irq_count++;

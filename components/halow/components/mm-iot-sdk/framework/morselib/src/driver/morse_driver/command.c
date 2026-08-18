@@ -4,7 +4,7 @@
  *
  */
 
-/* Phase 4j — file-scope MMLOG override left at INF so future cmd-tx ring-
+/* File-scope MMLOG override left at INF so future cmd-tx ring-
  * buffer dumps can surface (no live ERR prints from here today; the boot
  * 7-command sequence is documented in the comment inside morse_cmd_tx). */
 #define MMLOG_LEVEL_OVRD 5
@@ -63,58 +63,20 @@ int morse_cmd_tx(struct driver_data *driverd,
 
     DRVCMD_TRACE("cmd req %x", le16toh(cmd->hdr.message_id));
 
-    /* Phase 4j — boot-init chip-command audit DATA CAPTURED (decoded):
+    /* Two things about this command channel differ from the Linux driver and
+     * will mislead anyone reading across the two:
      *
-     *   #1 op=0x0002 GET_VERSION             vif=65535 plen=0
-     *   #2 op=0x0004 ADD_INTERFACE           vif=65535 plen=10
-     *   #3 op=0x0025 GET_CAPABILITIES        vif=0     plen=0
-     *   #4 op=0x0016 CONFIG_PS               vif=0     plen=2
-     *   #5 op=0x003e GENERIC_PARAM(SET)      vif=0     plen=16
-     *                pid=2  (TX_STATUS_FLUSH_WATERMARK)  value=10
-     *   #6 op=0x003e GENERIC_PARAM(SET)      vif=65535 plen=16
-     *                pid=18 (DYNAMIC_PS_TIMEOUT_MS)      value=100
-     *   #7 op=0x0019 HEALTH_CHECK            vif=65535 plen=0
+     *   - The action enum is INVERTED. Embedded morselib uses
+     *     MORSE_CMD_PARAM_ACTION_SET = 0 and _GET = 1; Linux uses the
+     *     opposite. An action byte of 0 on the wire here means SET.
+     *   - The generic-parameter struct orders its fields
+     *     {hdr, param_id, action, flags, value}, with flags and value
+     *     swapped relative to the Linux struct.
      *
-     * NOTE on action semantics: embedded morselib defines
-     *   MORSE_CMD_PARAM_ACTION_SET = 0,
-     *   MORSE_CMD_PARAM_ACTION_GET = 1.
-     * (OPPOSITE of Linux convention!) so the action=0 in capture = SET.
-     * Struct field order in embedded morselib is
-     *   {hdr, param_id, action, FLAGS, VALUE}
-     * (FLAGS and VALUE swapped relative to Linux struct), so the trailing
-     * 8 bytes decode as flags=0, value=10/100.
-     *
-     * Comparing to Linux (from /tmp/morse_driver agent survey):
-     *   - Linux sends ONLY GET_VERSION at boot
-     *   - Linux sends CONFIG_PS only when an interface is added
-     *   - Linux never sends GENERIC_PARAM(SET) at boot
-     *   - Linux sends HEALTH_CHECK only from a scheduled work timer
-     *
-     * So morselib sends FOUR extra commands at boot that Linux doesn't.
-     * However the parameter SETs (#5: TX_STATUS_FLUSH_WATERMARK=10,
-     * #6: DYNAMIC_PS_TIMEOUT_MS=100) are mundane queue/PS tuning — they
-     * don't toggle a "fullmac strict RX filter" mode.
-     *
-     * Conclusion: the chip-command surface does NOT contain a mode-switch
-     * that morselib pulls and Linux doesn't. The fullmac-vs-softmac
-     * behavior asymmetry must therefore live in:
-     *   (a) direct chip-RAM writes via morse_trns_write_le32 (out-of-band
-     *       of the command channel) during the bring-up sequence, or
-     *   (b) constants compiled into the firmware blob itself (which the
-     *       Phase 4i firmware swap proved DOES respond to morselib the
-     *       same way as our SDK firmware), or
-     *   (c) a chip-internal default that the SDK firmware never relaxes
-     *       because no published chip command relaxes it.
-     *
-     * Phase 4k follow-up: instrument morse_trns_write_le32 / read_le32
-     * to capture direct chip-register writes during boot. That's the
-     * one remaining host→chip path we haven't audited.
-     *
-     * Live instrumentation was REVERTED here because printf on USB-CDC
-     * added ~5ms per command, which under 7-command bursts pushed the
-     * cmd-path total past the IRQ-watchdog deadline (35ms watchdog vs
-     * 7×5 = 35ms log overhead). The capture above is preserved as a
-     * permanent documentation artifact in this comment block. */
+     * Do not add per-command logging here. printf over USB-CDC costs ~5ms per
+     * call, and boot issues seven commands in a burst -- 35ms of logging
+     * against a 35ms IRQ watchdog, which trips the watchdog rather than
+     * showing you the problem. */
 
     if (driverd->cfg == NULL || driverd->cfg->ops == NULL)
     {

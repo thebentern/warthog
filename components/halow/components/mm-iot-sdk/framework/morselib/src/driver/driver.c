@@ -636,7 +636,7 @@ int mmdrv_cfg_bss_beacon(uint16_t vif_id, bool enable)
 /* warthog mesh-support fork: send MESH_CONFIG (0x0039) to start/stop 802.11s
  * mesh operation on a VIF previously added with MMDRV_INTERFACE_TYPE_MESH.
  *
- * Phase 4f-step18 — switched from zero-MBCA-fields to the GPL Linux driver
+ * switched from zero-MBCA-fields to the GPL Linux driver
  * defaults (mesh.c:660-668). Specifically:
  *   - mbca_config       = MESH_MBCA_CFG_TBTT_SEL_ENABLE (BIT(0) = 0x01)
  *   - min_beacon_gap_ms = 25  (DEFAULT_MBCA_MIN_BEACON_GAP_MS)
@@ -657,9 +657,9 @@ int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing)
     }
 
     /* GPL morse_driver mesh.h MBCA defaults — kept as constants but the
-     * MESH_CONFIG below uses MBCA-OFF for Phase 4f-step25.
+     * MESH_CONFIG below uses MBCA-OFF for 
      *
-     * Phase 4f-step25 — DISABLE MBCA (mbca_config=0). After step24 confirmed
+     * DISABLE MBCA (mbca_config=0). After step24 confirmed
      * the chip's beacon IRQ fires exactly ONCE at startup and never again
      * in mesh mode, the hypothesis is that MBCA's TBTT-selection state
      * machine is gating the beacon timer until peer beacons are observed —
@@ -1317,7 +1317,7 @@ int mmdrv_tx_frame(struct mmpkt *mmpkt, bool is_mgmt)
         return -ENODEV;
     }
 
-    /* Phase 4f-step24 diagnostic — count every chip TX. After step 23 the
+    /* Diagnostic: count every chip TX. After step 23 the
      * chip only ever asks for the beacon template once (mmdrv_host_get_beacon
      * count stays at 1) and never reports TX_STATUS. This counts mgmt vs data
      * vs beacon frames going TO the chip — so we can tell whether mesh is

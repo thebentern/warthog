@@ -7,7 +7,7 @@
 #include "umac_supp_shim_private.h"
 #include "umac/ap/umac_ap.h"
 #include "umac/interface/umac_interface.h"
-/* Phase 4d — wpa_config_read_mesh() pulls the active mesh args from umac_mesh. */
+/* wpa_config_read_mesh() pulls the active mesh args from umac_mesh. */
 #include "umac/mesh/umac_mesh.h"
 #include "mmwlan_mesh.h"
 
@@ -390,7 +390,7 @@ const struct mmwlan_supp_config_entry mmwlan_wpa_config_ap = {
 };
 
 
-/* Phase 4d — minimal mesh config reader. Mirrors wpa_config_read_ap but
+/* minimal mesh config reader. Mirrors wpa_config_read_ap but
  * sets WPAS_MODE_MESH and skips AP-only fields (no beacon_int, dtim_period,
  * MBSSID, etc. — those live on hostapd_config, not wpa_ssid, and mesh runs
  * through ssid->mode). The actual channel + S1G op class come from the chip's

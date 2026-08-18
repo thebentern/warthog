@@ -43,7 +43,7 @@ set(SRCS
   ${ROOT_DIR}/src/utils/common.c
   ${ROOT_DIR}/src/utils/wpa_debug.c
   ${ROOT_DIR}/src/utils/wpabuf.c
-  # Phase 4a (mesh). morse.c provides S1G regulatory data + lookups that
+  # morse.c provides S1G regulatory data + lookups that
   # wpa_supplicant.c's mesh code paths call (morse_s1g_ch_to_op_class etc.).
   # Pure data — no syscalls. The companion morse_cli.c stays OUT of SRCS:
   # its functions are already stubbed in morselib (morse_stubs.c +
@@ -71,7 +71,7 @@ set(SRCS
   ${ROOT_DIR}/crypto_mbedtls_mm.c
   ${ROOT_DIR}/morse_stubs.c
   ${ROOT_DIR}/wpa_supplicant/ap.c
-  # Phase 4a (mesh) — 802.11s PLINK state machine + join entry point + RSN.
+  # 802.11s PLINK state machine + join entry point + RSN.
   ${ROOT_DIR}/wpa_supplicant/mesh.c
   ${ROOT_DIR}/wpa_supplicant/mesh_mpm.c
   ${ROOT_DIR}/wpa_supplicant/mesh_rsn.c
@@ -146,7 +146,7 @@ set(BUILD_DEFINES
   MM_IOT_DPP_HEADER=1
   CONFIG_AP=1
   NEED_AP_MLME=1
-  # Phase 4a — enables the 802.11s mesh code paths inside wpa_supplicant.c
+  # enables the 802.11s mesh code paths inside wpa_supplicant.c
   # (24 #ifdef CONFIG_MESH blocks), events.c (8), scan.c (4), and AP-side
   # sta_info / hostapd plink_state fields. Without this, mesh.c / mesh_mpm.c /
   # mesh_rsn.c are present but the supplicant core never dispatches into them.

@@ -67,7 +67,7 @@ enum s1g_op_class_type {
 	OP_CLASS_S1G_GLOBAL = 0,
 };
 
-/* Phase 4a (mesh). Reconstructed from morse.c's static initialisers
+/* Reconstructed from morse.c's static initialisers
  * (us1/us2/eu6/...) and access patterns in morse.c, rrm.c, hostapd.c,
  * acs.c, wpa_supplicant.c. The embedded fork shipped the regulatory data
  * but stripped this declaration — mesh code needs it visible so
@@ -254,7 +254,7 @@ int morse_raw_priority_enable(const char *ifname, bool enable, u8 prio, u32 star
 	u8 praw_period, u8 praw_start_offset);
 
 /* -------------------------------------------------------------------------
- * Phase 4a (mesh). Prototypes the embedded fork stripped from morse.h but
+ * Prototypes the embedded fork stripped from morse.h but
  * kept the definitions of in morse.c — re-added so wpa_supplicant.c / mesh.c
  * / acs.c compile clean (-Wimplicit-function-declaration + return-type fixes).
  * ------------------------------------------------------------------------- */

@@ -7,16 +7,16 @@
  * routed via umac_supp_process_mgmt_frame -> mesh_mpm_mgmt_rx, and peer
  * state transitions notify the umac side through wpa_mesh_notify_peer.
  *
- * Phase 4b (this file): build-verifiable shim — the interface registration
+ * This file is a build-verifiable shim — the interface registration
  * compiles + links. The reference to wpa_supplicant_join_mesh defeats
  * gc-sections so the hostap mesh layer (1500+ LOC across mesh.c / mesh_mpm.c
- * / mesh_rsn.c, see docs/mesh-port-scope.md Phase 4a) actually ships in
- * firmware.elf. Phase 4c will call it from umac_mesh_enable_mesh().
+ * / mesh_rsn.c) actually ships in
+ * firmware.elf. will call it from umac_mesh_enable_mesh().
  *
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
  */
 
-/* Phase 4f — surface MMLOG_INF/WRN. Without this, passive_init_ifmsh's
+/* surface MMLOG_INF/WRN. Without this, passive_init_ifmsh's
  * success line and the shim's status log are blackholed at ERR level. */
 #define MMLOG_LEVEL_OVRD 5
 
@@ -28,7 +28,7 @@
 #include "umac_supp_shim_private.h"
 #include "umac/datapath/umac_datapath.h"
 
-/* Phase 4f passive ifmsh init — pull the hostap mesh internals so we can
+/* passive ifmsh init — pull the hostap mesh internals so we can
  * allocate the bss / mconf / ifmsh directly without going through
  * wpa_supplicant_join_mesh (which cold-inits the chip and crashes us). */
 #pragma GCC diagnostic push
@@ -46,7 +46,7 @@
  * state machine. Without an explicit reference here, --gc-sections strips
  * them as unreachable.
  *
- * Phase 4e tried to actually CALL wpa_supplicant_join_mesh from this shim —
+ * tried to actually CALL wpa_supplicant_join_mesh from this shim —
  * that turned out to be the wrong architecture. It triggered hostap's normal
  * "set up the mesh interface from scratch" flow, which ran umac_interface_add
  * a second time (chip was already in mesh mode from umac_mesh_enable_mesh).
@@ -60,7 +60,7 @@
 extern int wpa_supplicant_join_mesh(struct wpa_supplicant *wpa_s,
                                     struct wpa_ssid *ssid);
 
-/* Phase 4f — selectively pull hostap mesh internals. wpa_supplicant_mesh_init
+/* selectively pull hostap mesh internals. wpa_supplicant_mesh_init
  * (mesh.c:425-622) walks through ~200 lines of host-side state setup, then
  * ends with two driver calls (wpa_drv_init_mesh + hostapd_setup_interface)
  * that cold-restart the chip. The pre-driver lines are safe to replicate —
@@ -186,7 +186,7 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
      * if a NULL hits some code path we'll learn which one from the crash.
      *
      * Skip mesh.c:613-616 (wpa_drv_init_mesh) and 618-622 (hostapd_setup_interface)
-     * — the latter is the cold-restart trap that crashed Phase 4e. The former
+     * — the latter is the cold-restart trap that crashed The former
      * is harmless via NULL check but unnecessary for passive PLINK. */
 
     MMLOG_INF("mesh: passive ifmsh init OK — mesh_mpm has hapd=%p mconf=%p own_addr=" MACSTR "\n",
@@ -218,7 +218,7 @@ enum mmwlan_status umac_supp_add_mesh_interface(struct umac_data *umacd)
     };
 
     /* wpa_supplicant_add_iface needs matching entries in mmwlan_wpa_configs[]
-     * (config reader) and wpa_drivers[] (driver ops). Phase 4d registered both.
+     * (config reader) and wpa_drivers[] (driver ops). registered both.
      * The driver_init step inside add_iface dispatches a few driver_ops calls
      * (wpa_clear_keys, etc.); AP-specific ops are NULLed on mmwlan_wpas_ops_mesh
      * to skip them. See driver_ap.c comment block above the mesh ops struct. */

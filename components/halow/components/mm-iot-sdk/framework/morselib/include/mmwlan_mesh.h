@@ -12,7 +12,7 @@
  *
  * Status: skeleton. mmwlan_mesh_enable() validates args and returns
  * MMWLAN_UNAVAILABLE until the umac/mesh state machine + chip MESH_CONFIG
- * command path are implemented. See docs/mesh-port-scope.md.
+ * command path are implemented. See docs/history/mesh-port-scope.md.
  */
 
 #pragma once
@@ -94,7 +94,7 @@ enum mmwlan_status mmwlan_mesh_register_peer_event_cb(mmwlan_mesh_peer_event_cb_
 uint8_t mmwlan_mesh_get_peer_count(void);
 
 /**
- * Phase 4f-step30 diagnostic — fire a broadcast probe request via the chip's
+ * Diagnostic: fire a broadcast probe request via the chip's
  * mgmt TX path on the active mesh VIF. The probe carries the mesh_id as SSID
  * (mimicking Linux's `mesh_beaconless_mode` discovery frames). Caller invokes
  * periodically (e.g. every 2s) to maintain on-air mesh-discovery traffic
@@ -105,7 +105,7 @@ uint8_t mmwlan_mesh_get_peer_count(void);
 int mmwlan_mesh_tx_broadcast_probe(void);
 
 /**
- * Phase 4f-step33 diagnostic — probe a single chip opcode. Sends a minimal
+ * Diagnostic: probe a single chip opcode. Sends a minimal
  * REQ with the given message_id (empty payload, vif_id = active mesh VIF)
  * via mmdrv_execute_command, bypassing the morselib opcode wrappers.
  *

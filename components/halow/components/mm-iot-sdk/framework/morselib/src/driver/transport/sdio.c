@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
  */
 
-/* Phase 4k — file-scope log override left at INF so future register-access
+/* File-scope log override left at INF so future register-access
  * dumps can surface without reverting this file (the live MMLOG_ERR audit
  * has been removed; the captured boot register sequence is preserved as a
  * comment block inside morse_trns_write_le32). */
@@ -614,7 +614,7 @@ morse_error_t morse_trns_read_le32(struct driver_data *driverd, uint32_t address
 
     PACK_LE32(*data, receive_data);
 
-    /* Phase 4k — direct chip-register read audit. DATA CAPTURED:
+    /* Observed boot-time register reads:
      * The first 24 chip-register reads during boot are all status-poll
      * loops on `addr=0x10054d40` (chip-ready status register) — 22 reads
      * returning 0, then chip transitions to ready. Aside from this poll
@@ -663,7 +663,7 @@ morse_error_t morse_trns_write_le32(struct driver_data *driverd, uint32_t addres
         morse_address_base_clear_cache();
     }
 
-    /* Phase 4k — direct chip-register write audit. DATA CAPTURED:
+    /* Observed boot-time register writes:
      *
      * First 24 chip-register writes during boot (both boards identical):
      *
@@ -682,10 +682,10 @@ morse_error_t morse_trns_write_le32(struct driver_data *driverd, uint32_t addres
      *
      * All writes are CHIP-INIT operations (IRQ setup, boot trigger,
      * pager/queue configuration). The Linux driver does similar writes
-     * via morse_reg32_write (see /tmp/morse_driver/firmware.c, hw.c).
+     * via morse_reg32_write (see the Linux morse driver's firmware.c / hw.c).
      *
      * Comparison to Linux driver's boot reg-write set (from
-     * /tmp/morse_driver agent survey):
+     * a survey of the Linux morse driver):
      *   - MORSE_REG_BOOT_ADDR write (firmware entry point) — both do
      *   - MORSE_REG_CLK_CTRL write (clock control) — both do
      *   - MORSE_REG_MSI write (MSI interrupt setup) — both do

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
  */
 
-/* Phase 4f note: do NOT set MMLOG_LEVEL_OVRD here. Bumping above ERR pulls
+/* Do NOT set MMLOG_LEVEL_OVRD here. Bumping above ERR pulls
  * mm_hexdump into the umac_datapath_get_llc_ethertype path, which isn't
  * linked by the component packaging — produces an undefined-reference at
  * the firmware link step. To surface specific diagnostics, use MMLOG_ERR
@@ -297,7 +297,7 @@ void umac_datapath_process_rx_action_frame(struct umac_data *umacd,
 {
     const struct dot11_action *frame = (struct dot11_action *)mmpkt_get_data_start(rxbufview);
 
-    /* Phase 4f diagnostic — use ERR so it surfaces at morselib's default
+    /* Use ERR so it surfaces at morselib's default
      * threshold (bumping the file with OVRD pulls mm_hexdump into the
      * llc-ethertype path which isn't linked, see top-of-file comment). */
     MMLOG_ERR("Action Category received: %u (len=%zu)\n",
@@ -316,7 +316,7 @@ void umac_datapath_process_rx_action_frame(struct umac_data *umacd,
             umac_supp_process_mgmt_frame(umacd, rxbufview);
             break;
 
-        /* Phase 4f (warthog mesh-support fork) — SELF_PROTECTED is the
+        /* SELF_PROTECTED is the
          * action category for 802.11s mesh PLINK Open/Confirm/Close frames.
          * Route them to the supplicant fan-out so hostap mesh_mpm sees them
          * via EVENT_RX_MGMT on the mesh_driver_ctx slot. */
@@ -1431,7 +1431,7 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
      * unknown-sender / BSSID checks), so a peer mesh frame is discarded before
      * any public hook can observe it. That is why every previous search for
      * peer mesh frames found nothing. This tap runs before all of them, so it
-     * answers the actual keystone question: does the chip hand foreign-BSSID
+     * answers the question this whole path exists for: does the chip hand foreign-BSSID
      * mesh frames to the host at all?
      *
      * Note the chip converts S1G beacons to legacy MGMT (type 0, subtype 8) on
@@ -1519,7 +1519,7 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
     if (data->ops == NULL)
     {
-        /* Phase 4f — bumped to ERR so the "no ops" drop is visible at
+        /* Bumped to ERR so the "no ops" drop is visible at
          * morselib's default log threshold. In mesh mode this fires for
          * every received frame because neither umac_datapath_configure_ap_mode
          * nor _sta_mode runs (mesh has no analog yet). With AP ops installed
@@ -1825,7 +1825,7 @@ void umac_datapath_rx_frame(struct umac_data *umacd, struct mmpkt *rxbuf)
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
     struct mmpktview *rxbufview = mmpkt_open(rxbuf);
 
-    /* Phase 4f-step8 — count RX frames at the chip-shim entry to see whether
+    /* Count RX frames at the chip-shim entry to see whether
      * mesh mode is even getting frames here. Log the first N at full detail
      * (fc bytes + length) then periodically afterward so we don't drown the
      * console. ERR level so it bypasses the morselib log threshold. */

@@ -324,7 +324,7 @@ static int eap_teap_update_icmk(struct eap_sm *sm, struct eap_teap_data *data)
 							 data->cmk_msk);
 
 	if (!data->phase2_method || !data->phase2_priv) {
-		wpa_printf(MSG_INFO, "EAP-TEAP: Phase 2 method not available");
+		wpa_printf(MSG_INFO, "EAP-TEAP: method not available");
 		return -1;
 	}
 
@@ -333,7 +333,7 @@ static int eap_teap_update_icmk(struct eap_sm *sm, struct eap_teap_data *data)
 						  &msk_len);
 		if (!msk) {
 			wpa_printf(MSG_INFO,
-				   "EAP-TEAP: Could not fetch Phase 2 MSK");
+				   "EAP-TEAP: Could not fetch MSK");
 			return -1;
 		}
 	}
@@ -506,7 +506,7 @@ static int eap_teap_phase1_done(struct eap_sm *sm, struct eap_teap_data *data)
 {
 	char cipher[64];
 
-	wpa_printf(MSG_DEBUG, "EAP-TEAP: Phase 1 done, starting Phase 2");
+	wpa_printf(MSG_DEBUG, "EAP-TEAP: done, starting ");
 
 	if (!data->identity && sm->cfg->eap_teap_auth == 2) {
 		const char *subject;
@@ -514,7 +514,7 @@ static int eap_teap_phase1_done(struct eap_sm *sm, struct eap_teap_data *data)
 		subject = tls_connection_get_peer_subject(data->ssl.conn);
 		if (subject) {
 			wpa_printf(MSG_DEBUG,
-				   "EAP-TEAP: Peer subject from Phase 1 client certificate: '%s'",
+				   "EAP-TEAP: Peer subject from client certificate: '%s'",
 				   subject);
 			data->identity = (u8 *) os_strdup(subject);
 			data->identity_len = os_strlen(subject);
@@ -597,7 +597,7 @@ static struct wpabuf * eap_teap_build_phase2_req(struct eap_sm *sm,
 	data->inner_eap_not_done = 1;
 	if (!data->phase2_priv) {
 		wpa_printf(MSG_DEBUG,
-			   "EAP-TEAP: Phase 2 method not initialized");
+			   "EAP-TEAP: method not initialized");
 		wpabuf_free(id_tlv);
 		return NULL;
 	}
@@ -608,7 +608,7 @@ static struct wpabuf * eap_teap_build_phase2_req(struct eap_sm *sm,
 		return NULL;
 	}
 
-	wpa_hexdump_buf_key(MSG_MSGDUMP, "EAP-TEAP: Phase 2 EAP-Request", req);
+	wpa_hexdump_buf_key(MSG_MSGDUMP, "EAP-TEAP: EAP-Request", req);
 
 	return wpabuf_concat(eap_teap_tlv_eap_payload(req), id_tlv);
 }
@@ -858,7 +858,7 @@ static int eap_teap_encrypt_phase2(struct eap_sm *sm,
 {
 	struct wpabuf *encr;
 
-	wpa_hexdump_buf_key(MSG_DEBUG, "EAP-TEAP: Encrypting Phase 2 TLVs",
+	wpa_hexdump_buf_key(MSG_DEBUG, "EAP-TEAP: Encrypting TLVs",
 			    plain);
 	encr = eap_server_tls_encrypt(sm, &data->ssl, plain);
 	wpabuf_free(plain);
@@ -868,7 +868,7 @@ static int eap_teap_encrypt_phase2(struct eap_sm *sm,
 
 	if (data->ssl.tls_out && piggyback) {
 		wpa_printf(MSG_DEBUG,
-			   "EAP-TEAP: Piggyback Phase 2 data (len=%d) with last Phase 1 Message (len=%d used=%d)",
+			   "EAP-TEAP: Piggyback data (len=%d) with last Message (len=%d used=%d)",
 			   (int) wpabuf_len(encr),
 			   (int) wpabuf_len(data->ssl.tls_out),
 			   (int) data->ssl.tls_out_pos);
@@ -919,12 +919,12 @@ static struct wpabuf * eap_teap_buildReq(struct eap_sm *sm, void *priv, u8 id)
 				int res;
 
 				/*
-				 * Try to generate Phase 2 data to piggyback
-				 * with the end of Phase 1 to avoid extra
+				 * Try to generate data to piggyback
+				 * with the end of to avoid extra
 				 * roundtrip.
 				 */
 				wpa_printf(MSG_DEBUG,
-					   "EAP-TEAP: Try to start Phase 2");
+					   "EAP-TEAP: Try to start ");
 				res = eap_teap_process_phase2_start(sm, data);
 				if (res == 1) {
 					req = eap_teap_build_crypto_binding(
@@ -1082,7 +1082,7 @@ static void eap_teap_process_phase2_response(struct eap_sm *sm,
 
 	if (!priv) {
 		wpa_printf(MSG_DEBUG,
-			   "EAP-TEAP: %s - Phase 2 not initialized?!",
+			   "EAP-TEAP: %s - not initialized?!",
 			   __func__);
 		return;
 	}
@@ -1093,7 +1093,7 @@ static void eap_teap_process_phase2_response(struct eap_sm *sm,
 	if (in_len > sizeof(*hdr) && *pos == EAP_TYPE_NAK) {
 		left = in_len - sizeof(*hdr);
 		wpa_hexdump(MSG_DEBUG,
-			    "EAP-TEAP: Phase 2 type Nak'ed; allowed types",
+			    "EAP-TEAP: type Nak'ed; allowed types",
 			    pos + 1, left - 1);
 #ifdef EAP_SERVER_TNC
 		if (m && m->vendor == EAP_VENDOR_IETF &&
@@ -1128,7 +1128,7 @@ static void eap_teap_process_phase2_response(struct eap_sm *sm,
 
 	if (m->check(sm, priv, &buf)) {
 		wpa_printf(MSG_DEBUG,
-			   "EAP-TEAP: Phase 2 check() asked to ignore the packet");
+			   "EAP-TEAP: check() asked to ignore the packet");
 		eap_teap_req_failure(data, TEAP_ERROR_INNER_METHOD);
 		return;
 	}
@@ -1139,7 +1139,7 @@ static void eap_teap_process_phase2_response(struct eap_sm *sm,
 		return;
 
 	if (!m->isSuccess(sm, priv)) {
-		wpa_printf(MSG_DEBUG, "EAP-TEAP: Phase 2 method failed");
+		wpa_printf(MSG_DEBUG, "EAP-TEAP: method failed");
 		next_vendor = EAP_VENDOR_IETF;
 		next_type = eap_teap_req_failure(data, TEAP_ERROR_INNER_METHOD);
 		eap_teap_phase2_init(sm, data, next_vendor, next_type);
@@ -1157,7 +1157,7 @@ static void eap_teap_process_phase2_response(struct eap_sm *sm,
 		}
 		if (eap_user_get(sm, sm->identity, sm->identity_len, 1) != 0) {
 			wpa_hexdump_ascii(MSG_DEBUG,
-					  "EAP-TEAP: Phase 2 Identity not found in the user database",
+					  "EAP-TEAP: Identity not found in the user database",
 					  sm->identity, sm->identity_len);
 			next_vendor = EAP_VENDOR_IETF;
 			next_type = eap_teap_req_failure(
@@ -1225,7 +1225,7 @@ static void eap_teap_process_phase2_eap(struct eap_sm *sm,
 	hdr = (struct eap_hdr *) in_data;
 	if (in_len < (int) sizeof(*hdr)) {
 		wpa_printf(MSG_INFO,
-			   "EAP-TEAP: Too short Phase 2 EAP frame (len=%lu)",
+			   "EAP-TEAP: Too short EAP frame (len=%lu)",
 			   (unsigned long) in_len);
 		eap_teap_req_failure(data, TEAP_ERROR_INNER_METHOD);
 		return;
@@ -1233,13 +1233,13 @@ static void eap_teap_process_phase2_eap(struct eap_sm *sm,
 	len = be_to_host16(hdr->length);
 	if (len > in_len) {
 		wpa_printf(MSG_INFO,
-			   "EAP-TEAP: Length mismatch in Phase 2 EAP frame (len=%lu hdr->length=%lu)",
+			   "EAP-TEAP: Length mismatch in EAP frame (len=%lu hdr->length=%lu)",
 			   (unsigned long) in_len, (unsigned long) len);
 		eap_teap_req_failure(data, TEAP_ERROR_INNER_METHOD);
 		return;
 	}
 	wpa_printf(MSG_DEBUG,
-		   "EAP-TEAP: Received Phase 2: code=%d identifier=%d length=%lu",
+		   "EAP-TEAP: Received : code=%d identifier=%d length=%lu",
 		   hdr->code, hdr->identifier,
 		   (unsigned long) len);
 	switch (hdr->code) {
@@ -1249,7 +1249,7 @@ static void eap_teap_process_phase2_eap(struct eap_sm *sm,
 		break;
 	default:
 		wpa_printf(MSG_INFO,
-			   "EAP-TEAP: Unexpected code=%d in Phase 2 EAP header",
+			   "EAP-TEAP: Unexpected code=%d in EAP header",
 			   hdr->code);
 		break;
 	}
@@ -1380,7 +1380,7 @@ static int eap_teap_parse_tlvs(struct wpabuf *data,
 			return -1;
 		}
 		wpa_printf(MSG_DEBUG,
-			   "EAP-TEAP: Received Phase 2: TLV type %u (%s) length %u%s",
+			   "EAP-TEAP: Received : TLV type %u (%s) length %u%s",
 			   tlv_type, eap_teap_tlv_type_str(tlv_type),
 			   (unsigned int) len,
 			   mandatory ? " (mandatory)" : "");
@@ -1538,7 +1538,7 @@ static void eap_teap_process_phase2_tlvs(struct eap_sm *sm,
 
 	if (eap_teap_parse_tlvs(in_data, &tlv) < 0) {
 		wpa_printf(MSG_DEBUG,
-			   "EAP-TEAP: Failed to parse received Phase 2 TLVs");
+			   "EAP-TEAP: Failed to parse received TLVs");
 		return;
 	}
 
@@ -1715,12 +1715,12 @@ static void eap_teap_process_phase2(struct eap_sm *sm,
 	struct wpabuf *in_decrypted;
 
 	wpa_printf(MSG_DEBUG,
-		   "EAP-TEAP: Received %lu bytes encrypted data for Phase 2",
+		   "EAP-TEAP: Received %lu bytes encrypted data for ",
 		   (unsigned long) wpabuf_len(in_buf));
 
 	if (data->pending_phase2_resp) {
 		wpa_printf(MSG_DEBUG,
-			   "EAP-TEAP: Pending Phase 2 response - skip decryption and use old data");
+			   "EAP-TEAP: Pending response - skip decryption and use old data");
 		eap_teap_process_phase2_tlvs(sm, data,
 					     data->pending_phase2_resp);
 		wpabuf_free(data->pending_phase2_resp);
@@ -1732,19 +1732,19 @@ static void eap_teap_process_phase2(struct eap_sm *sm,
 					      in_buf);
 	if (!in_decrypted) {
 		wpa_printf(MSG_INFO,
-			   "EAP-TEAP: Failed to decrypt Phase 2 data");
+			   "EAP-TEAP: Failed to decrypt data");
 		eap_teap_state(data, FAILURE);
 		return;
 	}
 
-	wpa_hexdump_buf_key(MSG_DEBUG, "EAP-TEAP: Decrypted Phase 2 TLVs",
+	wpa_hexdump_buf_key(MSG_DEBUG, "EAP-TEAP: Decrypted TLVs",
 			    in_decrypted);
 
 	eap_teap_process_phase2_tlvs(sm, data, in_decrypted);
 
 	if (sm->method_pending == METHOD_PENDING_WAIT) {
 		wpa_printf(MSG_DEBUG,
-			   "EAP-TEAP: Phase 2 method is in pending wait state - save decrypted response");
+			   "EAP-TEAP: method is in pending wait state - save decrypted response");
 		wpabuf_free(data->pending_phase2_resp);
 		data->pending_phase2_resp = in_decrypted;
 		return;
@@ -1794,8 +1794,8 @@ static int eap_teap_process_phase1(struct eap_sm *sm,
 		return 1;
 
 	/*
-	 * Phase 1 was completed with the received message (e.g., when using
-	 * abbreviated handshake), so Phase 2 can be started immediately
+	 * was completed with the received message (e.g., when using
+	 * abbreviated handshake), so can be started immediately
 	 * without having to send through an empty message to the peer.
 	 */
 
@@ -1818,7 +1818,7 @@ static int eap_teap_process_phase2_start(struct eap_sm *sm,
 		data->identity_len = 0;
 		if (eap_user_get(sm, sm->identity, sm->identity_len, 1) != 0) {
 			wpa_hexdump_ascii(MSG_DEBUG,
-					  "EAP-TEAP: Phase 2 Identity not found in the user database",
+					  "EAP-TEAP: Identity not found in the user database",
 					  sm->identity, sm->identity_len);
 			next_vendor = EAP_VENDOR_IETF;
 			next_type = EAP_TYPE_NONE;
@@ -1841,7 +1841,7 @@ static int eap_teap_process_phase2_start(struct eap_sm *sm,
 			return 1;
 		} else {
 			wpa_printf(MSG_DEBUG,
-				   "EAP-TEAP: Identity already known - skip Phase 2 Identity Request");
+				   "EAP-TEAP: Identity already known - skip Identity Request");
 			next_vendor = sm->user->methods[0].vendor;
 			next_type = sm->user->methods[0].method;
 			sm->user_eap_method_index = 1;
