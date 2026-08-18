@@ -3,6 +3,11 @@
  * helpers the dot11ah sources use. */
 #ifndef _COMPAT_LINUX_STRING_H_
 #define _COMPAT_LINUX_STRING_H_
+
+/* ssize_t. Reached transitively on macOS but not through glibc's headers, so
+ * without this the compat layer compiles on a developer laptop and fails on a
+ * Linux CI runner. */
+#include <sys/types.h>
 #include <string.h>
 #include <linux/types.h>
 

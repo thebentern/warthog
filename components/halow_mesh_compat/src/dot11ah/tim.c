@@ -5,6 +5,7 @@
  */
 
 #include <linux/types.h>
+#include <linux/errno.h>
 #include <linux/ieee80211.h>
 
 #include "dot11ah.h"

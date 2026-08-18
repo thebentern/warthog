@@ -9,6 +9,7 @@
  */
 
 #include <linux/types.h>
+#include <linux/errno.h>
 #include <net/mac80211.h>
 #include <linux/ieee80211.h>
 #include "s1g_ieee80211.h"

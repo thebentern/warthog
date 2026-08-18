@@ -6,6 +6,7 @@
  */
 
 #include <linux/types.h>
+#include <linux/errno.h>
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <net/mac80211.h>

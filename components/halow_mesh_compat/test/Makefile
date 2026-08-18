@@ -13,8 +13,11 @@ ifdef SAN
 SANFLAGS := -fsanitize=address,undefined -fno-sanitize-recover=all
 endif
 
-CFLAGS  := -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wno-macro-redefined \
-           -Wno-sign-compare -Wno-unused-function -Wno-visibility -g -O0
+# -Wno-macro-redefined and -Wno-visibility are clang spellings; gcc warns
+# that it does not recognise them, which buries real diagnostics in CI.
+CLANG_ONLY := $(shell $(CC) --version 2>/dev/null | grep -qi clang && echo -Wno-macro-redefined -Wno-visibility)
+CFLAGS  := -std=gnu11 -Wall -Wextra -Wno-unused-parameter $(CLANG_ONLY) \
+           -Wno-sign-compare -Wno-unused-function -g -O0
 INCS    := -I../src/compat -I../src/dot11ah -I../src
 COMPAT  := ../src/compat/compat.c
 
