@@ -67,6 +67,48 @@ Warthog is not one device role. A node runs an **uplink** and presents
 Both downstream surfaces are live at once. The two uplink modes are mutually
 exclusive and selected at build time.
 
+## Connecting phones and tablets
+
+Short version: **use the Wi-Fi AP for phones and tablets, and USB for laptops.**
+
+The USB surface presents **CDC-ECM**, which macOS and Linux support natively.
+Phones are a different story, and the class matters more than the cable:
+
+| Client | Over USB | Over the Wi-Fi AP |
+|---|---|---|
+| macOS laptop | ✅ verified — appears as a USB Ethernet adapter | ✅ |
+| Linux laptop | ✅ `cdc_ether` is in-tree | ✅ |
+| Windows laptop | ❌ needs RNDIS, not implemented (see below) | ✅ |
+| Android phone/tablet | ⚠️ untested — needs USB host mode and a kernel with `cdc_ether`; also has to power the board | ✅ recommended |
+| iPhone / iPad | ❌ iOS/iPadOS expect **CDC-NCM**, not ECM | ✅ recommended |
+
+### Why USB is the wrong tool for a phone
+
+Three reasons, in order of how likely they are to stop you:
+
+1. **Class mismatch.** iOS and iPadOS drive USB Ethernet through CDC-NCM.
+   Warthog presents ECM, so an iPhone or iPad will not bring the interface up
+   no matter which adapter you use. Android is more permissive — most kernels
+   carry `cdc_ether` — but it is not guaranteed, and it varies by vendor.
+2. **The phone has to be the USB host.** That means OTG mode and a suitable
+   adapter, and it means the phone supplies the power.
+3. **Power.** The HaLow PA draws a substantial inrush on transmit. This board
+   needs a bulk capacitor even from a laptop port (see
+   [`docs/power-notes.md`](docs/power-notes.md)); a phone port is a worse
+   supply, and browning out mid-association looks like a firmware fault.
+
+The Wi-Fi AP has none of these problems. It is the same uplink, the same NAT,
+and the same DNS — a phone joins `warthog` and shares the HaLow link exactly
+as a USB host does.
+
+### If you specifically need USB to a phone
+
+Windows and iOS both need a USB network class warthog does not implement
+(RNDIS and NCM respectively). Neither is a small change: `esp_tinyusb` exposes
+only one USB configuration, and offering a second class alongside ECM means a
+composite descriptor the component does not currently support. Both are
+tracked as unimplemented rather than planned — see [Status](#status).
+
 ## How Warthog compares
 
 There are off-the-shelf HaLow USB adapters that just work — Heltec HT-HD01 V2, Alfa Network AHUS-1, Vantron's MM8108 dongles. If you need a HaLow uplink for a laptop today and don't want to think about firmware, **buy one of those.** They're vendor-supported and require zero assembly.

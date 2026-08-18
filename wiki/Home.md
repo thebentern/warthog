@@ -13,6 +13,7 @@ reconfigure a node over a serial port instead of a rebuild.
 |---|---|
 | Get a board running for the first time | **[Quick Start](Quick-Start)** |
 | Give a laptop a long-range uplink over USB | **[Host Mode](Host-Mode)** |
+| Connect a phone or tablet | **[Client Mode](Client-Mode)** — not USB, see why there |
 | Let phones and IoT clients share that uplink | **[Client Mode](Client-Mode)** |
 | Build a peer-to-peer network with no infrastructure | **[Mesh Mode](Mesh-Mode)** |
 | Talk to OpenMANET or vanilla OpenWrt | **[OpenMANET Interop](OpenMANET-Interop)** |

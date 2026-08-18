@@ -1,7 +1,15 @@
-# Firmware tooling — Phase 4i artifacts
+# Firmware container tooling
 
-Tools and prepared firmware blobs from the Phase 4i reverse-engineering
-session (`docs/history/mesh-port-scope.md` Phase 4i).
+Tools for inspecting the MMFW container format used by the HaLow firmware
+images, written while working out why mesh receive behaved differently between
+the SDK firmware and the Linux driver's.
+
+The prepared `.mbin` images this directory once held have been removed. They
+were Morse Micro firmware re-wrapped into a different container, and the Morse
+Micro Binary Distribution Licence permits redistribution only of the firmware
+"complete, unmodified, and as provided by Morse Micro". Rebuild them locally
+from your own copy of the vendor firmware if you need them; do not redistribute
+the result.
 
 ## What's here
 
@@ -9,8 +17,6 @@ session (`docs/history/mesh-port-scope.md` Phase 4i).
 |---|---|
 | `mmfw_extract.py` | Parse MMFW TLV container, decompress and write each chip-memory segment as raw bin |
 | `elf_to_mmfw.py` | Take a Linux Morse Micro firmware ELF and re-wrap as MMFW (loadable by morselib SDK) |
-| `mm6108_softmac_1_17_9.mbin` | MMFW-wrapped Linux softmac firmware v1.17.9 (Apr 2026) — drop-in replacement for `morsefirmware/mm6108.mbin` |
-| `mm6108_tlm_1_17_9.mbin` | MMFW-wrapped Linux thin-LMAC firmware v1.17.9 — same drop-in |
 
 ## Why these exist
 
@@ -36,18 +42,22 @@ across all three variants (same task names `mesh_tbtt`, `mesh_delayed_start`,
 The MAC firmware is the same code with different builds (Feb 2026 vs Apr
 2026).
 
-`elf_to_mmfw.py` repackages an ELF into the SDK's MMFW format. **Verified on
-hardware (2026-05-26):** both `mm6108_softmac_1_17_9.mbin` and
-`mm6108_tlm_1_17_9.mbin` boot successfully on the MM6108 in our XIAO + Seeed
-HaLow setup, executing the standard morselib init path, accepting the full
-mesh command sequence we send, and TXing probe requests on-air.
+`elf_to_mmfw.py` repackages an ELF into the SDK's MMFW format. Images built
+this way were verified on hardware (2026-05-26): both the softmac and thin-LMAC
+v1.17.9 builds boot on the MM6108 in a XIAO + Seeed HaLow setup, execute the
+standard morselib init path, accept the full mesh command sequence, and
+transmit probe requests on air.
 
-**Equally critical:** chip RX behavior for foreign-BSSID mesh frames is
-**identical** across all three firmware variants — none deliver peer mesh
-frames to host. This narrows the bug location: it's not in the chip-side
-RX filter, it's in **morselib's host-side init sequence** that locks the
-chip into fullmac-restrictive mode regardless of which firmware blob is
-loaded.
+Chip RX behaviour for foreign-BSSID mesh frames was identical across all three
+firmware variants, which is what ruled the firmware out as the cause of the
+mesh receive problem at the time.
+
+> **Superseded.** That investigation concluded the chip was locked into a
+> restrictive mode by morselib's init sequence. It was not. Mesh receive works
+> on the stock SDK firmware: the peer frames were arriving and being discarded
+> further up, and the fixes were in address handling and element parsing rather
+> than anywhere near the firmware image. Swapping firmware is not necessary and
+> is kept here only as a record. See [`../../docs/mesh-openmanet.md`](../../docs/mesh-openmanet.md).
 
 ## How to use
 
@@ -55,7 +65,7 @@ loaded.
 ```sh
 SDK_FW=components/halow/components/mm-iot-sdk/framework/morsefirmware/mm6108.mbin
 cp "$SDK_FW" "$SDK_FW.orig_sdk_1_17_6"
-cp scripts/firmware/mm6108_softmac_1_17_9.mbin "$SDK_FW"
+cp your-locally-built-mm6108_softmac.mbin "$SDK_FW"
 pio run -e warthog-mesh-smoke -t upload
 ```
 

@@ -1,5 +1,11 @@
 /*
  * Copyright 2025-2026 Morse Micro
+ * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
+ *
+ * Modified for warthog: additional command and parameter ids taken from Morse
+ * Micro's GPL-2.0-or-later Linux driver (morse_driver, command.h) so the mesh
+ * path can reach chip commands the SDK header does not declare. Fork additions
+ * are marked inline.
  */
 
 

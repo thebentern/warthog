@@ -1,8 +1,19 @@
 # Host Mode — USB Ethernet for the machine it is plugged into
 
 Plug a Warthog into a laptop and the laptop gains a USB Ethernet adapter whose
-uplink is a kilometre-class HaLow link. No drivers on macOS or Linux; Windows
-needs RNDIS, which is not implemented yet.
+uplink is a kilometre-class HaLow link. No drivers on macOS or Linux.
+
+**This is a laptop feature.** Warthog presents CDC-ECM. Windows wants RNDIS and
+iOS/iPadOS want CDC-NCM, neither of which is implemented, and a phone acting as
+USB host also has to power a board with a hungry PA. For phones and tablets use
+[Client Mode](Client-Mode) — same uplink, none of the problems.
+
+| Client | USB | Wi-Fi AP |
+|---|---|---|
+| macOS / Linux laptop | ✅ | ✅ |
+| Windows laptop | ❌ needs RNDIS | ✅ |
+| Android | ⚠️ untested; needs host mode + `cdc_ether` | ✅ |
+| iPhone / iPad | ❌ needs CDC-NCM | ✅ |
 
 ## What the host sees
 
