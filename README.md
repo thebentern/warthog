@@ -207,15 +207,6 @@ Hold the XIAO's **BOOT** button, tap **RESET**, release BOOT to enter download m
 
 Tap RESET on the XIAO when it finishes.
 
-### Cutting a release (maintainers)
-
-```bash
-git tag -a v0.1.0 -m "first stable cut"
-git push origin v0.1.0
-```
-
-`.github/workflows/release.yml` then builds all five regions in parallel, bundles them, attaches `flash.sh` + a consolidated `SHA256SUMS.txt`, and publishes the GitHub release. Tags with a `-` suffix (e.g. `v0.1.0-rc1`) are marked as pre-release. The tag string is baked into the firmware via `scripts/inject_version.py`, so `AT+VERSION?` on the device reports the exact release.
-
 ## Build & flash
 
 Build for your region:
