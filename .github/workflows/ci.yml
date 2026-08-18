@@ -27,6 +27,16 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Seconds, and needs no embedded toolchain -- so it runs before the slow
+      # PlatformIO steps and fails fast. Covers the mesh on-air byte layout
+      # (IE construction, MPM frame build/parse) against a frame captured from
+      # hardware. The SAN=1 pass is the one that detects an over-read in the
+      # truncation/mutation sweeps; without it those tests prove very little.
+      - name: Host unit tests (mesh byte layout)
+        run: |
+          make -C components/halow_mesh_compat/test clean all
+          make -C components/halow_mesh_compat/test clean all SAN=1
+
       - name: Install PlatformIO
         run: pip install --upgrade platformio
 
@@ -45,6 +55,12 @@ jobs:
         # One region is enough for CI — the others differ only in the
         # WARTHOG_REGION_XX define and the BCF/country pick that drives.
         run: pio run -e warthog-us
+
+      # The mesh env is a different set of sources (probe responder, MPM,
+      # datapath ops) behind WARTHOG_MESH_SMOKE, so warthog-us compiles none of
+      # it. Without this, nothing in CI ever type-checks the mesh code.
+      - name: Smoke build (warthog-mesh-smoke)
+        run: pio run -e warthog-mesh-smoke
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

@@ -39,6 +39,18 @@ void umac_datapath_configure_ap_mode(struct umac_data *umacd);
  * chip-side ADD_INTERFACE(MESH) + MESH_CONFIG(START) sequence succeeds. */
 void umac_datapath_configure_mesh_mode(struct umac_data *umacd);
 
+/**
+ * Mesh peer table. Add a peer once its peering reaches ESTAB; from then on the
+ * generic datapath carries 4-address data frames to and from it. Remove it on
+ * Close. own_addr is stamped as addr2/TA on every frame we send.
+ */
+enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t vif_id,
+                                               const uint8_t *own_addr,
+                                               const uint8_t *peer_addr, bool sae);
+/** Remove one peer, or every peer if @p peer_addr is NULL. */
+void umac_datapath_mesh_del_peer(const uint8_t *peer_addr);
+uint8_t umac_datapath_mesh_peer_count(void);
+
 
 void umac_datapath_configure_scan_mode(struct umac_data *umacd);
 

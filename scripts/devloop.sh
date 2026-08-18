@@ -9,7 +9,7 @@
 #     LACKS both, you still need the manual BOOT+RESET dance once.
 #   - uhubctl is installed and the Plugable USBC-HUB7BC is connected.
 #   - pyserial is available via PlatformIO's venv at:
-#         /Users/benmeadors/.platformio/penv/bin/python3
+#         $HOME/.platformio/penv/bin/python3
 #
 # Usage:
 #   scripts/devloop.sh                              # both boards, default env
@@ -28,9 +28,10 @@ ENV="warthog-mesh-smoke"
 BOARDS="A B"
 SKIP_BUILD=0
 SKIP_VERIFY=0
-PIO="/Users/benmeadors/.platformio/penv/bin/pio"
-PY="/Users/benmeadors/.platformio/penv/bin/python3"
-PROJECT="/Users/benmeadors/Documents/GitHub/warthog"
+# Derive everything from this script rather than one developer's checkout.
+PIO="${PIO:-$HOME/.platformio/penv/bin/pio}"
+PY="${PIO_PYTHON:-$HOME/.platformio/penv/bin/python3}"
+PROJECT="${PROJECT:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -112,7 +113,7 @@ wait_for_bootloader() {
             # If this port wasn't in pre_ports, it's the bootloader.
             if ! grep -q "^${p}$" <<<"$pre_ports"; then
                 # Confirm esptool can connect (handshake = bootloader)
-                if /Users/benmeadors/.platformio/penv/bin/python3 -m esptool \
+                if "$PY" -m esptool \
                        --chip esp32s3 --port "$p" chip_id >/dev/null 2>&1; then
                     echo "$p"; return 0
                 fi
@@ -166,7 +167,7 @@ exit(0 if 'OK' in out else 1)
     echo "[devloop] bootloader on $jtag_port — flashing"
 
     # 4. Flash with --after no_reset (avoid RTC bit re-arming download mode).
-    /Users/benmeadors/.platformio/penv/bin/python3 -m esptool \
+    "$PY" -m esptool \
         --chip esp32s3 --port "$jtag_port" --baud 460800 --after no_reset \
         write_flash 0x0 \
         "$PROJECT/.pio/build/$ENV/firmware.factory.bin" >/dev/null

@@ -6,6 +6,7 @@ idf_component_register(
         "usb_net.c"
         "wifi_ap.c"
         "nat.c"
+        "mudp.c"
         "led.c"
         "cfg.c"
         "at.c"

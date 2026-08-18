@@ -17,6 +17,10 @@
  * of umac_ap_get_beacon (which asserts when no AP context exists). */
 #include "umac/mesh/umac_mesh_beacon.h"
 
+/* RX entry counters (storage in main/at.c; AT+RXCHAN?). */
+extern volatile uint32_t g_warthog_shim_rx;
+extern volatile uint32_t g_warthog_shim_rx_notrunning;
+
 
 
 void mmdrv_host_process_rx_frame(struct mmpkt *rxbuf, uint16_t channel)
@@ -46,8 +50,10 @@ void mmdrv_host_process_rx_frame(struct mmpkt *rxbuf, uint16_t channel)
                   (unsigned long)s_rx_shim_count, (unsigned)channel);
     }
 
+    g_warthog_shim_rx++;
     if (!umac_core_is_running(umacd))
     {
+        g_warthog_shim_rx_notrunning++;
         mmpkt_release(rxbuf);
         return;
     }
@@ -244,6 +250,16 @@ void mmdrv_host_stats_increment_datapath_driver_rx_read_failures(void)
     umac_stats_increment_datapath_driver_rx_read_failures(umacd);
 }
 
+/* Beacon-handshake counters, reported by AT+BCNSTAT?.
+ *
+ * Storage is defined in main/at.c, not here: morselib links as an archive and
+ * the linker will not extract an object from it merely to satisfy a reference
+ * originating in main, so main must own the storage. */
+extern volatile uint32_t g_warthog_bcn_req;
+extern volatile uint32_t g_warthog_bcn_served;
+extern volatile uint32_t g_warthog_bcn_null;
+extern volatile uint32_t g_warthog_bcn_inactive;
+
 struct mmpkt *mmdrv_host_get_beacon(void)
 {
     struct umac_data *umacd = umac_data_get_umacd();
@@ -262,6 +278,14 @@ struct mmpkt *mmdrv_host_get_beacon(void)
                   (unsigned long)s_beacon_req_count);
     }
 
+    /* Counters mirrored to AT+BCNSTAT? (storage in main/at.c). The MMLOG line
+     * above is unreachable on this hardware once the app claims the USB PHY for
+     * TinyUSB, so the log alone cannot answer whether the chip is still asking
+     * for beacon templates. "beacon IRQ fires once and never again" is the
+     * symptom being chased: req counts the chip's asks, served/null count what
+     * the host handed back. */
+    g_warthog_bcn_req = s_beacon_req_count;
+
     /* Phase 4f-step13 — when mesh is active, hand the chip a proper mesh
      * beacon template (with Mesh ID IE 114, Mesh Configuration IE 113, S1G
      * Capabilities + Operation IEs). Without this the chip falls back to an
@@ -270,8 +294,18 @@ struct mmpkt *mmdrv_host_get_beacon(void)
      * See umac_mesh_beacon.c for the frame layout. */
     if (umac_mesh_beacon_is_active())
     {
-        return umac_mesh_get_beacon(umacd);
+        struct mmpkt *bcn = umac_mesh_get_beacon(umacd);
+        if (bcn != NULL)
+        {
+            g_warthog_bcn_served++;
+        }
+        else
+        {
+            g_warthog_bcn_null++;
+        }
+        return bcn;
     }
+    g_warthog_bcn_inactive++;
     /* AP mode path: chip is on an AP VIF, so umac_ap_data is set up. If
      * neither mesh nor AP is active, returning NULL is safe — the chip
      * will fall back to its internal template and the (now-unused) beacon

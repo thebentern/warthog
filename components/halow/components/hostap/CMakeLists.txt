@@ -22,6 +22,7 @@ set(SRCS
   ${ROOT_DIR}/src/common/ptksa_cache.c
   ${ROOT_DIR}/src/common/sae.c
   ${ROOT_DIR}/src/common/wpa_common.c
+  ${ROOT_DIR}/src/crypto/aes-ccm.c
   ${ROOT_DIR}/src/crypto/aes-unwrap.c
   ${ROOT_DIR}/src/crypto/dh_groups.c
   ${ROOT_DIR}/src/crypto/sha256-kdf.c

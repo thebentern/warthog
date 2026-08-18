@@ -74,6 +74,9 @@ esp_err_t warthog_cfg_get_halow_psk(char *out, size_t out_len)
 
 esp_err_t warthog_cfg_set_halow(const char *ssid, const char *psk)
 {
+    if (strlen(ssid) > WARTHOG_CFG_SSID_MAXLEN || strlen(psk) > WARTHOG_CFG_PSK_MAXLEN) {
+        return ESP_ERR_INVALID_SIZE;
+    }
     if (!ssid || !psk) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -122,6 +125,9 @@ uint8_t warthog_cfg_get_ap_channel(void)
 
 esp_err_t warthog_cfg_set_ap(const char *ssid, const char *psk, int channel)
 {
+    if (strlen(ssid) > WARTHOG_CFG_SSID_MAXLEN || strlen(psk) > WARTHOG_CFG_PSK_MAXLEN) {
+        return ESP_ERR_INVALID_SIZE;
+    }
     if (!ssid || !psk) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -147,6 +153,41 @@ esp_err_t warthog_cfg_set_ap(const char *ssid, const char *psk, int channel)
     nvs_close(h);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "ap creds stored (ssid='%s' chan=%d)", ssid, channel);
+    }
+    return err;
+}
+
+uint8_t warthog_cfg_get_mesh_secure(void)
+{
+    nvs_handle_t h;
+    uint8_t secure = 1; /* keyed, matching the build default */
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v;
+        if (nvs_get_u8(h, "mesh_sec", &v) == ESP_OK && v <= 1) {
+            secure = v;
+        }
+        nvs_close(h);
+    }
+    return secure;
+}
+
+esp_err_t warthog_cfg_set_mesh_secure(uint8_t secure)
+{
+    if (secure > 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, "mesh_sec", secure);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "mesh data plane stored: %s", secure ? "keyed" : "open");
     }
     return err;
 }

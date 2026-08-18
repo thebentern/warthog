@@ -4,7 +4,10 @@
 
 set(src "mmhalow.c")
 
-set(inc ".")
+# main/region.h is the single source of truth for the build's regulatory
+# domain. Without it here, mmhalow.c falls back to CONFIG_HALOW_COUNTRY_CODE
+# and every non-US build comes up on the US channel list.
+set(inc "." "${CMAKE_SOURCE_DIR}/main")
 
 idf_component_register(
 	INCLUDE_DIRS

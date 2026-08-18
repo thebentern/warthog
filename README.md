@@ -38,6 +38,35 @@ Plug it into a laptop and the host gets a USB Ethernet adapter. Join the side-ca
 - Per-region release builds (US / EU / JP / KR / AU), BCF + country code baked in at compile time
 - Built on **ESP-IDF 5.5 + TinyUSB + `morsemicro/halow`**
 
+## Documentation
+
+Full guides live in the [wiki](../../wiki) — quick start, flashing, each
+operating mode, the AT reference and troubleshooting. Deep technical notes are
+versioned alongside the code in [`docs/`](docs/).
+
+## Operating modes
+
+Warthog is not one device role. A node runs an **uplink** and presents
+**downstream surfaces** to whatever is plugged into or associated with it.
+
+```
+        ┌──────── downstream ────────┐        ┌──── uplink ────┐
+
+  laptop ──USB──▶ CDC-ECM ┐
+                          ├─▶ NAPT ─▶ HaLow ─▶  AP  (station mode)
+  phone  ──WiFi─▶ 2.4 AP  ┘                or  mesh (802.11s peers)
+```
+
+| Mode | What it does | Chosen |
+|---|---|---|
+| **Host** | Gives the machine it is plugged into a USB Ethernet adapter (`192.168.4.1/24`) | always on |
+| **Client** | 2.4 GHz AP so phones and IoT clients share the uplink (`192.168.5.1/24`) | always on |
+| **Station uplink** | Joins an existing HaLow access point | default builds |
+| **Mesh uplink** | 802.11s peer-to-peer, no infrastructure | `warthog-mesh-smoke` build |
+
+Both downstream surfaces are live at once. The two uplink modes are mutually
+exclusive and selected at build time.
+
 ## How Warthog compares
 
 There are off-the-shelf HaLow USB adapters that just work — Heltec HT-HD01 V2, Alfa Network AHUS-1, Vantron's MM8108 dongles. If you need a HaLow uplink for a laptop today and don't want to think about firmware, **buy one of those.** They're vendor-supported and require zero assembly.
@@ -107,6 +136,7 @@ pio run -e warthog-eu       # Europe (863–868 MHz)
 pio run -e warthog-jp       # Japan (916.5–927.5 MHz)
 pio run -e warthog-kr       # Korea (917.5–923.5 MHz)
 pio run -e warthog-au       # Australia
+pio run -e warthog-mesh-smoke   # 802.11s mesh (see Mesh mode below)
 ```
 
 Flash (XIAO + HaLow uses USB-OTG, so the auto-reset path is gone — hold **BOOT**, tap **RESET**, then run):
@@ -233,6 +263,36 @@ curl -s -o /dev/null -w "%{http_code}\n" https://example.com   # proves DNS too
 ✅ Expected: three echo replies (~90 ms each — HaLow RTT), then `200` from the `curl`. CDC console shows `warthog.nat: NAPT up on HaLow STA`.
 
 ⚠️ If `ping` works but `curl` hangs, the DHCP-DNS option isn't reaching the host — see [Troubleshooting](#ping-8888-works-but-curl-examplecom-hangs).
+
+## Mesh mode (802.11s)
+
+Instead of associating to an access point, a node can join an 802.11s mesh over
+HaLow. Every node is a peer — nothing to elect, nothing to associate to, and a
+node that loses power takes only its own links with it.
+
+```bash
+pio run -e warthog-mesh-smoke -t upload
+```
+
+Nodes address themselves statically from their own MAC — `10.77.<mac[4]>.<mac[5]>/16`
+— so `3c:1a:cc:4c:83:a5` is `10.77.131.165`. There is no DHCP on the mesh.
+
+```
+AT+MPMPEERS?                     peers and handshake state
+AT+MESHSEC=0                     open data plane (needed for unencrypted peers)
+AT+MPING=10.77.199.248,4         confirm data
+```
+
+### Interoperating with OpenMANET / OpenWrt
+
+Warthog meshes with Linux `mac80211` peers. Verified against OpenMANET 1.8.0 on
+a Raspberry Pi 4 with a Seeed HaLow HAT, meshing with two Warthog nodes at once —
+0–3% loss, 8–19 ms round trip, with the peer in its stock configuration.
+
+Two OpenWrt defaults will stop it dead, each with no error message: the mesh
+interface is bridged into `br-lan`, and unbridging it drops it out of the `lan`
+firewall zone. Both are covered, with the diagnostic signature of each, in
+[`docs/mesh-openmanet.md`](docs/mesh-openmanet.md).
 
 ## Troubleshooting
 

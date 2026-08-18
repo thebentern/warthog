@@ -2,76 +2,30 @@
  * Copyright 2026 Warthog contributors
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
  *
- * Phase 4f-step23 — S1G beacon constructor for mesh.
+ * S1G beacon construction and the shared mesh discovery IEs.
  *
- * ============================================================================
- * THE KEY INSIGHT BEHIND STEP 23
- * ============================================================================
+ * Two consumers, deliberately sharing their IE values:
+ *   - umac_mesh_get_beacon(), the template the chip asks the host for
+ *   - umac_mesh_build_discovery_ies(), the flat IE blob used by mesh probe
+ *     responses and by every Mesh Peering (MPM) action frame
+ * They must agree: a peer runs mac80211's mesh_matches_local() over the Mesh
+ * ID and Mesh Configuration in whichever frame it sees first, and disagreement
+ * between our beacon and our peering frames would make peering succeed or fail
+ * depending on arrival order.
  *
- * After 21+ iterations against the chip's mesh path with zero RX activity, the
- * one consistent observation was: chip accepts every command, our beacon
- * template gets handed in once, peer chip never sees a single frame.
+ * Beacon caveat: this chip does not beacon in mesh mode. The beacon IRQ fires
+ * once at startup and never again (AT+BCNSTAT? reports req=1, and that one is
+ * the driver's own kickoff), so the S1G beacon path below is built and served
+ * but has never been observed on air. Discovery works entirely through probe
+ * request/response -- see umac_mesh.c. Root cause of the missing TBTT is open.
  *
- * Deep dive into the upstream Linux morse_driver `dot11ah` subsystem (cloned
- * to /tmp/morse_driver, see docs/morse-support-inquiry.md) surfaced the
- * missing piece:
- *
- *   The Linux driver TRANSFORMS regular 802.11 beacons into S1G beacons
- *   BEFORE handing them to the chip.
- *
- *   See `morse_dot11ah_beacon_to_s1g` in /tmp/morse_driver/dot11ah/
- *   tx_11n_to_s1g.c:819–956 — for every beacon mac80211 produces, dot11ah
- *   rewrites the MAC header (regular 0x80 → S1G-Ext 0x1C), strips
- *   non-S1G IEs (Supp Rates, DS Params, ERP, HT cap/op, …), and inserts
- *   the S1G-specific IEs (Beacon Compatibility, Capabilities, Operation,
- *   Short Beacon Interval). The chip only ever sees S1G beacons.
- *
- * AP mode works in our embedded port because hostap (compiled with
- * CONFIG_IEEE80211AH) builds the S1G beacon directly via the `ext_head`
- * branch in `ieee802_11_build_ap_params` (see beacon.c:2298–2326 in the
- * embedded hostap), so the chip gets a pre-formed S1G beacon and doesn't
- * need a dot11ah transform.
- *
- * Mesh mode in morselib (which doesn't have a host-side mesh hostap path)
- * was previously handing the chip a regular 802.11 beacon (FC 0x80 0x00)
- * and the chip's mesh firmware was silently rejecting it — explaining
- * every symptom we've seen:
- *   - mmdrv_host_get_beacon fires once (chip asks for template)
- *   - then silence: no TX_STATUS, no peer RX, no chip events
- *
- * ============================================================================
- * S1G BEACON LAYOUT (per IEEE 802.11-2020 §9.3.4)
- * ============================================================================
- *
- * Fixed header (15 bytes, vs 36 for regular 802.11 beacons):
- *   frame_control (2B)  = 0x001C (FTYPE_EXT=3 | STYPE_S1G_BEACON=1)
- *                                 -> wire LE bytes: 0x1C 0x00
- *   duration      (2B)  = 0x0000
- *   sa            (6B)  = source/BSSID of the mesh STA
- *   timestamp     (4B)  = 0 (chip fills on TX — 4 octets, NOT 8 like regular)
- *   change_seq    (1B)  = 0 (incrementing seqnum when beacon IEs change)
- *
- * IEs (in the order our embedded morselib expects, mirroring what hostap
- * tail-builds for an S1G AP beacon):
- *   SSID (0)                      — empty for mesh, peers ID via Mesh ID IE
- *   Mesh ID (114)                 — the mesh_id bytes
- *   Mesh Configuration (113, 7B)  — path/metric/sync/auth + caps
- *   S1G Beacon Compatibility (213, 8B) — cap_info, beacon_int, tsf_msb (chip)
- *   S1G Capabilities (217, 15B)   — via ie_s1g_capabilities_build
- *   S1G Operation (232, 6B)       — channel width/op_class/prim_chan/freq
- *   S1G Short Beacon Interval (214, 2B) — short_beacon_int
- *
- * NOT included (per S1G beacon spec — see morse_dot11ah_mask_ies in
- * /tmp/morse_driver/dot11ah/ie.c:502):
- *   - Supported Rates (1) — not used in S1G PHY
- *   - DS Params (3)       — irrelevant for sub-GHz
- *   - ERP Info (42), HT Cap/Op, VHT Cap/Op — all 11n/ac, masked for S1G
- *
- * If this finally unlocks mesh RX, we know the embedded port needs to live
- * with a parallel dot11ah-equivalent for any other mgmt frames mesh sends
- * (peering open/confirm/close action frames, etc.) — those also need to be
- * S1G-formatted before reaching the chip.
- * ============================================================================
+ * S1G short beacon layout (IEEE 802.11-2020 s9.3.4), 15-byte fixed header:
+ *   frame_control(2) duration(2) sa(6) timestamp(4) change_seq(1)
+ * then SSID(0, empty for mesh), Mesh ID(114), Mesh Configuration(113),
+ * S1G Beacon Compatibility(213), S1G Capabilities(217), S1G Operation(232),
+ * S1G Short Beacon Interval(214). Supported Rates / DS Params / ERP / HT / VHT
+ * are masked for S1G -- but note the discovery IE blob DOES carry Supported
+ * Rates, because mesh_matches_local() compares the basic rate set.
  */
 
 /* Lift log level to INF so we can see beacon-init diagnostics. ERR-only would
@@ -82,6 +36,7 @@
 #include "mmlog.h"
 
 #include "umac_mesh_beacon.h"
+#include "umac_mesh_ies.h"
 #include "umac/frames/frames_common.h"
 #include "umac/ies/ies_common.h"
 #include "umac/ies/s1g_capabilities.h"
@@ -93,6 +48,15 @@
 #include "mmdrv.h"
 
 #include <string.h>
+
+/* umac_mesh_ies.h must stay freestanding (the host tests link it with libc
+ * only), so it re-declares the element IDs instead of including dot11.h. This
+ * file sees both headers, which makes it the one place the two can be pinned
+ * together. If the SDK ever renumbers these, fail the build here rather than
+ * on air, where the symptom is a peer silently declining to peer. */
+MM_STATIC_ASSERT(UMAC_MESH_EID_MESH_ID == DOT11_IE_MESH_ID, "mesh IE id drift");
+MM_STATIC_ASSERT(UMAC_MESH_EID_MESH_CONFIG == DOT11_IE_MESH_CONFIGURATION, "mesh IE id drift");
+MM_STATIC_ASSERT(UMAC_MESH_IES_MESH_ID_MAXLEN == MMWLAN_MESH_ID_MAXLEN, "mesh id maxlen drift");
 
 /* Mesh state — only one mesh VIF can exist on the MM6108. */
 static bool s_initialized = false;
@@ -113,21 +77,49 @@ static uint8_t s_change_seq = 0;
  *
  * Compare to a regular 802.11 beacon (type=MGMT=0, subtype=BEACON=8 → 0x80
  * 0x00), which the embedded port was incorrectly using before this patch. */
+/* S1G short-beacon frame control: version 0, type EXT(3), subtype
+ * S1G_BEACON(1) => low byte 0x1C, high byte 0x00.
+ *
+ * UNTESTED on air: this chip does not beacon in mesh mode at all (the beacon
+ * IRQ fires once at startup and never again -- see AT+BCNSTAT?), so no value
+ * here has ever been transmitted. 0x00 matches the in-tree hostap S1G builder,
+ * which emits bss_bw=0 at both 1 and 2 MHz on the AP path that does work.
+ * Note the upper octet is the BSS-BW subfield (bits 11-13), NOT an
+ * optional-field presence flag -- the presence bits are 0x0100/0x0200/0x0400. */
 #define MESH_S1G_BEACON_FC_LO 0x1C
 #define MESH_S1G_BEACON_FC_HI 0x00
 
 /* Mesh Configuration IE — see field layout in S1G beacon header above and
  * IEEE 802.11-2020 §9.4.2.97. 7 bytes fixed payload. */
 #define MESH_CFG_IE_LEN 7
-#define MESH_PATH_PROTO_NONE  0x00
-#define MESH_PATH_METRIC_NONE 0x00
+/* 0x01/0x01 is correct FOR THIS PEER. Measured, not reasoned.
+ *
+ * The kernel's generic constants say otherwise -- Linux include/linux/ieee80211.h
+ * has IEEE80211_PATH_PROTOCOL_HWMP = 0 and IEEE80211_PATH_METRIC_AIRTIME = 0,
+ * and mac80211's mesh_matches_local() rejects a candidate whose meshconf_psel /
+ * meshconf_pmetric differ from ifmsh->mesh_pp_id / mesh_pm_id. That argues for
+ * 0x00/0x00, and it was tried on hardware. Result:
+ *
+ *   0x01/0x01 -> peer creates a candidate, sends Open, reaches OPN_RCVD
+ *   0x00/0x00 -> AT+PRSPSTAT? req_rx=16 rsp_tx=16 but AT+MPMSTAT? rx=0:
+ *                the peer probes us repeatedly and NEVER initiates peering
+ *
+ * So the morse driver runs with mesh_pp_id / mesh_pm_id = 1, not the kernel
+ * defaults, and 0x00 is what fails mesh_matches_local() here. Do not "correct"
+ * these to 0 on the strength of the kernel headers alone -- verify against the
+ * peer. Set WARTHOG_MESH_PATHSEL_ZERO to re-test 0x00/0x00. */
+#ifdef WARTHOG_MESH_PATHSEL_ZERO
+#define MESH_PATH_PROTO_ID  0x00
+#define MESH_PATH_METRIC_ID 0x00
+#else
+#define MESH_PATH_PROTO_ID  0x01  /* matches this peer's mesh_pp_id */
+#define MESH_PATH_METRIC_ID 0x01  /* matches this peer's mesh_pm_id */
+#endif
 #define MESH_CONGESTION_NONE  0x00
 #define MESH_SYNC_NEIGHBOR    0x01
 #define MESH_AUTH_NONE        0x00
 #define MESH_AUTH_SAE         0x01
 #define MESH_FORMATION_INFO   0x00
-/* Mesh Capability: bits 0 (accepting peerings) + 3 (forwarding) = 0x09 */
-#define MESH_CAPABILITY       0x09
 
 void umac_mesh_beacon_init(const struct mmwlan_mesh_args *args, const uint8_t own_addr[6])
 {
@@ -174,17 +166,35 @@ static void append_mesh_id_ie_(struct consbuf *buf)
 /* Mesh Configuration IE (113, 7B). See header comment for field meaning. */
 static void append_mesh_config_ie_(struct consbuf *buf)
 {
-    uint8_t ie[2 + MESH_CFG_IE_LEN] = {
-        DOT11_IE_MESH_CONFIGURATION, MESH_CFG_IE_LEN,
-        MESH_PATH_PROTO_NONE,
-        MESH_PATH_METRIC_NONE,
-        MESH_CONGESTION_NONE,
-        MESH_SYNC_NEIGHBOR,
-        (s_args.security_type == MMWLAN_SAE) ? MESH_AUTH_SAE : MESH_AUTH_NONE,
-        MESH_FORMATION_INFO,
-        MESH_CAPABILITY,
-    };
-    consbuf_append(buf, ie, sizeof(ie));
+    /* Same builder the probe-response / MPM blob uses. Hand-serializing these
+     * seven octets twice is how the beacon and the peering frames drift apart,
+     * and a peer runs mesh_matches_local() over whichever it sees first. */
+    uint8_t ie[2 + UMAC_MESH_CFG_IE_LEN];
+    uint16_t n = umac_mesh_ies_build_mesh_config(ie, (uint16_t)sizeof(ie),
+                                                 s_args.security_type == MMWLAN_SAE);
+    consbuf_append(buf, ie, n);
+}
+
+/* Serialize the IEs a peer needs to accept us as a mesh candidate, into a flat
+ * buffer (probe responses take a pre-built IE blob, not a consbuf).
+ *
+ * Deliberately emits the SAME values as the beacon path above -- 802.11s
+ * mesh_matches_local() compares Mesh ID plus the path-selection protocol,
+ * metric, congestion control, sync method and auth protocol fields, so a probe
+ * response that disagreed with our beacon would be rejected as a candidate.
+ *
+ * SSID is NOT included here: frame_probe_response_build takes ssid/ssid_len
+ * separately, and mesh STAs advertise a zero-length SSID.
+ *
+ * Returns bytes written, or 0 if mesh is inactive or the buffer is too small. */
+uint16_t umac_mesh_build_discovery_ies(uint8_t *out, uint16_t out_len)
+{
+    if (!s_initialized)
+    {
+        return 0;
+    }
+    return umac_mesh_ies_build_discovery(out, out_len, s_args.mesh_id, s_args.mesh_id_len,
+                                         s_args.security_type == MMWLAN_SAE);
 }
 
 /* S1G Beacon Compatibility IE (213, 8B payload).

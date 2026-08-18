@@ -16,6 +16,7 @@
 #include "mmwlan.h"
 #include "mmwlan_internal.h"
 #include "umac/datapath/umac_datapath.h"
+#include "umac/mesh/umac_mesh.h"
 #include "umac/datapath/umac_datapath_private.h"
 #include "umac/data/umac_data.h"
 #include "umac/datapath/datapath_defrag.h"
@@ -42,7 +43,9 @@
 static const uint8_t snap_802_1h[] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
 
 
-#define MAX_QOS_DATA_MAC_HEADER_LEN (sizeof(struct dot11_data_hdr) + sizeof(struct dot11_qos_ctrl))
+/* +6 for the 802.11s Mesh Control field, which mesh mode prepends. Harmless
+ * headroom for STA/AP. */
+#define MAX_QOS_DATA_MAC_HEADER_LEN (sizeof(struct dot11_data_hdr) + sizeof(struct dot11_qos_ctrl) + 6)
 
 
 #define ETHERTYPE_THRESHOLD 1536
@@ -58,6 +61,74 @@ static const uint8_t snap_802_1h[] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
 
 
 #define RX_REORDER_TIMER_PERIOD_MS (RX_REORDER_TIMEOUT_MS / 4)
+
+/* Declared unconditionally on purpose. The storage lives in main/at.c and is
+ * not guarded, but these declarations used to sit inside
+ * #ifdef WARTHOG_MESH_RX_TAP while every USE below stayed unguarded -- so any
+ * env without that flag (warthog-us and every region build) failed to compile
+ * this file. A declaration costs nothing; hiding it only breaks the build. */
+/* Warthog receive-path counters, reported by AT+MESHSTAT?.
+ *
+ * These exist because warthog's log output is physically unreachable on this
+ * board: ESP_CONSOLE is USB_SERIAL_JTAG, but the app switches the shared D+/D-
+ * PHY over to USB-OTG/TinyUSB for the AT console, so everything MMLOG/ESP_LOG
+ * prints after early boot goes nowhere. Counters read back over AT are the only
+ * way to see whether the chip delivers RX frames to the host.
+ *
+ * Must stay OUTSIDE the ENABLE_DATAPATH_TRACE block below -- that block is not
+ * compiled in this build.
+ *
+ * Storage is defined in main/at.c, not here. morselib is linked as an archive
+ * and the linker will not extract an object from it merely to satisfy a
+ * reference coming from main, so main owns the storage and morselib refers
+ * to it. */
+extern volatile uint32_t g_warthog_rxtap_total;
+extern volatile uint32_t g_warthog_rxtap_mgmt;
+extern volatile uint32_t g_warthog_rxtap_beacon;
+extern volatile uint16_t g_warthog_rxtap_last_fc;
+extern volatile uint8_t g_warthog_rxtap_last_ta[6];
+extern volatile uint32_t g_warthog_rxtap_data;
+extern volatile uint32_t g_warthog_rx_data_stad_hit;
+extern volatile uint32_t g_warthog_rx_data_stad_miss;
+extern volatile uint8_t g_warthog_rx_data_miss_ta[6];
+extern volatile uint32_t g_warthog_rx_data_delivered;
+extern volatile uint32_t g_warthog_tx_drv_ok;
+extern volatile uint32_t g_warthog_tx_drv_err;
+extern volatile int32_t g_warthog_tx_drv_last_err;
+extern volatile uint32_t g_warthog_txst_total;
+extern volatile uint32_t g_warthog_txst_acked;
+extern volatile uint32_t g_warthog_txst_noack;
+extern volatile uint32_t g_warthog_txst_unsent;
+extern volatile uint32_t g_warthog_txst_last_flags;
+extern volatile uint32_t g_warthog_tx_protected;
+extern volatile uint32_t g_warthog_tx_nokey;
+extern volatile uint32_t g_warthog_tx_last_key;
+extern volatile uint32_t g_warthog_txst_data_total;
+extern volatile uint32_t g_warthog_txst_data_acked;
+extern volatile uint32_t g_warthog_txst_data_noack;
+extern volatile uint32_t g_warthog_txst_data_unsent;
+extern volatile uint32_t g_warthog_txst_data_last_flags;
+extern volatile uint32_t g_warthog_rxframe_entry;
+extern volatile uint32_t g_warthog_filter_entry;
+extern volatile uint32_t g_warthog_filt_reason, g_warthog_filt_drop;
+extern volatile uint32_t g_warthog_filt_hist[9];
+extern volatile uint32_t g_warthog_rx_meshctrl_stripped;
+extern volatile uint32_t g_warthog_mesh_seq;
+extern volatile uint16_t g_warthog_fc_ring[32];
+extern volatile uint32_t g_warthog_fc_ring_idx;
+extern volatile uint32_t g_warthog_rxdrop_reason;
+extern volatile uint32_t g_warthog_rxdrop_count;
+extern volatile uint32_t g_warthog_reord_outdated, g_warthog_reord_buffered;
+extern volatile uint32_t g_warthog_reord_released, g_warthog_reord_bypass;
+extern volatile uint32_t g_warthog_reord_last_seq, g_warthog_reord_last_exp;
+void umac_mesh_handle_s1g_beacon(struct mmpktview *rxbufview);
+extern volatile uint32_t g_warthog_nodec_group, g_warthog_nodec_fc, g_warthog_nodec_keyid;
+extern volatile uint32_t g_warthog_nodec_group_n, g_warthog_nodec_uni_n;
+extern volatile uint8_t g_warthog_nodec_ta[6];
+extern volatile uint8_t g_warthog_rxdata_head[64];
+extern volatile uint16_t g_warthog_rxdata_head_len;
+extern const struct umac_datapath_ops datapath_ops_mesh;
+#define UMAC_MESH_CTRL_TTL 31
 
 #ifdef ENABLE_DATAPATH_TRACE
 #include "mmtrace.h"
@@ -201,6 +272,15 @@ static void umac_datapath_process_rx_extension_frame(struct umac_data *umacd,
     switch (subtype)
     {
         case DOT11_FC_SUBTYPE_S1G_BEACON:
+            /* An S1G Beacon is how a mac80211/OpenMANET mesh peer announces
+             * itself, and it arrives HERE rather than through the management
+             * dispatch -- extension frames have their own type. warthog never
+             * looked, so an OpenMANET node beaconing a metre away was invisible
+             * while its timestamp bytes were being misread as a peer address
+             * (offset 10 on a compressed header). Answer it like a probe
+             * request from that peer: directed probe response plus a peering
+             * attempt, gated on the Mesh ID. */
+            umac_mesh_handle_s1g_beacon(rxbufview);
             umac_datapath_process_s1g_beacon(umacd, rxbufview);
             break;
 
@@ -240,6 +320,28 @@ void umac_datapath_process_rx_action_frame(struct umac_data *umacd,
          * action category for 802.11s mesh PLINK Open/Confirm/Close frames.
          * Route them to the supplicant fan-out so hostap mesh_mpm sees them
          * via EVENT_RX_MGMT on the mesh_driver_ctx slot. */
+        /* Category 13 = MESH ACTION; action code 1 is HWMP path selection.
+         * Absent from enum dot11_action_category, so match the literal. A
+         * mac80211 peer will not send us a unicast data frame until it has a
+         * PATH, and peering ESTAB does not create one -- answering these is
+         * what makes warthog reachable for anything but broadcast. */
+        case 13:
+        {
+            /* The view still carries the 802.11 header: struct dot11_action is
+             * hdr + field, and the category this switch matched is read
+             * through that. Hand the handler the ACTION BODY, not the frame
+             * start -- passing the frame start makes every PREQ arrive with
+             * 0xd0 where the category belongs and fail to parse. */
+            uint32_t total = mmpkt_get_data_length(rxbufview);
+            if (total > sizeof(struct dot11_hdr))
+            {
+                umac_mesh_handle_hwmp((const uint8_t *)&frame->field,
+                                      (uint16_t)(total - sizeof(struct dot11_hdr)),
+                                      dot11_get_ta(&frame->hdr));
+            }
+            break;
+        }
+
         case DOT11_ACTION_CATEGORY_SELF_PROTECTED:
             MMLOG_ERR("mesh: routing SELF_PROTECTED action frame to supplicant\n");
             umac_supp_process_mgmt_frame(umacd, rxbufview);
@@ -468,6 +570,7 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     uint8_t tid_index = MMDRV_SEQ_NUM_BASELINE;
     const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
     struct umac_8023_hdr header_8023 = { 0 };
+    bool mesh_ctrl_present = false;
 
     if (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_DATA)
     {
@@ -480,6 +583,9 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         {
             tid_index = dot11_qos_control_get_tid(qos_control->field);
         }
+        mesh_ctrl_present = (le16toh(qos_control->field) & 0x0100) != 0;
+
+
     }
 
 
@@ -488,7 +594,7 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         !umac_datapath_is_eapol_frame(rxbufview))
     {
         MMLOG_INF("Received NON EAPOL frame in plain text.\n");
-        goto drop;
+        { g_warthog_rxdrop_reason = 3; g_warthog_rxdrop_count++; goto drop; }
     }
 
     if (dot11_frame_control_get_protected(header->frame_control))
@@ -496,10 +602,22 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         if (!(rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED))
         {
 
-            MMLOG_WRN("Received frame without HW Decryption (FC: 0x%04x, SEQ: 0x%04x).\n",
-                      le16toh(header->frame_control),
-                      le16toh(header->sequence_control));
-            goto drop;
+            /* Record WHAT failed to decrypt: group vs unicast RA, the sender,
+             * and the CCMP key id the transmitter used. "The chip had no key"
+             * is only actionable once you know which key it wanted. */
+            {
+                const uint8_t *r4ra = dot11_get_ra(header);
+                const uint8_t *r4ta = dot11_get_ta(header);
+                g_warthog_nodec_group = mm_mac_addr_is_multicast(r4ra) ? 1 : 0;
+                memcpy((void *)g_warthog_nodec_ta, r4ta, DOT11_MAC_ADDR_LEN);
+                g_warthog_nodec_fc = le16toh(header->frame_control);
+                const uint8_t *r4b = mmpkt_get_data_start(rxbufview);
+                g_warthog_nodec_keyid = umac_datapath_validate_buf_len(rxbufview, 4)
+                                            ? (uint32_t)((r4b[3] & 0xC0) >> 6) : 0xffu;
+                if (g_warthog_nodec_group) { g_warthog_nodec_group_n++; }
+                else                       { g_warthog_nodec_uni_n++; }
+            }
+            { g_warthog_rxdrop_reason = 4; g_warthog_rxdrop_count++; goto drop; }
         }
 
         uint8_t *ccmp_header = mmpkt_remove_from_start(rxbufview, DOT11_CCMP_HEADER_LEN);
@@ -508,14 +626,14 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         {
 
             umac_stats_increment_datapath_rx_ccmp_failures(umacd);
-            goto drop;
+            { g_warthog_rxdrop_reason = 5; g_warthog_rxdrop_count++; goto drop; }
         }
 
 
         if (mmpkt_remove_from_end(rxbufview, DOT11_CCMP_128_MIC_LEN) == NULL)
         {
             MMLOG_WRN("Drop frame as rxbuf was shorter than expected");
-            goto drop;
+            { g_warthog_rxdrop_reason = 6; g_warthog_rxdrop_count++; goto drop; }
         }
     }
 
@@ -530,13 +648,38 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
 
 
 
+    /* 802.11s Mesh Control sits INSIDE the (now-decrypted) body, i.e. after
+     * the CCMP header. Strip it here -- after the CCMP header and MIC are gone
+     * -- never before, or the CCMP parse reads Mesh Control bytes as the PN and
+     * key id. Length is attacker-controlled: bounds-check the AE octets. */
+    if (mesh_ctrl_present)
+    {
+        const uint8_t *mc = mmpkt_get_data_start(rxbufview);
+        if (!umac_datapath_validate_buf_len(rxbufview, 6))
+        {
+            { g_warthog_rxdrop_reason = 90; g_warthog_rxdrop_count++; goto drop; }
+        }
+        uint32_t ae_len = 0;
+        switch (mc[0] & 0x03)
+        {
+            case 0x01: ae_len = 6;  break; /* AE_A4 */
+            case 0x02: ae_len = 12; break; /* AE_A5_A6 */
+            default:   ae_len = 0;  break;
+        }
+        if (mmpkt_remove_from_start(rxbufview, 6 + ae_len) == NULL)
+        {
+            { g_warthog_rxdrop_reason = 91; g_warthog_rxdrop_count++; goto drop; }
+        }
+        g_warthog_rx_meshctrl_stripped++;
+    }
+
     if (mm_mac_addr_is_broadcast(dot11_get_da(header)) ||
         mm_mac_addr_is_multicast(dot11_get_da(header)))
     {
         if (dot11_frame_control_get_more_fragments(header->frame_control))
         {
             MMLOG_INF("Drop Mcast/Bcast frame with fragment bit on\n");
-            goto drop;
+            { g_warthog_rxdrop_reason = 7; g_warthog_rxdrop_count++; goto drop; }
         }
 
 
@@ -544,7 +687,7 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             umac_interface_addr_matches_mac_addr(stad, dot11_get_sa_data(data_hdr)))
         {
             MMLOG_DBG("Filter out Bcast frame which AP relayed for us\n");
-            goto drop;
+            { g_warthog_rxdrop_reason = 8; g_warthog_rxdrop_count++; goto drop; }
         }
     }
     else
@@ -573,24 +716,24 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         if (dot11_is_4addr_hdr(header->frame_control))
         {
             MMLOG_INF("Received 4-address EAPOL frame. Not supported\n");
-            goto drop;
+            { g_warthog_rxdrop_reason = 9; g_warthog_rxdrop_count++; goto drop; }
         }
         umac_datapath_process_rx_eapol_frame(umacd, data, rxbufview, header);
-        goto drop;
+        { g_warthog_rxdrop_reason = 10; g_warthog_rxdrop_count++; goto drop; }
     }
 
     MMOSAL_DEV_ASSERT(data->ops != NULL);
     if (data->ops->get_sta_state(stad) != MMWLAN_STA_CONNECTED)
     {
         MMLOG_DBG("Controlled Port is currently closed.\n");
-        goto drop;
+        { g_warthog_rxdrop_reason = 11; g_warthog_rxdrop_count++; goto drop; }
     }
 
 
     llc_ethertype = umac_datapath_get_llc_ethertype(rxbufview);
     if (!llc_ethertype)
     {
-        goto drop;
+        { g_warthog_rxdrop_reason = 12; g_warthog_rxdrop_count++; goto drop; }
     }
 
     umac_datapath_generate_8023_header(dot11_get_da(header),
@@ -611,10 +754,18 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     {
         vif = MMWLAN_VIF_AP;
     }
+    else if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH) != UMAC_INTERFACE_VIF_ID_INVALID)
+    {
+        /* Mesh delivers on the same rx_callback as an AP: the app-facing
+         * netif is per-device, not per-VIF, and mmwlan_vif has no MESH value.
+         * Without this arm every decrypted, validated mesh data frame was
+         * dropped as "Invalid RX VIF" one line before delivery. */
+        vif = MMWLAN_VIF_AP;
+    }
     else
     {
         MMLOG_WRN("Invalid RX VIF\n");
-        goto drop;
+        { g_warthog_rxdrop_reason = 13; g_warthog_rxdrop_count++; goto drop; }
     }
 
     mmwlan_rx_pkt_ext_cb_t rx_pkt_cb;
@@ -631,6 +782,7 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
 
         mmpkt_prepend_data(rxbufview, (const uint8_t *)&header_8023, sizeof(header_8023));
         mmpkt_close(&rxbufview);
+        g_warthog_rx_data_delivered++;
         rx_pkt_cb(rxbuf, &metadata, arg);
 
         return;
@@ -639,21 +791,29 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     {
         mmpkt_prepend_data(rxbufview, (const uint8_t *)&header_8023, sizeof(header_8023));
         mmpkt_close(&rxbufview);
+        g_warthog_rx_data_delivered++;
         data->rx_pkt_callback(rxbuf, data->rx_arg);
 
         return;
     }
     if (data->rx_callback != NULL)
     {
+        /* delivered= counts frames handed to the network stack. It used to be
+         * incremented ONLY here, and only under WARTHOG_MESH_RX_TAP -- but this
+         * build registers the extended callback above and returns before ever
+         * reaching this branch. So delivered= read 0 permanently while IP
+         * traffic flowed perfectly, which reads as a total data-plane failure
+         * and cost real bench time. Count every branch that delivers. */
+        g_warthog_rx_data_delivered++;
         data->rx_callback((uint8_t *)&header_8023,
                           sizeof(header_8023),
                           mmpkt_get_data_start(rxbufview),
                           mmpkt_get_data_length(rxbufview),
                           data->rx_arg);
-        goto drop;
+        { g_warthog_rxdrop_reason = 14; g_warthog_rxdrop_count++; goto drop; }
     }
     MMLOG_WRN("No RX callback registered by the network stack.\n");
-    goto drop;
+    { g_warthog_rxdrop_reason = 15; g_warthog_rxdrop_count++; goto drop; }
 
 drop:
     mmpkt_close(&rxbufview);
@@ -720,6 +880,7 @@ static void umac_datapath_evaluate_rx_reorder_list(struct umac_data *umacd,
         if (dequeue)
         {
             mmpkt_list_remove(&sta_data->rx_reorder_list, pkt);
+            g_warthog_reord_released++;
             umac_datapath_process_rx_data_frame_after_reorder(stad, sta_data, pkt, view);
         }
         else
@@ -928,6 +1089,7 @@ static void umac_datapath_process_rx_data_frame(struct umac_data *umacd,
 
     if (tid_index > MMWLAN_MAX_QOS_TID || reorder_buf_size == 0)
     {
+        g_warthog_reord_bypass++;
         umac_datapath_process_rx_data_frame_after_reorder(stad, sta_data, rxbuf, rxbufview);
         return;
     }
@@ -966,6 +1128,9 @@ static void umac_datapath_process_rx_data_frame(struct umac_data *umacd,
         {
 
             umac_stats_increment_datapath_rx_reorder_outdated_drops(umacd);
+            g_warthog_reord_outdated++;
+            g_warthog_reord_last_seq = seq_ctrl;
+            g_warthog_reord_last_exp = expected_seq_ctrl;
             MMLOG_DBG("Dropping outdated frame (SEQ: 0x%x, EXP: 0x%x)\n",
                       seq_ctrl,
                       expected_seq_ctrl);
@@ -975,6 +1140,7 @@ static void umac_datapath_process_rx_data_frame(struct umac_data *umacd,
         {
 
             mmpkt_close(&rxbufview);
+            g_warthog_reord_buffered++;
             umac_datapath_add_rx_mpdu_to_reorder_list(umacd,
                                                       stad,
                                                       sta_data,
@@ -1233,6 +1399,7 @@ void umac_datapath_set_filter_all_beacons(struct umac_data *umacd, bool filter)
 
 static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktview *rxbufview)
 {
+    g_warthog_filter_entry++;
     bool drop_frame = false;
     uint16_t frame_ver_type_subtype;
 
@@ -1244,16 +1411,85 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
 
     if (!umac_datapath_validate_buf_len(rxbufview, sizeof(header->frame_control)))
     {
+        g_warthog_filt_hist[1]++; g_warthog_filt_reason = 1; g_warthog_filt_drop++;
         drop_frame = true;
         goto exit;
     }
 
     frame_ver_type_subtype = dot11_frame_control_get_ver_type_subtype(header->frame_control);
 
+/* Still behind WARTHOG_MESH_RX_TAP, unlike the plain counters: this one copies
+ * 64 bytes of every data frame and writes a ring entry, which is a developer
+ * diagnostic rather than something a shipping image should pay for. The
+ * counters were unguarded because they are single increments and because
+ * hiding them made AT+DATASTAT? / AT+RXCHAN? read zero on every region build,
+ * which reads as a dead data plane rather than as absent instrumentation. */
+#ifdef WARTHOG_MESH_RX_TAP
+    /* Warthog RX tap -- the earliest point in the host datapath.
+     *
+     * mmwlan_register_rx_frame_cb() fires DOWNSTREAM of the drops below (the
+     * unknown-sender / BSSID checks), so a peer mesh frame is discarded before
+     * any public hook can observe it. That is why every previous search for
+     * peer mesh frames found nothing. This tap runs before all of them, so it
+     * answers the actual keystone question: does the chip hand foreign-BSSID
+     * mesh frames to the host at all?
+     *
+     * Note the chip converts S1G beacons to legacy MGMT (type 0, subtype 8) on
+     * the way up, so do NOT filter on EXT/S1G_BEACON here -- log everything and
+     * let the host decide. MMLOG_ERR so it survives the default log threshold.
+     */
+    {
+        /* Counters only. These read frame_control, which the length check above
+         * already validated. The transmitter address is NOT safe to touch here:
+         * a 10-byte ACK/CTS reaches this point (RTS is dropped a few lines
+         * below), and dot11_get_ta() returns &hdr->addr2 at offset 10 -- so it
+         * needs its own bounds check before being read.
+         *
+         * Deliberately no log line: this is the hottest path in the driver, and
+         * MMLOG output is physically unreachable on this board anyway (it goes
+         * to the USB_SERIAL_JTAG console, whose PHY the app hands to TinyUSB for
+         * the AT interface). AT+MESHSTAT? is the observability. */
+        unsigned tap_type = (unsigned)dot11_frame_control_get_type(header->frame_control);
+        unsigned tap_sub = (unsigned)dot11_frame_control_get_subtype(header->frame_control);
+
+        g_warthog_rxtap_total++;
+        if (tap_type == 0)
+        {
+            g_warthog_rxtap_mgmt++;
+            if (tap_sub == 8)
+            {
+                g_warthog_rxtap_beacon++;
+            }
+        }
+        else if (tap_type == 2)
+        {
+            g_warthog_rxtap_data++;
+            /* Snapshot the head of the last data frame -- MAC hdr, QoS, and
+             * whatever follows (Mesh Control / CCMP hdr / LLC) -- so we can
+             * see exactly what the peer put on air instead of inferring it. */
+            uint32_t have = mmpkt_get_data_length(rxbufview);
+            uint32_t n = have < sizeof(g_warthog_rxdata_head) ? have : (uint32_t)sizeof(g_warthog_rxdata_head);
+            memcpy((void *)g_warthog_rxdata_head, mmpkt_get_data_start(rxbufview), n);
+            g_warthog_rxdata_head_len = (uint16_t)n;
+        }
+        g_warthog_rxtap_last_fc = frame_ver_type_subtype;
+        g_warthog_fc_ring[g_warthog_fc_ring_idx++ & 31] = le16toh(header->frame_control);
+
+        if (umac_datapath_validate_buf_len(rxbufview,
+                                           offsetof(struct dot11_hdr, addr2) +
+                                               DOT11_MAC_ADDR_LEN))
+        {
+            memcpy((void *)g_warthog_rxtap_last_ta, dot11_get_ta(header),
+                   DOT11_MAC_ADDR_LEN);
+        }
+    }
+#endif
+
     if (frame_ver_type_subtype == DOT11_VER_TYPE_SUBTYPE(0, CTRL, RTS))
     {
 
         MMLOG_INF("Dropping RTS frame.\n");
+        g_warthog_filt_hist[2]++; g_warthog_filt_reason = 2; g_warthog_filt_drop++;
         drop_frame = true;
         goto exit;
     }
@@ -1263,6 +1499,7 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
         if (umac_datapath_filter_all_beacons(umacd))
         {
             MMLOG_VRB("Dropping beacon.\n");
+            g_warthog_filt_hist[3]++; g_warthog_filt_reason = 3; g_warthog_filt_drop++;
             drop_frame = true;
             goto exit;
         }
@@ -1274,6 +1511,7 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
     if (!umac_datapath_validate_buf_len(rxbufview, header_len))
     {
         MMLOG_INF("Frame too short, drop.\n");
+        g_warthog_filt_hist[4]++; g_warthog_filt_reason = 4; g_warthog_filt_drop++;
         drop_frame = true;
         goto exit;
     }
@@ -1289,6 +1527,7 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
          * firing — leaving this here as a tripwire if mesh setup regresses. */
         MMLOG_ERR("Frame received before datapath configured. Dropping (fc_vts=0x%04x).\n",
                   frame_ver_type_subtype);
+        g_warthog_filt_hist[5]++; g_warthog_filt_reason = 5; g_warthog_filt_drop++;
         drop_frame = true;
         goto exit;
     }
@@ -1305,6 +1544,7 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
             MMLOG_INF("Dropping packet from unknown sender " MM_MAC_ADDR_FMT " (%04x)\n",
                       MM_MAC_ADDR_VAL(ta),
                       frame_ver_type_subtype);
+            g_warthog_filt_hist[6]++; g_warthog_filt_reason = 6; g_warthog_filt_drop++;
             drop_frame = true;
             goto exit;
         }
@@ -1312,6 +1552,7 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
         if (umac_interface_addr_matches_mac_addr(stad, dot11_get_sa_data(data_hdr)))
         {
             MMLOG_INF("Source address matches our MAC address, dropping received frame.\n");
+            g_warthog_filt_hist[7]++; g_warthog_filt_reason = 7; g_warthog_filt_drop++;
             drop_frame = true;
             goto exit;
         }
@@ -1322,6 +1563,7 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
             MMLOG_INF("Dropping duplicate frame. Type %u, Subtype %u.\n",
                       dot11_frame_control_get_type(header->frame_control),
                       dot11_frame_control_get_subtype(header->frame_control));
+            g_warthog_filt_hist[8]++; g_warthog_filt_reason = 8; g_warthog_filt_drop++;
             drop_frame = true;
             goto exit;
         }
@@ -1483,6 +1725,11 @@ static void umac_datapath_process_rx_frame(struct umac_data *umacd,
         MMOSAL_DEV_ASSERT(data->ops != NULL);
         MMOSAL_DEV_ASSERT(mm_mac_addr_is_multicast(ta) == false);
         stad = data->ops->lookup_stad_by_peer_addr(umacd, ta);
+        if (frame_type == DOT11_FC_TYPE_DATA)
+        {
+            if (stad != NULL) { g_warthog_rx_data_stad_hit++; }
+            else              { g_warthog_rx_data_stad_miss++; memcpy((void *)g_warthog_rx_data_miss_ta, ta, 6); }
+        }
     }
 
 
@@ -1574,6 +1821,7 @@ static void umac_datapath_rx_queue_frame(struct umac_data *umacd,
 
 void umac_datapath_rx_frame(struct umac_data *umacd, struct mmpkt *rxbuf)
 {
+    g_warthog_rxframe_entry++;
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
     struct mmpktview *rxbufview = mmpkt_open(rxbuf);
 
@@ -1774,9 +2022,12 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
         {
             key_len = umac_keys_get_key_len(stad, key_id);
             header->frame_control |= htole16(DOT11_MASK_FC_PROTECTED);
+            g_warthog_tx_protected++;
+            g_warthog_tx_last_key = (uint32_t)key_id;
         }
         else if (enc == ENCRYPTION_ENABLED)
         {
+            g_warthog_tx_nokey++;
             MMLOG_WRN("Could not find key for type %u.\n", key_type);
             status = MMWLAN_ERROR;
             goto error;
@@ -1818,6 +2069,29 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
                                        DOT11_FCS_FIELD_LEN +
                                        ccmp_len) > rts_threshold));
 
+
+    /* 802.11s mesh data carries a Mesh Control field (IEEE 802.11-2020
+     * s9.2.4.7.3) between QoS Control and the body, flagged by QoS bit 8
+     * "Mesh Control Present". Measured on hardware: without it the peer's
+     * MM6108 ACKs every 4-address data frame at the MAC layer and delivers
+     * NONE of them to its host, while management flows fine -- the firmware
+     * recognises mesh data by this field, and a 4-addr frame without it is
+     * dropped after ACK. Only mesh-mode frames get it; STA/AP are untouched. */
+    if (data->ops == &datapath_ops_mesh)
+    {
+        qos_ctrl.field |= (uint16_t)0x0100; /* Mesh Control Present */
+        uint8_t mesh_ctrl[6] = {
+            0x00,                       /* flags: no address extension        */
+            UMAC_MESH_CTRL_TTL,         /* TTL                                */
+            0, 0, 0, 0                  /* mesh sequence number, LE           */
+        };
+        uint32_t seq = g_warthog_mesh_seq++;
+        mesh_ctrl[2] = (uint8_t)(seq);
+        mesh_ctrl[3] = (uint8_t)(seq >> 8);
+        mesh_ctrl[4] = (uint8_t)(seq >> 16);
+        mesh_ctrl[5] = (uint8_t)(seq >> 24);
+        mmpkt_prepend_data(txbufview, mesh_ctrl, sizeof(mesh_ctrl));
+    }
 
     MMLOG_VRB("Add QOS CNTL bytes\n");
     mmpkt_prepend_data(txbufview, (uint8_t *)&qos_ctrl.field, sizeof(qos_ctrl));
@@ -1871,6 +2145,8 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 
     mmpkt_close(&txbufview);
     int ret = mmdrv_tx_frame(txbuf, false);
+    if (ret == 0) { g_warthog_tx_drv_ok++; }
+    else          { g_warthog_tx_drv_err++; g_warthog_tx_drv_last_err = ret; }
     if (ret)
     {
         MMLOG_WRN("mmdrv_tx_frame failed with retcode %d\n", ret);
@@ -2167,6 +2443,46 @@ static inline void umac_datapath_process_tx_status_queue(struct umac_data *umacd
 
         struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(mmpkt);
 
+        /* The chip's per-frame verdict, captured BEFORE the AID lookup (which
+         * mesh cannot satisfy -- it has no AIDs). This is the only place the
+         * host learns whether a frame actually went on air and was ACKed. */
+        {
+            uint8_t sf = tx_metadata->status_flags;
+            g_warthog_txst_total++;
+            g_warthog_txst_last_flags = sf;
+            if (sf & (MMDRV_TX_STATUS_FLAG_PS_FILTERED | MMDRV_TX_STATUS_DUTY_CYCLE_CANT_SEND))
+            {
+                g_warthog_txst_unsent++;
+            }
+            else if (sf & MMDRV_TX_STATUS_FLAG_NO_ACK)
+            {
+                g_warthog_txst_noack++;
+            }
+            else
+            {
+                g_warthog_txst_acked++;
+            }
+            /* DATA frames carry the peer's AID (set at TX from the stad); the
+             * mgmt/probe path leaves it 0. Split so the data verdict is not
+             * hidden inside a pile of ACKed probe requests. */
+            if (tx_metadata->aid != 0)
+            {
+                g_warthog_txst_data_total++;
+                g_warthog_txst_data_last_flags = sf;
+                if (sf & (MMDRV_TX_STATUS_FLAG_PS_FILTERED | MMDRV_TX_STATUS_DUTY_CYCLE_CANT_SEND))
+                {
+                    g_warthog_txst_data_unsent++;
+                }
+                else if (sf & MMDRV_TX_STATUS_FLAG_NO_ACK)
+                {
+                    g_warthog_txst_data_noack++;
+                }
+                else
+                {
+                    g_warthog_txst_data_acked++;
+                }
+            }
+        }
 
         struct umac_sta_data *stad = data->ops->lookup_stad_by_aid(umacd, tx_metadata->aid);
         if (stad != NULL)

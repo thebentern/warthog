@@ -91,3 +91,7 @@ void mmhalow_print_version_info(void);
  * Start an AP interface
  */
 void mmhalow_wifi_start();
+
+/** The HaLow esp_netif, or NULL before mmhalow_init(). Mesh mode brings this
+ *  up itself once a peer link is established (no STA link-state event fires). */
+esp_netif_t *mmhalow_get_netif(void);

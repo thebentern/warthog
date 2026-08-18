@@ -5,13 +5,35 @@
  */
 
 #include "mmhalow.h"
+
+/* Regulatory domain.
+ *
+ * region.h maps the build's WARTHOG_REGION_<XX> flag to the country code the
+ * Morse regulatory database is keyed on ("US", "EU", "JP", "KR", "AU" -- all
+ * present in mmregdb.c). Before this, the channel list came from
+ * CONFIG_HALOW_COUNTRY_CODE, hardcoded to "US" in sdkconfig.defaults, while
+ * WARTHOG_COUNTRY_CODE reached nothing but two log lines. Every non-US build
+ * therefore booted the US channel list and said otherwise in its own log --
+ * an EU image transmitting on 902-928 MHz. Keep this deriving from the build
+ * region, not from Kconfig. */
+#include "region.h"
+#ifndef WARTHOG_COUNTRY_CODE
+#define WARTHOG_COUNTRY_CODE CONFIG_HALOW_COUNTRY_CODE
+#endif
 #include "esp_log.h"
 #include "mmlog.h"
 #include <string.h>
 
+int g_warthog_chan_pin_status = -1;
+
 static const char *TAG = "Morse Micro HaLow NetIF";
 
 static esp_netif_t *halow_netif = NULL;
+
+esp_netif_t *mmhalow_get_netif(void)
+{
+    return halow_netif;
+}
 
 static void mmhalow_link_state(enum mmwlan_link_state link_state, void *arg)
 {
@@ -188,9 +210,70 @@ esp_err_t mmhalow_init(const wifi_init_config_t *config)
 
     const struct mmwlan_regulatory_db *db = get_regulatory_db();
     const struct mmwlan_s1g_channel_list *channel_list =
-        mmwlan_lookup_regulatory_domain(db, CONFIG_HALOW_COUNTRY_CODE);
-    ESP_LOGI(TAG, "Setting Channel List %s", CONFIG_HALOW_COUNTRY_CODE);
-    mmwlan_set_channel_list(channel_list);
+        mmwlan_lookup_regulatory_domain(db, WARTHOG_COUNTRY_CODE);
+
+#ifdef WARTHOG_PIN_S1G_CHAN
+    /* Pin the radio to a SINGLE S1G channel. mmwlan_set_channel_list() must be
+     * called while the WLAN subsystem is inactive and BEFORE mmwlan_boot() --
+     * calling it later returns MMWLAN_UNAVAILABLE (3), so the pin has to live
+     * here rather than in the mesh bring-up path.
+     *
+     * A single-entry list makes the operating channel deterministic, which is
+     * what lets an external radio (Linux morse_driver on an MM8108) be brought
+     * up on a matching channel to sniff or to peer with us. The full
+     * regulatory list leaves the channel implicit and unobservable.
+     *
+     * WARTHOG_PIN_S1G_CHAN selects the S1G channel number; the entry below is
+     * the matching row from the US regulatory table. */
+    /* Operating class and bandwidth travel WITH the channel -- they are not
+     * independent knobs. A peer's mesh_matches_local() compares the operating
+     * class it sees against its own, so a channel change with a stale class
+     * peers with nothing and looks like a radio fault. The values here must
+     * match a row in mmregdb.c for the configured country:
+     *
+     *   ch 5  = 904.5 MHz, 1 MHz, global 68 / s1g 1   (our default)
+     *   ch 42 = 923.0 MHz, 2 MHz, global 69 / s1g 2   (mmregdb.c US row;
+     *                                                  OpenMANET's default)
+     *
+     * Overridable together from build flags so a channel profile is one
+     * coherent choice; see the openmanet-parity notes in platformio.ini. */
+#ifndef WARTHOG_PIN_S1G_GLOBAL_OP_CLASS
+#define WARTHOG_PIN_S1G_GLOBAL_OP_CLASS 68
+#endif
+#ifndef WARTHOG_PIN_S1G_OP_CLASS
+#define WARTHOG_PIN_S1G_OP_CLASS 1
+#endif
+#ifndef WARTHOG_PIN_S1G_BW_MHZ
+#define WARTHOG_PIN_S1G_BW_MHZ 1
+#endif
+#ifndef WARTHOG_PIN_S1G_EIRP_DBM
+#define WARTHOG_PIN_S1G_EIRP_DBM 36
+#endif
+
+    static const struct mmwlan_s1g_channel warthog_pinned_chan[] = {
+        /* freq_hz, duty_cycle, omit_ctrl_resp, global_op_class, s1g_op_class,
+         * s1g_chan, bw_mhz, max_eirp_dbm, pkt_spacing, airtime_min, airtime_max */
+        { WARTHOG_PIN_S1G_FREQ_HZ, 10000, false, WARTHOG_PIN_S1G_GLOBAL_OP_CLASS,
+          WARTHOG_PIN_S1G_OP_CLASS, WARTHOG_PIN_S1G_CHAN, WARTHOG_PIN_S1G_BW_MHZ,
+          WARTHOG_PIN_S1G_EIRP_DBM, 0, 0, 0 },
+    };
+    static const struct mmwlan_s1g_channel_list warthog_pinned_list = {
+        .country_code = WARTHOG_COUNTRY_CODE,
+        .num_channels = 1,
+        .channels = warthog_pinned_chan,
+    };
+    channel_list = &warthog_pinned_list;
+    ESP_LOGW(TAG, "PINNED S1G chan %d (%u Hz, %d MHz BW) -- single-channel list",
+             (int)WARTHOG_PIN_S1G_CHAN, (unsigned)WARTHOG_PIN_S1G_FREQ_HZ,
+             (int)WARTHOG_PIN_S1G_BW_MHZ);
+#endif
+
+    ESP_LOGI(TAG, "Setting Channel List %s", WARTHOG_COUNTRY_CODE);
+    enum mmwlan_status chan_st = mmwlan_set_channel_list(channel_list);
+    ESP_LOGI(TAG, "mmwlan_set_channel_list -> %d (0=SUCCESS)", (int)chan_st);
+    /* Stash for later reporting: this runs before the USB CDC console exists,
+     * so the log line above is invisible to a host attaching after boot. */
+    g_warthog_chan_pin_status = (int)chan_st;
 
     /* Boot the WLAN interface so that we can retrieve the firmware version. */
     struct mmwlan_boot_args boot_args = MMWLAN_BOOT_ARGS_INIT;

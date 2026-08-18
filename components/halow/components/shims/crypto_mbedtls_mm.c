@@ -672,7 +672,14 @@ void *aes_encrypt_init(const uint8_t *key, size_t len)
     }
 
     mbedtls_aes_init(aes);
-    if (mbedtls_aes_setkey_dec(aes, key, len * 8) == 0)
+    /* setkey_ENC: aes_encrypt() below runs mbedtls_aes_crypt_ecb() in
+     * MBEDTLS_AES_ENCRYPT mode, which needs the forward key schedule.
+     * This was setkey_dec -- byte-identical to aes_decrypt_init -- so every
+     * AES-ECB encryption through this shim produced wrong output, silently.
+     * Nothing in the current build encrypts through it, but aes-ctr.c,
+     * aes-siv.c (the AMPE MIC), aes-wrap.c and aes-cbc.c all do, so SAE/AMPE
+     * would have failed here with no diagnostic. */
+    if (mbedtls_aes_setkey_enc(aes, key, len * 8) == 0)
     {
         return aes;
     }

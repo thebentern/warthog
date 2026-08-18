@@ -10,6 +10,10 @@
 #include "mmpkt_list.h"
 #include "morse.h"
 #include "skbq.h"
+/* Bus-level RX channel counters (storage in main/at.c; AT+RXCHAN?). */
+extern volatile uint32_t g_warthog_rxchan_pages, g_warthog_rxchan_data, g_warthog_rxchan_beacon,
+    g_warthog_rxchan_mgmt, g_warthog_rxchan_cmd, g_warthog_rxchan_txstat, g_warthog_rxchan_last;
+
 #include "command.h"
 #include "skb_header.h"
 #include "dot11/dot11.h"
@@ -307,6 +311,15 @@ void morse_skbq_process_rx(struct driver_data *driverd, struct mmpkt *mmpkt)
         static uint32_t s_rx_pages = 0;
         s_rx_pages++;
         s_chan_hist[channel]++;
+        /* Mirror to AT+RXCHAN? -- the MMLOG lines below are unreachable on this
+         * board. This is the bus-level truth: a page counted here left the chip. */
+        g_warthog_rxchan_pages = s_rx_pages;
+        g_warthog_rxchan_data = s_chan_hist[0x00];
+        g_warthog_rxchan_beacon = s_chan_hist[0x03];
+        g_warthog_rxchan_mgmt = s_chan_hist[0x04];
+        g_warthog_rxchan_cmd = s_chan_hist[0xfe];
+        g_warthog_rxchan_txstat = s_chan_hist[0xff];
+        g_warthog_rxchan_last = channel;
         if (!s_seen_channels[channel])
         {
             s_seen_channels[channel] = 1;

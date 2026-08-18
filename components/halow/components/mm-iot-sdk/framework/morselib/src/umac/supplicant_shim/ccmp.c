@@ -4,6 +4,9 @@
  */
 
 #include "umac/keys/umac_keys.h"
+
+/* CCMP RX diagnostics (storage in main/at.c; AT+RXCHAN?). */
+extern volatile uint32_t g_warthog_ccmp_last_keyid, g_warthog_ccmp_blank, g_warthog_ccmp_last_pn, g_warthog_ccmp_replay;
 #include "dot11/dot11.h"
 
 
@@ -37,15 +40,21 @@ bool ccmp_is_valid(struct umac_sta_data *stad,
 
     uint8_t key_id = parse_ccmp_key_id(ccmp_header);
 
-
+    g_warthog_ccmp_last_keyid = key_id;
     if (umac_keys_get_key_type(stad, key_id) == UMAC_KEY_TYPE_BLANK)
     {
+        g_warthog_ccmp_blank++;
         return false;
     }
 
     uint64_t packet_number = parse_ccmp_packet_number(ccmp_header);
+    g_warthog_ccmp_last_pn = (uint32_t)packet_number;
     enum mmwlan_status status =
         umac_keys_check_and_update_rx_replay(stad, key_id, packet_number, space);
+    if (status != MMWLAN_SUCCESS)
+    {
+        g_warthog_ccmp_replay++;
+    }
 
     return (status == MMWLAN_SUCCESS);
 }

@@ -16,12 +16,14 @@
 
 static void xor_aes_block(u8 *dst, const u8 *src)
 {
-	u32 *d = (u32 *) dst;
-	u32 *s = (u32 *) src;
-	*d++ ^= *s++;
-	*d++ ^= *s++;
-	*d++ ^= *s++;
-	*d++ ^= *s++;
+	/* Byte-wise on purpose. This is handed pointers straight into packet
+	 * memory, whose 4-byte alignment is not guaranteed once a CCMP header
+	 * sits at an arbitrary offset -- the u32 casts this replaces were
+	 * undefined behaviour there and trap on some targets. */
+	size_t i;
+
+	for (i = 0; i < AES_BLOCK_SIZE; i++)
+		dst[i] ^= src[i];
 }
 
 
@@ -95,21 +97,38 @@ static void aes_ccm_encr(void *aes, size_t L, const u8 *in, size_t len, u8 *out,
 	size_t last = len % AES_BLOCK_SIZE;
 	size_t i;
 
+	/* Keystream into a scratch block rather than straight into `out`.
+	 *
+	 * Upstream writes S_i into `out` and then XORs `in` into it, which is
+	 * correct only while the two buffers differ: called in place (out == in)
+	 * the keystream overwrites the plaintext before the XOR reads it and the
+	 * result is all zeros -- silently, with a valid-looking MIC computed over
+	 * the real plaintext. Encrypting a packet in its own buffer is exactly
+	 * what a host CCMP datapath wants to do, so make it safe here.
+	 *
+	 * The tail is also exact now. Upstream ran E(K, A_i) directly into `out`
+	 * for a partial block, writing a full 16 bytes and overrunning by up to
+	 * 15; every caller had to over-allocate by AES_BLOCK_SIZE to survive it.
+	 */
+	u8 s[AES_BLOCK_SIZE];
+	size_t j;
+
 	/* crypt = msg XOR (S_1 | S_2 | ... | S_n) */
 	for (i = 1; i <= len / AES_BLOCK_SIZE; i++) {
 		WPA_PUT_BE16(&a[AES_BLOCK_SIZE - 2], i);
 		/* S_i = E(K, A_i) */
-		aes_encrypt(aes, a, out);
-		xor_aes_block(out, in);
+		aes_encrypt(aes, a, s);
+		for (j = 0; j < AES_BLOCK_SIZE; j++)
+			out[j] = in[j] ^ s[j];
 		out += AES_BLOCK_SIZE;
 		in += AES_BLOCK_SIZE;
 	}
 	if (last) {
 		WPA_PUT_BE16(&a[AES_BLOCK_SIZE - 2], i);
-		aes_encrypt(aes, a, out);
+		aes_encrypt(aes, a, s);
 		/* XOR zero-padded last block */
-		for (i = 0; i < last; i++)
-			*out++ ^= *in++;
+		for (j = 0; j < last; j++)
+			out[j] = in[j] ^ s[j];
 	}
 }
 

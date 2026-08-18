@@ -678,9 +678,44 @@ int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing)
     #define WARTHOG_MESH_MBCA_MIN_BEACON_GAP_MS (25u)
     #define WARTHOG_MESH_MBCA_MBSS_SCAN_DUR_MS  (2048u)
     #define WARTHOG_MESH_MBCA_TBTT_ADJ_INT_MS   (60000u)
-    /* Step 25 flag — 1 = MBCA-OFF (current experiment), 0 = MBCA-ON
-     * (Linux-defaults baseline). */
-    #define WARTHOG_MESH_STEP25_MBCA_OFF 1
+    /* Step 25 flag — 1 = MBCA-OFF, 0 = MBCA-ON (Linux-defaults baseline).
+     *
+     * NOW 0. Step 25 set this to 1 on the theory that MBCA's TBTT-selection
+     * state machine was gating the beacon timer. But the comment above is the
+     * refutation: Linux zeroes mbca.config for *beaconless mode*. So
+     * mbca_config == 0 does not mean "MBCA disabled, beacon freely" -- it
+     * selects the mode where the chip deliberately does NOT beacon. That fits
+     * the observed behaviour exactly: MESH_CONFIG(START) is accepted, the
+     * beacon IRQ fires once at startup and never again, and on-air monitor
+     * capture shows only the 2 s diagnostic probe bursts -- no ~10/s beacons.
+     *
+     * Sending the real Linux MBCA defaults (TBTT_SEL_ENABLE + the gap/scan/
+     * adjust timers below) is what puts the chip in a beaconing mesh mode. */
+    /* MEASURED against a real beaconing MM8108 -- supersedes the theory above.
+     *
+     * A Linux MM8108 was brought up as a mesh point and SDR-confirmed beaconing
+     * at +15.24 dB. The exact MESH_CONFIG it was sent (command.c
+     * morse_cmd_cfg_mesh) was:
+     *
+     *     enable_beaconing            = 1        (= !mesh_beaconless_mode)
+     *     mbca_config                 = 0        (mesh_conf->mbca.config, never set)
+     *     min_beacon_gap_ms           = 0
+     *     tbtt_adj_timer_interval_ms  = 0
+     *     mbss_start_scan_duration_ms = 0
+     *
+     * So mbca_config == 0 does NOT select a beaconless mode -- that is what the
+     * separate mesh_beaconless_mode field does, and it is what drives
+     * enable_beaconing. A device with mbca_config = 0 beacons happily.
+     *
+     * Warthog was sending mbca_config = TBTT_SEL_ENABLE plus non-zero MBCA
+     * timers, and does not beacon: MESH_CONFIG(START) is accepted, the beacon
+     * IRQ fires once and never again, and on air there are only the 2 s probe
+     * bursts. Enabling MBCA TBTT-selection makes the chip wait to schedule its
+     * TBTT against neighbours it has not found yet, so it never starts.
+     *
+     * Match the known-good configuration exactly: MBCA off, all MBCA timers 0.
+     * Set WARTHOG_MESH_MBCA_ENABLE to 1 to restore the old behaviour. */
+    #define WARTHOG_MESH_MBCA_ENABLE 0
 
     struct morse_cmd_resp_mesh_config resp;
     struct morse_cmd_req_mesh_config cmd = MORSE_COMMAND_INIT(
@@ -690,12 +725,13 @@ int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing)
         .mesh_cfg_opcode = start ? MORSE_CMD_MESH_CONFIG_OPCODE_START
                                  : MORSE_CMD_MESH_CONFIG_OPCODE_STOP,
         .enable_beaconing = enable_beaconing ? 1 : 0,
-        .mbca_config = WARTHOG_MESH_STEP25_MBCA_OFF
-                         ? 0u
-                         : WARTHOG_MESH_MBCA_TBTT_SEL_ENABLE,
-        .min_beacon_gap_ms = WARTHOG_MESH_MBCA_MIN_BEACON_GAP_MS,
-        .mbss_start_scan_duration_ms = htole16(WARTHOG_MESH_MBCA_MBSS_SCAN_DUR_MS),
-        .tbtt_adj_timer_interval_ms = htole16(WARTHOG_MESH_MBCA_TBTT_ADJ_INT_MS));
+        .mbca_config = WARTHOG_MESH_MBCA_ENABLE ? WARTHOG_MESH_MBCA_TBTT_SEL_ENABLE : 0u,
+        .min_beacon_gap_ms = WARTHOG_MESH_MBCA_ENABLE
+                               ? WARTHOG_MESH_MBCA_MIN_BEACON_GAP_MS : 0u,
+        .mbss_start_scan_duration_ms =
+            htole16(WARTHOG_MESH_MBCA_ENABLE ? WARTHOG_MESH_MBCA_MBSS_SCAN_DUR_MS : 0u),
+        .tbtt_adj_timer_interval_ms =
+            htole16(WARTHOG_MESH_MBCA_ENABLE ? WARTHOG_MESH_MBCA_TBTT_ADJ_INT_MS : 0u));
 
     return morse_cmd_tx(&driver_data,
                         (struct morse_cmd_resp *)&resp,
@@ -979,6 +1015,99 @@ int mmdrv_update_sta_state(uint16_t vif_id,
                         0);
 }
 
+/* Key-install trace (storage in main/at.c; AT+KEYINST?). */
+extern volatile uint32_t g_warthog_keyinst[8];
+extern volatile uint32_t g_warthog_keyinst_n;
+
+/* Ask the chip to stop doing crypto and hand protected frames to the host raw.
+ *
+ * MORSE_CMD_PARAM_ID_CRYPTO_IN_HOST is the documented lever for host software
+ * CCMP, and it is the prerequisite for per-link keys: the chip holds only ONE
+ * pairwise key per key-index for a VIF (proven on the bench -- re-installing
+ * one peer's key breaks another's link), while AMPE derives a distinct MTK per
+ * link. Software crypto keyed off the transmitter address has no such limit.
+ *
+ * MEASURED: this firmware does NOT honour it. The command returns status 0 --
+ * and morse_cmd_tx() returns the firmware's own status, so that is the chip
+ * accepting the request, not a transport success -- but nothing changes on air.
+ * With CRYPTO_IN_HOST=1 a peered link kept passing 3/3, rx_data kept climbing,
+ * and ZERO frames arrived undecrypted (AT+RXCHAN? nodec uni=0, rxdrop=0). The
+ * chip carried on decrypting in firmware. Read-back is no help either: GET
+ * answers 0 whatever was set.
+ *
+ * Kept because the negative result is worth more than the code -- it is the
+ * documented lever, it looks like it works, and the only thing that exposes it
+ * as a no-op is watching the RX counters rather than the return value.
+ *
+ * The mechanism that DOES deliver protected frames to the host needs no
+ * parameter: install no key for a peer and the chip cannot decrypt its frames,
+ * so it hands them up with MMDRV_RX_FLAG_DECRYPTED clear. We have already seen
+ * exactly that -- group frames arrived intact and were dropped at the "no HW
+ * decryption" gate (rxdrop reason=4) with the CCMP header visible in
+ * AT+RXHEAD?. That is the hook host software CCMP should use.
+ *
+ * @returns 0 on success, or a negative error.
+ */
+int mmdrv_set_crypto_in_host(uint16_t vif_id, bool enable, uint32_t *out_value)
+{
+    if (!driver_data.started)
+    {
+        return -ENODEV;
+    }
+
+    struct morse_cmd_resp_get_set_generic_param resp;
+    struct morse_cmd_req_get_set_generic_param cmd =
+        MORSE_COMMAND_INIT(cmd, MORSE_CMD_ID_GET_SET_GENERIC_PARAM, vif_id,
+                           .param_id = htole32(MORSE_CMD_PARAM_ID_CRYPTO_IN_HOST),
+                           .action = htole32(MORSE_CMD_PARAM_ACTION_SET),
+                           .flags = 0,
+                           .value = htole32(enable ? 1u : 0u));
+
+    int result = morse_cmd_tx(&driver_data, (struct morse_cmd_resp *)&resp,
+                              (struct morse_cmd_req *)&cmd, sizeof(resp), 0);
+    if (result)
+    {
+        MMLOG_WRN("crypto_in_host set failed %d\n", result);
+        return result;
+    }
+    if (out_value != NULL)
+    {
+        *out_value = le32toh(resp.value);
+    }
+    return 0;
+}
+
+/* Read the parameter back. A firmware that ignores an unknown parameter can
+ * still answer the SET with success, so the only honest confirmation is
+ * reading the value the chip actually holds. */
+int mmdrv_get_crypto_in_host(uint16_t vif_id, uint32_t *out_value)
+{
+    if (!driver_data.started)
+    {
+        return -ENODEV;
+    }
+
+    struct morse_cmd_resp_get_set_generic_param resp;
+    struct morse_cmd_req_get_set_generic_param cmd =
+        MORSE_COMMAND_INIT(cmd, MORSE_CMD_ID_GET_SET_GENERIC_PARAM, vif_id,
+                           .param_id = htole32(MORSE_CMD_PARAM_ID_CRYPTO_IN_HOST),
+                           .action = htole32(MORSE_CMD_PARAM_ACTION_GET),
+                           .flags = 0,
+                           .value = 0);
+
+    int result = morse_cmd_tx(&driver_data, (struct morse_cmd_resp *)&resp,
+                              (struct morse_cmd_req *)&cmd, sizeof(resp), 0);
+    if (result)
+    {
+        return result;
+    }
+    if (out_value != NULL)
+    {
+        *out_value = le32toh(resp.value);
+    }
+    return 0;
+}
+
 int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_conf)
 {
     if (!driver_data.started)
@@ -1048,6 +1177,19 @@ int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_
         MMLOG_WRN("mmdrv_add_key - morse_cmd_install_key failed %d\n", result);
         return result;
     }
+
+    /* Record what the CHIP assigned. It returns the hardware slot it chose,
+     * which is the only evidence of whether keys are per-STA or per-VIF on
+     * this part -- and the SDK throws it away (the assert below is compiled
+     * out in release, and nothing propagates a differing index to the TX
+     * path, so a silently remapped key would encrypt with the wrong slot). */
+    if (g_warthog_keyinst_n < 8)
+    {
+        uint32_t i = g_warthog_keyinst_n;
+        g_warthog_keyinst[i] = ((uint32_t)aid << 24) | ((uint32_t)key_conf->is_pairwise << 16) |
+                               ((uint32_t)requested_key_idx << 8) | (uint32_t)resp.key_idx;
+    }
+    g_warthog_keyinst_n++;
 
     key_conf->key_idx = resp.key_idx;
     MMLOG_DBG("%s Installed key @ hw index: %d\n", __func__, resp.key_idx);

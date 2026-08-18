@@ -54,6 +54,12 @@ set(SRCS
     ${ROOT_DIR}/src/umac/mesh/umac_mesh.c
     ${ROOT_DIR}/src/umac/mesh/mmwlan_mesh.c
     ${ROOT_DIR}/src/umac/mesh/umac_mesh_beacon.c
+    ${ROOT_DIR}/src/umac/mesh/umac_mesh_ies.c
+    ${ROOT_DIR}/src/umac/mesh/umac_mesh_plink_tbl.c
+    ${ROOT_DIR}/src/umac/mesh/umac_mesh_hwmp.c
+    ${ROOT_DIR}/src/umac/mesh/umac_mesh_ccmp_kat.c
+    ${ROOT_DIR}/src/umac/mesh/umac_mesh_ccm.c
+    ${ROOT_DIR}/src/umac/mesh/umac_mesh_ccmp_hdr.c
     ${ROOT_DIR}/src/umac/keys/connection_keys.c
     ${ROOT_DIR}/src/umac/keys/umac_keys.c
     ${ROOT_DIR}/src/umac/ps/umac_ps.c

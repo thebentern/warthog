@@ -9,6 +9,10 @@
 #   make clean
 
 CC      ?= clang
+ifdef SAN
+SANFLAGS := -fsanitize=address,undefined -fno-sanitize-recover=all
+endif
+
 CFLAGS  := -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wno-macro-redefined \
            -Wno-sign-compare -Wno-unused-function -Wno-visibility -g -O0
 INCS    := -I../src/compat -I../src/dot11ah -I../src
@@ -27,13 +31,73 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
            ../src/dot11ah/main.c \
            ../src/dot11ah/debug.c
 
-TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame
+TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
+           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccmp_hdr test_s1g_beacon test_mesh_hwmp
 
-.PHONY: all clean linkcheck
-all: $(TESTS) linkcheck
+# The shipping mesh byte-layout code, compiled straight out of the vendored SDK.
+# These tests link the REAL firmware source, not a copy of it -- umac_mesh_ies.c
+# is deliberately freestanding (libc only) so it can be built here. `make
+# freestanding` fails loudly if an SDK include ever creeps back in and quietly
+# un-tests the on-air byte layout.
+SDKMESH := ../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh
+MESHIES := $(SDKMESH)/umac_mesh_ies.c
+
+.PHONY: all clean linkcheck freestanding region
+all: $(TESTS) linkcheck freestanding region
 	@echo "=== running host tests ==="
 	@fail=0; for t in $(TESTS); do echo "--- $$t ---"; ./$$t || fail=1; done; \
 	  if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
+
+# The build's regulatory domain must reach the radio, not just the log. Shell
+# rather than C because what needs checking is the PREPROCESSOR result of the
+# real header under each region flag, plus the call sites that consume it.
+region:
+	@echo "=== regulatory region mapping ==="
+	@sh ./test_region_map.sh
+
+# Note: -I$(SDKMESH) ONLY, deliberately not $(INCS) -- if these tests could see
+# the compat/dot11ah headers, an SDK dependency could sneak into umac_mesh_ies.c
+# without anything failing.
+test_mesh_hwmp: test_mesh_hwmp.c $(SDKMESH)/umac_mesh_hwmp.c
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+
+test_mesh_ies_golden: test_mesh_ies_golden.c $(MESHIES)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+
+test_mesh_mpm_parse: test_mesh_mpm_parse.c $(MESHIES)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+
+test_mesh_beacon_id: test_mesh_beacon_id.c $(MESHIES)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+
+test_mesh_plink_tbl: test_mesh_plink_tbl.c $(SDKMESH)/umac_mesh_plink_tbl.c
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+
+test_ccmp_hdr: test_ccmp_hdr.c $(SDKMESH)/umac_mesh_ccmp_hdr.c
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+
+test_s1g_beacon: test_s1g_beacon.c $(MESHIES)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+
+# AES-CCM against the RFC 3610 vectors, using hostap's own software AES so the
+# cipher is tested independently of the on-target mbedtls shim.
+HOSTAP := ../../halow/components/mm-iot-sdk/framework/src/hostap
+CCMSRC := $(HOSTAP)/src/crypto/aes-ccm.c $(HOSTAP)/src/crypto/aes-internal.c \
+          $(HOSTAP)/src/crypto/aes-internal-enc.c
+test_aes_ccm: test_aes_ccm.c $(CCMSRC)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-parameter -Wno-sign-compare \
+	  -Ihostcompat -I$(HOSTAP)/src/utils -I$(HOSTAP)/src/crypto -I$(HOSTAP)/src -I$(HOSTAP) $^ -o $@
+
+test_mesh_data_hdr: test_mesh_data_hdr.c $(MESHIES)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+
+# Proves the mesh byte-layout TU still compiles with nothing but libc.
+freestanding:
+	@echo "=== freestanding check (mesh byte layout must not depend on the SDK) ==="
+	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(MESHIES) && echo "ok   umac_mesh_ies.c is freestanding"
+	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_plink_tbl.c && echo "ok   umac_mesh_plink_tbl.c is freestanding"
+	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_ccmp_hdr.c && echo "ok   umac_mesh_ccmp_hdr.c is freestanding"
+	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_hwmp.c && echo "ok   umac_mesh_hwmp.c is freestanding"
 
 test_s1g_ieee80211: test_s1g_ieee80211.c ../src/dot11ah/s1g_ieee80211.c $(COMPAT)
 	$(CC) $(CFLAGS) $(INCS) $^ -o $@

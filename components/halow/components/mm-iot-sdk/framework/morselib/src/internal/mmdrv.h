@@ -452,6 +452,11 @@ int mmdrv_update_sta_state(uint16_t vif_id,
  */
 int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_conf);
 
+/** Ask the chip to hand protected frames to the host undecrypted. */
+int mmdrv_set_crypto_in_host(uint16_t vif_id, bool enable, uint32_t *out_value);
+/** Read back what the chip actually holds for that parameter. */
+int mmdrv_get_crypto_in_host(uint16_t vif_id, uint32_t *out_value);
+
 /**
  * Disable the given encryption key.
  *

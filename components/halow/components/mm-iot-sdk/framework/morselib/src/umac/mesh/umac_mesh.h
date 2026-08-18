@@ -31,6 +31,17 @@ struct umac_data;
  */
 bool umac_mesh_validate_args(struct umac_data *umacd, const struct mmwlan_mesh_args *args);
 
+/** Forget every peer link; the next beacon re-runs the peering. */
+void umac_mesh_reset_links(void);
+
+/** Send an HWMP PREQ to @p da, targeting @p da itself. Emitting this is what
+ *  makes us reachable: a peer installs a path to a PREQ's originator. */
+int umac_mesh_hwmp_send_preq(const uint8_t *da);
+
+/** Handle a received mesh action frame (category 13). Answers a PREQ that
+ *  targets us with a PREP. */
+void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta);
+
 /**
  * Bring the mesh interface up: ADD_INTERFACE(type=MESH), BSS config, then
  * MESH_CONFIG(START) to begin beaconing.
@@ -48,6 +59,7 @@ enum mmwlan_status umac_mesh_disable_mesh(struct umac_data *umacd);
 
 /** Count of peers in the ESTABLISHED state. */
 uint8_t umac_mesh_get_peer_count(struct umac_data *umacd);
+
 
 /**
  * Phase 4d — retrieve the mesh args saved by the last successful

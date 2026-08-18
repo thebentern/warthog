@@ -70,6 +70,30 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd);
  */
 bool umac_mesh_beacon_is_active(void);
 
+/**
+ * Serialize the Mesh ID (114) and Mesh Configuration (113) IEs into a flat
+ * buffer, using the same values the beacon advertises. Used to build mesh
+ * probe responses, which take a pre-built IE blob rather than a consbuf.
+ *
+ * SSID is not included -- frame_probe_response_build takes it separately and
+ * mesh STAs advertise a zero-length SSID.
+ *
+ * @param out     destination buffer
+ * @param out_len size of @p out
+ * @returns bytes written, or 0 if mesh is inactive or @p out is too small.
+ */
+uint16_t umac_mesh_build_discovery_ies(uint8_t *out, uint16_t out_len);
+
+/** Worst-case size of umac_mesh_build_discovery_ies() output:
+ *  Supported Rates (2+8) + Mesh ID (2+MMWLAN_MESH_ID_MAXLEN) + Mesh Config (2+7).
+ *  Size every caller's buffer from this -- an under-sized buffer makes the
+ *  builder return 0, which silently kills the only working discovery path. */
+#define UMAC_MESH_DISCOVERY_IES_MAXLEN (2 + 8 + 2 + MMWLAN_MESH_ID_MAXLEN + 2 + 7)
+
+/** Worst-case Mesh Peering action-frame body: category, action, capability(2),
+ *  AID(2), the discovery IEs, then the Peer Management IE (2 + 6). */
+#define UMAC_MESH_MPM_BODY_MAXLEN (6 + UMAC_MESH_DISCOVERY_IES_MAXLEN + 8)
+
 #ifdef __cplusplus
 }
 #endif

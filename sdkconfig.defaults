@@ -89,3 +89,14 @@ CONFIG_MBEDTLS_NIST_KW_C=y
 # --- Log level ---------------------------------------------------------------
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_DEFAULT_LEVEL=3
+
+# AES: poll rather than wait on an interrupt.
+#
+# With CONFIG_MBEDTLS_AES_USE_INTERRUPT the AES peripheral signals completion
+# through an ISR and a semaphore, so every 16-byte block pays a task-switch.
+# Measured on target: 45 us per AES block, ~1.6 ms to CCMP a 256-byte frame,
+# which is ~31% of a core just to encrypt at this link's 400 kbps -- and the
+# same again to decrypt. Host software CCMP (the prerequisite for per-link
+# keys, SAE and OpenMANET interop) has to run per frame, so this cost is
+# structural, not incidental.
+CONFIG_MBEDTLS_AES_USE_INTERRUPT=n

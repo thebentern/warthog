@@ -48,3 +48,41 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Local QEMU VM harness for the Linux MM8108 peer -- never committed.
+# Contains an SSH private key (id_vm), a cloud-init seed with credentials,
+# and several GB of disk images. Recreate with .vm/run-vm.sh.
+.vm/
+
+# Credentials -- never commit, anywhere in the tree
+id_rsa
+id_ecdsa
+id_ed25519
+id_vm
+
+# VM and disk images
+*.qcow2
+*.img
+*.iso
+*.fd
+
+# Run logs and bench scratch
+*.log
+
+# Host-test build products (clang binaries + macOS debug bundles)
+components/halow_mesh_compat/test/*.dSYM/
+components/halow_mesh_compat/test/test_*
+# ...but that pattern is for the COMPILED binaries. Test SOURCES live beside
+# them and must stay tracked -- without these negations a new test_*.c or
+# test_*.sh is silently untracked, and the existing ones only survive because
+# they predate the rule.
+!components/halow_mesh_compat/test/test_*.c
+!components/halow_mesh_compat/test/test_*.h
+!components/halow_mesh_compat/test/test_*.sh
+!components/halow_mesh_compat/test/test_*.c
+components/halow_mesh_compat/test/linkcheck_all
+
+# editor / tooling backups -- never belong in the tree
+*.bak
+*.orig
+*.rej

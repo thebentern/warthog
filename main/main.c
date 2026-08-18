@@ -9,6 +9,7 @@
 #include "at.h"
 #include "cfg.h"
 #include "halow.h"
+#include "mudp.h"
 #include "led.h"
 #include "nat.h"
 #include "region.h"
@@ -63,6 +64,11 @@ void app_main(void)
     (void)warthog_wifi_ap_start();
 
     ESP_ERROR_CHECK(warthog_nat_start());
+    /* Multicast repeater: bridges 239.0.0.69:4403 (Meshtastic's UDP transport)
+     * between the USB, Wi-Fi AP and HaLow-mesh netifs. lwIP does not forward
+     * multicast between netifs, so without this a Meshtastic node on the AP
+     * side never reaches the mesh. */
+    (void)warthog_mudp_start();
     (void)warthog_at_start();
 
     while (1) {

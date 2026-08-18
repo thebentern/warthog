@@ -27,6 +27,10 @@
 
 #include "common/common.h"
 #include "mmlog.h"
+#include "umac/mesh/umac_mesh_plink_tbl.h"
+#include "umac/mesh/umac_mesh_ccmp_kat.h"
+#include "mmosal.h"
+#include "mmhal_core.h"
 
 #include "umac_mesh.h"
 #include "umac/core/umac_core.h"
@@ -40,14 +44,19 @@
 #include "umac/datapath/umac_datapath.h"
 /* Phase 4f-step10 — set the per-VIF operating channel via regdb. */
 #include "umac/regdb/umac_regdb.h"
+#include "umac/ies/s1g_capabilities.h"
+#include "umac/mesh/umac_mesh_hwmp.h"
 /* Phase 4f-step13 — mesh beacon constructor. Replaces the NULL return in
  * mmdrv_host_get_beacon() when the chip asks for a mesh beacon template. */
 #include "umac_mesh_beacon.h"
+#include "umac_mesh_ies.h"
 /* For mmwlan_get_mac_addr() — we need own_addr to stamp into addr2/addr3. */
 #include "mmwlan.h"
 /* Phase 4f-step29 — manual probe-request burst to test chip TX path. */
 #include "umac/frames/frames_common.h"     /* build_mgmt_frame, mgmt_frame_builder_t */
 #include "umac/frames/probe_request.h"     /* frame_probe_request_build, frame_data_probe_request */
+#include "umac/frames/probe_response.h"    /* frame_probe_response_build, frame_data_probe_response */
+#include "umac/frames/action.h"           /* frame_action_build, frame_data_action */
 #include "umac/rc/umac_rc.h"               /* umac_rc_init_rate_table_mgmt */
 #include "common/mac_address.h"            /* mac_addr_broadcast */
 #include "mmdrv.h"                          /* mmdrv_tx_frame, mmdrv_get_tx_metadata */
@@ -75,6 +84,39 @@ static bool s_mesh_args_valid;
  * side mesh-probe task in main/mesh.c calls umac_mesh_tx_broadcast_probe()
  * which uses these to construct + submit each probe. We stash them once
  * during mesh enable so the task doesn't need to re-discover them. */
+/* Probe-response counters, reported by AT+PRSPSTAT?. Storage lives in
+ * main/at.c -- morselib links as an archive, so main must own it. */
+extern volatile uint32_t g_warthog_prsp_rx;
+extern volatile uint32_t g_warthog_prsp_tx;
+extern volatile uint32_t g_warthog_prsp_fail;
+extern volatile uint32_t g_warthog_mpm_rx;
+extern volatile uint32_t g_warthog_mpm_open_tx;
+extern volatile uint32_t g_warthog_mpm_conf_tx;
+extern volatile uint32_t g_warthog_mpm_conf_rx;
+extern volatile uint32_t g_warthog_mpm_close_rx;
+extern volatile uint32_t g_warthog_mpm_parse_fail;
+extern volatile uint32_t g_warthog_mpm_our_llid;
+extern volatile uint32_t g_warthog_mpm_our_plid;
+extern volatile uint8_t g_warthog_mpm_dump[96];
+extern volatile uint16_t g_warthog_mpm_dump_len;
+extern volatile uint16_t g_warthog_mpm_dump_full;
+extern volatile uint32_t g_warthog_mpm_close_reason;
+extern volatile uint32_t g_warthog_mpm_estab;
+extern volatile uint32_t g_warthog_mpm_no_slot;
+extern volatile uint32_t g_warthog_mpm_expired;
+extern volatile uint32_t g_warthog_mpm_close_tx;
+extern volatile uint32_t g_warthog_hwmp_rx, g_warthog_hwmp_preq_rx, g_warthog_hwmp_preq_tx;
+extern volatile uint32_t g_warthog_hwmp_prep_tx, g_warthog_hwmp_parse_fail, g_warthog_hwmp_not_ours;
+extern volatile uint32_t g_warthog_hwmp_prep_rx;
+extern volatile uint8_t g_warthog_hwmp_dump[48];
+extern volatile uint16_t g_warthog_hwmp_dump_len, g_warthog_hwmp_dump_full;
+extern volatile uint32_t g_warthog_cryptohost_req, g_warthog_cryptohost_done;
+extern volatile uint32_t g_warthog_cryptohost_rc, g_warthog_cryptohost_val;
+extern volatile uint32_t g_warthog_ccmp_kat_ran;
+void umac_datapath_mesh_service_rekey(void);
+extern volatile char g_warthog_mpm_links[256];
+extern volatile uint32_t g_warthog_mesh_peer_add_fail;
+
 static struct umac_data *s_mesh_umacd = NULL;
 static uint16_t s_mesh_vif_id = 0;
 static uint8_t s_mesh_own_addr[6] = {0};
@@ -85,12 +127,6 @@ static uint8_t s_mesh_own_addr[6] = {0};
  * BSSID set as their Addr3 RX filter will admit our beacon. */
 static uint8_t s_mesh_shared_bssid[6] = {0};
 static bool s_mesh_shared_bssid_valid = false;
-
-/* Public accessor for the beacon constructor. */
-const uint8_t *umac_mesh_get_shared_bssid(void)
-{
-    return s_mesh_shared_bssid_valid ? s_mesh_shared_bssid : NULL;
-}
 
 const struct mmwlan_mesh_args *umac_mesh_get_args(void)
 {
@@ -150,6 +186,20 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
     }
 
     MMLOG_INF("mesh: chip firmware ACCEPTED a mesh VIF (vif_id=%u)\n", vif_id);
+
+    /* Install the mesh datapath ops HERE, immediately after the vif exists and
+     * BEFORE any command that can make the chip start delivering frames.
+     *
+     * The reference port binds umac_datapath_ops_mesh at umac_interface_add()
+     * time for exactly this reason. Warthog used to install them near the end
+     * of this function -- after MESH_CONFIG(START) -- which leaves a window
+     * where the chip is already beaconing/receiving while data->ops is still
+     * NULL, and umac_datapath_rx_frame_filter() drops every frame with
+     * "Frame received before datapath configured".
+     *
+     * Idempotent (it just assigns a pointer), so the later call is harmless. */
+    umac_datapath_configure_mesh_mode(umacd);
+    MMLOG_INF("mesh: datapath ops installed early (before any RX can arrive)\n");
 
     /* Phase 4f-step10 — set the per-VIF operating channel. AP mode does this
      * via umac_interface_set_channel before BSS_CONFIG (umac_ap.c:245). The
@@ -257,20 +307,19 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
      * If the chip's mesh state machine requires NDP probe support to be
      * enabled before its `mesh_delayed_start` task arms, this is the
      * missing trigger. */
-    {
-        extern int mmdrv_set_ndp_probe(uint16_t vif_id, bool enabled);
-        int ndp_ret = mmdrv_set_ndp_probe(vif_id, true);
-        if (ndp_ret != 0)
-        {
-            MMLOG_WRN("mesh: SET_NDP_PROBE_SUPPORT(enable=1) rejected: %d "
-                      "(opcode 0x800C; could be chip firmware doesn't expose it)\n", ndp_ret);
-        }
-        else
-        {
-            MMLOG_INF("mesh: [step28] SET_NDP_PROBE_SUPPORT(enable=1) OK — "
-                      "chip should now RX NDP probe req/resp for mesh peer discovery\n");
-        }
-    }
+    /* DISABLED BY DEFAULT (step28 was speculative and is a prime RX suspect).
+     *
+     * The known-working ESP32 mesh port never sends SET_NDP_PROBE_SUPPORT at all
+     * -- zero occurrences in its entire mesh implementation. NDP (Null Data
+     * Packet) probes are matched by CSSID, the same field we were wrongly
+     * programming non-zero above. Enabling NDP probe support plausibly switches
+     * the chip's discovery/match path to NDP+CSSID and stops ordinary mgmt
+     * frames from being delivered -- which is exactly the failure we measured
+     * (TX fine, MESH_CONFIG accepted, zero RX once the mesh vif is active).
+     *
+     * Define WARTHOG_MESH_NDP_PROBE to restore it for an A/B. */
+    MMLOG_INF("mesh: SET_NDP_PROBE_SUPPORT skipped (reference port never sends it)\n");
+
 
     /* Linux step 2 (BSS_CHANGED_BEACON_ENABLED handler, first thing in
      * morse_mac_bss_info_changed): BSS_BEACON_CONFIG enable=true.
@@ -286,17 +335,22 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
                   "(now sent BEFORE BSSID/BSS_CONFIG, matching Linux)\n");
     }
 
-    /* Linux step 3 (same handler block, immediately after BSS_BEACON_CONFIG):
-     * MESH_CONFIG(START) with mbca_config=0 (step25 confirmed MBCA-OFF works
-     * and chip accepts), enable_beaconing=true. */
-    ret = mmdrv_mesh_config(vif_id, /*start=*/true, /*enable_beaconing=*/true);
-    if (ret != 0)
-    {
-        MMLOG_ERR("mesh: MESH_CONFIG(START) rejected by firmware: %d\n", ret);
-        return MMWLAN_ERROR;
-    }
-    MMLOG_INF("mesh: [step27] MESH_CONFIG(START) accepted — "
-              "expecting chip's mesh_delayed_start task to arm now\n");
+    /* MESH_CONFIG(START) USED TO BE HERE — it is now the LAST chip command in
+     * this function. See the block after mmdrv_start_beaconing() below.
+     *
+     * Rationale: MESH_CONFIG(START, enable_beaconing=1) makes the firmware run
+     * an MBSS TBTT-selection scan and then raise a beacon interrupt every TBTT,
+     * expecting the HOST to serve each beacon template via
+     * mmdrv_host_get_beacon(). Issuing it here -- before BSSID_SET, BSS_CONFIG,
+     * the beacon constructor init, and mmdrv_start_beaconing() -- points the
+     * firmware at a host that cannot answer yet. The firmware then beacons into
+     * an unready host and the command channel backs up (page exhaustion), which
+     * matches both symptoms we measured: no beacons on air (monitor capture saw
+     * only the 2 s diagnostic probe bursts, never ~10/s beacons) and RXCHAN
+     * never showing anything but chan=0xfe, the command channel.
+     *
+     * The ordering is load-bearing: configure the BSS, then make the host able
+     * to serve a beacon, and only then tell the firmware to start. */
 
     /* Phase 4f-step32 — derive a SHARED mesh BSSID from the mesh_id hash.
      *
@@ -320,12 +374,33 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
     uint16_t beacon_int = args->beacon_interval_tu ? args->beacon_interval_tu : 100;
 
     uint8_t shared_bssid[6];
+#ifdef WARTHOG_MESH_BSSID_OWN_MAC
+    /* Use our OWN MAC as the mesh BSSID -- what mac80211 actually does
+     * (bss_conf.bssid = vif->addr for NL80211_IFTYPE_MESH_POINT), and what the
+     * known-working ESP32 mesh port does ("Set the BSSID = this node's own MAC
+     * ... Unlike IBSS, MESH_CONFIG doesn't carry the BSSID, so it must be set
+     * separately first").
+     *
+     * The step-32 derived-BSSID scheme below was invented to force two warthog
+     * boards onto a common Addr3 so the chip's BSSID RX filter would pass peer
+     * frames. But it makes us incompatible with any REAL 802.11s peer: a Linux
+     * mesh node beacons with addr3 = its own MAC, so a derived BSSID guarantees
+     * a mismatch in both directions. Measured directly: the Linux peer hears us
+     * fine in monitor mode (+7 dBm) but shows RX=0 and no peers once it is in
+     * mesh mode with its own-MAC BSSID. */
+    if (mmwlan_get_mac_addr(shared_bssid) != MMWLAN_SUCCESS)
+    {
+        MMLOG_ERR("mesh: get_mac_addr failed; cannot set own-MAC BSSID\n");
+        return MMWLAN_ERROR;
+    }
+#else
     shared_bssid[0] = 0x02;
     shared_bssid[1] = (uint8_t)((cssid      ) & 0xff);
     shared_bssid[2] = (uint8_t)((cssid >>  8) & 0xff);
     shared_bssid[3] = (uint8_t)((cssid >> 16) & 0xff);
     shared_bssid[4] = (uint8_t)((cssid >> 24) & 0xff);
     shared_bssid[5] = 0x5a;
+#endif
 
     ret = mmdrv_set_bssid(vif_id, shared_bssid);
     if (ret != 0)
@@ -347,7 +422,21 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
 
     /* Linux step 5 (BSS_CHANGED_BEACON_INT|SSID handler, LAST in
      * morse_mac_bss_info_changed): BSS_CONFIG with cssid + beacon_int. */
-    ret = mmdrv_cfg_bss(vif_id, beacon_int, /*dtim_period=*/1, cssid);
+    /* cssid = 0 for mesh, deliberately.
+     *
+     * The CSSID (Compressed SSID) is an S1G matching field the chip uses for
+     * NDP probe / short-beacon matching. Programming our own CRC32(mesh_id)
+     * here tells the chip to match on THAT value; a peer's frames need not
+     * carry it (a Linux mac80211 mesh node does not populate a matching
+     * cssid at all), so a non-zero value can gate RX in exactly the way we
+     * measured: chip accepts MESH_CONFIG, TX works, and nothing is ever
+     * delivered up once the mesh vif is active.
+     *
+     * The known-working ESP32 mesh port passes 0 here
+     * (mmdrv_cfg_bss(vif_id, beacon_interval_tu, 1, 0)). Match it.
+     * WARTHOG_MESH_CSSID_NONZERO restores the old behaviour for A/B testing. */
+    ret = mmdrv_cfg_bss(vif_id, beacon_int, /*dtim_period=*/1, /*cssid=*/0);
+
     if (ret != 0)
     {
         MMLOG_ERR("mesh: BSS_CONFIG rejected by firmware: %d "
@@ -416,6 +505,30 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
                   "for vif_id=%u (watch mmdrv_host_get_beacon counter)\n",
                   vif_id);
     }
+
+    /* MESH_CONFIG(START, enable_beaconing=1) — LAST chip command, deliberately.
+     *
+     * Everything the firmware needs before it may beacon is now in place:
+     * BSSID_SET, BSS_CONFIG (beacon_int + cssid), the beacon constructor
+     * (umac_mesh_beacon_init), and the host beacon engine / beacon IRQ
+     * (mmdrv_start_beaconing). Only now is it safe to let the firmware start
+     * requesting beacons, because mmdrv_host_get_beacon() can actually answer.
+     *
+     * mbca_config must be NON-ZERO (see mmdrv_mesh_config in driver.c): zero
+     * selects beaconless mode, which contradicts enable_beaconing=1 and leaves
+     * the chip accepting START while never beaconing -- exactly what we
+     * measured on air before this change.
+     *
+     * The firmware runs an MBSS TBTT-selection scan (~2 s) before the first
+     * beacon interrupt, so expect a short delay before beacons appear. */
+    ret = mmdrv_mesh_config(vif_id, /*start=*/true, /*enable_beaconing=*/true);
+    if (ret != 0)
+    {
+        MMLOG_ERR("mesh: MESH_CONFIG(START) rejected by firmware: %d\n", ret);
+        return MMWLAN_ERROR;
+    }
+    MMLOG_INF("mesh: MESH_CONFIG(START) accepted LAST (after BSSID/BSS_CONFIG/"
+              "beacon-engine) — firmware TBTT scan ~2s, then beacon IRQs\n");
 
     /* Phase 4f-step7 — install mesh-aware datapath ops. This unblocks the
      * RX filter (data->ops != NULL gate) so the chip's delivered frames
@@ -604,38 +717,799 @@ int umac_mesh_tx_broadcast_probe(void)
     return ret;
 }
 
+/* Answer a peer's mesh probe request.
+ *
+ * This closes the discovery loop. A Linux MM8108 in beaconless mesh mode
+ * (mesh_beaconless_mode=1) discovers peers by probing rather than by listening
+ * for beacons, and warthog was receiving those probe requests and dropping them
+ * -- "ignoring probe req (no responder yet)" in umac_datapath_mesh.c. With no
+ * response the peer never learns warthog exists, so no candidate and no plink.
+ *
+ * That path matters because warthog's chip does not currently beacon in mesh
+ * mode at all (the beacon IRQ never fires; see AT+BCNSTAT?), so probe/response
+ * is the only discovery mechanism available to us.
+ *
+ * addr3 is our own address: mac80211 uses vif->addr as the mesh BSSID, so a
+ * Linux peer matches on that. The IEs carry Mesh ID + Mesh Configuration with
+ * exactly the values our beacon would advertise, because mesh_matches_local()
+ * compares them before accepting a candidate. */
+int umac_mesh_tx_probe_response(const uint8_t *da)
+{
+    if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL)
+    {
+        g_warthog_prsp_fail++;
+        return -1;
+    }
+
+    uint8_t ies[UMAC_MESH_DISCOVERY_IES_MAXLEN];
+    uint16_t ies_len = umac_mesh_build_discovery_ies(ies, (uint16_t)sizeof(ies));
+    if (ies_len == 0)
+    {
+        g_warthog_prsp_fail++;
+        return -2;
+    }
+
+    /* Chip stamps the real TSF on TX; zero here is fine. */
+    uint8_t timestamp[8] = { 0 };
+    struct frame_data_probe_response prsp = {
+        .destination_address = da,
+        .timestamp = timestamp,
+        .bssid = s_mesh_own_addr,
+        .ssid = NULL,
+        .ssid_len = 0,
+        .ies = ies,
+        .ies_len = ies_len,
+        .beacon_interval = s_mesh_args.beacon_interval_tu ? s_mesh_args.beacon_interval_tu : 100,
+        .capability_info = (s_mesh_args.security_type == MMWLAN_SAE) ? 0x0010 : 0x0000,
+    };
+
+    struct mmpkt *rsp = build_mgmt_frame(s_mesh_umacd, frame_probe_response_build, &prsp);
+    if (rsp == NULL)
+    {
+        g_warthog_prsp_fail++;
+        return -3;
+    }
+
+    struct mmdrv_tx_metadata *tx_md = mmdrv_get_tx_metadata(rsp);
+    tx_md->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
+    tx_md->tid = MMWLAN_MAX_QOS_TID;
+    tx_md->vif_id = s_mesh_vif_id;
+    umac_rc_init_rate_table_mgmt(s_mesh_umacd, &tx_md->rc_data, false);
+
+    int ret = mmdrv_tx_frame(rsp, /*is_mgmt=*/true);
+    if (ret >= 0)
+    {
+        g_warthog_prsp_tx++;
+    }
+    else
+    {
+        g_warthog_prsp_fail++;
+    }
+    return ret;
+}
+
+/* ---- Mesh Peering Management (MPM) ------------------------------------- *
+ *
+ * Minimal responder so a peer's peering handshake can complete. The Phase-1
+ * port of mac80211's full MPM FSM lives in components/halow_mesh_compat, but
+ * that component is host-test only and is NOT linked into the firmware, so the
+ * on-air behaviour has to live here.
+ *
+ * Observed state before this: the Linux peer reaches OPN_SNT with a valid llid
+ * and plid=0, retransmitting Open and never hearing back, so the plink never
+ * reaches ESTAB. We answer an Open with our own Open followed by a Confirm,
+ * which is what mac80211's mesh_plink does for a passive peer.
+ *
+ * Frame layout follows mesh_mpm_frame.c (the ported builder):
+ *   category(1)=15 SELF_PROTECTED, action(1), capability(2),
+ *   [AID(2) for CONFIRM], Mesh ID IE, Mesh Configuration IE,
+ *   Peer Management IE(117): len, peering_proto(2)=0, llid(2), [plid(2)]
+ *
+ * Link-id perspective: the llid carried in a received frame is, from our point
+ * of view, the *peer's* id -- i.e. our plid. Confirm must echo it back.
+ */
+#define MPM_CATEGORY_SELF_PROTECTED 15
+#define MPM_ACTION_OPEN 1
+#define MPM_ACTION_CONFIRM 2
+#define MPM_ACTION_CLOSE 3
+
+/** Unanswered Opens before we assume the peer holds a stale link and Close it.
+ *  Opens go out one per received beacon (~1 s), so this is a few seconds. */
+#ifndef MPM_OPEN_RETRY_MAX
+#define MPM_OPEN_RETRY_MAX 8
+#endif
+/** 802.11 reason 52, MESH-PEERING-CANCELLED. */
+#define MPM_REASON_PEER_CANCELED 52
+
+/** Path lifetime we advertise, in TUs. 4882 TU ~= 5 s, which is what
+ *  mac80211 uses for dot11MeshHWMPactivePathTimeout by default. */
+#define UMAC_MESH_HWMP_LIFETIME_TU 4882u
+
+/** How often we refresh our path at each peer. Must stay comfortably inside
+ *  the peer's 5 s active-path timeout. */
+#define UMAC_MESH_HWMP_PREQ_PERIOD_MS 2000u
+#define MPM_IE_PEER_MGMT 117
+
+/* Per-peer MPM link state. The table itself lives in the freestanding
+ * umac_mesh_plink_tbl.c so the host tests drive the real code; this file keeps
+ * the policy that needs the radio -- llid minting, teardown, publication. */
+/* Drop a link we have heard nothing from for this long. Peers probe every 2 s
+ * and that probe refreshes the timer, so 30 s is ~15 missed probes. */
+#define MPM_PEER_TIMEOUT_MS 30000u
+
+static struct mpm_table s_mpm;
+
+/* Mint an llid for a NEW link.
+ *
+ * Must be random, not derived from the MAC: a deterministic llid makes a
+ * rebooted node come back with the id it had before, so its peers cannot tell
+ * the link restarted -- the "re-opened with a new llid" teardown never fires,
+ * they keep a stale stad and a stale chip registration, and the returning node
+ * can talk to nobody. Measured exactly that (estab=1 on every side, 0/4 both
+ * ways). mac80211 randomises llid per plink for this reason.
+ *
+ * mpm_table_get_or_create() ignores this for an EXISTING link, so calling it
+ * per frame cannot disturb a handshake in progress.
+ */
+/* Per-link AID for the Confirm: the link's slot, 1-based. Non-zero (AID 0 is
+ * the group key) and distinct per peer, mirroring what wpa_supplicant assigns.
+ * Returns 1 for an unknown link rather than 0 -- a wrong-but-valid AID still
+ * peers; a zero one does not. */
+static uint16_t mpm_aid_for_(const struct mpm_link *l)
+{
+    if (l == NULL)
+    {
+        return 1;
+    }
+    long idx = (long)(l - &s_mpm.links[0]);
+    if (idx < 0 || idx >= MPM_MAX_LINKS)
+    {
+        return 1;
+    }
+    return (uint16_t)(idx + 1);
+}
+
+static uint16_t mpm_mint_llid_(void)
+{
+    uint16_t v = (uint16_t)mmhal_random_u32(1, 0xfffe);
+    return v ? v : (uint16_t)0x1234;
+}
+
+static void mpm_publish_(const struct mpm_link *l);
+
+/* Expire links we have stopped hearing from, tearing down the datapath peer
+ * for each. Driven from the probe path rather than a timer: peers probe every
+ * 2 s, so this runs often enough and costs nothing when idle. */
+static void mpm_expire_stale_(uint32_t now_ms)
+{
+    uint8_t gone[MPM_MAX_LINKS][MPM_ADDR_LEN];
+    int n = mpm_table_expire(&s_mpm, now_ms, MPM_PEER_TIMEOUT_MS, gone, MPM_MAX_LINKS);
+    for (int i = 0; i < n; i++)
+    {
+        umac_datapath_mesh_del_peer(gone[i]);
+    }
+    if (n > 0)
+    {
+        g_warthog_mpm_expired = s_mpm.expired;
+        mpm_publish_(NULL);
+    }
+}
+
+/* Mirror the aggregate view the AT counters expose. `estab` is the number of
+ * established links, so the two-board case still reads estab=1. */
+static void mpm_publish_(const struct mpm_link *l)
+{
+    if (l != NULL)
+    {
+        g_warthog_mpm_our_llid = l->llid;
+        g_warthog_mpm_our_plid = l->plid;
+    }
+    g_warthog_mpm_estab = mpm_table_estab_count(&s_mpm);
+    g_warthog_mpm_no_slot = s_mpm.no_slot;
+    g_warthog_mpm_expired = s_mpm.expired;
+
+    /* Render into main's buffer for AT+MPMPEERS?. Pushed rather than exposed
+     * as a getter: morselib is a static archive, and the linker will not
+     * extract an object merely to satisfy a call from main. */
+    mpm_table_render(&s_mpm, (char *)g_warthog_mpm_links, sizeof(g_warthog_mpm_links));
+}
+
+static int mesh_tx_mpm_(const uint8_t *da, uint8_t action, uint16_t llid, uint16_t plid,
+                        uint16_t reason, uint16_t aid)
+{
+    if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL)
+    {
+        return -1;
+    }
+
+    /* S1G Capabilities. The far side's Morse driver validates this on every
+     * peering frame -- without it the receiving driver logs
+     * "S1G capabilities mismatch - fc 0x00d0" and the frame never reaches
+     * wpa_supplicant, so a peer answers our Open but never sees our Confirm.
+     * Built with morselib's own element builder so it describes this chip
+     * rather than a hand-rolled guess. */
+    uint8_t s1g_caps[64];
+    struct consbuf cb;
+    consbuf_reinit(&cb, s1g_caps, sizeof(s1g_caps));
+    ie_s1g_capabilities_build(s_mesh_umacd, &cb);
+    uint16_t s1g_caps_len = (uint16_t)cb.offset;
+
+    uint8_t body[UMAC_MESH_MPM_BODY_MAXLEN + sizeof(s1g_caps)];
+    uint16_t n = umac_mesh_ies_build_mpm_body(body, (uint16_t)sizeof(body), action, llid, plid, reason, aid,
+                                              s_mesh_args.mesh_id, s_mesh_args.mesh_id_len,
+                                              s_mesh_args.security_type == MMWLAN_SAE,
+                                              s1g_caps, s1g_caps_len);
+    if (n == 0)
+    {
+        return -2; /* unsupported action (CLOSE) or bad arguments */
+    }
+
+    struct frame_data_action act = {
+        .bssid = s_mesh_own_addr, /* mesh: BSSID = our own address */
+        .dst_address = da,
+        .src_address = s_mesh_own_addr,
+        .action_field = body,
+        .action_field_len = n,
+    };
+
+    /* Stash the exact bytes for AT+MPMDUMP?. This driver cannot capture frames
+     * on air (NL80211_IFTYPE_MONITOR is absent from its interface_modes, so iw
+     * monitor mode silently captures nothing), and the remaining MPM failure
+     * can only be diagnosed by diffing our Confirm against a Linux-generated
+     * one field by field. Dumping what we build is the only way to get there. */
+    if (action == MPM_ACTION_CONFIRM)
+    {
+        uint16_t cp = (n < sizeof(g_warthog_mpm_dump)) ? n : (uint16_t)sizeof(g_warthog_mpm_dump);
+        memcpy((void *)g_warthog_mpm_dump, body, cp);
+        g_warthog_mpm_dump_len = cp;
+        g_warthog_mpm_dump_full = n;
+    }
+
+    struct mmpkt *frm = build_mgmt_frame(s_mesh_umacd, frame_action_build, &act);
+    if (frm == NULL)
+    {
+        return -3;
+    }
+
+    struct mmdrv_tx_metadata *tx_md = mmdrv_get_tx_metadata(frm);
+    tx_md->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
+    tx_md->tid = MMWLAN_MAX_QOS_TID;
+    tx_md->vif_id = s_mesh_vif_id;
+    umac_rc_init_rate_table_mgmt(s_mesh_umacd, &tx_md->rc_data, false);
+
+    return mmdrv_tx_frame(frm, /*is_mgmt=*/true);
+}
+
+/* Our HWMP sequence number and path-discovery id. Both are ours alone to
+ * increment; a peer only ever compares them against what it last saw from us,
+ * so they must be monotonic across the life of the link and must never be
+ * reset while a peer still holds a path to us. */
+static uint32_t s_hwmp_sn;
+static uint32_t s_hwmp_preq_id;
+static uint32_t s_hwmp_last_preq_ms;
+
+/* Send an HWMP action frame. Same recipe as mesh_tx_mpm_, including the S1G
+ * Capabilities element: the far side's Morse driver validates that on action
+ * frames and drops the ones that lack it, which is what made our Confirms
+ * vanish before. A mac80211 peer parses elements generically and length-checks
+ * only the PREQ/PREP element, so the extra element is harmless to Linux and
+ * required by a warthog peer. */
+static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
+{
+    if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL || body == NULL || body_len == 0)
+    {
+        return -1;
+    }
+
+    uint8_t s1g_caps[64];
+    struct consbuf cb;
+    consbuf_reinit(&cb, s1g_caps, sizeof(s1g_caps));
+    ie_s1g_capabilities_build(s_mesh_umacd, &cb);
+    uint16_t s1g_caps_len = (uint16_t)cb.offset;
+
+    uint8_t frame[HWMP_PREQ_BODY_LEN + sizeof(s1g_caps)];
+    if ((uint32_t)body_len + s1g_caps_len > sizeof(frame))
+    {
+        return -2;
+    }
+    memcpy(frame, body, body_len);
+    memcpy(frame + body_len, s1g_caps, s1g_caps_len);
+
+    struct frame_data_action act = {
+        .bssid = s_mesh_own_addr,
+        .dst_address = da,
+        .src_address = s_mesh_own_addr,
+        .action_field = frame,
+        .action_field_len = (uint16_t)(body_len + s1g_caps_len),
+    };
+
+    struct mmpkt *frm = build_mgmt_frame(s_mesh_umacd, frame_action_build, &act);
+    if (frm == NULL)
+    {
+        return -3;
+    }
+
+    struct mmdrv_tx_metadata *tx_md = mmdrv_get_tx_metadata(frm);
+    tx_md->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
+    tx_md->tid = MMWLAN_MAX_QOS_TID;
+    tx_md->vif_id = s_mesh_vif_id;
+    umac_rc_init_rate_table_mgmt(s_mesh_umacd, &tx_md->rc_data, false);
+
+    return mmdrv_tx_frame(frm, /*is_mgmt=*/true);
+}
+
+/* Ask @p da for a path to itself.
+ *
+ * Emitting this is what makes US reachable: a peer that accepts a PREQ installs
+ * a path to the ORIGINATOR, so the request does double duty. Targeting the peer
+ * itself (rather than the broadcast address, which selects the peer's
+ * proactive-root branch) also makes it answer with a PREP. */
+int umac_mesh_hwmp_send_preq(const uint8_t *da)
+{
+    uint8_t body[HWMP_PREQ_BODY_LEN];
+    uint16_t n = umac_mesh_hwmp_build_preq(body, sizeof(body), s_mesh_own_addr, ++s_hwmp_sn,
+                                           ++s_hwmp_preq_id, da, UMAC_MESH_HWMP_LIFETIME_TU);
+    if (n == 0)
+    {
+        return -1;
+    }
+    int rc = mesh_tx_hwmp_(da, body, n);
+    if (rc >= 0)
+    {
+        g_warthog_hwmp_preq_tx++;
+    }
+    return rc;
+}
+
+/* Handle a received mesh action frame (category 13).
+ *
+ * Answer a PREQ that targets us with a PREP; a PREQ for anyone else is counted
+ * and ignored, because warthog does not forward. */
+void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta)
+{
+    struct hwmp_preq preq;
+
+    g_warthog_hwmp_rx++;
+    {
+        /* Snapshot whatever category 13 actually delivers. parse_fail counting
+         * every frame while the link works says the shape is not what we
+         * assumed, and there is no other way to see it on this board. */
+        uint16_t cp = (len < sizeof(g_warthog_hwmp_dump)) ? len
+                                                          : (uint16_t)sizeof(g_warthog_hwmp_dump);
+        memcpy((void *)g_warthog_hwmp_dump, body, cp);
+        g_warthog_hwmp_dump_len = cp;
+        g_warthog_hwmp_dump_full = len;
+    }
+    /* A PREP is the peer ANSWERING one of our PREQs -- it means the path we
+     * asked for exists. Count it as the success it is; lumping it into
+     * parse_fail reads as "we cannot decode anything" on a link that is in
+     * fact working. We do not act on it: mac80211 installs the path to us
+     * from our own PREQ's originator block, which is the whole point of
+     * emitting one. */
+    if (len >= 3u && body[2] == HWMP_EID_PREP)
+    {
+        g_warthog_hwmp_prep_rx++;
+        return;
+    }
+    if (!umac_mesh_hwmp_parse_preq(body, len, &preq))
+    {
+        g_warthog_hwmp_parse_fail++;
+        return;
+    }
+    g_warthog_hwmp_preq_rx++;
+    if (!umac_mesh_hwmp_targets_us(&preq, s_mesh_own_addr))
+    {
+        g_warthog_hwmp_not_ours++;
+        return; /* we do not forward, so a PREQ for a third party is not ours */
+    }
+
+    /* Our sequence number must stay ahead of anything the peer has recorded
+     * for us, or it treats our PREP as stale and keeps discovering -- but only
+     * where the peer actually has a value. See umac_mesh_hwmp_next_own_sn(). */
+    s_hwmp_sn = umac_mesh_hwmp_next_own_sn(s_hwmp_sn, &preq);
+
+    uint8_t prep[HWMP_PREP_BODY_LEN];
+    uint16_t n = umac_mesh_hwmp_build_prep(prep, sizeof(prep), &preq, s_mesh_own_addr, s_hwmp_sn);
+    if (n == 0)
+    {
+        return;
+    }
+    /* Reply to the transmitter, which for a one-hop peer is the originator. */
+    if (mesh_tx_hwmp_(ta != NULL ? ta : preq.orig_addr, prep, n) >= 0)
+    {
+        g_warthog_hwmp_prep_tx++;
+    }
+}
+
+/* Pull the reason code out of a Close frame's Peer Management IE.
+ *
+ * mac80211 states WHY it refused the peering here -- 802.11 reason codes 52-60
+ * (MESH_MAX_PEERS, MESH_CONFIG_POLICY_VIOLATION, MESH_CONFIRM_TIMEOUT,
+ * MESH_INCONSISTENT_PARAMS ...). That is far more informative than guessing at
+ * which IE field it dislikes, and there is no way to capture the frame on air
+ * with this driver. Reason is the last two octets of the PM IE. */
+
+/* Locate the Peer Management IE and pull out the sender's link id. */
+
+/* Second link-id field of a Confirm: the sender's view of OUR llid. */
+
+/* Proactively open a peering with a node we have just heard from.
+ *
+ * warthog-to-warthog needs this: both ends only ever ANSWERED an Open, so two
+ * warthog boards sat waiting for each other forever. mac80211 initiates from
+ * mesh_neighbour_update when auto_open_plinks is set; this is the equivalent.
+ * Driven off the peer's probe request (every 2 s), which doubles as the
+ * retransmit timer -- MPM tolerates duplicate Opens. */
+void umac_mesh_maybe_initiate_mpm(const uint8_t *ta)
+{
+    if (s_mesh_umacd == NULL || !s_mesh_args_valid || ta == NULL)
+    {
+        return;
+    }
+    const uint32_t now_ms = (uint32_t)mmosal_get_time_ms();
+    mpm_expire_stale_(now_ms);
+    umac_datapath_mesh_service_rekey(); /* AT+REKEY=<n>, serviced here */
+
+    /* Validate AES-CCM through the shipping mbedtls path, once. The host test
+     * links hostap's software AES, so this is the only thing that exercises
+     * crypto_mbedtls_mm.c -- whose aes_encrypt_init() built a DECRYPTION key
+     * schedule until recently, which would make every result silently wrong. */
+    if (g_warthog_ccmp_kat_ran == 0)
+    {
+        umac_mesh_ccmp_kat_run();
+    }
+
+    /* AT+CRYPTOHOST=<0|1> / ? -- same flag-and-service pattern, because main
+     * cannot call into the morselib archive directly. Set, then read back:
+     * a firmware that ignores an unknown parameter can still answer the SET
+     * with success, so only the read-back says whether it took. */
+    {
+        uint32_t req = g_warthog_cryptohost_req;
+        if (req != 0)
+        {
+            g_warthog_cryptohost_req = 0;
+            uint32_t val = 0xffffffffu;
+            int rc = 0;
+            if (req == 3)
+            {
+                rc = mmdrv_get_crypto_in_host(s_mesh_vif_id, &val);
+            }
+            else
+            {
+                rc = mmdrv_set_crypto_in_host(s_mesh_vif_id, req == 1, &val);
+                if (rc == 0)
+                {
+                    (void)mmdrv_get_crypto_in_host(s_mesh_vif_id, &val);
+                }
+            }
+            g_warthog_cryptohost_rc = (uint32_t)rc;
+            g_warthog_cryptohost_val = val;
+            g_warthog_cryptohost_done++;
+        }
+    }
+
+    /* Keep a path to us alive at every established peer.
+     *
+     * The peer's path expires after dot11MeshHWMPactivePathTimeout (5 s by
+     * default) and, once it has, the peer silently stops sending us unicast --
+     * broadcast keeps working, so the link looks up while nothing routes. Our
+     * own PREQ refreshes it: a peer installs a path to any PREQ originator it
+     * accepts, so this is what keeps warthog reachable without waiting to be
+     * asked. Driven off the probe cadence, which is warthog's own clock, not
+     * the peer's -- a peer that goes quiet is exactly when this must not stop. */
+    {
+        const uint32_t now = (uint32_t)mmosal_get_time_ms();
+        if (s_hwmp_last_preq_ms == 0u ||
+            (uint32_t)(now - s_hwmp_last_preq_ms) >= UMAC_MESH_HWMP_PREQ_PERIOD_MS)
+        {
+            s_hwmp_last_preq_ms = now;
+            for (int i = 0; i < MPM_MAX_LINKS; i++)
+            {
+                struct mpm_link *pl = &s_mpm.links[i];
+                if (pl->used && pl->estab)
+                {
+                    (void)umac_mesh_hwmp_send_preq(pl->addr);
+                }
+            }
+        }
+    }
+
+    struct mpm_link *l = mpm_table_get_or_create(&s_mpm, ta, mpm_mint_llid_(), (uint32_t)mmosal_get_time_ms());
+    if (l == NULL)
+    {
+        return; /* table full -- a real mesh would answer Close(MESH_MAX_PEERS) */
+    }
+    l->last_heard_ms = now_ms;
+    if (l->estab)
+    {
+        return; /* already peered with THIS neighbour; others still open freely */
+    }
+    /* A peer that already holds an ESTAB link to us ignores Opens carrying a
+     * new link id, so a node that restarted while its neighbour did not will
+     * retry forever against a peer that considers the link up. That is not
+     * hypothetical: it is what warthog does after a reflash, and it left the
+     * peering established on one side and stuck at plid=0 on ours.
+     *
+     * After MPM_OPEN_RETRY_MAX unanswered Opens, send Close so the peer drops
+     * its half and runs the handshake again, then forget the link so the next
+     * beacon is a first sighting and re-opens with a fresh llid. Close carries
+     * our llid in the plid position: that is the id the peer recorded for us,
+     * and it is all we can cite while our own plid is still unknown. */
+    if (l->opens >= MPM_OPEN_RETRY_MAX)
+    {
+        if (mesh_tx_mpm_(ta, MPM_ACTION_CLOSE, 0, l->llid, MPM_REASON_PEER_CANCELED, 0) >= 0)
+        {
+            g_warthog_mpm_close_tx++;
+        }
+        mpm_table_release(&s_mpm, l);
+        return;
+    }
+    if (mesh_tx_mpm_(ta, MPM_ACTION_OPEN, l->llid, 0, 0, 0) >= 0)
+    {
+        g_warthog_mpm_open_tx++;
+        l->opens++;
+    }
+    mpm_publish_(l);
+}
+
+void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
+{
+    if (ta == NULL || body == NULL || len < 4)
+    {
+        return;
+    }
+
+    uint8_t action = body[1];
+    uint16_t peer_llid = 0;
+    /* Track parse success: a silent failure here would leave peer_llid at 0 and
+     * make our Confirm carry plid=0, which mac80211 answers with CNF_IGNR
+     * (it requires frame plid == its own llid) -- leaving the peer stuck in
+     * OPN_RCVD exactly as observed. Surfaced via AT+MPMSTAT?. */
+    if (!umac_mesh_ies_get_peer_llid(body, len, &peer_llid))
+    {
+        g_warthog_mpm_parse_fail++;
+    }
+
+    g_warthog_mpm_rx++;
+    {
+        struct mpm_link *heard = mpm_table_find(&s_mpm, ta);
+        if (heard != NULL)
+        {
+            heard->last_heard_ms = (uint32_t)mmosal_get_time_ms();
+        }
+    }
+
+    if (action == MPM_ACTION_OPEN)
+    {
+        /* Their llid is our plid. If it failed to parse, stay quiet: a Confirm
+         * carrying plid=0 is answered with CNF_IGNR (mac80211 requires the
+         * frame's plid to equal its own llid), so sending one would burn the
+         * peer's 100 ms confirm window on a frame guaranteed to be dropped. */
+        if (peer_llid == 0)
+        {
+            return;
+        }
+        struct mpm_link *l = mpm_table_get_or_create(&s_mpm, ta, mpm_mint_llid_(), (uint32_t)mmosal_get_time_ms());
+        if (l == NULL)
+        {
+            /* Table full. Say so rather than dropping the Open in silence:
+             * 802.11s expects Close(MESH-MAX-PEERS), and a peer that gets no
+             * answer at all just retries until it times out, having learned
+             * nothing. plid is the requester's llid; ours is 0, we have none. */
+            if (peer_llid != 0 &&
+                mesh_tx_mpm_(ta, MPM_ACTION_CLOSE, 0, peer_llid,
+                             UMAC_MESH_REASON_MAX_PEERS, 0) >= 0)
+            {
+                g_warthog_mpm_close_tx++;
+            }
+            g_warthog_mpm_no_slot = s_mpm.no_slot;
+            return;
+        }
+        /* A peer that restarted returns with a fresh llid -- tear the link down
+         * so the full handshake runs again rather than answering for a dead
+         * one. Only THIS link is affected; other neighbours stay up. */
+        if (l->estab && peer_llid != l->plid)
+        {
+            umac_datapath_mesh_del_peer(ta);
+            l->estab = false;
+        }
+
+        l->plid = peer_llid;
+        l->opens = 0; /* the peer answered: it is not holding a stale link */
+
+        /* Open first, then Confirm. Confirm-first was tried on the theory that
+         * the Confirm is the latency-critical frame; it measured worse (peer
+         * stalled in OPN_SNT where Open-first reliably reached OPN_RCVD). The
+         * peer's mesh_confirm_timeout is only 100 ms, so neither may be delayed.
+         *
+         * Once ESTAB, answer with the Confirm ALONE. Replying to an Open with
+         * our own Open makes the peer reply with its Open, which makes us reply
+         * again -- a symmetric loop with no terminating condition, measured at
+         * ~94 frames/s of pure MPM between two established boards. mac80211's
+         * FSM does the same thing: OPN_ACPT in ESTAB emits a Confirm, not an
+         * Open. The peer is already established, so it quiesces on our Confirm
+         * and the exchange stops. */
+        if (!l->estab)
+        {
+            if (mesh_tx_mpm_(ta, MPM_ACTION_OPEN, l->llid, 0, 0, 0) >= 0)
+            {
+                g_warthog_mpm_open_tx++;
+            }
+        }
+        if (mesh_tx_mpm_(ta, MPM_ACTION_CONFIRM, l->llid, l->plid, 0, mpm_aid_for_(l)) >= 0)
+        {
+            g_warthog_mpm_conf_tx++;
+        }
+        mpm_publish_(l);
+    }
+    else if (action == MPM_ACTION_CONFIRM)
+    {
+        g_warthog_mpm_conf_rx++;
+
+        /* Their Confirm echoes our llid in the plid field. If it matches, the
+         * peer has accepted us and the link is up from our side -- this is the
+         * ESTAB indicator, since warthog has no station table to inspect. */
+        struct mpm_link *l = mpm_table_get_or_create(&s_mpm, ta, mpm_mint_llid_(), (uint32_t)mmosal_get_time_ms());
+        if (l == NULL)
+        {
+            return;
+        }
+
+        uint16_t echoed = 0;
+        if (umac_mesh_ies_get_peer_plid(body, len, &echoed) && echoed == l->llid &&
+            l->llid != 0)
+        {
+            if (!l->estab)
+            {
+                /* Link is up: hand the peer to the data plane. From here the
+                 * vendor datapath carries 4-address data frames both ways. */
+                enum mmwlan_status st = umac_datapath_mesh_add_peer(
+                    s_mesh_umacd, s_mesh_vif_id, s_mesh_own_addr, ta,
+                    s_mesh_args.security_type == MMWLAN_SAE);
+                if (st != MMWLAN_SUCCESS)
+                {
+                    g_warthog_mesh_peer_add_fail++;
+                }
+            }
+            l->estab = true;
+        }
+
+        /* The peer retransmits Confirm while it waits for OURS. Measured:
+         * conf_rx=4 against conf_tx=1 -- we answered once and then went quiet,
+         * so a single lost or too-early Confirm stalls the handshake forever
+         * and the peer eventually times back out to LISTEN.
+         *
+         * Re-send our Confirm on every one of theirs. This is the retransmit
+         * behaviour a real MPM timer provides, without needing a timer here. */
+        if (peer_llid != 0)
+        {
+            l->plid = peer_llid;
+        l->opens = 0; /* the peer answered: it is not holding a stale link */
+        }
+
+        /* Answer only while the link is still coming up. Retransmitting is
+         * what rescued the handshake (the peer resends Confirm while waiting),
+         * but once ESTAB it becomes a feedback loop: each side answers the
+         * other's Confirm forever, measured at ~80 frames/s of pure MPM. Real
+         * MPM quiesces after ESTAB, so stop once the peer has echoed our llid. */
+        if (l->plid != 0 && !l->estab)
+        {
+            if (mesh_tx_mpm_(ta, MPM_ACTION_CONFIRM, l->llid, l->plid, 0, mpm_aid_for_(l)) >= 0)
+            {
+                g_warthog_mpm_conf_tx++;
+            }
+        }
+        mpm_publish_(l);
+    }
+    else if (action == MPM_ACTION_CLOSE)
+    {
+        uint16_t reason = 0;
+        if (umac_mesh_ies_get_close_reason(body, len, &reason))
+        {
+            g_warthog_mpm_close_reason = reason;
+        }
+        /* Clear ESTAB too. umac_mesh_maybe_initiate_mpm() early-returns on it
+         * and the Confirm retransmit is gated on !estab, so leaving it latched
+         * after a Close permanently wedges peering until reboot -- and with no
+         * other initiator on warthog<->warthog, nothing would ever reopen it.
+         * Safe against the ~80 fps ping-pong: both link ids are zero here, so
+         * the quiesce gate re-arms cleanly on the next ESTAB. */
+        umac_datapath_mesh_del_peer(ta);
+        mpm_table_release(&s_mpm, mpm_table_find(&s_mpm, ta));
+        g_warthog_mpm_our_llid = 0;
+        g_warthog_mpm_our_plid = 0;
+        g_warthog_mpm_estab = mpm_table_estab_count(&s_mpm);
+        g_warthog_mpm_close_rx++;
+    }
+}
+
 uint8_t umac_mesh_get_peer_count(struct umac_data *umacd)
 {
     (void)umacd;
-    return 0;
+    return umac_datapath_mesh_peer_count();
 }
 
-/* Phase 4f-step33 — chip opcode probe.
- *
- * Send every opcode in [start_opcode, end_opcode] with empty payload via
- * mmdrv_execute_command (which bypasses opcode validation). Log which
- * opcodes the chip ACCEPTS (returns 0 or MORSE_RET_EPERM=-1 vs unrecognized
- * codes). This is intended to surface undocumented opcodes that might
- * affect RX behavior — promiscuous mode, monitor mode, filter bypass, etc.
- *
- * Run on the umac task. Each call sends 1 opcode and logs the result.
- * Caller iterates from a host task.
- */
-int umac_mesh_probe_opcode(uint16_t opcode)
+
+
+/* Does this beacon body advertise OUR mesh? Wraps the freestanding matcher so
+ * the datapath does not need the mesh args. */
+bool umac_mesh_beacon_is_our_mesh(const uint8_t *body, uint32_t len)
 {
-    extern int mmdrv_execute_command(uint8_t *command, uint8_t *response, uint32_t *response_len);
+    if (!s_mesh_args_valid)
+    {
+        return false;
+    }
+    return umac_mesh_ies_beacon_has_mesh_id(body, len, s_mesh_args.mesh_id,
+                                            s_mesh_args.mesh_id_len);
+}
 
-    /* Build a minimal request: just header, no payload. */
-    struct morse_cmd_req cmd_req;
-    memset(&cmd_req, 0, sizeof(cmd_req));
-    cmd_req.hdr.flags = MORSE_CMD_TYPE_REQ;
-    cmd_req.hdr.message_id = opcode;
-    cmd_req.hdr.len = sizeof(struct morse_cmd_header);
-    cmd_req.hdr.host_id = 0;
-    cmd_req.hdr.vif_id = s_mesh_vif_id;
+/* Does this S1G Beacon advertise OUR mesh? Wraps the freestanding matcher so
+ * the datapath does not need the mesh args. */
+bool umac_mesh_s1g_beacon_is_our_mesh(const uint8_t *frame, uint32_t len)
+{
+    if (!s_mesh_args_valid)
+    {
+        return false;
+    }
+    return umac_mesh_ies_s1g_beacon_has_mesh_id(frame, len, s_mesh_args.mesh_id,
+                                                s_mesh_args.mesh_id_len);
+}
 
-    uint8_t resp_buf[64];
-    uint32_t resp_len = sizeof(resp_buf);
-    int ret = mmdrv_execute_command((uint8_t *)&cmd_req, resp_buf, &resp_len);
-    return ret;
+/* First sight of this peer? Refreshes its liveness either way.
+ *
+ * A beacon must NOT be answered with a probe response every time. mac80211
+ * raises NL80211_CMD_NEW_PEER_CANDIDATE for each probe response from a station
+ * it has no plink for, and wpa_supplicant answers a candidate by starting a
+ * FRESH peering -- tearing down the one already in progress with
+ * Close(reason 52, MESH-PEER-CANCELED) and a new link id. Answering every
+ * beacon therefore livelocks the handshake: captured on air as an endless
+ * Open/Confirm/Close cycle where both ends' link ids changed every second and
+ * the peer never left OPN_RCVD, with every individual frame verifiably
+ * correct.
+ *
+ * Answer the first beacon, then stay quiet and let the ordinary MPM path
+ * retransmit.
+ */
+/* Forget every peer link, so the next beacon from each is treated as a first
+ * sighting and the peering runs again from LISTEN.
+ *
+ * The MPM table IS the "have I seen this peer" state, so clearing it re-arms
+ * the announce-once logic too. The peer must be restarted alongside: a node
+ * that still holds an ESTAB link ignores Opens carrying a new link id, which
+ * is what leaves one side established and the other at plid=0.
+ */
+void umac_mesh_reset_links(void)
+{
+    mpm_table_init(&s_mpm);
+}
+
+bool umac_mesh_note_s1g_beacon(const uint8_t *sa)
+{
+    if (sa == NULL)
+    {
+        return false;
+    }
+    struct mpm_link *l = mpm_table_find(&s_mpm, sa);
+    if (l != NULL)
+    {
+        l->last_heard_ms = (uint32_t)mmosal_get_time_ms();
+        return false; /* already known -- do not re-announce ourselves */
+    }
+    return true;
+}
+
+/* Is a peering with this peer still unfinished? Used to retransmit our Open.
+ *
+ * Announcing ourselves once is right for the PROBE RESPONSE -- repeating that
+ * makes mac80211 raise NEW_PEER_CANDIDATE and restart the peering. It is wrong
+ * for the Open: with no retransmission a single lost Open strands the link
+ * forever, which is exactly what happened -- the peer reached ESTAB from an
+ * earlier attempt while our side sat at plid=0 with nothing to drive it.
+ * mac80211 tolerates repeated Opens (it answers each with a Confirm), and the
+ * reference port retransmits in OPN_SNT/OPN_RCVD/CNF_RCVD for the same reason.
+ */
+bool umac_mesh_peering_incomplete(const uint8_t *sa)
+{
+    struct mpm_link *l = mpm_table_find(&s_mpm, sa);
+    return l != NULL && !l->estab;
 }
