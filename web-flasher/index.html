@@ -142,12 +142,17 @@
 
     <div class="card">
       <h2>Mesh data plane <span class="dim" style="font-weight:400">(mesh build only)</span></h2>
-      <label for="meshsec">Encryption</label>
+      <label for="meshsec">Data-plane encryption</label>
       <select id="meshsec">
-        <option value="0">Open — required to talk to stock OpenMANET</option>
-        <option value="1">Keyed — one shared key on every warthog (obfuscation, not security)</option>
+        <option value="0">Open — use this for OpenMANET / OpenWrt</option>
+        <option value="1">Keyed — warthog-to-warthog only, NOT real encryption</option>
       </select>
-      <p class="hint">Applies immediately and persists. The node re-peers within ~2 s.</p>
+      <p class="hint">Applies immediately and persists; the node re-peers within ~2&nbsp;s.
+      <b>Keyed is not a security feature and cannot reach OpenMANET.</b> It encrypts
+      frames with a constant compiled into every warthog, so anyone holding the
+      firmware holds the key, and a peer without that exact constant — which is
+      every non-warthog node — cannot decrypt anything. Peering is unauthenticated
+      either way. Real per-link keys need SAE/AMPE, which is not implemented.</p>
       <div class="row"><button id="meshsecSave" class="secondary" disabled>Save mesh setting</button></div>
     </div>
 

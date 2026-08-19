@@ -167,11 +167,25 @@ nobody is answering.
 
 ## Encryption
 
-> **The keyed mode is not security.** Every node ships the same hardcoded
-> 128-bit key, used as both pairwise and group key. It keeps traffic off a
-> casual listener and nothing more — anyone with the firmware has the key.
-> Per-link derivation (SAE/AMPE) is not implemented. Do not describe a Warthog
-> mesh as encrypted in any sense that matters.
+> **There is no encrypted interop with OpenMANET, and the keyed mode is not
+> security.**
+>
+> `AT+MESHSEC=1` encrypts data frames with a 16-byte constant compiled into
+> every warthog image (`00 11 22 ... ee ff`), used as both the pairwise and the
+> group key. Anyone holding the firmware holds the key. It exists to exercise
+> the CCMP data path, not to protect traffic.
+>
+> It also cannot reach OpenMANET: a standard secured 802.11s node derives
+> per-link keys through SAE authentication and AMPE key exchange, so it can
+> neither decrypt warthog's frames nor warthog its. Keyed mode interoperates
+> with other warthogs and nothing else.
+>
+> Peering is unauthenticated in both modes — `main/mesh.c` requests
+> `MMWLAN_OPEN`, so no SAE handshake ever runs. hostap's `mesh_rsn.c` is
+> compiled in but nothing drives it.
+>
+> **Treat the mesh as an untrusted transport and encrypt above it.** For ATAK
+> and similar that is the normal posture anyway.
 
 Warthog's mesh data plane can run keyed or open:
 

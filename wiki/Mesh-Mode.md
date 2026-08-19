@@ -74,14 +74,23 @@ AT+MESHSEC?      → +MESHSEC: 1 (keyed)
 AT+MESHSEC=0     → open; re-peers within ~2 s
 ```
 
-Keyed uses **one hardcoded key, identical on every node**, as both the pairwise
-and the group key. That is obfuscation, not security: anyone holding the
-firmware holds the key. It cannot interoperate with a peer that does not have
-it — which includes stock OpenMANET. The setting persists in NVS — though a
-factory flash (`write_flash 0x0`) overwrites the NVS partition, so a freshly
-reflashed node is keyed again.
+Keyed uses **one hardcoded key, identical on every warthog image** — a counting
+sequence, `00 11 22 ... ee ff` — as both the pairwise and the group key. Anyone
+holding the firmware holds the key, so it is obfuscation, not security.
 
-Per-link key derivation (SAE/AMPE) is not implemented.
+**There is no encrypted interop with any non-warthog node.** A standard secured
+802.11s peer derives per-link keys through SAE authentication and AMPE key
+exchange. warthog implements neither, so a secured OpenMANET mesh and a keyed
+warthog cannot decrypt each other. Keyed talks to other warthogs and nothing
+else; against OpenMANET you must run open.
+
+Peering is unauthenticated in both modes regardless — the mesh is brought up
+with `MMWLAN_OPEN`, so no SAE handshake runs at all.
+
+Treat the mesh as an untrusted transport and encrypt above it.
+
+The setting persists in NVS, though a factory flash overwrites that partition,
+so a freshly reflashed node is keyed again.
 
 Per-pair key derivation (SAE/AMPE) is not implemented.
 

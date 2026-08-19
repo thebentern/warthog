@@ -213,6 +213,21 @@ static struct umac_sta_data *mesh_find_peer_(const uint8_t *addr)
 
 /* Phase-1 shared keys. Every warthog node uses these; a per-pair SAE-derived
  * MTK replaces the pairwise one later. 16 bytes = CCMP-128. */
+/* NOT A SECRET. A counting sequence compiled into every warthog image, used as
+ * both the pairwise and the group key when AT+MESHSEC=1.
+ *
+ * It exists so the data plane can be exercised with CCMP on, not to protect
+ * anything: anyone with the firmware has it. It also means "keyed" only
+ * interoperates with another warthog carrying the same constant -- a mesh peer
+ * that derives real keys (OpenMANET with SAE/AMPE, or any standard secured
+ * 802.11s node) cannot decrypt a frame encrypted with it, and warthog cannot
+ * decrypt theirs.
+ *
+ * Peering itself is unauthenticated regardless: main/mesh.c requests
+ * MMWLAN_OPEN, so no SAE handshake runs at all. Real per-link keys need
+ * SAE authentication plus AMPE key exchange; hostap's mesh_rsn.c is compiled
+ * in but nothing in this port drives it. Until that exists, treat the mesh as
+ * an untrusted transport and protect traffic above it. */
 static const uint8_t k_mesh_p1_mtk[UMAC_KEY_AES_128_LEN] = {
     0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
     0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
