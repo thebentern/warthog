@@ -269,82 +269,6 @@ AT+ERASE                    → wipe NVS warthog namespace
 
 Credentials and the custom DNS live in NVS namespace `warthog`. On boot, `halow.c`, `wifi_ap.c`, and `usb_net.c` read NVS first and fall back to the `-DHALOW_SSID=...` / `-DWARTHOG_AP_SSID=...` / `-DWARTHOG_DOWNSTREAM_DNS=...` build flags only if the NVS entry is absent.
 
-## Bench-test checklist
-
-Bring-up flow for a fresh board. Each step has a clear pass signal — stop and debug if any fails.
-
-### 1. Build + flash
-
-```bash
-pio run -e warthog-us -t upload    # hold BOOT, tap RESET, release BOOT first
-```
-
-### 2. USB-Serial-JTAG boot logs (~1 s window before USB-OTG takes over)
-
-```bash
-~/Documents/GitHub/warthog/scripts/watch.sh
-```
-
-✅ Expected: HaLow chip ID `0x0306`, BCF version, factory MAC printed within ~1 s.
-
-### 3. USB CDC-ACM console comes up after USB-OTG handoff
-
-`watch.sh` automatically reattaches to the new `/dev/cu.usbmodemXXXX` port.
-
-✅ Expected: stable port (no cycling back to the JTAG `usbmodem101`). LED enters the HaLow-state pattern with a 100 ms wink every 2 s once macOS opens the CDC.
-
-### 4. USB Ethernet adapter
-
-```bash
-sudo ipconfig set en10 DHCP && sleep 3
-ifconfig en10 | grep "inet "
-ping -c 3 192.168.4.1
-```
-
-✅ Expected: `inet 192.168.4.2`, three echo replies, <5 ms RTT.
-
-### 5. 2.4 GHz Wi-Fi AP
-
-Phone → Settings → Wi-Fi → look for `warthog`. Default PSK is `warthog-default`.
-
-✅ Expected: associates, gets `192.168.5.2`, can `ping 192.168.5.1`.
-
-### 6. AT command surface
-
-In a serial terminal on `/dev/cu.usbmodemXXXX`:
-
-```
-AT
-AT+STATUS?
-AT+VERSION?
-```
-
-✅ Expected: each replies `OK`. `STATUS?` shows real IPs for USB + AP, zeros for HaLow if no AP is associated.
-
-### 7. HaLow STA (requires upstream HaLow AP)
-
-```
-AT+HALOW=YourHaLowAP,yourpsk
-AT+RESET
-```
-
-On reboot, watch the CDC console for `warthog.halow: DHCP lease: ip=...`.
-
-✅ Expected: HaLow STA gets a DHCP lease from the upstream AP within ~30 s.
-
-### 8. NAT bridge (depends on step 7)
-
-From the USB-attached laptop or the Wi-Fi-AP-attached phone:
-
-```bash
-ping -c 3 -b en10 8.8.8.8       # IP-only — proves L3 forwarding + NAPT
-curl -s -o /dev/null -w "%{http_code}\n" https://example.com   # proves DNS too
-```
-
-✅ Expected: three echo replies (~90 ms each — HaLow RTT), then `200` from the `curl`. CDC console shows `warthog.nat: NAPT up on HaLow STA`.
-
-⚠️ If `ping` works but `curl` hangs, the DHCP-DNS option isn't reaching the host — see [Troubleshooting](#ping-8888-works-but-curl-examplecom-hangs).
-
 ## Mesh mode (802.11s)
 
 Instead of associating to an access point, a node can join an 802.11s mesh over
@@ -369,6 +293,16 @@ AT+MPING=10.77.199.248,4         confirm data
 Warthog meshes with Linux `mac80211` peers. Verified against OpenMANET 1.8.0 on
 a Raspberry Pi 4 with a Seeed HaLow HAT, meshing with two Warthog nodes at once —
 0–3% loss, 8–19 ms round trip, with the peer in its stock configuration.
+
+What the OpenMANET side sees once a warthog has joined — established peer
+links, resolved paths at hop count 1, and answered pings:
+
+![OpenMANET view of the mesh](docs/img/openmanet-pi.svg)
+
+**The point of doing this** is to hang phones and EUDs off your mesh: a warthog
+joins as a peer and presents a Wi-Fi AP and a USB Ethernet adapter on the other
+side. That story, end to end, is in the wiki:
+[OpenMANET Gateway](../../wiki/OpenMANET-Gateway).
 
 Two OpenWrt defaults will stop it dead, each with no error message: the mesh
 interface is bridged into `br-lan`, and unbridging it drops it out of the `lan`

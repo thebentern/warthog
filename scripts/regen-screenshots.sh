@@ -53,5 +53,12 @@ IFACE=$(for i in $(ifconfig -l | tr ' ' '\n' | grep -E '^en[0-9]+'); do
 python3 scripts/make_terminal_svg.py "$CAP/build.txt" docs/img/usb-build.svg   "Building — pio run -e warthog-us"
 python3 scripts/make_terminal_svg.py "$CAP/at.txt"    docs/img/usb-console.svg "warthog — AT console over USB"
 python3 scripts/make_terminal_svg.py "$CAP/host.txt"  docs/img/usb-host.svg    "macOS — USB Ethernet via CDC-NCM"
+# OpenMANET captures need the Pi (PI_SSH="ssh root@<pi>") and a mesh build on
+# the board; skipped when PI_SSH is unset.
+if [ -n "${PI_SSH:-}" ]; then
+  echo "== OpenMANET (Pi) =="
+  $PI_SSH 'echo "root@OpenMANET:~# iw dev wlh0 station dump | grep -E \"^Station|plink\""; iw dev wlh0 station dump | grep -E "^Station|plink"; echo ""; echo "root@OpenMANET:~# iw dev wlh0 mpath dump"; iw dev wlh0 mpath dump; echo ""; echo "root@OpenMANET:~# ping -c 4 10.77.131.165"; ping -c 4 -W 2 10.77.131.165' > "$CAP/pi.txt" 2>&1
+  python3 scripts/make_terminal_svg.py "$CAP/pi.txt" docs/img/openmanet-pi.svg "OpenMANET (Raspberry Pi) — the mesh as it sees it"
+fi
 rm -rf "$CAP"
 echo "done"

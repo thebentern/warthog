@@ -188,6 +188,16 @@ The setting persists in NVS, so a node that loses power comes back able to
 talk to the same peer. Before it did not, and a rebooted node would peer
 perfectly and carry no data with nothing in any log to explain it.
 
+## What it looks like when it works
+
+From the OpenMANET node — two warthogs established, both paths resolved:
+
+![OpenMANET view](img/openmanet-pi.svg)
+
+From a warthog — the peering, the path-selection counters, and a ping back:
+
+![warthog view](img/openmanet-warthog.svg)
+
 ## Verifying a link
 
 Work outward from peering. Each step has a distinct failure signature.

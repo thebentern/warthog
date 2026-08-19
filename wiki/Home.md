@@ -17,9 +17,11 @@ reconfigure a node over a serial port instead of a rebuild.
 | Let phones and IoT clients share that uplink | **[Client Mode](Client-Mode)** |
 | Build a peer-to-peer network with no infrastructure | **[Mesh Mode](Mesh-Mode)** |
 | Talk to OpenMANET or vanilla OpenWrt | **[OpenMANET Interop](OpenMANET-Interop)** |
+| Put phones and EUDs onto an OpenMANET mesh | **[OpenMANET Gateway](OpenMANET-Gateway)** |
 | Look up a command | **[AT Command Reference](AT-Command-Reference)** |
 | Work out why something is not passing traffic | **[Troubleshooting](Troubleshooting)** |
 | Build, test, contribute | **[Development](Development)** |
+| Bring up a fresh board step by step | **[Bench-Test Checklist](Bench-Test-Checklist)** |
 
 ## The three surfaces
 
