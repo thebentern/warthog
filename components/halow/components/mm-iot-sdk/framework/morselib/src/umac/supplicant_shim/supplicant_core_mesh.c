@@ -371,21 +371,26 @@ void umac_supp_mesh_new_peer(const uint8_t *addr, const uint8_t *ies, size_t ies
      * grounds to reset its own SAE state -- so one stale open node in range
      * stops every SAE handshake on the mesh, including between two nodes
      * that agree. Observed on the bench with exactly that setup. */
+    /* Authentication Protocol Identifier (Mesh Configuration octet 4:
+     * 0 = none, 1 = SAE) must match ours -- the comparison upstream's
+     * mesh_matches_local() would have made if this port reached
+     * mesh_mpm_add_peer() through it.
+     *
+     * This is not just correctness, it is coexistence: an open-mesh node
+     * sharing the Mesh ID answers SAE Commits with NOT_SUPPORTED_AUTH_ALG,
+     * and hostap resets its SAE state on a peer's failure status -- so
+     * without this gate one open node in range keeps every SAE handshake
+     * in a reset loop. (An earlier reading dismissed this gate because the
+     * octet was 0 on every sampled frame; those samples were all from the
+     * open node -- warthog itself discovers peers by probe, not beacon.) */
     if (elems.mesh_config_len >= 5)
     {
         const uint8_t want = umac_mesh_sae_active() ? 1u : 0u;
         if (elems.mesh_config[4] != want)
         {
-            /* Observational only. Dropping the candidate here looked correct
-             * and was not: on the bench it rejected every peer (apx=83,
-             * offers=0) including a node that genuinely runs SAE, so the
-             * value being compared is not the peer's advertised protocol as
-             * assumed -- most likely the S1G IE offset this port hands to
-             * ieee802_11_parse_elems() does not put mesh_config where a
-             * legacy parse expects it. Left as a counter, plus the observed
-             * octet, until that is pinned down; peering is not gated on it. */
             g_warthog_sae_peer_authproto++;
             g_warthog_sae_peer_authval = elems.mesh_config[4];
+            return;
         }
     }
     /* S1G beacons carry no Supported Rates element -- the S1G PHY has its own
