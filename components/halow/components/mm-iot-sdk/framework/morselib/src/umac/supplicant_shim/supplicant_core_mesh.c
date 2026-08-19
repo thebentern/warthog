@@ -378,7 +378,10 @@ void umac_supp_mesh_new_peer(const uint8_t *addr, const uint8_t *ies, size_t ies
      * in a reset loop. Note when sampling this octet: beacons come only from
      * non-warthog nodes (warthog discovers peers by probe, not beacon), so an
      * all-zero beacon sample says nothing about SAE peers. */
-    if (elems.mesh_config_len >= 5)
+    /* AT+SAEBRIDGE=2 skips the check: some stacks advertise 0 here while
+     * genuinely running SAE (the Morse S1G port's probe responses do), and
+     * the override lets an operator peer with one deliberately. */
+    if (elems.mesh_config_len >= 5 && g_warthog_sae_bridge_en != 2u)
     {
         const uint8_t want = umac_mesh_sae_active() ? 1u : 0u;
         if (elems.mesh_config[4] != want)

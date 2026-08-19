@@ -79,9 +79,23 @@ must be the `-mesh`/full variants, which OpenMANET ships).
 
 Warthog↔Warthog SAE is hardware-validated (single-exchange peering, AMPE keys
 in the chip, 0% loss over the CCMP link). Warthog↔OpenMANET SAE runs the same
-hostap code on both ends but has not yet been hardware-verified. `AT+SAERX?`
-on the Warthog shows the SAE conversation state and which peer it is talking
-to.
+hostap code on both ends but has not yet completed on hardware. What bench
+testing established so far:
+
+- **OpenMANET's kernel-MPM mesh advertises Authentication Protocol 0 even
+  when running SAE** (`wpa_supplicant_s1g` with `key_mgmt=SAE`; observed in
+  its probe responses). Warthog's candidate gate therefore refuses to
+  initiate toward it. `AT+SAEBRIDGE=2` overrides the gate for exactly this
+  case.
+- `sae_pwe=1` (H2E-only) is OpenMANET's shipped default; Warthog sends
+  hunt-and-peck Commits, so set `sae_pwe=0` or `2` on the Linux side.
+- The Morse supplicant rejects `MESH_PEER_ADD` even with `user_mpm=1` +
+  `no_auto_peer=1`, so the Linux side cannot be told to initiate; and Warthog
+  does not beacon in mesh mode, so kernel-MPM candidate discovery never sees
+  it. The Warthog must initiate — hence the `AT+SAEBRIDGE=2` override.
+
+`AT+SAERX?` on the Warthog shows the SAE conversation state and which peer it
+is talking to.
 
 ## OpenWrt side
 
