@@ -93,17 +93,20 @@ testing established so far:
   `no_auto_peer=1`, so the Linux side cannot be told to initiate; and Warthog
   does not beacon in mesh mode, so kernel-MPM candidate discovery never sees
   it. The Warthog must initiate — hence the `AT+SAEBRIDGE=2` override.
-- **The hard blocker, measured end to end**: with the override armed, Warthog
-  discovers the SAE OpenMANET node from its beacons, creates the station and
-  transmits SAE Commits at it (43 observed) — and OpenMANET never answers.
-  Its kernel-MPM stack only engages SAE with peers it discovered from
-  *beacons*; it does not respond to unsolicited Commits. Since the Warthog
-  chip does not radiate mesh beacons (template is served to the chip, nothing
-  transmits — confirmed by a second Warthog hearing only the Pi's beacons),
-  the handshake cannot start from either side. **Warthog↔OpenMANET SAE is
-  blocked on Warthog mesh beaconing**, a chip-firmware work item. Everything
-  Warthog-side up to the airlink is proven: discovery, station creation,
-  Commit transmission, and the full SAE/AMPE exchange against a hostap peer.
+- OpenMANET's kernel-MPM stack only engages SAE with peers it discovered from
+  *beacons*, not from unsolicited Commits. Warthog now beacons (see below), so
+  the discovery path exists in both directions: Warthog discovers OpenMANET
+  from probe responses (with `AT+SAEBRIDGE=2`), and OpenMANET can discover
+  Warthog from its beacons.
+
+**Warthog mesh beaconing.** The MM6108 firmware fires its beacon TBTT once and
+never re-arms it, so early builds did not beacon and were invisible to a
+beacon-driven peer. A host beacon timer now re-drives the beacon at the
+interval; `AT+BCNSTAT?` shows `served`/`txcomp` climbing together (~1.15/s),
+i.e. the chip transmits every beacon. Warthog↔Warthog SAE is fully verified;
+the Warthog↔OpenMANET SAE handshake over these beacons is pending a clean
+bench run (the resident OpenMANET node's MM8108 receiver needs re-pinning to
+its channel after a reboot — a Pi-side issue, not Warthog's).
 
 `AT+SAERX?` on the Warthog shows the SAE conversation state and which peer it
 is talking to.
