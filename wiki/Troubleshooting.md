@@ -52,7 +52,7 @@ mesh, and a mismatch produces no error — just silence.
 +MPMPEERS: ... 28bf74 llid=34244 plid=0 estab=0 opens=12
 ```
 
-`plid=0` with `opens` climbing means we are sending Opens nobody answers. The
+`plid=0` with `opens` climbing means the node is sending Opens nobody answers. The
 usual cause is that the peer still holds an established link from before your
 node rebooted, and ignores Opens carrying a new link id.
 
@@ -65,7 +65,7 @@ The signature is distinctive — ARP arrives, pings do not, and the peer's
 per-station transmit counter is frozen at a small number.
 
 An 802.11s node will not send unicast to a neighbour it has no *path* to, and
-peering does not create one. Check we are advertising ourselves:
+peering does not create one. Check that the node is advertising itself:
 
 ```
 AT+HWMPSTAT?
@@ -74,7 +74,7 @@ AT+HWMPSTAT?
 
 `preq_tx` should be climbing. `preq_rx` should match `prep_tx` — every request
 aimed at us answered. `parse_fail` above 0 means frames are arriving in a shape
-we do not understand; `AT+HWMPDUMP?` shows the bytes.
+the node does not understand; `AT+HWMPDUMP?` shows the bytes.
 
 On the peer, `iw dev wlh0 mpath dump` should show a resolved next hop, not
 `00:00:00:00:00:00`.

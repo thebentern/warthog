@@ -4,7 +4,7 @@ Warthog meshes with Linux `mac80211` 802.11s peers. Verified against OpenMANET
 1.8.0 on a Raspberry Pi 4 with a Seeed HaLow HAT, meshing with two Warthog nodes
 at once.
 
-Measured on that bench with the peer in its stock configuration:
+Measured with the peer in its stock configuration:
 
 | Direction | Result |
 |---|---|
@@ -77,11 +77,11 @@ On OpenWrt, the equivalent uci is `encryption='sae'` +
 `key='warthog-mesh'` on the mesh interface section (hostapd/wpa_supplicant
 must be the `-mesh`/full variants, which OpenMANET ships).
 
-Warthog↔Warthog SAE is bench-validated (single-exchange peering, AMPE keys in
-the chip, 0% loss over the CCMP link). Warthog↔OpenMANET SAE speaks the same
-hostap code on both ends but has not yet been exercised on this bench — the
-resident OpenMANET node runs open. If you try it first, `AT+SAERX?` on the
-Warthog shows the SAE conversation state and which peer it is talking to.
+Warthog↔Warthog SAE is hardware-validated (single-exchange peering, AMPE keys
+in the chip, 0% loss over the CCMP link). Warthog↔OpenMANET SAE runs the same
+hostap code on both ends but has not yet been hardware-verified. `AT+SAERX?`
+on the Warthog shows the SAE conversation state and which peer it is talking
+to.
 
 ## OpenWrt side
 

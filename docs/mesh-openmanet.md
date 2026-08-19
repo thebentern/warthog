@@ -8,7 +8,7 @@ This document is the setup procedure, the settings that must match, and the
 failure modes — all of it measured against OpenMANET 1.8.0 on a Raspberry Pi 4
 with a Seeed HaLow HAT, and two Warthog nodes.
 
-Verified result on that bench, stock peer configuration, unencrypted mesh:
+Verified result, stock peer configuration, unencrypted mesh:
 
 | Direction | Result |
 |---|---|
@@ -238,9 +238,9 @@ AT+HWMPSTAT?
 +HWMPSTAT: rx=234 preq_rx=75 preq_tx=142 prep_rx=159 prep_tx=75 parse_fail=0 not_ours=0
 ```
 
-`preq_tx` climbing means we are advertising ourselves. `preq_rx` matching
-`prep_tx` means we are answering everything asked of us. `parse_fail` should be
-0 — anything else means frames are arriving in a shape we do not understand, and
+`preq_tx` climbing means the node is advertising itself. `preq_rx` matching
+`prep_tx` means it answers every request aimed at it. `parse_fail` should be
+0 — anything else means frames are arriving in a shape the parser does not handle, and
 `AT+HWMPDUMP?` will show the bytes.
 
 **3. Data.**

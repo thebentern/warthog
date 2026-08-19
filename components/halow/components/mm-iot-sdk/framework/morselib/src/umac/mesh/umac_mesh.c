@@ -472,10 +472,9 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
      * after BSS_CONFIG (umac_ap.c:267) — that's what enables the per-VIF
      * beacon IRQ (MORSE_INT_BEACON_BASE_NUM + vif_id). Without it, the
      * chip never asks the host for beacon templates via
-     * mmdrv_host_get_beacon. We previously observed zero
-     * mmdrv_host_get_beacon calls in 7+ seconds of mesh operation;
-     * the most likely explanation is that this call simply isn't being
-     * made for the mesh VIF.
+     * mmdrv_host_get_beacon. Without this call the mesh VIF produces zero
+     * mmdrv_host_get_beacon requests (measured over 7+ seconds of mesh
+     * operation).
      *
      * If after this addition the chip starts calling
      * mmdrv_host_get_beacon (counter increments in the diagnostic
@@ -1064,9 +1063,8 @@ int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_le
      * peer wants on peering frames. Under AMPE that is destructive: hostap
      * ends an Open/Confirm with the AMPE element, whose MIC covers the body,
      * so anything appended afterwards invalidates it and the peer rejects the
-     * peering. Seen on hardware as plink advancing OPN_SNT -> HOLDING and
-     * never reaching ESTAB once the frames themselves started arriving.
-     * HWMP (category 13) still gets the element. */
+     * peering. Symptom: plink advances OPN_SNT -> HOLDING and never reaches
+     * ESTAB. HWMP (category 13) still gets the element. */
     if (body_len >= 1 && body[0] == 15u)
     {
         return mesh_tx_action_raw_(da, body, body_len);
@@ -1090,10 +1088,9 @@ static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_l
     /* Sized for the LARGEST action body this path carries, which is not a
      * HWMP PREQ. hostap's MPM peering frames (Open/Confirm) carry the peering
      * elements plus AMPE's encrypted key blob and run several hundred bytes;
-     * with the old HWMP_PREQ_BODY_LEN + caps budget (105 B) every one of them
-     * failed the bounds check below and returned before reaching the radio.
-     * That is why SAE completed on both peers and no peering frame was ever
-     * received: they were never sent. */
+     * with a HWMP_PREQ_BODY_LEN + caps budget (105 B) every one of them
+     * fails the bounds check below and returns before reaching the radio --
+     * SAE completes on both peers and peering silently never starts. */
     uint8_t frame[UMAC_MESH_ACTION_BODY_MAX + sizeof(s1g_caps)];
     if ((uint32_t)body_len + s1g_caps_len > sizeof(frame))
     {

@@ -191,9 +191,8 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
     /* SAE group list. Upstream wpa_supplicant_mesh_init() copies
      * wpa_s->conf->sae_groups into the bss conf (mesh.c); this passive init
      * never did, and mesh_rsn_sae_group() indexes the array without a NULL
-     * check -- the first SAE authentication died at groups[0]. Found on
-     * hardware: breadcrumb trail ended between trace 55 and 56, i.e. inside
-     * mesh_rsn_sae_group(). Group 19 (NIST P-256) is the SAE default used by
+     * check -- the first SAE authentication dereferences NULL at groups[0],
+     * inside mesh_rsn_sae_group(). Group 19 (NIST P-256) is the SAE default used by
      * wpa_supplicant, hostapd and OpenMANET alike. Static storage: this conf
      * is torn down by hostapd_config_free(), which would os_free() a heap
      * pointer -- but bss->conf here is a *copy* of conf->bss[0] (line above),
@@ -236,9 +235,8 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
         /* The hostapd-side SAE code reads its password from THIS conf --
          * sae_get_password() never looks at wpa_s's ssid -- and upstream
          * copies it across right before mesh_rsn_auth_init (mesh.c:214).
-         * Found on hardware: without it every auth_build_sae_commit died at
-         * "SAE: No password available" (authsta=0/1, mlme=0), after the
-         * sae_groups fix let SAE get that far at all. */
+         * Without it every auth_build_sae_commit fails at "SAE: No
+         * password available" and no Commit is ever built. */
         {
             /* Mirror wpa_supplicant_mesh_init()'s RSN block (mesh.c:201-214).
              * All three fields live on the hostapd-side conf, which is what
@@ -248,10 +246,9 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
              * handle_auth() only reaches the SAE branch when
              * `hapd->conf->wpa && wpa_key_mgmt_sae(hapd->conf->wpa_key_mgmt)`.
              * With them zero it answers every SAE Authentication frame with
-             * NOT_SUPPORTED_AUTH_ALG. Measured on hardware before this fix:
-             * handle_auth() ran 6956 times and handle_auth_sae() zero times,
-             * while both boards retransmitted Commit at the 40 ms
-             * dot11RSNASAERetransPeriod forever. */
+             * NOT_SUPPORTED_AUTH_ALG and both ends retransmit Commit at the
+             * 40 ms dot11RSNASAERetransPeriod forever (measured:
+             * handle_auth() thousands of calls, handle_auth_sae() zero). */
             bss->conf->wpa = ssid->proto ? ssid->proto : WPA_PROTO_RSN;
             bss->conf->wpa_key_mgmt =
                 ssid->key_mgmt ? ssid->key_mgmt : WPA_KEY_MGMT_SAE;
@@ -313,11 +310,9 @@ static struct wpa_supplicant *s_mesh_wpa_s;
 /* Tell hostap's MPM about a mesh peer we heard beaconing.
  *
  * hostap starts peering from mesh_mpm_add_peer(), which it normally reaches
- * from its own scan results. This port never runs that scan -- warthog spots
- * peers in S1G beacons and drives its own MPM instead -- so under SAE, where
- * hostap owns peering, nothing was ever telling it a candidate existed. That
- * is the whole reason a SAE mesh came up with the authenticator initialised
- * and no peer ever established.
+ * from its own scan results. This port never runs that scan, so under SAE,
+ * where hostap owns peering, nothing tells it a candidate exists: without
+ * this call the authenticator initialises and no peer is ever offered.
  *
  * @param addr     the peer's address, from the beacon's SA.
  * @param ies      the beacon's information elements.
@@ -380,9 +375,9 @@ void umac_supp_mesh_new_peer(const uint8_t *addr, const uint8_t *ies, size_t ies
      * sharing the Mesh ID answers SAE Commits with NOT_SUPPORTED_AUTH_ALG,
      * and hostap resets its SAE state on a peer's failure status -- so
      * without this gate one open node in range keeps every SAE handshake
-     * in a reset loop. (An earlier reading dismissed this gate because the
-     * octet was 0 on every sampled frame; those samples were all from the
-     * open node -- warthog itself discovers peers by probe, not beacon.) */
+     * in a reset loop. Note when sampling this octet: beacons come only from
+     * non-warthog nodes (warthog discovers peers by probe, not beacon), so an
+     * all-zero beacon sample says nothing about SAE peers. */
     if (elems.mesh_config_len >= 5)
     {
         const uint8_t want = umac_mesh_sae_active() ? 1u : 0u;

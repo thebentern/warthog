@@ -315,11 +315,10 @@ static const uint8_t k_mesh_p1_mgtk[UMAC_KEY_AES_128_LEN] = {
  * key breaks peer 1's link, re-installing peer 1's restores it. One slot,
  * last write wins, even though each peer has its own AID and the AIDs are
  * passed correctly. A link then only works when BOTH ends happen to hold each
- * other's key -- which is why one pair worked and every link to the third
- * board failed. (An earlier note here retracted this conclusion on the grounds
- * that the `hw` index INSTALL_KEY returns is only an echo. That reasoning
- * about the echo is correct and the retraction was still wrong: the echo
- * proves nothing either way, and this experiment settles it.)
+ * other's key -- which is why one pair works while a link to a third board
+ * fails. (The `hw` index INSTALL_KEY returns is only an echo and proves
+ * nothing about slot allocation; the re-install experiment above is what
+ * establishes the single-slot behavior.)
  *
  * The consequence is the important part: AMPE derives a DISTINCT MTK per link,
  * so SAE/AMPE -- and therefore OpenMANET interop -- cannot use chip crypto as
@@ -562,11 +561,11 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
      * Marking it secured here instead looks harmless and is fatal: the TX path
      * then sets Protected and asks the chip to encrypt with a key that does
      * not exist yet, so the MPM peering frames that AMPE needs in order to
-     * derive that key are the ones destroyed. Measured: both peers sent
-     * peering frames (act=47 and act=20) and neither received a single one
-     * (rxact=0), while SAE Authentication -- which goes out through a
-     * different, unprotected path -- crossed normally. 802.11s peering is in
-     * the clear until the link is keyed; AMPE protects its own elements. */
+     * derive that key are the ones destroyed (measured: peering frames
+     * transmitted on both ends, zero received on either, while SAE
+     * Authentication -- a different, unprotected path -- crossed normally).
+     * 802.11s peering is in the clear until the link is keyed; AMPE protects
+     * its own elements. */
     umac_sta_data_set_security(stad,
                                (!sae && g_warthog_mesh_secure) ? MMWLAN_SAE : MMWLAN_OPEN,
                                MMWLAN_PMF_DISABLED);

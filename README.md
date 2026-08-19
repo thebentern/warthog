@@ -311,7 +311,7 @@ links, resolved paths at hop count 1, and answered pings:
 
 ![OpenMANET view of the mesh](docs/img/openmanet-pi.svg)
 
-**The point of doing this** is to hang phones and EUDs off your mesh: a warthog
+**The use case** is hanging phones and EUDs off your mesh: a warthog
 joins as a peer and presents a Wi-Fi AP and a USB Ethernet adapter on the other
 side. That story, end to end, is in the wiki:
 [OpenMANET Gateway](../../wiki/OpenMANET-Gateway).
@@ -325,7 +325,7 @@ firewall zone. Both are covered, with the diagnostic signature of each, in
 
 ### "`ping 8.8.8.8` works but `curl example.com` hangs"
 
-Classic DHCP-DNS gap. The symptom is exact: ICMP to a numeric IP returns within ~90 ms (HaLow RTT), but any name resolution stalls.
+A DHCP-DNS gap: ICMP to a numeric IP returns within ~90 ms (HaLow RTT), but name resolution stalls.
 
 **Cause.** The Warthog DHCP server has to hand the host a DNS resolver via DHCP option 6, *and* that resolver has to be reachable through the NAT chain. Two ways that breaks:
 

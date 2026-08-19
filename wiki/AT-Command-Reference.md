@@ -90,7 +90,7 @@ OK
 ```
 
 Reading `AT+MPMPEERS?`: `estab=1` with a non-zero `plid` is a complete two-way
-handshake. `plid=0` with `opens` climbing means we are sending Opens nobody
+handshake. `plid=0` with `opens` climbing means the node is sending Opens nobody
 answers — Warthog sends a Close and restarts after 8.
 
 ## Datapath diagnostics

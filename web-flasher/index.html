@@ -329,7 +329,7 @@ $("erase").addEventListener("click", () => doFlash(true));
 //
 // Contract, from main/at.c: lines end in \r\n; every command answers with
 // zero or more "+VERB: ..." lines then a terminating "OK" or "ERROR"; failures
-// carry "+ERR: <why>" before the ERROR. The console echoes what we type. A
+// carry "+ERR: <why>" before the ERROR. The console echoes input. A
 // bare AT answers OK. Setters that persist reply "+INFO: stored. AT+RESET to
 // apply." before OK. The parser below reads until it sees OK/ERROR, so a
 // slow command (AT+MPING) just takes longer rather than tearing.

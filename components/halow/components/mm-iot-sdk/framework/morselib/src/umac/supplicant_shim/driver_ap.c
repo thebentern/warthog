@@ -467,10 +467,9 @@ static int mmwpas_send_mlme(void *priv,
      * to the shared derived BSSID; the RX half swaps it back before hostap,
      * which enforces A3 == SA, ever sees the frame. Unprotected mgmt frames
      * only -- nothing at the Commit stage MICs the header. */
-    /* hostap's mesh A3 convention (A3 == SA) goes out untouched: measured on
-     * hardware, the peer chip's filter passes it and the peer's hostap
-     * requires it. (An A3-rewrite experiment lived here while that was in
-     * question; every mode other than "leave it alone" was wrong.) */
+    /* hostap's mesh A3 convention (A3 == SA) goes out untouched: the peer
+     * chip's filter passes it and the peer's hostap requires it (measured --
+     * substituting the shared BSSID or the DA both fail). */
     mmpkt_append_data(tx_pktview, data, data_len);
     mmpkt_close(&tx_pktview);
     if (umac_mesh_sae_active())
@@ -764,12 +763,11 @@ static int mmwpas_set_key_mesh(void *priv, struct wpa_driver_set_key_params *par
 
 /* Insert a peer hostap's MPM has accepted.
  *
- * This op is NOT optional, and that cost a long hunt: wpa_drv_sta_add()
- * returns -1 when the driver leaves .sta_add NULL -- it does not treat the
- * op as absent and carry on, the way most wpa_drv_* helpers do. It is the
- * final step of mesh_mpm_add_peer(), so with .sta_add unset that function
- * returned NULL for every candidate and SAE never began: no Auth frame was
- * ever transmitted, and the only visible symptom was a peer count of zero.
+ * This op is NOT optional: wpa_drv_sta_add() returns -1 when the driver
+ * leaves .sta_add NULL -- it does not treat the op as absent and carry on,
+ * the way most wpa_drv_* helpers do. It is the final step of
+ * mesh_mpm_add_peer(), so with .sta_add unset every candidate is rejected
+ * and SAE never begins; the only visible symptom is a peer count of zero.
  *
  * Creating the station here rather than at ESTAB is the right order for SAE:
  * the station must exist before .set_key can install the AMPE-derived MTK. */
