@@ -56,6 +56,7 @@ extern volatile uint32_t g_warthog_tx_data_deq;
 extern volatile uint32_t g_warthog_tx_data_hdr;
 extern volatile uint32_t g_warthog_mesh_chip_sta_fail;
 extern volatile uint32_t g_warthog_mesh_key_fail;
+extern volatile uint32_t g_warthog_ampe_mtk_installed, g_warthog_ampe_mgtk_installed;
 extern volatile uint32_t g_warthog_mesh_secure;
 extern volatile uint8_t g_warthog_mesh_self_addr[6];
 extern volatile uint32_t g_warthog_peer_fp[4];
@@ -112,7 +113,13 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
             {
                 break;
             }
-            if (frame[hdr_len] == DOT11_ACTION_CATEGORY_SELF_PROTECTED)
+            /* Peering frames go to hostap's MPM when SAE/AMPE is running --
+             * it owns the handshake then, because the AMPE elements that carry
+             * the keys are built and verified inside mesh_mpm/mesh_rsn.
+             * warthog's own MPM keeps the open mesh, where there are no keys
+             * to exchange and it is the simpler, working path. */
+            if (frame[hdr_len] == DOT11_ACTION_CATEGORY_SELF_PROTECTED &&
+                !umac_mesh_sae_active())
             {
                 umac_mesh_handle_mpm(dot11_get_ta(header), frame + hdr_len,
                                      frame_len - hdr_len);
@@ -533,6 +540,81 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
 
     s_peers[slot] = stad;
     MMLOG_INF("mesh: peer " MM_MAC_ADDR_FMT " added (slot %d)\n", MM_MAC_ADDR_VAL(peer_addr), slot);
+    return MMWLAN_SUCCESS;
+}
+
+/* Install a key that came from somewhere else -- in practice AMPE, via the
+ * supplicant shim's .set_key driver op.
+ *
+ * This is the same install the hardcoded path does, with the same two
+ * constraints, which are properties of the chip rather than of the key:
+ *
+ *  - the pairwise TX packet number must only ever move FORWARD across
+ *    installs, or existing peers reject our frames as replays; and
+ *  - the group key is a VIF-wide resource and must go to the chip exactly
+ *    once, at aid 0, while every peer keeps a host-keychain copy for the
+ *    per-sender replay check.
+ *
+ * @param peer_addr  peer the key belongs to; for a group key, any established
+ *                   peer (the chip slot is VIF-wide).
+ * @param pairwise   true for the MTK, false for the MGTK.
+ */
+enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, const uint8_t *key,
+                                                   uint8_t key_len, uint8_t key_id, bool pairwise)
+{
+    if (peer_addr == NULL || key == NULL || key_len != UMAC_KEY_AES_128_LEN)
+    {
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+    struct umac_sta_data *stad = mesh_find_peer_(peer_addr);
+    if (stad == NULL)
+    {
+        MMLOG_WRN("mesh: set_key for unknown peer " MM_MAC_ADDR_FMT "\n",
+                  MM_MAC_ADDR_VAL(peer_addr));
+        return MMWLAN_ERROR;
+    }
+    uint16_t vif_id = umac_sta_data_get_vif_id(stad);
+
+    struct umac_key k = { .key_id = key_id, .key_len = key_len,
+                          .key_type = pairwise ? UMAC_KEY_TYPE_PAIRWISE : UMAC_KEY_TYPE_GROUP };
+    memcpy(k.key_data, key, key_len);
+
+    if (pairwise)
+    {
+        s_mesh_key_epoch++;
+        k.tx_seq = (uint64_t)s_mesh_key_epoch << 20;
+        enum mmwlan_status st = umac_keys_install_key(stad, vif_id, &k);
+        if (st != MMWLAN_SUCCESS)
+        {
+            MMLOG_WRN("mesh: AMPE MTK install failed %d\n", (int)st);
+            g_warthog_mesh_key_fail++;
+            return st;
+        }
+        g_warthog_ampe_mtk_installed++;
+        MMLOG_INF("mesh: AMPE MTK installed for " MM_MAC_ADDR_FMT "\n",
+                  MM_MAC_ADDR_VAL(peer_addr));
+        return MMWLAN_SUCCESS;
+    }
+
+    if (!connection_keys_install_key(&umac_sta_data_get_keys(stad)->keys, &k))
+    {
+        MMLOG_WRN("mesh: AMPE MGTK keychain install failed\n");
+        return MMWLAN_ERROR;
+    }
+    if (!s_group_key_in_chip)
+    {
+        struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = k.key_id,
+                                     .length = k.key_len, .tx_pn = 0 };
+        memcpy(kc.key, k.key_data, k.key_len);
+        if (mmdrv_install_key(vif_id, 0, &kc) != 0)
+        {
+            MMLOG_WRN("mesh: AMPE MGTK chip install failed\n");
+            return MMWLAN_ERROR;
+        }
+        s_group_key_in_chip = true;
+    }
+    g_warthog_ampe_mgtk_installed++;
+    MMLOG_INF("mesh: AMPE MGTK installed (key_id %u)\n", (unsigned)k.key_id);
     return MMWLAN_SUCCESS;
 }
 

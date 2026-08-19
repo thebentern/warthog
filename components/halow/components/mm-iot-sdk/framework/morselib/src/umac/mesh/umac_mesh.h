@@ -31,6 +31,9 @@ struct umac_data;
  */
 bool umac_mesh_validate_args(struct umac_data *umacd, const struct mmwlan_mesh_args *args);
 
+/** True when the mesh runs SAE/AMPE, so hostap's MPM owns peering. */
+bool umac_mesh_sae_active(void);
+
 /** Forget every peer link; the next beacon re-runs the peering. */
 void umac_mesh_reset_links(void);
 
@@ -41,6 +44,17 @@ int umac_mesh_hwmp_send_preq(const uint8_t *da);
 /** Handle a received mesh action frame (category 13). Answers a PREQ that
  *  targets us with a PREP. */
 void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta);
+
+/**
+ * Transmit an action frame to a mesh peer, appending S1G Capabilities.
+ *
+ * The Morse driver on the far side validates that element on peering frames,
+ * so hostap's MPM output cannot go on air without it. Used by the supplicant
+ * shim's .send_action driver op.
+ *
+ * @returns 0 or a negative error.
+ */
+int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len);
 
 /**
  * Bring the mesh interface up: ADD_INTERFACE(type=MESH), BSS config, then

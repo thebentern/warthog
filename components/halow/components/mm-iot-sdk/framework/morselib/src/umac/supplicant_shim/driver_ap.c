@@ -16,6 +16,7 @@
 #include "umac/config/umac_config.h"
 #include "umac/core/umac_core.h"
 #include "umac/datapath/umac_datapath.h"
+#include "umac/mesh/umac_mesh.h"
 #include "umac/ps/umac_ps.h"
 #include "umac/scan/umac_scan.h"
 #include "umac/connection/umac_connection.h"
@@ -668,9 +669,74 @@ static void mmwpas_deinit_mesh(void *priv)
     data->mesh_driver_ctx = NULL;
 }
 
+/* ---- mesh-specific driver ops ------------------------------------------
+ *
+ * hostap's mesh MPM and RSN reach the radio through these. The AP versions
+ * cannot be reused: they look up an AP-side STA and assert when it is absent,
+ * which is always, because mesh has no AP BSS.
+ */
+
+/* PLINK Open/Confirm/Close, and the AMPE elements inside them.
+ *
+ * mesh_mpm.c builds the whole action body and sends it via wpa_drv_send_action
+ * (mesh_mpm.c:442); with no .send_action the call returns -1 and the frame is
+ * never built, which is why hostap's MPM could never have worked here. */
+static int mmwpas_send_action_mesh(void *priv, unsigned int freq, unsigned int wait,
+                                   const u8 *dst, const u8 *src, const u8 *bssid,
+                                   const u8 *data, size_t data_len, int no_cck)
+{
+    (void)priv; (void)freq; (void)wait; (void)src; (void)bssid; (void)no_cck;
+    if (dst == NULL || data == NULL || data_len == 0 || data_len > 0xffffu)
+    {
+        return -1;
+    }
+    /* umac_mesh_tx_action appends S1G Capabilities, which the Morse driver on
+     * the far side requires on peering frames and hostap knows nothing about. */
+    return umac_mesh_tx_action(dst, data, (uint16_t)data_len) < 0 ? -1 : 0;
+}
+
+/* The payoff: keys that SAE and AMPE actually derived, rather than a constant.
+ *
+ * mesh_rsn installs the per-link MTK (mesh_mpm.c:928) and the group MGTK
+ * (:938) through here. Anything else -- IGTK/BIP, or a key with no peer
+ * address -- is accepted and ignored rather than failed, so a build without
+ * management-frame protection does not take the peering down with it. */
+static int mmwpas_set_key_mesh(void *priv, struct wpa_driver_set_key_params *params)
+{
+    (void)priv;
+    if (params == NULL)
+    {
+        return -1;
+    }
+    if (params->alg == WPA_ALG_NONE)
+    {
+        return 0;  /* key removal: the peer teardown path already clears these */
+    }
+    if (params->alg != WPA_ALG_CCMP)
+    {
+        MMLOG_WRN("mesh set_key: alg %d not CCMP, ignoring\n", (int)params->alg);
+        return 0;
+    }
+    if (params->addr == NULL)
+    {
+        MMLOG_WRN("mesh set_key: no peer address, ignoring\n");
+        return 0;
+    }
+    bool pairwise = (params->key_idx == 0);
+    enum mmwlan_status st = umac_datapath_mesh_set_peer_key(params->addr, params->key,
+                                                            (uint8_t)params->key_len,
+                                                            (uint8_t)params->key_idx, pairwise);
+    return (st == MMWLAN_SUCCESS) ? 0 : -1;
+}
+
 const struct wpa_driver_ops mmwlan_wpas_ops_mesh = {
     .name = UMAC_SUPP_MESH_DRIVER_NAME,
     .desc = "Warthog mesh driver",
+    /* The real mesh implementations promised by the comment below: hostap's
+     * MPM sends every PLINK frame through .send_action, and mesh_rsn installs
+     * the SAE/AMPE-derived keys through .set_key. */
+    .send_action = mmwpas_send_action_mesh,
+    .set_key = mmwpas_set_key_mesh,
     .init = mmwpas_init_mesh,
     .deinit = mmwpas_deinit_mesh,
     /* Chip-level info — safe to share with AP. */

@@ -13,6 +13,16 @@
 #include "mmhalow.h"
 #include "cfg.h"
 
+/* 802.11s security. Default OFF: stock OpenMANET ships encryption='none', and
+ * an open mesh is what it must be matched with. The warthog-mesh-sae env turns
+ * it on. The passphrase must be identical on every node in the mesh. */
+#ifndef WARTHOG_MESH_SAE
+#define WARTHOG_MESH_SAE 0
+#endif
+#ifndef WARTHOG_MESH_PASSPHRASE
+#define WARTHOG_MESH_PASSPHRASE "warthog-mesh"
+#endif
+
 static const char *TAG = "warthog.mesh";
 
 /* periodic probe-request burst.
@@ -314,7 +324,36 @@ void warthog_mesh_smoke_test(void)
     static const char MESH_ID[] = WARTHOG_MESH_ID;
     args.mesh_id_len = (uint8_t)(sizeof(MESH_ID) - 1);
     memcpy(args.mesh_id, MESH_ID, args.mesh_id_len);
+    /* Mesh security.
+     *
+     * MMWLAN_SAE runs real 802.11s security: SAE (dragonfly) authentication
+     * derives a PMK per peer, and AMPE carries the per-link MTK and the group
+     * MGTK inside the peering handshake. That is what hostap's mesh_rsn.c
+     * implements and what a mac80211 peer speaks, so it is the only mode that
+     * can interoperate with a secured OpenMANET mesh.
+     *
+     * MMWLAN_OPEN leaves the mesh unauthenticated and unencrypted, which is
+     * what stock OpenMANET ships and what the data plane must match.
+     *
+     * The passphrase must be identical on every node, exactly as it must be
+     * for any 802.11s SAE mesh. */
+#if WARTHOG_MESH_SAE
+    args.security_type = MMWLAN_SAE;
+    {
+        const char *pw = WARTHOG_MESH_PASSPHRASE;
+        size_t pw_len = strlen(pw);
+        if (pw_len == 0 || pw_len >= sizeof(args.passphrase)) {
+            ESP_LOGE(TAG, "mesh: WARTHOG_MESH_PASSPHRASE must be 1..%u chars",
+                     (unsigned)(sizeof(args.passphrase) - 1));
+            return;
+        }
+        memcpy(args.passphrase, pw, pw_len);
+        args.passphrase_len = (uint8_t)pw_len;
+    }
+    ESP_LOGW(TAG, "mesh: SAE/AMPE enabled (passphrase %u chars)", args.passphrase_len);
+#else
     args.security_type = MMWLAN_OPEN;
+#endif
     args.beacon_interval_tu = WARTHOG_MESH_BEACON_TU;
 
     enum mmwlan_status st = mmwlan_mesh_enable(&args);

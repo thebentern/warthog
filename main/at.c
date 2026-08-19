@@ -519,6 +519,11 @@ volatile uint32_t g_warthog_hwmp_rx = 0, g_warthog_hwmp_preq_rx = 0, g_warthog_h
 volatile uint32_t g_warthog_hwmp_prep_tx = 0, g_warthog_hwmp_parse_fail = 0;
 volatile uint32_t g_warthog_hwmp_not_ours = 0;
 volatile uint32_t g_warthog_hwmp_prep_rx = 0;
+
+/* AMPE key installs. Non-zero means SAE/AMPE actually derived a key and it
+ * reached the chip -- the difference between real mesh security and the
+ * hardcoded constant. */
+volatile uint32_t g_warthog_ampe_mtk_installed = 0, g_warthog_ampe_mgtk_installed = 0;
 volatile uint8_t g_warthog_hwmp_dump[48];
 volatile uint16_t g_warthog_hwmp_dump_len = 0, g_warthog_hwmp_dump_full = 0;
 volatile uint8_t g_warthog_rxdata_head[64]; volatile uint16_t g_warthog_rxdata_head_len = 0;

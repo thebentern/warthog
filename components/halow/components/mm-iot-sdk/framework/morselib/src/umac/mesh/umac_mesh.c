@@ -816,6 +816,8 @@ int umac_mesh_tx_probe_response(const uint8_t *da)
 /** 802.11 reason 52, MESH-PEERING-CANCELLED. */
 #define MPM_REASON_PEER_CANCELED 52
 
+static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_len);
+
 /** Path lifetime we advertise, in TUs. 4882 TU ~= 5 s, which is what
  *  mac80211 uses for dot11MeshHWMPactivePathTimeout by default. */
 #define UMAC_MESH_HWMP_LIFETIME_TU 4882u
@@ -989,6 +991,24 @@ static uint32_t s_hwmp_last_preq_ms;
  * vanish before. A mac80211 peer parses elements generically and length-checks
  * only the PREQ/PREP element, so the extra element is harmless to Linux and
  * required by a warthog peer. */
+/* Transmit an arbitrary action frame to a mesh peer.
+ *
+ * Public because hostap's mesh MPM needs it: mesh_mpm.c builds PLINK
+ * Open/Confirm/Close bodies itself and sends them through the driver's
+ * .send_action op, which has nowhere else to go on this port.
+ *
+ * S1G Capabilities is appended here, not by the caller. The Morse driver on
+ * the far side validates that element on peering frames and drops the ones
+ * that lack it -- which is true of another warthog and of an OpenMANET node
+ * alike, since both run that driver. hostap has no idea it needs to emit an
+ * S1G element, so the port supplies it. A mac80211 peer parses elements
+ * generically and ignores the extra one.
+ */
+int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len)
+{
+    return mesh_tx_hwmp_(da, body, body_len);
+}
+
 static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL || body == NULL || body_len == 0)
@@ -1476,6 +1496,13 @@ bool umac_mesh_s1g_beacon_is_our_mesh(const uint8_t *frame, uint32_t len)
 void umac_mesh_reset_links(void)
 {
     mpm_table_init(&s_mpm);
+}
+
+/* True when the mesh was brought up with SAE, i.e. hostap's MPM owns peering
+ * and warthog's own MPM must not intercept SELF_PROTECTED frames. */
+bool umac_mesh_sae_active(void)
+{
+    return s_mesh_args_valid && s_mesh_args.security_type == MMWLAN_SAE;
 }
 
 bool umac_mesh_note_s1g_beacon(const uint8_t *sa)

@@ -49,6 +49,16 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
                                                const uint8_t *peer_addr, bool sae);
 /** Remove one peer, or every peer if @p peer_addr is NULL. */
 void umac_datapath_mesh_del_peer(const uint8_t *peer_addr);
+
+/**
+ * Install an externally derived mesh key -- in practice one AMPE produced.
+ *
+ * @param pairwise  true installs the per-link MTK on that peer; false installs
+ *                  the group MGTK, which is a VIF-wide chip resource written
+ *                  once and mirrored into each peer's host keychain.
+ */
+enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, const uint8_t *key,
+                                                   uint8_t key_len, uint8_t key_id, bool pairwise);
 uint8_t umac_datapath_mesh_peer_count(void);
 
 

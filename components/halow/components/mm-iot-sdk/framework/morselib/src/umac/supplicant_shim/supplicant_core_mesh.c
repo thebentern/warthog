@@ -37,6 +37,7 @@
 #include "hostap/src/ap/hostapd.h"
 #include "hostap/src/ap/ap_config.h"
 #include "hostap/wpa_supplicant/config_ssid.h"
+#include "hostap/wpa_supplicant/mesh_rsn.h"
 #include "hostap/wpa_supplicant/mesh.h"
 #include "hostap/wpa_supplicant/mesh_mpm.h"
 #pragma GCC diagnostic pop
@@ -114,6 +115,15 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
         return -1;
     }
     wpa_s->ifmsh = ifmsh;
+    /* SAE arrives in Authentication frames, and ieee802_11_mgmt() drops every
+     * one of them unless the interface is ENABLED (ieee802_11.c:6428).
+     * hostapd_alloc_iface() zeroes the struct, so the state is
+     * HAPD_IFACE_UNINITIALIZED, and the passive bring-up here deliberately
+     * never runs hostapd_setup_interface() -- that is the cold-restart path
+     * that panics the chip. Set the state directly: the interface genuinely is
+     * up by the time we get here, the chip having been configured through
+     * mmdrv_mesh_config. Without this, SAE cannot even begin. */
+    ifmsh->state = HAPD_IFACE_ENABLED;
     ifmsh->owner = wpa_s;
     ifmsh->drv_flags = wpa_s->drv_flags;
     ifmsh->drv_flags2 = wpa_s->drv_flags2;
@@ -179,6 +189,33 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
         return -1;
     }
     ifmsh->mconf = mconf;
+
+    /* Bring up mesh RSN when the config asked for SAE.
+     *
+     * mesh_config_create() sets mconf->security from ssid->key_mgmt
+     * (mesh.c:103), so this is AMPE exactly when config.c chose
+     * WPA_KEY_MGMT_SAE for us. Without this call wpa_s->mesh_rsn stays NULL,
+     * mesh_mpm skips every AMPE branch, and the whole of mesh_rsn.c is
+     * garbage-collected out of the image -- which is how the mesh ended up
+     * running on a hardcoded key.
+     *
+     * mesh_rsn_auth_init() builds the AP-side WPA authenticator, derives the
+     * group key (MGTK) and installs the SAE password, so it must run before
+     * any peer is admitted. */
+    if (mconf->security & MESH_CONF_SEC_AMPE)
+    {
+        wpa_s->mesh_rsn = mesh_rsn_auth_init(wpa_s, mconf);
+        if (wpa_s->mesh_rsn == NULL)
+        {
+            MMLOG_ERR("mesh: mesh_rsn_auth_init failed — SAE/AMPE unavailable\n");
+            return -1;
+        }
+        MMLOG_INF("mesh: SAE/AMPE authenticator up (rsn=%p)\n", wpa_s->mesh_rsn);
+    }
+    else
+    {
+        MMLOG_INF("mesh: open mesh — no SAE/AMPE\n");
+    }
 
     /* Skip mesh.c:552-611 (hw_mode lookup, basic_rates, conf_ap_ht) — those
      * need a meaningful ssid->frequency / freq->freq which we don't have in
