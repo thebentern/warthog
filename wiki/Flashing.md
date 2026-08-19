@@ -1,5 +1,10 @@
 # Flashing
 
+> **Easiest route: the [web flasher](https://thebentern.github.io/warthog/).**
+> Chrome, Edge or Opera, nothing to install. Pick a release build or load a
+> `.bin` you built, do the BOOT/RESET dance, and flash. It also configures a
+> running board over the same cable.
+
 ## Why the usual auto-reset does not work
 
 The XIAO plus HaLow add-on drives USB-OTG rather than the built-in

@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Warthog Flasher</title>
+<style>
+  :root {
+    --bg:#0f1318; --card:#161c24; --line:#243040; --fg:#dbe4ee; --dim:#7d8b9c;
+    --accent:#7aa2f7; --ok:#7ee787; --warn:#f0b429; --err:#ff7b72; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif }
+  main { max-width:760px; margin:0 auto; padding:32px 20px 64px }
+  h1 { font-size:26px; margin:0 0 4px }
+  h1 small { color:var(--dim); font-weight:400; font-size:15px; margin-left:8px }
+  .sub { color:var(--dim); margin:0 0 28px }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px 22px; margin-bottom:16px }
+  .card h2 { font-size:15px; margin:0 0 12px; color:var(--accent); letter-spacing:.02em }
+  label { display:block; color:var(--dim); font-size:13px; margin:12px 0 4px }
+  select, button { font:inherit; border-radius:8px; border:1px solid var(--line); background:#0f141b; color:var(--fg); padding:9px 12px }
+  select { width:100% }
+  button { cursor:pointer; background:var(--accent); color:#0b0f14; border:0; font-weight:600; padding:10px 18px }
+  button:disabled { opacity:.45; cursor:not-allowed }
+  button.secondary { background:#243040; color:var(--fg) }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:14px }
+  .steps { margin:0; padding-left:20px } .steps li { margin:6px 0 }
+  kbd { font-family:var(--mono); background:#0f141b; border:1px solid var(--line); border-radius:5px; padding:1px 6px; font-size:13px }
+  .prog { height:8px; background:#0f141b; border-radius:6px; overflow:hidden; margin-top:12px }
+  .prog > div { height:100%; width:0; background:var(--accent); transition:width .15s }
+  pre#log { font-family:var(--mono); font-size:12.5px; background:#0b0f14; border:1px solid var(--line); border-radius:8px; padding:12px; height:220px; overflow:auto; margin:12px 0 0; white-space:pre-wrap; color:#b8c4d2 }
+  .ok { color:var(--ok) } .warn { color:var(--warn) } .err { color:var(--err) } .dim { color:var(--dim) }
+  .banner { border-left:3px solid var(--warn); background:#1c1a12; padding:10px 14px; border-radius:6px; margin-bottom:16px }
+  .banner.err { border-color:var(--err); background:#1c1213 }
+  a { color:var(--accent) }
+  .foot { color:var(--dim); font-size:13px; margin-top:28px }
+  .tabs { display:flex; gap:6px; margin-bottom:18px; border-bottom:1px solid var(--line) }
+  .tab { background:transparent; color:var(--dim); border:0; border-bottom:2px solid transparent; border-radius:0; padding:8px 14px; font-weight:600 }
+  .tab.active { color:var(--fg); border-bottom-color:var(--accent) }
+  section[data-panel] { display:none } section[data-panel].active { display:block }
+  input[type=text], input[type=password] { font:inherit; width:100%; border-radius:8px; border:1px solid var(--line); background:#0f141b; color:var(--fg); padding:9px 12px }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:0 16px } @media (max-width:560px) { .grid { grid-template-columns:1fr } }
+  .kv { font-family:var(--mono); font-size:13px; white-space:pre-wrap; background:#0b0f14; border:1px solid var(--line); border-radius:8px; padding:12px; margin-top:10px; min-height:44px }
+  .hint { color:var(--dim); font-size:12.5px; margin:4px 0 0 }
+</style>
+</head>
+<body>
+<main>
+  <h1>Warthog Flasher <small>flash from your browser</small></h1>
+  <p class="sub">Web Serial + <a href="https://github.com/espressif/esptool-js">esptool-js</a>. Chrome, Edge or Opera on a desktop — Safari and Firefox do not implement Web Serial.</p>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="flash">Flash</button>
+    <button class="tab" data-tab="config">Configure</button>
+  </nav>
+
+  <section data-panel="flash" class="active">
+  <div id="unsupported" class="banner err" hidden>
+    This browser does not support Web Serial. Use Chrome, Edge or Opera on macOS, Windows or Linux.
+  </div>
+
+  <div class="card">
+    <h2>1 · Firmware</h2>
+    <label for="release">Release</label>
+    <select id="release"><option>Loading releases…</option></select>
+    <label for="variant">Build</label>
+    <select id="variant"></select>
+    <p class="dim" id="assetInfo" style="margin:10px 0 0;font-size:13px"></p>
+    <div class="row">
+      <label for="localBin" class="dim" style="margin:0">or</label>
+      <input type="file" id="localBin" accept=".bin" style="font-size:13px">
+    </div>
+    <p class="hint">Load a <code>.factory.bin</code> you built yourself — <code>.pio/build/warthog-&lt;env&gt;/firmware.factory.bin</code>. Written to <code>0x0</code>, same as a release asset.</p>
+  </div>
+
+  <div class="card">
+    <h2>2 · Put the board in download mode</h2>
+    <p>The HaLow add-on drives USB-OTG, so the board <b>cannot</b> be reset into the bootloader over the wire. Do it by hand:</p>
+    <ol class="steps">
+      <li>Hold <kbd>BOOT</kbd></li>
+      <li>Tap <kbd>RESET</kbd></li>
+      <li>Release <kbd>BOOT</kbd></li>
+    </ol>
+    <p class="dim" style="margin:8px 0 0;font-size:13px">It then enumerates as an Espressif ROM device (<code>303a:0009</code>) and stays there until flashed or reset. If it is already running warthog you can also send <code>AT+DLMODE</code> over the console.</p>
+  </div>
+
+  <div class="card">
+    <h2>3 · Flash</h2>
+    <div class="row">
+      <button id="connect">Connect</button>
+      <button id="flash" disabled>Flash</button>
+      <button id="erase" class="secondary" disabled>Erase &amp; flash</button>
+      <span id="port" class="dim"></span>
+    </div>
+    <div class="prog"><div id="bar"></div></div>
+    <pre id="log"></pre>
+    <p class="dim" style="font-size:13px;margin:10px 0 0">Tap <kbd>RESET</kbd> when it finishes. <b>Erase &amp; flash</b> also wipes stored settings (HaLow and AP credentials, DNS, mesh security).</p>
+  </div>
+
+  </section>
+
+  <section data-panel="config">
+    <div class="card">
+      <h2>Console</h2>
+      <p style="margin:0 0 6px">Talks to the running firmware over its CDC-ACM console — the board must be <b>booted normally</b>, not in download mode. Every field here is a documented <a href="https://github.com/thebentern/warthog/wiki/AT-Command-Reference">AT command</a>.</p>
+      <div class="row">
+        <button id="cfgConnect">Connect to console</button>
+        <button id="cfgRefresh" class="secondary" disabled>Read status</button>
+        <span id="cfgPort" class="dim"></span>
+      </div>
+      <div class="kv" id="status">Not connected.</div>
+    </div>
+
+    <div class="card">
+      <h2>HaLow uplink (station mode)</h2>
+      <div class="grid">
+        <div><label for="halowSsid">SSID</label><input id="halowSsid" type="text" placeholder="MyHaLowAP"></div>
+        <div><label for="halowPsk">Passphrase</label><input id="halowPsk" type="password" placeholder="leave blank for an open network"></div>
+      </div>
+      <p class="hint">Stored in NVS. Takes effect after a reboot — <b>Apply &amp; reboot</b> below does that. Not used by the mesh build.</p>
+      <div class="row"><button id="halowSave" class="secondary" disabled>Save HaLow</button></div>
+    </div>
+
+    <div class="card">
+      <h2>2.4 GHz Wi-Fi AP</h2>
+      <div class="grid">
+        <div><label for="apSsid">SSID</label><input id="apSsid" type="text" placeholder="warthog"></div>
+        <div><label for="apPsk">Passphrase</label><input id="apPsk" type="password" placeholder="min 8 chars — change the default"></div>
+      </div>
+      <label for="apChan">Channel</label>
+      <select id="apChan"></select>
+      <div class="row"><button id="apSave" class="secondary" disabled>Save AP</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Downstream DNS</h2>
+      <label for="dns">Resolver handed to USB and AP clients</label>
+      <input id="dns" type="text" placeholder="1.1.1.1">
+      <p class="hint">Must be reachable through the uplink. If <code>ping 8.8.8.8</code> works but names do not resolve, this is why.</p>
+      <div class="row"><button id="dnsSave" class="secondary" disabled>Save DNS</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Mesh data plane <span class="dim" style="font-weight:400">(mesh build only)</span></h2>
+      <label for="meshsec">Encryption</label>
+      <select id="meshsec">
+        <option value="0">Open — required to talk to stock OpenMANET</option>
+        <option value="1">Keyed — one shared key on every warthog (obfuscation, not security)</option>
+      </select>
+      <p class="hint">Applies immediately and persists. The node re-peers within ~2 s.</p>
+      <div class="row"><button id="meshsecSave" class="secondary" disabled>Save mesh setting</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Apply</h2>
+      <div class="row">
+        <button id="reboot" disabled>Apply &amp; reboot</button>
+        <button id="eraseNvs" class="secondary" disabled>Erase all settings</button>
+      </div>
+      <p class="hint">Reboot applies stored HaLow, AP and DNS changes. <b>Erase all settings</b> wipes every field above back to the build defaults.</p>
+      <pre id="cfgLog"></pre>
+    </div>
+  </section>
+
+  <p class="foot">
+    Same bytes as <code>scripts/flash.sh</code>: the <code>.factory.bin</code> for your region written to <code>0x0</code>.
+    Pick the region you are operating in — the channel list is baked into the image and it is on you to be legal.
+    <a href="https://github.com/thebentern/warthog">Source</a> · <a href="https://github.com/thebentern/warthog/wiki/Flashing">Flashing guide</a>
+  </p>
+</main>
+
+<script type="module">
+import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.5.4/bundle.js";
+
+const REPO = "thebentern/warthog";
+const $ = (id) => document.getElementById(id);
+const log = $("log");
+const say = (msg, cls = "") => { const l = document.createElement("div"); if (cls) l.className = cls; l.textContent = msg; log.appendChild(l); log.scrollTop = log.scrollHeight; };
+const bar = (pct) => { $("bar").style.width = `${Math.max(0, Math.min(100, pct))}%`; };
+
+const VARIANTS = [
+  { key: "us",         label: "US — 902–928 MHz (station uplink)" },
+  { key: "eu",         label: "EU — 863–868 MHz (station uplink)" },
+  { key: "jp",         label: "JP — 916.5–927.5 MHz (station uplink)" },
+  { key: "kr",         label: "KR — 917.5–923.5 MHz (station uplink)" },
+  { key: "au",         label: "AU (station uplink)" },
+  { key: "mesh-smoke", label: "Mesh — 802.11s peer, OpenMANET-compatible (US band)" },
+];
+
+if (!("serial" in navigator)) {
+  $("unsupported").hidden = false;
+  $("connect").disabled = true;
+}
+
+// ---- releases -----------------------------------------------------------
+let releases = [];
+async function loadReleases() {
+  try {
+    const r = await fetch(`https://api.github.com/repos/${REPO}/releases?per_page=20`, { headers: { Accept: "application/vnd.github+json" } });
+    if (!r.ok) throw new Error(`GitHub API ${r.status}`);
+    releases = (await r.json()).filter((x) => !x.draft);
+  } catch (e) {
+    say(`Could not list releases: ${e.message}`, "err");
+    if (String(e.message).includes("403")) {
+      say("GitHub's unauthenticated API limit is 60 requests/hour per IP. Wait, or use \u201cLoad a .bin file\u201d below.", "warn");
+    }
+    releases = [];
+  }
+  const sel = $("release");
+  sel.innerHTML = "";
+  if (!releases.length) {
+    sel.innerHTML = `<option value="">— none available —</option>`;
+    say("No releases to list. Use \u201cLoad a .bin file\u201d below to flash a local build.", "warn");
+    $("variant").innerHTML = "";
+    return;
+  }
+  for (const rel of releases) {
+    const o = document.createElement("option");
+    o.value = rel.tag_name;
+    o.textContent = `${rel.tag_name}${rel.prerelease ? "  (pre-release)" : ""}`;
+    sel.appendChild(o);
+  }
+  populateVariants();
+}
+function currentRelease() { return releases.find((r) => r.tag_name === $("release").value); }
+function assetFor(rel, key) {
+  return rel?.assets?.find((a) => a.name === `warthog-${rel.tag_name}-${key}.factory.bin`);
+}
+function populateVariants() {
+  const rel = currentRelease();
+  const sel = $("variant"); sel.innerHTML = "";
+  for (const v of VARIANTS) {
+    const a = assetFor(rel, v.key);
+    if (!a) continue;              // only offer what the release actually shipped
+    const o = document.createElement("option");
+    o.value = v.key; o.textContent = v.label; sel.appendChild(o);
+  }
+  describeAsset();
+}
+function describeAsset() {
+  const local = $("localBin")?.files?.[0];
+  if (local) { $("assetInfo").textContent = `${local.name} · ${(local.size / 1024).toFixed(0)} KB · local file, written to 0x0`; return; }
+  const rel = currentRelease(); const a = assetFor(rel, $("variant").value);
+  $("assetInfo").textContent = a ? `${a.name} · ${(a.size / 1024).toFixed(0)} KB · written to 0x0` : "";
+}
+$("release").addEventListener("change", populateVariants);
+$("variant").addEventListener("change", describeAsset);
+$("localBin").addEventListener("change", describeAsset);
+loadReleases();
+
+// ---- serial + esptool -----------------------------------------------------
+let device, transport, loader, chip;
+
+$("connect").addEventListener("click", async () => {
+  try {
+    // Filter to Espressif so the picker is not a wall of unrelated ports.
+    device = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x303a }] });
+    transport = new Transport(device, true);
+    loader = new ESPLoader({ transport, baudrate: 921600, terminal: { clean() {}, writeLine: (s) => say(s, "dim"), write: (s) => say(s, "dim") } });
+    say("Connecting… (board must already be in download mode)");
+    chip = await loader.main();      // syncs with the ROM; no reset strobe needed or possible here
+    say(`Connected: ${chip}`, "ok");
+    const info = device.getInfo();
+    $("port").textContent = `USB ${info.usbVendorId?.toString(16)}:${info.usbProductId?.toString(16)}`;
+    if (info.usbProductId !== 0x0009) {
+      say(`Note: PID 0x${info.usbProductId?.toString(16)} is not the ROM bootloader (0x0009). If flashing fails, redo the BOOT/RESET step.`, "warn");
+    }
+    $("flash").disabled = false; $("erase").disabled = false; $("connect").disabled = true;
+  } catch (e) {
+    say(`Connect failed: ${e.message}`, "err");
+    say("Is the board in download mode? Hold BOOT, tap RESET, release BOOT, then Connect again.", "warn");
+  }
+});
+
+async function fetchAsset() {
+  const local = $("localBin").files?.[0];
+  if (local) {
+    say(`Using local file ${local.name} (${(local.size / 1024).toFixed(0)} KB)`);
+    const buf = new Uint8Array(await local.arrayBuffer());
+    let s = ""; for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+    return s;
+  }
+  const rel = currentRelease(); const a = assetFor(rel, $("variant").value);
+  if (!a) throw new Error("no firmware selected — pick a release build or load a .bin file");
+  say(`Downloading ${a.name}…`);
+  // browser_download_url redirects to a CORS-enabled objects host, so a plain fetch works.
+  const r = await fetch(a.browser_download_url);
+  if (!r.ok) throw new Error(`download failed: ${r.status}`);
+  const buf = new Uint8Array(await r.arrayBuffer());
+  say(`Downloaded ${(buf.length / 1024).toFixed(0)} KB`, "ok");
+  // esptool-js wants a binary string
+  let s = ""; for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+  return s;
+}
+
+async function doFlash(erase) {
+  $("flash").disabled = true; $("erase").disabled = true; bar(0);
+  try {
+    const data = await fetchAsset();
+    if (erase) { say("Erasing flash… (takes a while)", "warn"); await loader.eraseFlash(); say("Erased", "ok"); }
+    say("Writing at 0x0…");
+    await loader.writeFlash({
+      fileArray: [{ data, address: 0x0 }],
+      flashSize: "keep", flashMode: "keep", flashFreq: "keep",
+      eraseAll: false, compress: true,
+      reportProgress: (i, written, total) => bar((written / total) * 100),
+    });
+    bar(100);
+    say("Done. Tap RESET on the board.", "ok");
+    say("The console reappears as /dev/cu.usbmodem* (macOS) or /dev/ttyACM* (Linux) once it boots.", "dim");
+    try { await transport.disconnect(); } catch {}
+    $("connect").disabled = false;
+  } catch (e) {
+    say(`Flash failed: ${e.message}`, "err");
+    $("flash").disabled = false; $("erase").disabled = false;
+  }
+}
+$("flash").addEventListener("click", () => doFlash(false));
+$("erase").addEventListener("click", () => doFlash(true));
+
+// ============================================================================
+// Configure tab: drive the AT console over Web Serial.
+//
+// Contract, from main/at.c: lines end in \r\n; every command answers with
+// zero or more "+VERB: ..." lines then a terminating "OK" or "ERROR"; failures
+// carry "+ERR: <why>" before the ERROR. The console echoes what we type. A
+// bare AT answers OK. Setters that persist reply "+INFO: stored. AT+RESET to
+// apply." before OK. The parser below reads until it sees OK/ERROR, so a
+// slow command (AT+MPING) just takes longer rather than tearing.
+// ============================================================================
+const tabs = document.querySelectorAll(".tab");
+tabs.forEach((t) => t.addEventListener("click", () => {
+  tabs.forEach((x) => x.classList.toggle("active", x === t));
+  document.querySelectorAll("section[data-panel]").forEach((p) => p.classList.toggle("active", p.dataset.panel === t.dataset.tab));
+}));
+
+const clog = $("cfgLog");
+const csay = (msg, cls = "") => { const l = document.createElement("div"); if (cls) l.className = cls; l.textContent = msg; clog.appendChild(l); clog.scrollTop = clog.scrollHeight; };
+
+for (let c = 1; c <= 13; c++) { const o = document.createElement("option"); o.value = c; o.textContent = `Channel ${c}`; if (c === 6) o.selected = true; $("apChan").appendChild(o); }
+
+let cport, creader, cwriter, cbuf = "";
+async function cfgOpen() {
+  cport = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x303a }] });
+  await cport.open({ baudRate: 115200 });          // CDC ignores baud; 115200 by convention
+  cwriter = cport.writable.getWriter();
+  creader = cport.readable.getReader();
+  cbuf = "";
+  (async () => {                                     // background reader into cbuf
+    const dec = new TextDecoder();
+    try { for (;;) { const { value, done } = await creader.read(); if (done) break; cbuf += dec.decode(value, { stream: true }); } }
+    catch {} finally { csay("Console disconnected.", "warn"); setCfgEnabled(false); }
+  })();
+}
+// Send one command, return {ok, lines} where lines are the "+..." replies.
+async function at(cmd, timeoutMs = 4000) {
+  cbuf = "";
+  await cwriter.write(new TextEncoder().encode(cmd + "\r\n"));
+  const t0 = Date.now();
+  for (;;) {
+    const m = cbuf.match(/(^|\r?\n)(OK|ERROR)\r?\n/);
+    if (m) {
+      const body = cbuf.slice(0, m.index);
+      const lines = body.split(/\r?\n/).map((x) => x.trim()).filter((x) => x && x !== cmd && !x.startsWith("W (") && !x.startsWith("I (") && !x.startsWith("E "));
+      return { ok: m[2] === "OK", lines };
+    }
+    if (Date.now() - t0 > timeoutMs) return { ok: false, lines: ["(timeout — is the board booted normally, not in download mode?)"] };
+    await new Promise((r) => setTimeout(r, 30));
+  }
+}
+function setCfgEnabled(on) {
+  for (const id of ["cfgRefresh", "halowSave", "apSave", "dnsSave", "meshsecSave", "reboot", "eraseNvs"]) $(id).disabled = !on;
+  $("cfgConnect").disabled = on;
+}
+// AT+ERR lines are the useful part of a failure; surface them verbatim.
+function report(label, r) {
+  const err = r.lines.find((l) => l.startsWith("+ERR"));
+  if (r.ok) csay(`${label}: ${r.lines.filter((l) => l.startsWith("+INFO")).join(" ") || "OK"}`, "ok");
+  else csay(`${label}: ${err || "ERROR"}`, "err");
+  return r.ok;
+}
+const q = (s) => s.replace(/,/g, "");   // commas are the argument separator; strip rather than mangle silently
+
+async function readStatus() {
+  const out = [];
+  const st = await at("AT+STATUS?"); out.push(...st.lines);
+  const ver = await at("AT+VERSION?"); out.push(...ver.lines);
+  const h = await at("AT+HALOW?");   const hm = h.lines.join(" ").match(/ssid="([^"]*)"/);   if (hm) $("halowSsid").value = hm[1];
+  const a = await at("AT+WIFIAP?");  const am = a.lines.join(" ").match(/ssid="([^"]*)" chan=(\d+)/); if (am) { $("apSsid").value = am[1]; $("apChan").value = am[2]; }
+  const d = await at("AT+DNS?");     const dm = d.lines.join(" ").match(/\+DNS:\s*(\S+)/);        if (dm) $("dns").value = dm[1];
+  const m = await at("AT+MESHSEC?"); const mm = m.lines.join(" ").match(/\+MESHSEC:\s*(\d)/);
+  if (m.ok && mm) { $("meshsec").value = mm[1]; $("meshsecSave").disabled = false; }
+  else { $("meshsecSave").disabled = true; out.push("(mesh commands not available on this build)"); }
+  $("status").textContent = out.join("\n") || "(no reply)";
+}
+
+$("cfgConnect").addEventListener("click", async () => {
+  try {
+    await cfgOpen();
+    const info = cport.getInfo();
+    $("cfgPort").textContent = `USB ${info.usbVendorId?.toString(16)}:${info.usbProductId?.toString(16)}`;
+    if (info.usbProductId === 0x0009) { csay("That is the ROM bootloader, not the firmware. Tap RESET and reconnect.", "warn"); await cport.close(); return; }
+    const r = await at("AT");
+    if (!r.ok) { csay("No AT response. The console shares the port with a second CDC interface on some hosts — try the other one.", "err"); return; }
+    setCfgEnabled(true);
+    csay("Connected.", "ok");
+    await readStatus();
+  } catch (e) { csay(`Connect failed: ${e.message}`, "err"); }
+});
+$("cfgRefresh").addEventListener("click", readStatus);
+
+$("halowSave").addEventListener("click", async () => {
+  const ssid = q($("halowSsid").value.trim()), psk = $("halowPsk").value;
+  if (!ssid) return csay("HaLow: SSID required", "err");
+  report("HaLow", await at(`AT+HALOW=${ssid},${psk}`));
+});
+$("apSave").addEventListener("click", async () => {
+  const ssid = q($("apSsid").value.trim()), psk = q($("apPsk").value), ch = $("apChan").value;
+  if (!ssid) return csay("AP: SSID required", "err");
+  if (psk && psk.length < 8) return csay("AP: WPA2 passphrase must be at least 8 characters", "err");
+  report("AP", await at(`AT+WIFIAP=${ssid},${psk},${ch}`));
+});
+$("dnsSave").addEventListener("click", async () => {
+  const v = $("dns").value.trim();
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(v)) return csay("DNS: dotted-quad IPv4 only", "err");
+  report("DNS", await at(`AT+DNS=${v}`));
+});
+$("meshsecSave").addEventListener("click", async () => {
+  report("Mesh", await at(`AT+MESHSEC=${$("meshsec").value}`));
+});
+$("reboot").addEventListener("click", async () => {
+  csay("Rebooting… the console will drop and reappear in ~15 s.", "warn");
+  await at("AT+RESET", 1500).catch(() => {});
+  setCfgEnabled(false);
+});
+$("eraseNvs").addEventListener("click", async () => {
+  if (!confirm("Erase ALL stored settings (HaLow, AP, DNS, mesh)? The board reverts to build defaults.")) return;
+  if (report("Erase", await at("AT+ERASE"))) csay("Reboot to apply the defaults.", "warn");
+});
+</script>
+</body>
+</html>

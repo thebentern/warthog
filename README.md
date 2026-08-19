@@ -83,6 +83,10 @@ pio run -e warthog-us
 
 ### 2. Flash
 
+**No toolchain?** Use the [web flasher](https://thebentern.github.io/warthog/) —
+Chrome, Edge or Opera, no install. It also has a Configure tab that drives the
+same AT commands from the browser.
+
 The HaLow add-on drives USB-OTG, so `esptool` cannot pull the board into
 download mode over DTR/RTS. Do it by hand — **hold BOOT, tap RESET, release
 BOOT** — then:
