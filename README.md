@@ -156,7 +156,7 @@ Two caveats that remain:
    worse supply.
 2. **Two warthogs on one host collide.** Both vend `192.168.4.1/24`, so a host
    with two attached configures only one and the other falls back to a
-   link-local address. Fine on a bench, worth knowing.
+   link-local address.
 
 If you meet a host that binds ECM and not NCM, `warthog-us-ecm` builds the old
 class as a fallback.
@@ -330,9 +330,9 @@ Classic DHCP-DNS gap. The symptom is exact: ICMP to a numeric IP returns within 
 **Cause.** The Warthog DHCP server has to hand the host a DNS resolver via DHCP option 6, *and* that resolver has to be reachable through the NAT chain. Two ways that breaks:
 
 1. **No DNS option** — the host gets only IP + gateway, falls back to its primary-interface resolver (usually a `192.168.x.1` or `10.x.x.1` from Wi-Fi), and tries to query that LAN IP through the Warthog USB tunnel. The LAN IP isn't reachable through HaLow's NAT, so DNS just times out.
-2. **DNS option present but unroutable** — the upstream HaLow AP's DHCP lease hands the ESP32 a *LAN-side* resolver (e.g. on the HaLowLink 2 it's `192.168.12.1`). If we re-advertised that to downstream USB clients, the Mac would NAPT a DNS query through HaLow targeting `192.168.12.1` — which the HaLowLink only answers for clients on its own subnet, not for NAT'd traffic arriving from upstream. Same hang.
+2. **DNS option present but unroutable** — the upstream HaLow AP's DHCP lease hands the ESP32 a *LAN-side* resolver (e.g. on a HaLowLink 2, `192.168.12.1`). Re-advertising that address to downstream USB clients makes the host NAPT its DNS queries through HaLow toward `192.168.12.1` — which the upstream AP only answers for clients on its own subnet, not for NAT'd traffic. Same hang.
 
-**Fix.** Warthog hands out a *publicly reachable* resolver instead. Default is **`1.1.1.1`** (Cloudflare) — works through any NAT chain, no LAN dependency. Override at runtime if you'd rather use `8.8.8.8` or a private resolver you actually run:
+**Fix.** Warthog hands out a *publicly reachable* resolver instead. Default is **`1.1.1.1`** (Cloudflare) — works through any NAT chain, no LAN dependency. Override at runtime to use a different public resolver or a private one reachable from the upstream network:
 
 ```
 AT+DNS=8.8.8.8
@@ -352,9 +352,9 @@ ipconfig getpacket en10 | grep domain_name_server
 # Expected: domain_name_server (ip_mult): {1.1.1.1}
 ```
 
-If the new firmware shows the right DNS but the Mac still uses the old one, kick the lease: `sudo ifconfig en10 down && sudo ifconfig en10 up`, or unplug+replug the USB-C cable. macOS otherwise caches the original lease for hours.
+If the firmware advertises the right DNS but the host still uses the old one, force a new lease: `sudo ifconfig en10 down && sudo ifconfig en10 up`, or unplug and replug the cable. macOS caches the original lease for hours otherwise.
 
-**Verified path.** This was the actual failure on a HaLowLink 2 + Warthog bench: `ping 8.8.8.8` came back at 85–92 ms, DNS hung indefinitely, `ipconfig getpacket` showed no `domain_name_server` entry. Fixing it required *two* ESP-IDF calls per netif (USB + Wi-Fi AP), not one:
+**Implementation note.** Advertising DHCP option 6 requires *two* ESP-IDF calls per netif (USB and Wi-Fi AP), not one:
 
 ```c
 dhcps_offer_t offer_dns = OFFER_DNS;
@@ -364,7 +364,7 @@ esp_netif_dhcps_option(netif, ESP_NETIF_OP_SET,
 esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns); /* set the IP to advertise */
 ```
 
-The trap: `esp_netif_set_dns_info` alone *looks* sufficient — it stores the IP in the dhcps struct — but lwip's dhcpserver only includes DHCP option 6 in offers when the `dhcps_dns` enable bit is set, which defaults to `0x00`. Skipping the `dhcps_option(OFFER_DNS)` call is a silent no-op for clients. See `main/usb_net.c` and `main/wifi_ap.c` for the working pattern.
+`esp_netif_set_dns_info` alone is not sufficient: it stores the address in the dhcps struct, but lwip's dhcpserver only includes option 6 in offers when the `dhcps_dns` enable bit is set, which defaults to `0x00`. Without the `dhcps_option(OFFER_DNS)` call the address is silently never advertised. See `main/usb_net.c` and `main/wifi_ap.c`.
 
 ### Debug logging
 
@@ -377,12 +377,12 @@ PLATFORMIO_BUILD_FLAGS="-DWARTHOG_DEBUG=1" pio run -e warthog-us -t upload
 That switches on:
 
 - `warthog.nat: tick: halow_ip=… usb.napt=1 ap.napt=1 default=…` every 30 s — confirms the NAPT supervisor is enforcing state.
-- `warthog.nat: HaLow STA IP changed: X -> Y (NAPT table now stale; downstream clients will see drops)` — fires on STA re-association with a new IP, the most common cause of "iPad worked for 2 min then said no internet."
-- Future diagnostic blocks should be gated with the same `#if WARTHOG_DEBUG` so we have one knob, not a dozen.
+- `warthog.nat: HaLow STA IP changed: X -> Y (NAPT table now stale; downstream clients will see drops)` — fires on STA re-association with a new IP, the usual cause of downstream clients losing internet after a few minutes.
+- New diagnostic blocks should be gated behind the same `#if WARTHOG_DEBUG`, keeping a single knob.
 
 ### When in doubt
 
-The CDC console (`/dev/cu.usbmodemXXXX`) carries all ESP-IDF logs after USB-OTG takes over, and `AT+STATUS?` gives a one-shot view of every netif's IP plus the currently-offered DNS. See `docs/` for diagnoses of the gotchas we've already hit (`power-notes.md`, `napt-notes.md`).
+The CDC console (`/dev/cu.usbmodemXXXX`) carries all ESP-IDF logs after USB-OTG takes over, and `AT+STATUS?` gives a one-shot view of every netif's IP plus the currently-offered DNS. Known failure modes and their diagnostic signatures are documented in `docs/` (`power-notes.md`, `napt-notes.md`).
 
 ## Status
 
@@ -392,7 +392,7 @@ The CDC console (`/dev/cu.usbmodemXXXX`) carries all ESP-IDF logs after USB-OTG 
 | 1 | HaLow STA bring-up | ✅ SAE association + DHCP lease verified against a HaLowLink 2 |
 | 2 | USB net device (CDC-ECM, macOS/Linux) | ✅ DHCP + ping verified on macOS |
 | 3 | 2.4 GHz Wi-Fi AP | ✅ SSID `warthog` visible |
-| 4 | lwIP NAPT bridge | ✅ end-to-end internet verified (Mac → USB → HaLow → upstream → 8.8.8.8) |
+| 4 | lwIP NAPT bridge | ✅ end-to-end internet verified (host → USB → HaLow → upstream → 8.8.8.8) |
 | 5 | Polish (LEDs, AT, NVS) | ✅ partial — LED state machine, AT commands, NVS persistence shipped. Windows RNDIS, NCM (iOS) and a web UI deferred. |
 | 6 | 802.11s mesh over HaLow | ✅ peering, data plane and HWMP path selection; 3-node mesh verified |
 | 7 | OpenMANET / OpenWrt interop | ✅ 0–3% loss, 8–19 ms against OpenMANET 1.8.0 — see [`docs/mesh-openmanet.md`](docs/mesh-openmanet.md) |
