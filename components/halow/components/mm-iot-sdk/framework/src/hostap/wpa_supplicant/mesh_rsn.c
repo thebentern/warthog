@@ -25,6 +25,8 @@
 #include "mesh_mpm.h"
 #include "mesh_rsn.h"
 
+extern volatile unsigned int g_warthog_ampe_start;
+
 #define MESH_AUTH_TIMEOUT 10
 #define MESH_AUTH_RETRY 3
 #define MESH_RSN_FRAME_MIC_OFFSET 6
@@ -137,6 +139,7 @@ static int auth_start_ampe(void *ctx, const u8 *addr)
 	sta = ap_get_sta(hapd, addr);
 	if (sta)
 		eloop_cancel_timeout(mesh_auth_timer, mesh_rsn->wpa_s, sta);
+	g_warthog_ampe_start++;
 	wpa_printf(MSG_DEBUG, "mesh: Initializing AMPE, Peering Start");
 	mesh_mpm_auth_peer(mesh_rsn->wpa_s, addr);
 	return 0;
@@ -337,6 +340,8 @@ static int mesh_rsn_sae_group(struct wpa_supplicant *wpa_s,
 }
 
 
+extern void warthog_sae_trace(unsigned int n);
+
 static int mesh_rsn_build_sae_commit(struct wpa_supplicant *wpa_s,
 				     struct wpa_ssid *ssid,
 				     struct sta_info *sta)
@@ -351,6 +356,7 @@ static int mesh_rsn_build_sae_commit(struct wpa_supplicant *wpa_s,
 		return -1;
 	}
 
+	warthog_sae_trace(55);
 	if (mesh_rsn_sae_group(wpa_s, sta->sae) < 0) {
 		wpa_msg(wpa_s, MSG_DEBUG, "SAE: Failed to select group");
 		return -1;
@@ -361,9 +367,14 @@ static int mesh_rsn_build_sae_commit(struct wpa_supplicant *wpa_s,
 		if (!sta->sae->tmp->pw_id)
 			return -1;
 	}
-	return sae_prepare_commit(wpa_s->own_addr, sta->addr,
-				  (u8 *) password, os_strlen(password),
-				  sta->sae);
+	warthog_sae_trace(56); /* entering sae_prepare_commit (dragonfly ECC) */
+	{
+		int pcret = sae_prepare_commit(wpa_s->own_addr, sta->addr,
+					       (u8 *) password, os_strlen(password),
+					       sta->sae);
+		warthog_sae_trace(57); /* survived sae_prepare_commit */
+		return pcret;
+	}
 }
 
 
@@ -377,6 +388,7 @@ int mesh_rsn_auth_sae_sta(struct wpa_supplicant *wpa_s,
 	unsigned int rnd;
 	int ret;
 
+	warthog_sae_trace(50);
 	if (!ssid) {
 		wpa_msg(wpa_s, MSG_DEBUG,
 			"AUTH: No current_ssid known to initiate new SAE");
@@ -389,6 +401,7 @@ int mesh_rsn_auth_sae_sta(struct wpa_supplicant *wpa_s,
 			return -1;
 	}
 
+	warthog_sae_trace(51);
 	pmksa = wpa_auth_pmksa_get(hapd->wpa_auth, sta->addr, NULL);
 	if (pmksa) {
 		if (!sta->wpa_sm)
@@ -413,14 +426,17 @@ int mesh_rsn_auth_sae_sta(struct wpa_supplicant *wpa_s,
 	}
 	sta->mesh_sae_pmksa_caching = 0;
 
+	warthog_sae_trace(52);
 	if (mesh_rsn_build_sae_commit(wpa_s, ssid, sta))
 		return -1;
+	warthog_sae_trace(53);
 
 	wpa_msg(wpa_s, MSG_DEBUG,
 		"AUTH: started authentication with SAE peer: " MACSTR,
 		MAC2STR(sta->addr));
 
 	ret = auth_sae_init_committed(hapd, sta);
+	warthog_sae_trace(54);
 	if (ret)
 		return ret;
 

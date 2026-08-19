@@ -22,6 +22,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "soc/rtc_cntl_reg.h"   /* RTC_CNTL_OPTION1_REG for AT+DLMODE */
+#include "esp_attr.h"   /* RTC_NOINIT_ATTR */
+#include "esp_core_dump.h" /* AT+COREDUMP? crash forensics */
 #include "soc/soc.h"            /* REG_WRITE */
 #include "tinyusb_cdc_acm.h"
 #include "tusb.h"
@@ -524,6 +526,67 @@ volatile uint32_t g_warthog_hwmp_prep_rx = 0;
  * reached the chip -- the difference between real mesh security and the
  * hardcoded constant. */
 volatile uint32_t g_warthog_ampe_mtk_installed = 0, g_warthog_ampe_mgtk_installed = 0;
+/* 0 = open mesh, 1 = SAE authenticator initialised, 2 = SAE asked for but
+ * mesh_rsn_auth_init() failed (mesh still runs, unsecured). */
+volatile uint32_t g_warthog_sae_init = 0;
+volatile uint32_t g_warthog_sae_peer_offers = 0, g_warthog_sae_peer_parse_fail = 0;
+volatile uint32_t g_warthog_sae_mlme_tx = 0, g_warthog_sae_mlme_auth_tx = 0;
+volatile unsigned int g_warthog_sae_addpeer_null = 0, g_warthog_sae_addpeer_ok = 0;
+volatile unsigned int g_warthog_sae_authsta_fail = 0, g_warthog_sae_authsta_ok = 0;
+volatile uint32_t g_warthog_sae_rates_synth = 0;
+volatile uint32_t g_warthog_sae_peer_authproto = 0;
+volatile uint32_t g_warthog_sae_peer_authval = 0xff;
+volatile unsigned int g_warthog_addp_r_crowded = 0, g_warthog_addp_r_exists = 0;
+volatile unsigned int g_warthog_addp_r_addfail = 0, g_warthog_addp_r_rates = 0;
+volatile uint32_t g_warthog_sae_sta_add_ok = 0, g_warthog_sae_sta_add_fail = 0;
+volatile uint32_t g_warthog_rx_auth = 0;
+volatile uint32_t g_warthog_rx_auth_router = 0, g_warthog_rx_auth_other = 0;
+/* A3-rewrite kill-switch, default OFF: hostap sets AUTH A3=SA, exactly like
+ * the ACTION frames that already cross in the open mesh, so try that first. */
+volatile uint32_t g_warthog_a3fix_en = 0;
+volatile unsigned int g_warthog_sae_hdl_auth = 0, g_warthog_sae_hdl_sae = 0;
+volatile unsigned int g_warthog_sae_rx_trans = 0, g_warthog_sae_rx_status = 0;
+volatile unsigned int g_warthog_sae_state_now = 0, g_warthog_sae_state_seen = 0;
+volatile unsigned int g_warthog_sae_confirm_tx = 0;
+volatile unsigned int g_warthog_sae_tx_status = 0, g_warthog_sae_alg_reject = 0;
+volatile unsigned int g_warthog_sae_keymgmt = 0, g_warthog_sae_wpa = 0;
+volatile unsigned int g_warthog_sae_txfail = 0, g_warthog_sae_txfail_last = 0;
+volatile unsigned int g_warthog_sae_rxfail_sa = 0;
+volatile unsigned int g_warthog_sae_rx_sa = 0, g_warthog_sae_rx_da = 0;
+volatile uint32_t g_warthog_sae_offer_addr = 0;
+volatile unsigned int g_warthog_mpm_act_rx = 0, g_warthog_mpm_act_tx = 0;
+volatile unsigned int g_warthog_mpm_plink = 0, g_warthog_mpm_plink_seen = 0;
+volatile unsigned int g_warthog_hostap_estab = 0, g_warthog_mpm_fsm = 0;
+volatile unsigned int g_warthog_accept = 0, g_warthog_accept_nosm = 0, g_warthog_ampe_start = 0;
+volatile unsigned int g_warthog_rx_selfprot = 0, g_warthog_rx_action_any = 0;
+volatile unsigned int g_warthog_evt_action = 0, g_warthog_evt_mgmt = 0;
+volatile unsigned int g_warthog_mesh_act_oversize = 0;
+/* Survives the panic SW-reset (only a power-off clears RTC): the last per-peer
+ * SAE step reached before a crash. Tagged 0x5AE0xxxx so garbage at power-on is
+ * distinguishable from a real reading. */
+RTC_NOINIT_ATTR volatile uint32_t g_warthog_sae_stage;
+/* SAE discovery-bridge kill-switch. Defaults ON so a SAE build peers on its
+ * own; AT+SAEBRIDGE=0 makes the node deaf to candidates, which is the state
+ * to debug from when the SAE path itself is suspected (a crash there takes
+ * the USB CDC down with it -- see warthog_sae_trace). */
+volatile uint32_t g_warthog_sae_bridge_en = 1;
+
+/* Live breadcrumb for the SAE path: stamps RTC (survives SW reset) AND prints
+ * straight to the AT CDC. The CDC rides the TinyUSB task, so when the SAE
+ * path hangs the evtloop with interrupts held, everything already queued
+ * still drains -- the last [SAE:n] seen on the wire is the step that died. */
+void warthog_sae_trace(uint32_t n)
+{
+    /* RTC stamp only. This deliberately does NOT print: it runs on the
+     * evtloop task for every step of every peer offer, and writing to the AT
+     * CDC from here interleaved "[SAE:n]" into the middle of command
+     * responses, making the management interface unreliable. Read the last
+     * step with AT+SAESTAGE? -- it survives the panic reset, which was the
+     * point. Re-enable the print only while chasing a hang that kills USB
+     * before AT can be reached. */
+    g_warthog_sae_stage = 0x5AE00000u | n;
+}
+
 volatile uint8_t g_warthog_hwmp_dump[48];
 volatile uint16_t g_warthog_hwmp_dump_len = 0, g_warthog_hwmp_dump_full = 0;
 volatile uint8_t g_warthog_rxdata_head[64]; volatile uint16_t g_warthog_rxdata_head_len = 0;
@@ -1148,6 +1211,69 @@ static void cmd_meshsec(char *args)
     cdc_write(buf);
     reply_ok();
 }
+/* AT+COREDUMP? -- read back the last panic from the flash coredump partition.
+ *
+ * This exists because a live panic is unreadable on this board: the ESP32-S3
+ * has one USB PHY, and once TinyUSB takes it for CDC/NCM the USB-Serial-JTAG
+ * console the panic handler prints to is disconnected. Flash survives the
+ * power cycle a wedged USB needs; RTC memory does not.
+ * Prints the faulting task, PC, and raw backtrace for addr2line.
+ */
+static void cmd_coredump(void)
+{
+#if !CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
+    cdc_write("+COREDUMP: disabled in this build\r\n");
+    reply_ok();
+#else
+    char buf[160];
+    esp_core_dump_summary_t *sum = calloc(1, sizeof(*sum));
+    if (sum == NULL)
+    {
+        cdc_write("+ERR: no mem\r\nERROR\r\n");
+        return;
+    }
+    esp_err_t err = esp_core_dump_get_summary(sum);
+    if (err != ESP_OK)
+    {
+        snprintf(buf, sizeof(buf), "+COREDUMP: none (err=0x%x)\r\n", err);
+        cdc_write(buf);
+        free(sum);
+        reply_ok();
+        return;
+    }
+    snprintf(buf, sizeof(buf), "+COREDUMP: task=%s pc=0x%08lx\r\n",
+             sum->exc_task, (unsigned long)sum->exc_pc);
+    cdc_write(buf);
+    int n = sum->exc_bt_info.depth;
+    if (n > 16) { n = 16; }
+    for (int i = 0; i < n; i++)
+    {
+        snprintf(buf, sizeof(buf), "+COREDUMP: bt%d=0x%08lx%s\r\n", i,
+                 (unsigned long)sum->exc_bt_info.bt[i],
+                 sum->exc_bt_info.corrupted ? " (corrupt)" : "");
+        cdc_write(buf);
+    }
+    free(sum);
+    reply_ok();
+#endif
+}
+
+static void cmd_saestage(void)
+{
+    char buf[64];
+    uint32_t v = g_warthog_sae_stage;
+    if ((v & 0xFFFF0000u) != 0x5AE00000u)
+    {
+        cdc_write("+SAESTAGE: (unset)\r\n");
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf), "+SAESTAGE: %lu\r\n", (unsigned long)(v & 0xFFFFu));
+        cdc_write(buf);
+    }
+    reply_ok();
+}
+
 static void cmd_meshsec_q(void)
 {
     char buf[64];
@@ -1210,9 +1336,32 @@ static void cmd_keyfp(void)
 static void cmd_mpmpeers(void)
 {
     char buf[400];
-    snprintf(buf, sizeof(buf), "+MPMPEERS: self=%02x%02x%02x %sno_slot=%lu expired=%lu bcn_peer=%lu close_tx=%lu s1g_bcn=%lu/%lu new=%lu retry=%lu sa=%02x%02x%02x\r\n",
+    snprintf(buf, sizeof(buf), "+MPMPEERS: self=%02x%02x%02x %ssae=%lu offers=%lu pfail=%lu mlme=%lu auth_tx=%lu addp=%lu/%lu authsta=%lu/%lu rates=%lu apx=%lu/%lu rej=c%lu/e%lu/a%lu/r%lu stadd=%lu/%lu rxauth=%lu/%lu/%lu ampe_mtk=%lu ampe_mgtk=%lu no_slot=%lu expired=%lu bcn_peer=%lu close_tx=%lu s1g_bcn=%lu/%lu new=%lu retry=%lu sa=%02x%02x%02x\r\n",
              g_warthog_mesh_self_addr[3], g_warthog_mesh_self_addr[4], g_warthog_mesh_self_addr[5],
              (const char *)g_warthog_mpm_links,
+             (unsigned long)g_warthog_sae_init,
+             (unsigned long)g_warthog_sae_peer_offers,
+             (unsigned long)g_warthog_sae_peer_parse_fail,
+             (unsigned long)g_warthog_sae_mlme_tx,
+             (unsigned long)g_warthog_sae_mlme_auth_tx,
+             (unsigned long)g_warthog_sae_addpeer_ok,
+             (unsigned long)g_warthog_sae_addpeer_null,
+             (unsigned long)g_warthog_sae_authsta_ok,
+             (unsigned long)g_warthog_sae_authsta_fail,
+             (unsigned long)g_warthog_sae_rates_synth,
+             (unsigned long)g_warthog_sae_peer_authproto,
+             (unsigned long)g_warthog_sae_peer_authval,
+             (unsigned long)g_warthog_addp_r_crowded,
+             (unsigned long)g_warthog_addp_r_exists,
+             (unsigned long)g_warthog_addp_r_addfail,
+             (unsigned long)g_warthog_addp_r_rates,
+             (unsigned long)g_warthog_sae_sta_add_ok,
+             (unsigned long)g_warthog_sae_sta_add_fail,
+             (unsigned long)g_warthog_rx_auth,
+             (unsigned long)g_warthog_rx_auth_router,
+             (unsigned long)g_warthog_rx_auth_other,
+             (unsigned long)g_warthog_ampe_mtk_installed,
+             (unsigned long)g_warthog_ampe_mgtk_installed,
              (unsigned long)g_warthog_mpm_no_slot, (unsigned long)g_warthog_mpm_expired,
              (unsigned long)g_warthog_bcn_peer_rx, (unsigned long)g_warthog_mpm_close_tx,
              (unsigned long)g_warthog_s1g_bcn_ours, (unsigned long)g_warthog_s1g_bcn_rx,
@@ -1401,6 +1550,52 @@ static void dispatch(char *line)
         cmd_meshsec(args);
     } else if (strcasecmp(verb, "MESHSEC") == 0 && terminator == '?') {
         cmd_meshsec_q();
+    } else if (strcasecmp(verb, "COREDUMP") == 0 && terminator == '?') {
+        cmd_coredump();
+    } else if (strcasecmp(verb, "SAESTAGE") == 0 && terminator == '?') {
+        cmd_saestage();
+    } else if (strcasecmp(verb, "SAEBRIDGE") == 0 && terminator == '=') {
+        g_warthog_sae_bridge_en = (uint32_t)strtoul(args, NULL, 10);
+        reply_ok();
+    } else if (strcasecmp(verb, "SAERX") == 0 && terminator == '?') {
+        char rbuf[512];
+        snprintf(rbuf, sizeof(rbuf),
+                 "+SAERX: hdl_auth=%lu hdl_sae=%lu trans=%lu status=%lu state=%lu seen=0x%lx confirm_tx=%lu txstat=%lu algrej=%lu txfail=%lu/%lu rxfail_sa=%06lx rxsa=%06lx rxda=%06lx offer=%06lx | act=%lu/%lu fsm=%lu plink=%lu seen=0x%lx ESTAB=%lu acc=%lu/%lu ampe_start=%lu rxact=%lu/%lu evt=%lu/%lu oversz=%lu\r\n",
+                 (unsigned long)g_warthog_sae_hdl_auth, (unsigned long)g_warthog_sae_hdl_sae,
+                 (unsigned long)g_warthog_sae_rx_trans, (unsigned long)g_warthog_sae_rx_status,
+                 (unsigned long)g_warthog_sae_state_now, (unsigned long)g_warthog_sae_state_seen,
+                 (unsigned long)g_warthog_sae_confirm_tx,
+                 (unsigned long)g_warthog_sae_tx_status,
+                 (unsigned long)g_warthog_sae_alg_reject,
+                 (unsigned long)g_warthog_sae_txfail,
+                 (unsigned long)g_warthog_sae_txfail_last,
+                 (unsigned long)g_warthog_sae_rxfail_sa,
+                 (unsigned long)g_warthog_sae_rx_sa,
+                 (unsigned long)g_warthog_sae_rx_da,
+                 (unsigned long)g_warthog_sae_offer_addr,
+                 (unsigned long)g_warthog_mpm_act_tx,
+                 (unsigned long)g_warthog_mpm_act_rx,
+                 (unsigned long)g_warthog_mpm_fsm,
+                 (unsigned long)g_warthog_mpm_plink,
+                 (unsigned long)g_warthog_mpm_plink_seen,
+                 (unsigned long)g_warthog_hostap_estab,
+                 (unsigned long)g_warthog_accept,
+                 (unsigned long)g_warthog_accept_nosm,
+                 (unsigned long)g_warthog_ampe_start,
+                 (unsigned long)g_warthog_rx_action_any,
+                 (unsigned long)g_warthog_rx_selfprot,
+                 (unsigned long)g_warthog_evt_mgmt,
+                 (unsigned long)g_warthog_evt_action,
+                 (unsigned long)g_warthog_mesh_act_oversize);
+        cdc_write(rbuf); reply_ok();
+    } else if (strcasecmp(verb, "SAEBRIDGE") == 0 && terminator == '?') {
+        char bbuf[40];
+        snprintf(bbuf, sizeof(bbuf), "+SAEBRIDGE: %lu\r\n", (unsigned long)g_warthog_sae_bridge_en);
+        cdc_write(bbuf);
+        reply_ok();
+    } else if (strcasecmp(verb, "SAESTAGE") == 0 && terminator == '=') {
+        g_warthog_sae_stage = 0x5AE00000u; /* clear to 'no step yet' */
+        reply_ok();
     } else if (strcasecmp(verb, "REKEY") == 0 && terminator == '=') {
         cmd_rekey(args);
     } else if (strcasecmp(verb, "KEYFP") == 0 && terminator == '?') {

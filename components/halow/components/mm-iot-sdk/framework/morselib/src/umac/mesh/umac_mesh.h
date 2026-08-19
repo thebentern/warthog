@@ -32,6 +32,12 @@ struct umac_data;
 bool umac_mesh_validate_args(struct umac_data *umacd, const struct mmwlan_mesh_args *args);
 
 /** True when the mesh runs SAE/AMPE, so hostap's MPM owns peering. */
+/** TX a fully built mgmt frame (hostap's SAE auth) with mesh VIF metadata. */
+int umac_mesh_tx_mgmt_mmpkt(struct mmpkt *frm);
+
+/** Register a datapath peer for hostap's mesh MPM (the .sta_add path). */
+enum mmwlan_status umac_mesh_add_datapath_peer(const uint8_t *peer_addr);
+
 bool umac_mesh_sae_active(void);
 
 /** Forget every peer link; the next beacon re-runs the peering. */

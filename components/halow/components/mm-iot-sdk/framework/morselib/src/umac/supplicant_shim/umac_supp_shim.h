@@ -40,6 +40,9 @@ enum mmwlan_status umac_supp_remove_ap_interface(struct umac_data *umacd);
  * context. */
 enum mmwlan_status umac_supp_add_mesh_interface(struct umac_data *umacd);
 
+/** Offer a beaconing peer to hostap's mesh MPM (SAE path). */
+void umac_supp_mesh_new_peer(const uint8_t *addr, const uint8_t *ies, size_t ies_len);
+
 
 enum mmwlan_status umac_supp_remove_mesh_interface(struct umac_data *umacd);
 

@@ -20,4 +20,5 @@ idf_component_register(
         lwip
         nvs_flash
         esp_tinyusb
+        espcoredump
 )

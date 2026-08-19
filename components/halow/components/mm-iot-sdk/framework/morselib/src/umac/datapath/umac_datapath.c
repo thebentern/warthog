@@ -397,12 +397,18 @@ static void umac_datapath_process_unprotected_robust_mgmt_frame(struct umac_data
 }
 
 
+extern volatile uint32_t g_warthog_rx_auth_router;
+
 static void umac_datapath_process_rx_mgmt_frame(struct umac_data *umacd,
                                                 struct umac_sta_data *stad,
                                                 struct umac_datapath_data *data,
                                                 struct mmpktview *rxbufview)
 {
     const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
+    if (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_AUTH)
+    {
+        g_warthog_rx_auth_router++;
+    }
 
     MMOSAL_ASSERT(umac_datapath_validate_buf_len(rxbufview, sizeof(*header)));
 
@@ -1227,6 +1233,11 @@ static void umac_datapath_process_rx_other_frame(struct umac_data *umacd,
     const enum dot11_fc_type frame_type =
         (enum dot11_fc_type)dot11_frame_control_get_type(header->frame_control);
     const uint16_t frame_subtype = dot11_frame_control_get_subtype(header->frame_control);
+    if (frame_type == DOT11_FC_TYPE_MGMT && frame_subtype == DOT11_FC_SUBTYPE_AUTH)
+    {
+        extern volatile uint32_t g_warthog_rx_auth_other;
+        g_warthog_rx_auth_other++;
+    }
     const enum mmwlan_frame_filter_flag frame_filter_flag =
         umac_datapath_rx_frame_filter_matches(umacd, frame_type, frame_subtype);
 

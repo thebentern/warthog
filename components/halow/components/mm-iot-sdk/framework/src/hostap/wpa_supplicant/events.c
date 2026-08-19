@@ -5440,10 +5440,13 @@ void wpa_supplicant_update_channel_list(struct wpa_supplicant *wpa_s,
 }
 
 
+extern volatile unsigned int g_warthog_evt_action, g_warthog_evt_mgmt;
+
 static void wpas_event_rx_mgmt_action(struct wpa_supplicant *wpa_s,
 				      const u8 *frame, size_t len, int freq,
 				      int rssi)
 {
+	g_warthog_evt_action++;
 	const struct ieee80211_mgmt *mgmt;
 	const u8 *payload;
 	size_t plen;
@@ -6630,6 +6633,7 @@ void wpa_supplicant_event(void *ctx, enum wpa_event_type event,
 	case EVENT_RX_MGMT: {
 		u16 fc, stype;
 		const struct ieee80211_mgmt *mgmt;
+		g_warthog_evt_mgmt++;
 
 #ifdef CONFIG_TESTING_OPTIONS
 		if (wpa_s->ext_mgmt_frame_handling) {

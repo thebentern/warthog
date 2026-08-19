@@ -80,6 +80,9 @@ void umac_mesh_maybe_initiate_mpm(const uint8_t *ta);
 
 /* --- RX management frame dispatch ---------------------------------------- */
 
+extern volatile uint32_t g_warthog_rx_auth;
+extern volatile unsigned int g_warthog_rx_selfprot, g_warthog_rx_action_any;
+
 static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
                                        struct umac_sta_data *stad,
                                        struct mmpktview *rxbufview)
@@ -118,6 +121,11 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
              * the keys are built and verified inside mesh_mpm/mesh_rsn.
              * warthog's own MPM keeps the open mesh, where there are no keys
              * to exchange and it is the simpler, working path. */
+            g_warthog_rx_action_any++;
+            if (frame[hdr_len] == DOT11_ACTION_CATEGORY_SELF_PROTECTED)
+            {
+                g_warthog_rx_selfprot++;
+            }
             if (frame[hdr_len] == DOT11_ACTION_CATEGORY_SELF_PROTECTED &&
                 !umac_mesh_sae_active())
             {
@@ -140,8 +148,13 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
             const uint8_t *ta = dot11_get_ta(header);
             g_warthog_prsp_rx++;
             (void)umac_mesh_tx_probe_response(ta);
-            /* Also OPEN toward them: warthog<->warthog has no other initiator. */
-            umac_mesh_maybe_initiate_mpm(ta);
+            /* Also OPEN toward them: warthog<->warthog has no other initiator.
+             * Not under SAE -- there hostap's MPM owns the link, and two state
+             * machines opening the same peering race each other's link ids. */
+            if (!umac_mesh_sae_active())
+            {
+                umac_mesh_maybe_initiate_mpm(ta);
+            }
             break;
         }
 
@@ -161,24 +174,62 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
             {
                 g_warthog_bcn_peer_rx++;
                 (void)umac_mesh_tx_probe_response(ta);
-                umac_mesh_maybe_initiate_mpm(ta);
+                if (!umac_mesh_sae_active())
+                {
+                    umac_mesh_maybe_initiate_mpm(ta);
+                }
             }
             break;
         }
 
         case DOT11_FC_SUBTYPE_PROBE_RSP:
+        {
+            /* Peer discovery for SAE happens HERE, not from beacons.
+             *
+             * The S1G beacon's address fields survive the chip's
+             * S1G->legacy conversion badly (this file already warns that A2/A3
+             * arrive zeroed), so the address taken from a beacon is not
+             * dependable. Measured consequence: every candidate we offered
+             * hostap carried the same address -- a real but unrelated HaLow
+             * node that happened to be beaconing our Mesh ID -- so hostap
+             * opened exactly one SAE session, with the wrong station, and the
+             * warthog peer we could actually key with was never offered at
+             * all (offers=96, addp=1, all 95 rejects "already exists").
+             *
+             * A probe response is addressed to us and carries a genuine TA,
+             * plus the same Mesh ID / Mesh Configuration elements
+             * mesh_mpm_add_peer() needs. Fixed fields are 12 bytes
+             * (timestamp 8, beacon interval 2, capability 2) before the IEs. */
+            if (umac_mesh_sae_active())
+            {
+                const uint8_t *pf = (const uint8_t *)mmpkt_get_data_start(rxbufview);
+                uint32_t pflen = mmpkt_get_data_length(rxbufview);
+                const uint32_t ie_off = sizeof(struct dot11_hdr) + 12u;
+                if (pflen > ie_off)
+                {
+                    umac_supp_mesh_new_peer(dot11_get_ta(header), pf + ie_off,
+                                            (size_t)(pflen - ie_off));
+                }
+            }
             /* Forward to supplicant — bss.c uses these for IE caching. */
             umac_supp_process_mgmt_frame(umacd, rxbufview);
             break;
+        }
 
         default:
+        {
             /* Other mgmt subtypes (auth/assoc/disassoc/deauth/etc.) — route
              * to supplicant. Anything mesh-specific that needs handling will
              * surface as a WRN here. */
+            if (subtype == DOT11_FC_SUBTYPE_AUTH)
+            {
+                g_warthog_rx_auth++;
+            }
             MMLOG_ERR("mesh: rx mgmt subtype=%u (fc=0x%04x) -> supplicant fan-out\n",
                       subtype, frame_control_le);
             umac_supp_process_mgmt_frame(umacd, rxbufview);
             break;
+        }
     }
 }
 
@@ -505,9 +556,20 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
      * already strips the CCMP header and replay-checks against the stad key.
      * The RX-side check "security != OPEN => drop plaintext non-EAPOL" is also
      * what we want: a keyed mesh must not accept clear-text data. */
-    umac_sta_data_set_security(stad, g_warthog_mesh_secure ? MMWLAN_SAE : MMWLAN_OPEN,
+    /* Under SAE the station starts UNPROTECTED and is promoted when AMPE
+     * delivers the MTK (umac_datapath_mesh_set_peer_key).
+     *
+     * Marking it secured here instead looks harmless and is fatal: the TX path
+     * then sets Protected and asks the chip to encrypt with a key that does
+     * not exist yet, so the MPM peering frames that AMPE needs in order to
+     * derive that key are the ones destroyed. Measured: both peers sent
+     * peering frames (act=47 and act=20) and neither received a single one
+     * (rxact=0), while SAE Authentication -- which goes out through a
+     * different, unprotected path -- crossed normally. 802.11s peering is in
+     * the clear until the link is keyed; AMPE protects its own elements. */
+    umac_sta_data_set_security(stad,
+                               (!sae && g_warthog_mesh_secure) ? MMWLAN_SAE : MMWLAN_OPEN,
                                MMWLAN_PMF_DISABLED);
-    (void)sae;
 
     /* Rate control, otherwise every frame goes out at the base rate. */
     umac_rc_start(stad, /*sgi_flags=*/0, /*max_mcs=*/7);
@@ -532,7 +594,12 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
      * chip's "no station" slot) so our own broadcast TX has a key.
      * Deriving per-pair keys from SAE is the follow-up; the install mechanics
      * are unchanged by it. */
-    if (g_warthog_mesh_secure &&
+    /* NOT under SAE. The hardcoded MTK/MGTK below is a shared constant with no
+     * secrecy value (it is in this source file); installing it on a SAE link
+     * would overwrite the AMPE-derived per-link key that .set_key installs a
+     * moment later, silently downgrading a real handshake to a known key.
+     * Under SAE the station is left unkeyed here and keyed by AMPE. */
+    if (!sae && g_warthog_mesh_secure &&
         umac_datapath_mesh_install_peer_keys(stad, vif_id) != MMWLAN_SUCCESS)
     {
         g_warthog_mesh_key_fail++;
@@ -590,6 +657,9 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
             g_warthog_mesh_key_fail++;
             return st;
         }
+        /* Now -- and only now -- the link is keyed, so the TX path may set
+         * Protected and the RX path may insist on it. */
+        umac_sta_data_set_security(stad, MMWLAN_SAE, MMWLAN_PMF_DISABLED);
         g_warthog_ampe_mtk_installed++;
         MMLOG_INF("mesh: AMPE MTK installed for " MM_MAC_ADDR_FMT "\n",
                   MM_MAC_ADDR_VAL(peer_addr));
@@ -1066,9 +1136,23 @@ void umac_mesh_handle_s1g_beacon(struct mmpktview *rxbufview)
         /* First sight: announce ourselves so the peer learns we exist. */
         g_warthog_s1g_bcn_new++;
         (void)umac_mesh_tx_probe_response(sa);
-        umac_mesh_maybe_initiate_mpm(sa);
+        if (umac_mesh_sae_active())
+        {
+            /* Under SAE hostap owns peering, but we deliberately do NOT offer
+             * it a candidate from here: the address a beacon yields after the
+             * chip's S1G conversion is not dependable, and offering it made
+             * hostap run a full SAE session against a node that was merely in
+             * range -- consuming the peering slot the real peer needed. The
+             * probe-response handler does the offering, where the transmitter
+             * address is real. Answering the beacon (above) is what prompts
+             * that probe response, so discovery still starts here. */
+        }
+        else
+        {
+            umac_mesh_maybe_initiate_mpm(sa);
+        }
     }
-    else if (umac_mesh_peering_incomplete(sa))
+    else if (!umac_mesh_sae_active() && umac_mesh_peering_incomplete(sa))
     {
         /* Known peer, handshake unfinished: retransmit the Open only. NOT the
          * probe response -- that is what restarts the peer's FSM. */

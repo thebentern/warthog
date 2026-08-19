@@ -108,3 +108,18 @@ CONFIG_LOG_DEFAULT_LEVEL=3
 # keys, SAE and OpenMANET interop) has to run per frame, so this cost is
 # structural, not incidental.
 CONFIG_MBEDTLS_AES_USE_INTERRUPT=n
+
+# Core dump to flash: panics land in the coredump partition (AT+COREDUMP?
+# reads the summary back after reboot) because the one USB PHY is on OTG when
+# the mesh code panics, making the live panic text unreachable.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=32
+
+# Panic prints go to the USB-Serial-JTAG console, but by the time the mesh
+# stack can panic the app has moved the sole USB PHY to OTG -- the print
+# blocks forever and the chip hangs with USB dead until someone pulls power.
+# Reboot silently instead: the flash core dump still gets written, RTC
+# survives the SW reset, and the board comes back up readable.
+CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y

@@ -424,6 +424,12 @@ int mmwpas_set_key_ap(void *priv, struct wpa_driver_set_key_params *params)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+extern volatile uint32_t g_warthog_sae_mlme_tx, g_warthog_sae_mlme_auth_tx;
+extern volatile uint32_t g_warthog_sae_sta_add_ok, g_warthog_sae_sta_add_fail;
+extern volatile unsigned int g_warthog_mpm_act_tx;
+extern volatile uint32_t g_warthog_sae_stage;
+extern void warthog_sae_trace(uint32_t n);
+
 static int mmwpas_send_mlme(void *priv,
                             const u8 *data,
                             size_t data_len,
@@ -437,6 +443,13 @@ static int mmwpas_send_mlme(void *priv,
 {
     struct umac_data *umacd = (struct umac_data *)priv;
 
+    /* Auth frames are how SAE talks: subtype 11 (0xb0) in the frame control. */
+    if (data_len >= 2 && (data[0] & 0xfc) == 0xb0)
+    {
+        g_warthog_sae_mlme_auth_tx++;
+    }
+    g_warthog_sae_mlme_tx++;
+
     struct mmpkt *tx_pkt = umac_datapath_alloc_raw_tx_mmpkt(MMDRV_PKT_CLASS_DATA_TID7, 0, data_len);
     if (tx_pkt == NULL)
     {
@@ -445,8 +458,27 @@ static int mmwpas_send_mlme(void *priv,
     }
 
     struct mmpktview *tx_pktview = mmpkt_open(tx_pkt);
+    /* A3 translation, TX half. hostap's mesh convention is A3 == SA
+     * (send_auth_reply copies sa into bssid), but the chip on the RECEIVING
+     * side filters Addr3 against {own MAC, shared mesh BSSID, broadcast} --
+     * a peer's SA is none of those, so every SAE Auth frame we sent was
+     * dropped by the peer's chip and both sides retransmitted Commits into
+     * the void (auth_tx grew on both boards, nothing ever advanced). Swap A3
+     * to the shared derived BSSID; the RX half swaps it back before hostap,
+     * which enforces A3 == SA, ever sees the frame. Unprotected mgmt frames
+     * only -- nothing at the Commit stage MICs the header. */
+    /* hostap's mesh A3 convention (A3 == SA) goes out untouched: measured on
+     * hardware, the peer chip's filter passes it and the peer's hostap
+     * requires it. (An A3-rewrite experiment lived here while that was in
+     * question; every mode other than "leave it alone" was wrong.) */
     mmpkt_append_data(tx_pktview, data, data_len);
     mmpkt_close(&tx_pktview);
+    if (umac_mesh_sae_active())
+    {
+        /* Mesh VIF: use the metadata recipe MPM/HWMP frames fly with (see
+         * umac_mesh_tx_mgmt_mmpkt). The AP path below is for the real AP. */
+        return umac_mesh_tx_mgmt_mmpkt(tx_pkt) < 0 ? -1 : 0;
+    }
     umac_datapath_tx_mgmt_frame_ap(umacd, tx_pkt, NULL);
 
     return 0;
@@ -692,6 +724,7 @@ static int mmwpas_send_action_mesh(void *priv, unsigned int freq, unsigned int w
     }
     /* umac_mesh_tx_action appends S1G Capabilities, which the Morse driver on
      * the far side requires on peering frames and hostap knows nothing about. */
+    g_warthog_mpm_act_tx++;
     return umac_mesh_tx_action(dst, data, (uint16_t)data_len) < 0 ? -1 : 0;
 }
 
@@ -729,6 +762,47 @@ static int mmwpas_set_key_mesh(void *priv, struct wpa_driver_set_key_params *par
     return (st == MMWLAN_SUCCESS) ? 0 : -1;
 }
 
+/* Insert a peer hostap's MPM has accepted.
+ *
+ * This op is NOT optional, and that cost a long hunt: wpa_drv_sta_add()
+ * returns -1 when the driver leaves .sta_add NULL -- it does not treat the
+ * op as absent and carry on, the way most wpa_drv_* helpers do. It is the
+ * final step of mesh_mpm_add_peer(), so with .sta_add unset that function
+ * returned NULL for every candidate and SAE never began: no Auth frame was
+ * ever transmitted, and the only visible symptom was a peer count of zero.
+ *
+ * Creating the station here rather than at ESTAB is the right order for SAE:
+ * the station must exist before .set_key can install the AMPE-derived MTK. */
+static int mmwpas_sta_add_mesh(void *priv, struct hostapd_sta_add_params *params)
+{
+    MM_UNUSED(priv);
+    warthog_sae_trace(20);
+    if (params == NULL || params->addr == NULL)
+    {
+        return -1;
+    }
+    enum mmwlan_status st = umac_mesh_add_datapath_peer(params->addr);
+    warthog_sae_trace(21);
+    if (st != MMWLAN_SUCCESS)
+    {
+        g_warthog_sae_sta_add_fail++;
+        return -1;
+    }
+    g_warthog_sae_sta_add_ok++;
+    return 0;
+}
+
+static int mmwpas_sta_remove_mesh(void *priv, const u8 *addr)
+{
+    MM_UNUSED(priv);
+    if (addr == NULL)
+    {
+        return -1;
+    }
+    umac_datapath_mesh_del_peer(addr);
+    return 0;
+}
+
 const struct wpa_driver_ops mmwlan_wpas_ops_mesh = {
     .name = UMAC_SUPP_MESH_DRIVER_NAME,
     .desc = "Warthog mesh driver",
@@ -737,6 +811,8 @@ const struct wpa_driver_ops mmwlan_wpas_ops_mesh = {
      * the SAE/AMPE-derived keys through .set_key. */
     .send_action = mmwpas_send_action_mesh,
     .set_key = mmwpas_set_key_mesh,
+    .sta_add = mmwpas_sta_add_mesh,
+    .sta_remove = mmwpas_sta_remove_mesh,
     .init = mmwpas_init_mesh,
     .deinit = mmwpas_deinit_mesh,
     /* Chip-level info — safe to share with AP. */

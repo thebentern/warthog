@@ -25,6 +25,10 @@
 #include "mesh_rsn.h"
 #include "notify.h"
 
+extern void warthog_sae_trace(unsigned int n);
+extern volatile unsigned int g_warthog_mpm_act_rx, g_warthog_mpm_plink, g_warthog_mpm_plink_seen;
+extern volatile unsigned int g_warthog_hostap_estab, g_warthog_mpm_fsm;
+
 struct mesh_peer_mgmt_ie {
 	const u8 *proto_id; /* Mesh Peering Protocol Identifier (2 octets) */
 	const u8 *llid; /* Local Link ID (2 octets) */
@@ -471,6 +475,7 @@ void wpa_mesh_set_plink_state(struct wpa_supplicant *wpa_s,
 	params.set = 1;
 	params.mld_link_id = -1;
 
+	warthog_sae_trace(24);
 	ret = wpa_drv_sta_add(wpa_s, &params);
 	if (ret) {
 		wpa_msg(wpa_s, MSG_ERROR, "Driver failed to set " MACSTR
@@ -710,8 +715,10 @@ void mesh_mpm_auth_peer(struct wpa_supplicant *wpa_s, const u8 *addr)
 			MAC2STR(sta->addr), ret);
 	}
 
+	warthog_sae_trace(22);
 	if (!sta->my_lid)
 		mesh_mpm_init_link(wpa_s, sta);
+	warthog_sae_trace(23);
 
 	mesh_mpm_plink_open(wpa_s, sta, PLINK_OPN_SNT);
 }
@@ -722,6 +729,9 @@ void mesh_mpm_auth_peer(struct wpa_supplicant *wpa_s, const u8 *addr)
  * Beacon (secure or open mesh) or a peering open frame (for open mesh) is
  * received from the peer for the first time.
  */
+extern volatile unsigned int g_warthog_addp_r_crowded, g_warthog_addp_r_exists,
+	g_warthog_addp_r_addfail, g_warthog_addp_r_rates;
+
 static struct sta_info * mesh_mpm_add_peer(struct wpa_supplicant *wpa_s,
 					   const u8 *addr,
 					   struct ieee802_11_elems *elems)
@@ -738,22 +748,28 @@ static struct sta_info * mesh_mpm_add_peer(struct wpa_supplicant *wpa_s,
 		wpa_msg(wpa_s, MSG_DEBUG,
 			"mesh: Ignore a crowded peer " MACSTR,
 			MAC2STR(addr));
+		g_warthog_addp_r_crowded++;
 		return NULL;
 	}
 
 	sta = ap_get_sta(data, addr);
-	if (sta)
+	if (sta) {
+		g_warthog_addp_r_exists++;
 		return NULL;
+	}
 
 	sta = ap_sta_add(data, addr);
-	if (!sta)
+	if (!sta) {
+		g_warthog_addp_r_addfail++;
 		return NULL;
+	}
 
 	/* Set WMM by default since Mesh STAs are QoS STAs */
 	sta->flags |= WLAN_STA_WMM;
 
 	/* initialize sta */
 	if (copy_supp_rates(wpa_s, sta, elems)) {
+		g_warthog_addp_r_rates++;
 		ap_free_sta(data, sta);
 		return NULL;
 	}
@@ -848,6 +864,10 @@ static struct sta_info * mesh_mpm_add_peer(struct wpa_supplicant *wpa_s,
 }
 
 
+extern volatile unsigned int g_warthog_sae_addpeer_null, g_warthog_sae_addpeer_ok,
+	g_warthog_sae_authsta_fail, g_warthog_sae_authsta_ok;
+extern volatile unsigned int g_warthog_sae_stage;
+
 void wpa_mesh_new_mesh_peer(struct wpa_supplicant *wpa_s, const u8 *addr,
 			    struct ieee802_11_elems *elems)
 {
@@ -857,8 +877,12 @@ void wpa_mesh_new_mesh_peer(struct wpa_supplicant *wpa_s, const u8 *addr,
 	struct wpa_ssid *ssid = wpa_s->current_ssid;
 
 	sta = mesh_mpm_add_peer(wpa_s, addr, elems);
-	if (!sta)
+	if (!sta) {
+		g_warthog_sae_addpeer_null++;
 		return;
+	}
+	g_warthog_sae_addpeer_ok++;
+	warthog_sae_trace(25);
 
 	if (ssid && ssid->no_auto_peer &&
 	    (is_zero_ether_addr(data->mesh_required_peer) ||
@@ -896,7 +920,12 @@ void wpa_mesh_new_mesh_peer(struct wpa_supplicant *wpa_s, const u8 *addr,
 		    sta->plink_state > PLINK_ESTAB)
 			mesh_mpm_plink_open(wpa_s, sta, PLINK_OPN_SNT);
 	} else {
-		mesh_rsn_auth_sae_sta(wpa_s, sta);
+		warthog_sae_trace(30);
+		if (mesh_rsn_auth_sae_sta(wpa_s, sta) < 0)
+			g_warthog_sae_authsta_fail++;
+		else
+			g_warthog_sae_authsta_ok++;
+		warthog_sae_trace(31);
 	}
 }
 
@@ -920,6 +949,7 @@ static void mesh_mpm_plink_estab(struct wpa_supplicant *wpa_s,
 	struct mesh_conf *conf = wpa_s->ifmsh->mconf;
 	u8 seq[6] = {};
 
+	g_warthog_hostap_estab++;
 	wpa_msg(wpa_s, MSG_INFO, "mesh plink with " MACSTR " established",
 		MAC2STR(sta->addr));
 
@@ -974,6 +1004,9 @@ static void mesh_mpm_plink_estab(struct wpa_supplicant *wpa_s,
 static void mesh_mpm_fsm(struct wpa_supplicant *wpa_s, struct sta_info *sta,
 			 enum plink_event event, u16 reason)
 {
+	g_warthog_mpm_fsm++;
+	g_warthog_mpm_plink = sta->plink_state;
+	g_warthog_mpm_plink_seen |= 1u << (sta->plink_state & 31u);
 	struct hostapd_data *hapd = wpa_s->ifmsh->bss[0];
 	struct mesh_conf *conf = wpa_s->ifmsh->mconf;
 
@@ -1162,6 +1195,7 @@ static void mesh_mpm_fsm(struct wpa_supplicant *wpa_s, struct sta_info *sta,
 void mesh_mpm_action_rx(struct wpa_supplicant *wpa_s,
 			const struct ieee80211_mgmt *mgmt, size_t len)
 {
+	g_warthog_mpm_act_rx++;
 	u8 action_field;
 	struct hostapd_data *hapd = wpa_s->ifmsh->bss[0];
 	struct mesh_conf *mconf = wpa_s->ifmsh->mconf;

@@ -61,6 +61,7 @@ static const char *TAG = "warthog.mesh";
  * no DHCP to run over a link that has no server. That is enough for IP,
  * ARP, and UDP multicast -- which is what a Meshtastic UDP transport needs. */
 extern volatile uint32_t g_warthog_mpm_estab;
+extern volatile unsigned int g_warthog_hostap_estab;
 static bool s_mesh_netif_up;
 static void mesh_netif_up_(void)
 {
@@ -98,7 +99,10 @@ static void mesh_probe_burst_task(void *arg)
         } else if (iter <= 4 || (iter % 30) == 0) {
             ESP_LOGW(TAG, "probe_burst#%lu: ret=%d", (unsigned long)iter, ret);
         }
-        if (g_warthog_mpm_estab) {
+        /* Either MPM counts: warthog's own (open mesh) or hostap's (SAE --
+         * where warthog's MPM is deliberately disabled and this gate used to
+         * keep the netif down forever, leaving a keyed link with no L3). */
+        if (g_warthog_mpm_estab || g_warthog_hostap_estab) {
             mesh_netif_up_();
         }
         vTaskDelay(pdMS_TO_TICKS(MESH_PROBE_BURST_PERIOD_MS));

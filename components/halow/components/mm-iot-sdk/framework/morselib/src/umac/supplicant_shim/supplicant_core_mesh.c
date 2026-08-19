@@ -27,6 +27,8 @@
 #include "umac/supplicant_shim/umac_supp_shim.h"
 #include "umac_supp_shim_private.h"
 #include "umac/datapath/umac_datapath.h"
+#include "umac/mesh/umac_mesh_ies.h"
+#include "umac/mesh/umac_mesh.h"
 
 /* passive ifmsh init — pull the hostap mesh internals so we can
  * allocate the bss / mconf / ifmsh directly without going through
@@ -38,6 +40,17 @@
 #include "hostap/src/ap/ap_config.h"
 #include "hostap/wpa_supplicant/config_ssid.h"
 #include "hostap/wpa_supplicant/mesh_rsn.h"
+
+/* 0 = open mesh, 1 = SAE authenticator up, 2 = SAE requested but init failed. */
+extern volatile uint32_t g_warthog_sae_init;
+extern volatile uint32_t g_warthog_sae_peer_offers, g_warthog_sae_peer_parse_fail;
+extern volatile uint32_t g_warthog_sae_rates_synth;
+extern volatile uint32_t g_warthog_sae_peer_authproto;
+extern volatile uint32_t g_warthog_sae_peer_authval;
+extern volatile uint32_t g_warthog_sae_offer_addr;
+extern volatile uint32_t g_warthog_sae_stage;
+extern volatile uint32_t g_warthog_sae_bridge_en;
+extern void warthog_sae_trace(uint32_t n);
 #include "hostap/wpa_supplicant/mesh.h"
 #include "hostap/wpa_supplicant/mesh_mpm.h"
 #pragma GCC diagnostic pop
@@ -174,6 +187,22 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
     bss->conf->mesh = MESH_ENABLED;
     bss->conf->ap_max_inactivity = wpa_s->conf->mesh_max_inactivity;
     bss->conf->mesh_fwding = wpa_s->conf->mesh_fwding;
+
+    /* SAE group list. Upstream wpa_supplicant_mesh_init() copies
+     * wpa_s->conf->sae_groups into the bss conf (mesh.c); this passive init
+     * never did, and mesh_rsn_sae_group() indexes the array without a NULL
+     * check -- the first SAE authentication died at groups[0]. Found on
+     * hardware: breadcrumb trail ended between trace 55 and 56, i.e. inside
+     * mesh_rsn_sae_group(). Group 19 (NIST P-256) is the SAE default used by
+     * wpa_supplicant, hostapd and OpenMANET alike. Static storage: this conf
+     * is torn down by hostapd_config_free(), which would os_free() a heap
+     * pointer -- but bss->conf here is a *copy* of conf->bss[0] (line above),
+     * freed through conf, whose own sae_groups stays NULL, so the static is
+     * never freed. */
+    {
+        static int mesh_sae_groups[] = { 19, -1 };
+        bss->conf->sae_groups = mesh_sae_groups;
+    }
     bss->iconf = conf;
     ifmsh->conf = conf;
     ifmsh->bss[0]->max_plinks = wpa_s->conf->max_peer_links;
@@ -204,13 +233,56 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
      * any peer is admitted. */
     if (mconf->security & MESH_CONF_SEC_AMPE)
     {
+        /* The hostapd-side SAE code reads its password from THIS conf --
+         * sae_get_password() never looks at wpa_s's ssid -- and upstream
+         * copies it across right before mesh_rsn_auth_init (mesh.c:214).
+         * Found on hardware: without it every auth_build_sae_commit died at
+         * "SAE: No password available" (authsta=0/1, mlme=0), after the
+         * sae_groups fix let SAE get that far at all. */
+        {
+            /* Mirror wpa_supplicant_mesh_init()'s RSN block (mesh.c:201-214).
+             * All three fields live on the hostapd-side conf, which is what
+             * the AP code paths read -- they never consult wpa_s's ssid.
+             *
+             * conf->wpa + conf->wpa_key_mgmt are not cosmetic: ieee802_11.c's
+             * handle_auth() only reaches the SAE branch when
+             * `hapd->conf->wpa && wpa_key_mgmt_sae(hapd->conf->wpa_key_mgmt)`.
+             * With them zero it answers every SAE Authentication frame with
+             * NOT_SUPPORTED_AUTH_ALG. Measured on hardware before this fix:
+             * handle_auth() ran 6956 times and handle_auth_sae() zero times,
+             * while both boards retransmitted Commit at the 40 ms
+             * dot11RSNASAERetransPeriod forever. */
+            bss->conf->wpa = ssid->proto ? ssid->proto : WPA_PROTO_RSN;
+            bss->conf->wpa_key_mgmt =
+                ssid->key_mgmt ? ssid->key_mgmt : WPA_KEY_MGMT_SAE;
+
+            const char *password = ssid->sae_password;
+            if (password == NULL)
+            {
+                password = ssid->passphrase;
+            }
+            if (password != NULL && bss->conf->ssid.wpa_passphrase == NULL)
+            {
+                bss->conf->ssid.wpa_passphrase = os_strdup(password);
+            }
+        }
         wpa_s->mesh_rsn = mesh_rsn_auth_init(wpa_s, mconf);
         if (wpa_s->mesh_rsn == NULL)
         {
-            MMLOG_ERR("mesh: mesh_rsn_auth_init failed — SAE/AMPE unavailable\n");
-            return -1;
+            /* Deliberately NOT fatal. Failing the whole bring-up here takes
+             * the mesh down with it -- own_addr never gets set and the node
+             * beacons into the void -- which hides the actual failure behind a
+             * dead mesh. Record it and carry on unsecured; g_warthog_sae_init
+             * says which happened, and this board's logs are unreachable after
+             * the USB-OTG handoff so a counter is the only way to find out. */
+            g_warthog_sae_init = 2;
+            MMLOG_ERR("mesh: mesh_rsn_auth_init failed — continuing WITHOUT SAE\n");
         }
-        MMLOG_INF("mesh: SAE/AMPE authenticator up (rsn=%p)\n", wpa_s->mesh_rsn);
+        else
+        {
+            g_warthog_sae_init = 1;
+            MMLOG_INF("mesh: SAE/AMPE authenticator up (rsn=%p)\n", wpa_s->mesh_rsn);
+        }
     }
     else
     {
@@ -229,6 +301,114 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
     MMLOG_INF("mesh: passive ifmsh init OK — mesh_mpm has hapd=%p mconf=%p own_addr=" MACSTR "\n",
               ifmsh->bss[0], ifmsh->mconf, MAC2STR(wpa_s->own_addr));
     return 0;
+}
+
+/* The mesh wpa_supplicant, cached for callers that reach us from the datapath.
+ *
+ * The shim's own accessor needs a struct umac_data, and the S1G beacon handler
+ * has only the received frame -- there is no global umac handle to recover it
+ * from. Set once when the mesh interface comes up, cleared when it goes down. */
+static struct wpa_supplicant *s_mesh_wpa_s;
+
+/* Tell hostap's MPM about a mesh peer we heard beaconing.
+ *
+ * hostap starts peering from mesh_mpm_add_peer(), which it normally reaches
+ * from its own scan results. This port never runs that scan -- warthog spots
+ * peers in S1G beacons and drives its own MPM instead -- so under SAE, where
+ * hostap owns peering, nothing was ever telling it a candidate existed. That
+ * is the whole reason a SAE mesh came up with the authenticator initialised
+ * and no peer ever established.
+ *
+ * @param addr     the peer's address, from the beacon's SA.
+ * @param ies      the beacon's information elements.
+ * @param ies_len  their length.
+ */
+void umac_supp_mesh_new_peer(const uint8_t *addr, const uint8_t *ies, size_t ies_len)
+{
+    /* Runtime kill-switch, default OFF. The SAE path crashes somewhere past
+     * this point and takes the USB CDC down with it, so the only way to get a
+     * live AT session on a board that can hear peers is to boot deaf and let
+     * the operator pull the trigger: AT+SAEBRIDGE=1, then read the wreckage
+     * out of RTC (AT+SAESTAGE?) and flash (AT+COREDUMP?) after the reboot. */
+    if (!g_warthog_sae_bridge_en)
+    {
+        return;
+    }
+    warthog_sae_trace(10);
+    struct wpa_supplicant *wpa_s = s_mesh_wpa_s;
+    if (wpa_s == NULL || addr == NULL || ies == NULL)
+    {
+        return;
+    }
+    if (wpa_s->ifmsh == NULL || wpa_s->ifmsh->mconf == NULL)
+    {
+        return;
+    }
+
+    struct ieee802_11_elems elems;
+    if (ieee802_11_parse_elems((const u8 *)ies, ies_len, &elems, 0) == ParseFailed)
+    {
+        g_warthog_sae_peer_parse_fail++;
+        return;
+    }
+    /* mesh_mpm_add_peer() dereferences these; a beacon without them is not a
+     * usable mesh candidate and hostap would fault on it. */
+    if (elems.mesh_id == NULL || elems.mesh_config == NULL)
+    {
+        return;
+    }
+
+    /* Auth protocol must match ours. Upstream reaches mesh_mpm_add_peer()
+     * through mesh_matches_local(), which compares the whole Mesh
+     * Configuration; this port calls it directly, so the comparison that
+     * matters here has to be done by hand.
+     *
+     * Octet 4 of the Mesh Configuration IE is the Authentication Protocol
+     * Identifier (0 = none, 1 = SAE). Peering with a node advertising a
+     * different one cannot work, and it actively breaks us: an open-mesh
+     * node answers our SAE Authentication frames with
+     * NOT_SUPPORTED_AUTH_ALG, and hostap treats a peer's failure status as
+     * grounds to reset its own SAE state -- so one stale open node in range
+     * stops every SAE handshake on the mesh, including between two nodes
+     * that agree. Observed on the bench with exactly that setup. */
+    if (elems.mesh_config_len >= 5)
+    {
+        const uint8_t want = umac_mesh_sae_active() ? 1u : 0u;
+        if (elems.mesh_config[4] != want)
+        {
+            /* Observational only. Dropping the candidate here looked correct
+             * and was not: on the bench it rejected every peer (apx=83,
+             * offers=0) including a node that genuinely runs SAE, so the
+             * value being compared is not the peer's advertised protocol as
+             * assumed -- most likely the S1G IE offset this port hands to
+             * ieee802_11_parse_elems() does not put mesh_config where a
+             * legacy parse expects it. Left as a counter, plus the observed
+             * octet, until that is pinned down; peering is not gated on it. */
+            g_warthog_sae_peer_authproto++;
+            g_warthog_sae_peer_authval = elems.mesh_config[4];
+        }
+    }
+    /* S1G beacons carry no Supported Rates element -- the S1G PHY has its own
+     * MCS set and the legacy element is not part of the frame. hostap's
+     * copy_supp_rates() rejects any peer without one, so mesh_mpm_add_peer()
+     * returned NULL for every beacon we offered it and no peering ever began.
+     * Substitute the rate set we ourselves advertise in probe responses and
+     * MPM frames: this is a homogeneous S1G mesh, so it is the set both ends
+     * would have agreed on anyway. */
+    if (elems.supp_rates == NULL)
+    {
+        uint8_t rlen = 0;
+        const uint8_t *rates = umac_mesh_ies_supported_rates(&rlen);
+        elems.supp_rates = (u8 *)rates;
+        elems.supp_rates_len = rlen;
+        g_warthog_sae_rates_synth++;
+    }
+
+    warthog_sae_trace(12);
+    g_warthog_sae_offer_addr = ((uint32_t)addr[3] << 16) | ((uint32_t)addr[4] << 8) | addr[5];
+    g_warthog_sae_peer_offers++;
+    wpa_mesh_new_mesh_peer(wpa_s, (const u8 *)addr, &elems);
+    warthog_sae_trace(19); /* returned alive */
 }
 
 enum mmwlan_status umac_supp_add_mesh_interface(struct umac_data *umacd)
@@ -260,6 +440,7 @@ enum mmwlan_status umac_supp_add_mesh_interface(struct umac_data *umacd)
      * (wpa_clear_keys, etc.); AP-specific ops are NULLed on mmwlan_wpas_ops_mesh
      * to skip them. See driver_ap.c comment block above the mesh ops struct. */
     data->mesh_wpa_s = wpa_supplicant_add_iface(data->global, &iface, NULL);
+    s_mesh_wpa_s = data->mesh_wpa_s;
     if (data->mesh_wpa_s == NULL)
     {
         MMLOG_ERR("mesh: wpa_supplicant_add_iface returned NULL — "
@@ -305,6 +486,7 @@ enum mmwlan_status umac_supp_remove_mesh_interface(struct umac_data *umacd)
 
     int ret = wpa_supplicant_remove_iface(data->global, data->mesh_wpa_s, 0);
     data->mesh_wpa_s = NULL;
+    s_mesh_wpa_s = NULL;
 
     if (ret == 0)
     {

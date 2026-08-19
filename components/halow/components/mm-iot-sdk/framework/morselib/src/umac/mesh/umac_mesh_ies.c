@@ -58,6 +58,15 @@ static const uint8_t k_supported_rates[] = {
     0x6C, /* 54 Mbps       */
 };
 
+const uint8_t *umac_mesh_ies_supported_rates(uint8_t *len_out)
+{
+    if (len_out != NULL)
+    {
+        *len_out = (uint8_t)sizeof(k_supported_rates);
+    }
+    return k_supported_rates;
+}
+
 uint16_t umac_mesh_ies_build_mesh_config(uint8_t *out, uint16_t out_len, bool sae)
 {
     if (out == NULL || out_len < 2 + UMAC_MESH_CFG_IE_LEN)

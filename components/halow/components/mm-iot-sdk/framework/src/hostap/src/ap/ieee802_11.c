@@ -89,6 +89,18 @@ static void handle_auth(struct hostapd_data *hapd,
 static int add_associated_sta(struct hostapd_data *hapd,
 			      struct sta_info *sta, int reassoc);
 
+/* warthog SAE FSM breadcrumbs — see AT+SAERX?. */
+extern volatile unsigned int g_warthog_sae_hdl_auth, g_warthog_sae_hdl_sae;
+extern volatile unsigned int g_warthog_sae_rx_trans, g_warthog_sae_rx_status;
+extern volatile unsigned int g_warthog_sae_state_now, g_warthog_sae_state_seen;
+extern volatile unsigned int g_warthog_sae_confirm_tx;
+extern volatile unsigned int g_warthog_sae_tx_status, g_warthog_sae_alg_reject;
+extern volatile unsigned int g_warthog_sae_keymgmt, g_warthog_sae_wpa;
+extern volatile unsigned int g_warthog_sae_txfail, g_warthog_sae_rxfail_sa;
+extern volatile unsigned int g_warthog_sae_txfail_last;
+extern volatile unsigned int g_warthog_sae_rx_sa, g_warthog_sae_rx_da;
+extern volatile unsigned int g_warthog_accept_nosm, g_warthog_accept;
+
 
 static u8 * hostapd_eid_multi_ap(struct hostapd_data *hapd, u8 *eid, size_t len)
 {
@@ -418,6 +430,9 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 			   u16 auth_alg, u16 auth_transaction, u16 resp,
 			   const u8 *ies, size_t ies_len, const char *dbg)
 {
+	g_warthog_sae_tx_status = resp;
+	if (resp != 0) { g_warthog_sae_txfail++; g_warthog_sae_txfail_last = resp; }
+
 	struct ieee80211_mgmt *reply;
 	u8 *buf;
 	size_t rlen;
@@ -553,6 +568,8 @@ static void sae_set_state(struct sta_info *sta, enum sae_state state,
 	wpa_printf(MSG_DEBUG, "SAE: State %s -> %s for peer " MACSTR " (%s)",
 		   sae_state_txt(sta->sae->state), sae_state_txt(state),
 		   MAC2STR(sta->addr), reason);
+	g_warthog_sae_state_now = (unsigned int) state;
+	g_warthog_sae_state_seen |= 1u << ((unsigned int) state & 31u);
 	sta->sae->state = state;
 }
 
@@ -975,6 +992,17 @@ void sae_accept_sta(struct hostapd_data *hapd, struct sta_info *sta)
 	sta->flags |= WLAN_STA_AUTH;
 	sta->auth_alg = WLAN_AUTH_SAE;
 	mlme_authenticate_indication(hapd, sta);
+	g_warthog_accept++;
+	/* AMPE is started by wpa_auth_sm_event(WPA_AUTH) -> start_ampe callback,
+	 * and wpa_auth_sm_event() returns immediately when the state machine is
+	 * NULL. An AP creates that machine at association; a mesh STA never
+	 * associates, and on the no-PMKSA path (i.e. every first join) nothing
+	 * else creates it -- so SAE reached ACCEPTED on both peers and AMPE was
+	 * never started, leaving the link unkeyed. Create it here. */
+	if (!sta->wpa_sm) {
+		g_warthog_accept_nosm++;
+		sta->wpa_sm = wpa_auth_sta_init(hapd->wpa_auth, sta->addr, NULL);
+	}
 	wpa_auth_sm_event(sta->wpa_sm, WPA_AUTH);
 	sae_set_state(sta, SAE_ACCEPTED, "Accept Confirm");
 	crypto_bignum_deinit(sta->sae->peer_commit_scalar_accepted, 0);
@@ -1078,6 +1106,7 @@ static int sae_sm_step(struct hostapd_data *hapd, struct sta_info *sta,
 			ret = auth_sae_send_confirm(hapd, sta);
 			if (ret)
 				return ret;
+			g_warthog_sae_confirm_tx++;
 			sae_set_state(sta, SAE_CONFIRMED, "Sent Confirm");
 			sta->sae->sync = 0;
 			sae_set_retransmit_timer(hapd, sta);
@@ -1105,6 +1134,7 @@ static int sae_sm_step(struct hostapd_data *hapd, struct sta_info *sta,
 			if (ret)
 				return ret;
 
+			g_warthog_sae_confirm_tx++;
 			sae_set_state(sta, SAE_CONFIRMED, "Sent Confirm");
 
 			/*
@@ -1338,6 +1368,15 @@ static void handle_auth_sae(struct hostapd_data *hapd, struct sta_info *sta,
 	const u8 *pos, *end;
 	int sta_removed = 0;
 	bool success_status;
+
+	g_warthog_sae_hdl_sae++;
+	g_warthog_sae_rx_sa = (mgmt->sa[3] << 16) | (mgmt->sa[4] << 8) | mgmt->sa[5];
+	g_warthog_sae_rx_da = (mgmt->da[3] << 16) | (mgmt->da[4] << 8) | mgmt->da[5];
+	g_warthog_sae_rx_trans = auth_transaction;
+	g_warthog_sae_rx_status = status_code;
+	if (status_code != 0) {
+		g_warthog_sae_rxfail_sa = (mgmt->sa[3] << 16) | (mgmt->sa[4] << 8) | mgmt->sa[5];
+	}
 
 	if (!groups) {
 		groups = default_groups;
@@ -2904,6 +2943,7 @@ static void handle_auth(struct hostapd_data *hapd,
 			const struct ieee80211_mgmt *mgmt, size_t len,
 			int rssi, int from_queue)
 {
+	g_warthog_sae_hdl_auth++;
 	u16 auth_alg, auth_transaction, status_code;
 	u16 resp = WLAN_STATUS_SUCCESS;
 	struct sta_info *sta = NULL;
@@ -3016,6 +3056,9 @@ static void handle_auth(struct hostapd_data *hapd,
 	       auth_alg == WLAN_AUTH_SHARED_KEY))) {
 		wpa_printf(MSG_INFO, "Unsupported authentication algorithm (%d)",
 			   auth_alg);
+		g_warthog_sae_alg_reject++;
+		g_warthog_sae_keymgmt = hapd->conf->wpa_key_mgmt;
+		g_warthog_sae_wpa = hapd->conf->wpa;
 		resp = WLAN_STATUS_NOT_SUPPORTED_AUTH_ALG;
 		goto fail;
 	}

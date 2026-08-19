@@ -78,6 +78,10 @@ uint16_t umac_mesh_ies_build_discovery(uint8_t *out, uint16_t out_len, const uin
  * Build the Mesh Configuration IE alone (element ID + length + 7 payload
  * octets), so the beacon path and the discovery blob cannot drift apart.
  */
+/** The rate set we advertise. S1G beacons carry no Supported Rates element,
+ *  but hostap's MPM refuses a peer without one; this is what we substitute. */
+const uint8_t *umac_mesh_ies_supported_rates(uint8_t *len_out);
+
 uint16_t umac_mesh_ies_build_mesh_config(uint8_t *out, uint16_t out_len, bool sae);
 
 /**

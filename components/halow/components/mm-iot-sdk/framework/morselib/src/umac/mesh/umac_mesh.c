@@ -72,6 +72,8 @@ extern uint32_t ieee80211_crc32(const uint8_t *frame, size_t frame_len);
 
 #include <string.h>
 
+extern volatile unsigned int g_warthog_mesh_act_oversize;
+
 /* save the args from the last successful enable so
  * wpa_config_read_mesh() can read them. File-static because the MM6108 only
  * has one VIF (mesh and STA/AP are mutually exclusive). s_mesh_args_valid
@@ -816,6 +818,32 @@ int umac_mesh_tx_probe_response(const uint8_t *da)
 /** 802.11 reason 52, MESH-PEERING-CANCELLED. */
 #define MPM_REASON_PEER_CANCELED 52
 
+/** Largest action body umac_mesh_tx_action carries: an MPM Open/Confirm with
+ *  AMPE. hostap caps its own peering buffer well under this. */
+#define UMAC_MESH_ACTION_BODY_MAX 512
+
+/* Send an action body verbatim (no appended elements). */
+static int mesh_tx_action_raw_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
+{
+    if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL || body == NULL || body_len == 0)
+    {
+        return -1;
+    }
+    struct frame_data_action act = {
+        .bssid = s_mesh_own_addr,
+        .dst_address = da,
+        .src_address = s_mesh_own_addr,
+        .action_field = (uint8_t *)body,
+        .action_field_len = body_len,
+    };
+    struct mmpkt *frm = build_mgmt_frame(s_mesh_umacd, frame_action_build, &act);
+    if (frm == NULL)
+    {
+        return -3;
+    }
+    return umac_mesh_tx_mgmt_mmpkt(frm);
+}
+
 static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_len);
 
 /** Path lifetime we advertise, in TUs. 4882 TU ~= 5 s, which is what
@@ -1004,8 +1032,45 @@ static uint32_t s_hwmp_last_preq_ms;
  * S1G element, so the port supplies it. A mac80211 peer parses elements
  * generically and ignores the extra one.
  */
+/* Transmit a fully built management frame on the mesh VIF.
+ *
+ * hostap hands send_mlme a complete 802.11 frame (SAE Authentication, in
+ * practice). Sending it through umac_datapath_tx_mgmt_frame_ap -- the AP
+ * path -- put it on metadata the mesh VIF never validated, and whether those
+ * frames ever left the antenna was unprovable. This uses the exact metadata
+ * recipe of mesh_tx_hwmp_(), whose frames demonstrably fly between boards.
+ */
+int umac_mesh_tx_mgmt_mmpkt(struct mmpkt *frm)
+{
+    if (s_mesh_umacd == NULL || !s_mesh_args_valid || frm == NULL)
+    {
+        return -1;
+    }
+    struct mmdrv_tx_metadata *tx_md = mmdrv_get_tx_metadata(frm);
+    tx_md->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
+    tx_md->tid = MMWLAN_MAX_QOS_TID;
+    tx_md->vif_id = s_mesh_vif_id;
+    umac_rc_init_rate_table_mgmt(s_mesh_umacd, &tx_md->rc_data, false);
+    return mmdrv_tx_frame(frm, /*is_mgmt=*/true);
+}
+
+static int mesh_tx_action_raw_(const uint8_t *da, const uint8_t *body, uint16_t body_len);
+
 int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len)
 {
+    /* Category 15 (Self-protected) bodies must go out BYTE-FOR-BYTE.
+     *
+     * mesh_tx_hwmp_ appends an S1G Capabilities element, which the vendor MPM
+     * peer wants on peering frames. Under AMPE that is destructive: hostap
+     * ends an Open/Confirm with the AMPE element, whose MIC covers the body,
+     * so anything appended afterwards invalidates it and the peer rejects the
+     * peering. Seen on hardware as plink advancing OPN_SNT -> HOLDING and
+     * never reaching ESTAB once the frames themselves started arriving.
+     * HWMP (category 13) still gets the element. */
+    if (body_len >= 1 && body[0] == 15u)
+    {
+        return mesh_tx_action_raw_(da, body, body_len);
+    }
     return mesh_tx_hwmp_(da, body, body_len);
 }
 
@@ -1022,9 +1087,17 @@ static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_l
     ie_s1g_capabilities_build(s_mesh_umacd, &cb);
     uint16_t s1g_caps_len = (uint16_t)cb.offset;
 
-    uint8_t frame[HWMP_PREQ_BODY_LEN + sizeof(s1g_caps)];
+    /* Sized for the LARGEST action body this path carries, which is not a
+     * HWMP PREQ. hostap's MPM peering frames (Open/Confirm) carry the peering
+     * elements plus AMPE's encrypted key blob and run several hundred bytes;
+     * with the old HWMP_PREQ_BODY_LEN + caps budget (105 B) every one of them
+     * failed the bounds check below and returned before reaching the radio.
+     * That is why SAE completed on both peers and no peering frame was ever
+     * received: they were never sent. */
+    uint8_t frame[UMAC_MESH_ACTION_BODY_MAX + sizeof(s1g_caps)];
     if ((uint32_t)body_len + s1g_caps_len > sizeof(frame))
     {
+        g_warthog_mesh_act_oversize++;
         return -2;
     }
     memcpy(frame, body, body_len);
@@ -1500,6 +1573,26 @@ void umac_mesh_reset_links(void)
 
 /* True when the mesh was brought up with SAE, i.e. hostap's MPM owns peering
  * and warthog's own MPM must not intercept SELF_PROTECTED frames. */
+/* Register a datapath peer on hostap's behalf.
+ *
+ * Under SAE, hostap's MPM -- not ours -- decides when a peer exists, and it
+ * does so through .sta_add. The vif id and our own mesh address are file
+ * statics here, so the driver op cannot build the call itself. */
+enum mmwlan_status umac_mesh_add_datapath_peer(const uint8_t *peer_addr)
+{
+    if (!s_mesh_args_valid || peer_addr == NULL)
+    {
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+    return umac_datapath_mesh_add_peer(s_mesh_umacd, s_mesh_vif_id, s_mesh_own_addr, peer_addr,
+                                       s_mesh_args.security_type == MMWLAN_SAE);
+}
+
+const uint8_t *umac_mesh_get_shared_bssid(void)
+{
+    return s_mesh_shared_bssid_valid ? s_mesh_shared_bssid : NULL;
+}
+
 bool umac_mesh_sae_active(void)
 {
     return s_mesh_args_valid && s_mesh_args.security_type == MMWLAN_SAE;

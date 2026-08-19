@@ -106,7 +106,12 @@ enum mmwlan_status umac_core_start(struct umac_data *umacd)
 
 
         core->evtloop_task =
-            mmosal_task_create(evtloop_main, umacd, MMOSAL_TASK_PRI_HIGH, 2152, "evtloop");
+            /* 2152 words (8.6 KB) was sized for the vendor event loop. Mesh SAE runs on
+             * this task -- wpa_mesh_new_mesh_peer() is reached from the S1G beacon
+             * handler, and mesh_rsn_auth_sae_sta() does P-256 ECC underneath, whose
+             * mbedtls ECP frames alone rival the old budget. eloop_register_timeout()
+             * is no escape: it dispatches back onto this same task. */
+            mmosal_task_create(evtloop_main, umacd, MMOSAL_TASK_PRI_HIGH, 6144, "evtloop");
         if (core->evtloop_task == NULL)
         {
             mmosal_semb_delete(core->evtloop_semb);
