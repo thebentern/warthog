@@ -93,6 +93,17 @@ testing established so far:
   `no_auto_peer=1`, so the Linux side cannot be told to initiate; and Warthog
   does not beacon in mesh mode, so kernel-MPM candidate discovery never sees
   it. The Warthog must initiate — hence the `AT+SAEBRIDGE=2` override.
+- **The hard blocker, measured end to end**: with the override armed, Warthog
+  discovers the SAE OpenMANET node from its beacons, creates the station and
+  transmits SAE Commits at it (43 observed) — and OpenMANET never answers.
+  Its kernel-MPM stack only engages SAE with peers it discovered from
+  *beacons*; it does not respond to unsolicited Commits. Since the Warthog
+  chip does not radiate mesh beacons (template is served to the chip, nothing
+  transmits — confirmed by a second Warthog hearing only the Pi's beacons),
+  the handshake cannot start from either side. **Warthog↔OpenMANET SAE is
+  blocked on Warthog mesh beaconing**, a chip-firmware work item. Everything
+  Warthog-side up to the airlink is proven: discovery, station creation,
+  Commit transmission, and the full SAE/AMPE exchange against a hostap peer.
 
 `AT+SAERX?` on the Warthog shows the SAE conversation state and which peer it
 is talking to.

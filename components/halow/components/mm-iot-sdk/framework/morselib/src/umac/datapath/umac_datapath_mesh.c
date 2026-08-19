@@ -1137,14 +1137,20 @@ void umac_mesh_handle_s1g_beacon(struct mmpktview *rxbufview)
         (void)umac_mesh_tx_probe_response(sa);
         if (umac_mesh_sae_active())
         {
-            /* Under SAE hostap owns peering, but we deliberately do NOT offer
-             * it a candidate from here: the address a beacon yields after the
-             * chip's S1G conversion is not dependable, and offering it made
-             * hostap run a full SAE session against a node that was merely in
-             * range -- consuming the peering slot the real peer needed. The
-             * probe-response handler does the offering, where the transmitter
-             * address is real. Answering the beacon (above) is what prompts
-             * that probe response, so discovery still starts here. */
+            /* Under SAE, beacons are the discovery path for mac80211-style
+             * peers (OpenMANET): they beacon and never probe, so the
+             * probe-response path cannot see them. The S1G beacon's SA reads
+             * true from the chip (verified against a live node), and the
+             * candidate still passes umac_supp_mesh_new_peer's auth-protocol
+             * gate, so an open node sharing the Mesh ID is not SAE'd at.
+             * Warthog peers are discovered by the probe-response path; both
+             * feed the same gate. */
+            uint32_t boff = umac_mesh_ies_s1g_beacon_ie_offset(
+                (uint16_t)(f[0] | ((uint16_t)f[1] << 8)));
+            if (flen > boff)
+            {
+                umac_supp_mesh_new_peer(sa, f + boff, (size_t)(flen - boff));
+            }
         }
         else
         {
