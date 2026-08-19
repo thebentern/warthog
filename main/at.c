@@ -101,6 +101,12 @@ static bool starts_with_i(const char *s, const char *prefix)
     return true;
 }
 
+/* USB network transmit, counted because the deferred path can drop.
+ * sent/dropped are per frame; a rising dropped count means every NCM transmit
+ * buffer was busy when the frame arrived, which is a throughput ceiling rather
+ * than a fault. */
+volatile uint32_t g_warthog_usb_tx_sent = 0, g_warthog_usb_tx_dropped = 0;
+
 static void cmd_status(void)
 {
     char buf[160];
@@ -121,8 +127,9 @@ static void cmd_status(void)
     if (usb) {
         esp_netif_get_ip_info(usb, &usb_ip);
     }
-    snprintf(buf, sizeof(buf), "+USB: ip=" IPSTR " mounted=%d\r\n",
-             IP2STR(&usb_ip.ip), tud_mounted() ? 1 : 0);
+    snprintf(buf, sizeof(buf), "+USB: ip=" IPSTR " mounted=%d tx=%lu drop=%lu\r\n",
+             IP2STR(&usb_ip.ip), tud_mounted() ? 1 : 0,
+             (unsigned long)g_warthog_usb_tx_sent, (unsigned long)g_warthog_usb_tx_dropped);
     cdc_write(buf);
 
     /* Wi-Fi AP netif */
