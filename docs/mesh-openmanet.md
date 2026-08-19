@@ -167,25 +167,21 @@ nobody is answering.
 
 ## Encryption
 
-> **There is no encrypted interop with OpenMANET, and the keyed mode is not
-> security.**
+> **Real 802.11s security is the `warthog-mesh-sae` build**: SAE (Dragonfly,
+> group 19) authentication and AMPE per-link key exchange, hardware-validated
+> warthog↔warthog (peering + keying in one exchange, 0% loss over the CCMP
+> link). Every node needs the same passphrase
+> (`-DWARTHOG_MESH_PASSPHRASE`, default `warthog-mesh`). A standard secured
+> 802.11s stack such as OpenMANET's speaks the same protocol; configure its
+> `wpa_supplicant` for mesh SAE with the matching passphrase.
 >
-> `AT+MESHSEC=1` encrypts data frames with a 16-byte constant compiled into
-> every warthog image (`00 11 22 ... ee ff`), used as both the pairwise and the
-> group key. Anyone holding the firmware holds the key. It exists to exercise
-> the CCMP data path, not to protect traffic.
->
-> It also cannot reach OpenMANET: a standard secured 802.11s node derives
-> per-link keys through SAE authentication and AMPE key exchange, so it can
-> neither decrypt warthog's frames nor warthog its. Keyed mode interoperates
-> with other warthogs and nothing else.
->
-> Peering is unauthenticated in both modes — `main/mesh.c` requests
-> `MMWLAN_OPEN`, so no SAE handshake ever runs. hostap's `mesh_rsn.c` is
-> compiled in but nothing drives it.
->
-> **Treat the mesh as an untrusted transport and encrypt above it.** For ATAK
-> and similar that is the normal posture anyway.
+> The legacy `AT+MESHSEC=1` keyed mode on the non-SAE build encrypts data
+> frames with a 16-byte constant compiled into every image
+> (`00 11 22 ... ee ff`). Anyone holding the firmware holds the key — it
+> exists to exercise the CCMP data path, not to protect traffic, and it
+> interoperates with other warthogs and nothing else. Against a secured
+> OpenMANET mesh use SAE on both sides; against an open one run
+> `AT+MESHSEC=0`.
 
 Warthog's mesh data plane can run keyed or open:
 

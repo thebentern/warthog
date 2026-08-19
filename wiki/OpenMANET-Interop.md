@@ -12,7 +12,21 @@ Measured on that bench with the peer in its stock configuration:
 | OpenMANET → Warthog B | 30/30, 0% loss, 8.6 / 15.2 ms |
 | Warthog → OpenMANET | 8/8, 0% loss, 8 / 19 ms |
 
-## Warthog side
+## Pick the security mode first
+
+Warthog and OpenMANET must agree on mesh security. Two working combinations:
+
+| Mesh | Warthog build | OpenMANET config |
+|---|---|---|
+| **Encrypted (SAE/AMPE)** | `warthog-mesh-sae` | `wpa_supplicant` mesh SAE (below) |
+| Open | `warthog-mesh-smoke` + `AT+MESHSEC=0` | stock `encryption='none'` |
+
+Mismatched modes fail cleanly rather than half-working: a SAE Warthog does not
+offer peering to an open node at all (the Mesh Configuration's Authentication
+Protocol Identifier must match), and an open Warthog peers with a SAE node but
+no keys exist so no data crosses.
+
+## Warthog side — open
 
 Build for mesh and set the data plane to match the peer. Stock OpenMANET runs
 `encryption='none'`, so:
@@ -28,6 +42,46 @@ AT+MESHSEC=0
 Keyed Warthog against an open peer produces perfect peering and zero data, in
 both directions — it is the first thing to check when links establish but
 nothing routes.
+
+## Encrypted meshing — SAE/AMPE on both sides
+
+Warthog side:
+
+```bash
+pio run -e warthog-mesh-sae -t upload     # passphrase: -DWARTHOG_MESH_PASSPHRASE='"..."', default warthog-mesh
+```
+
+Nothing to configure at runtime — the node authenticates (SAE, group 19),
+exchanges per-link keys (AMPE) and peers on its own. Verify with `AT+SAERX?`
+(`ESTAB=1`) and `AT+MPMPEERS?` (`ampe_mtk=1 ampe_mgtk=1`).
+
+OpenMANET side — mesh SAE is standard `wpa_supplicant`, not `iw`:
+
+```
+# /etc/wpa_supplicant-mesh.conf
+network={
+    ssid="halowmesh"          # the Mesh ID — must match Warthog's
+    mode=5
+    frequency=5180            # your S1G channel mapping
+    key_mgmt=SAE
+    sae_password="warthog-mesh"
+    ieee80211w=2
+}
+```
+
+```sh
+wpa_supplicant -i wlh0 -c /etc/wpa_supplicant-mesh.conf -B
+```
+
+On OpenWrt, the equivalent uci is `encryption='sae'` +
+`key='warthog-mesh'` on the mesh interface section (hostapd/wpa_supplicant
+must be the `-mesh`/full variants, which OpenMANET ships).
+
+Warthog↔Warthog SAE is bench-validated (single-exchange peering, AMPE keys in
+the chip, 0% loss over the CCMP link). Warthog↔OpenMANET SAE speaks the same
+hostap code on both ends but has not yet been exercised on this bench — the
+resident OpenMANET node runs open. If you try it first, `AT+SAERX?` on the
+Warthog shows the SAE conversation state and which peer it is talking to.
 
 ## OpenWrt side
 

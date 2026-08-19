@@ -148,11 +148,11 @@
         <option value="1">Keyed — warthog-to-warthog only, NOT real encryption</option>
       </select>
       <p class="hint">Applies immediately and persists; the node re-peers within ~2&nbsp;s.
-      <b>Keyed is not a security feature and cannot reach OpenMANET.</b> It encrypts
-      frames with a constant compiled into every warthog, so anyone holding the
-      firmware holds the key, and a peer without that exact constant — which is
-      every non-warthog node — cannot decrypt anything. Peering is unauthenticated
-      either way. Real per-link keys need SAE/AMPE, which is not implemented.</p>
+      This switch belongs to the <b>open mesh build</b> and its legacy shared key —
+      a constant compiled into every warthog, so anyone holding the firmware holds
+      the key. <b>For real security flash the encrypted mesh variant instead</b>:
+      SAE authentication and AMPE per-link keys, no runtime switch needed (the
+      passphrase is set at build time). It has no effect on the encrypted build.</p>
       <div class="row"><button id="meshsecSave" class="secondary" disabled>Save mesh setting</button></div>
     </div>
 
@@ -189,7 +189,8 @@ const VARIANTS = [
   { key: "jp",         label: "JP — 916.5–927.5 MHz (station uplink)" },
   { key: "kr",         label: "KR — 917.5–923.5 MHz (station uplink)" },
   { key: "au",         label: "AU (station uplink)" },
-  { key: "mesh-smoke", label: "Mesh — 802.11s peer, OpenMANET-compatible (US band)" },
+  { key: "mesh-sae",   label: "Mesh, encrypted — 802.11s + SAE/AMPE per-link keys (US band)" },
+  { key: "mesh-smoke", label: "Mesh, open — 802.11s peer, stock-OpenMANET-compatible (US band)" },
 ];
 
 if (!("serial" in navigator)) {

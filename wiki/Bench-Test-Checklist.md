@@ -94,3 +94,32 @@ AT+MPING=<peer's 10.77.x.y>,4
 ✅ Expected: four replies. Against an OpenMANET peer, `AT+MESHSEC=0` first
 — stock OpenMANET is unencrypted. See [OpenMANET Gateway](OpenMANET-Gateway).
 
+## 10. Encrypted mesh — SAE/AMPE (two boards)
+
+Flash `warthog-mesh-sae` to two boards (same build → same passphrase). After
+~30 s, on either board:
+
+```
+AT+SAERX?
+AT+MPMPEERS?
+AT+KEYINST?
+```
+
+✅ Expected:
+- `AT+SAERX?` shows `ESTAB=1` and low single-digit `act=`/`rxact=` counts —
+  peering completes in one Open/Confirm exchange, not a retransmit storm.
+- `AT+MPMPEERS?` shows `ampe_mtk=1 ampe_mgtk=1` — AMPE-derived keys installed.
+- `AT+KEYINST?` shows `n=2`: a pairwise key on the peer's AID and the group
+  key on AID 0.
+
+```
+AT+MPING=<peer's 10.77.x.y>,8
+```
+
+✅ Expected: 8/8 replies over the CCMP-encrypted link (bench: ~16 ms RTT).
+
+If an open-mesh node shares the Mesh ID (an OpenMANET box in stock config),
+the SAE boards must still key up beside it, and `AT+SAERX?` must show
+`status=0` / `rxfail_sa=000000` — no failure statuses from the open node,
+because it is never offered as a candidate.
+

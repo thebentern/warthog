@@ -62,7 +62,7 @@ Warthog is not one device role. A node runs an **uplink** and presents
 | **Host** | Gives the machine it is plugged into a USB Ethernet adapter (`192.168.4.1/24`) | always on |
 | **Client** | 2.4 GHz AP so phones and IoT clients share the uplink (`192.168.5.1/24`) | always on |
 | **Station uplink** | Joins an existing HaLow access point | default builds |
-| **Mesh uplink** | 802.11s peer-to-peer, no infrastructure | `warthog-mesh-smoke` build |
+| **Mesh uplink** | 802.11s peer-to-peer, no infrastructure | `warthog-mesh-sae` (encrypted) / `warthog-mesh-smoke` (open) |
 
 Both downstream surfaces are live at once. The two uplink modes are mutually
 exclusive and selected at build time.
@@ -280,15 +280,23 @@ HaLow. Every node is a peer — nothing to elect, nothing to associate to, and a
 node that loses power takes only its own links with it.
 
 ```bash
-pio run -e warthog-mesh-smoke -t upload
+pio run -e warthog-mesh-sae -t upload      # encrypted: SAE auth + AMPE per-link keys
+pio run -e warthog-mesh-smoke -t upload    # open: for stock (unencrypted) OpenMANET
 ```
+
+The encrypted build runs real 802.11s security — SAE authentication
+(Dragonfly, group 19) and AMPE key exchange, with per-link pairwise and group
+keys installed in the radio. All nodes share a passphrase set at build time
+(`-DWARTHOG_MESH_PASSPHRASE='"..."'`, default `warthog-mesh`). Peering, keying
+and addressing are automatic.
 
 Nodes address themselves statically from their own MAC — `10.77.<mac[4]>.<mac[5]>/16`
 — so `3c:1a:cc:4c:83:a5` is `10.77.131.165`. There is no DHCP on the mesh.
 
 ```
-AT+MPMPEERS?                     peers and handshake state
-AT+MESHSEC=0                     open data plane (needed for unencrypted peers)
+AT+MPMPEERS?                     peers, handshake state, AMPE key counters
+AT+SAERX?                        SAE/peering state machine (encrypted build)
+AT+MESHSEC=0                     open data plane (open build, unencrypted peers)
 AT+MPING=10.77.199.248,4         confirm data
 ```
 

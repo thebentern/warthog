@@ -69,30 +69,67 @@ AT+MPING=10.77.199.248,4
 
 ## Encryption
 
+Warthog has three mesh security levels. Pick one at build time and, for the
+legacy shared key, at runtime:
+
+| Mode | Build | What it is |
+|---|---|---|
+| **SAE/AMPE** | `warthog-mesh-sae` | Real 802.11s security: SAE (Dragonfly, group 19) authentication and AMPE per-link key exchange. This is the mode to use. |
+| Shared key | `warthog-mesh-smoke` + `AT+MESHSEC=1` | One hardcoded key baked into every image — obfuscation, not security. Kept for bring-up debugging only. |
+| Open | `warthog-mesh-smoke` + `AT+MESHSEC=0` | No keys. Interops with an open OpenMANET mesh. |
+
+### SAE/AMPE
+
+```
+pio run -e warthog-mesh-sae -t upload
+```
+
+The passphrase defaults to `warthog-mesh` and is set at build time with
+`-DWARTHOG_MESH_PASSPHRASE='"your-passphrase"'`. Every node on the mesh needs
+the same one.
+
+On boot the node authenticates each SAE peer it discovers (SAE Commit/Confirm,
+NIST P-256), then AMPE derives a per-link pairwise key (MTK) and a group key
+(MGTK) and installs both in the chip. Peering completes in a single
+Open/Confirm exchange and data flows CCMP-encrypted end to end. Verify:
+
+```
+AT+SAERX?
++SAERX: ... ESTAB=1 ...
+AT+MPMPEERS?
++MPMPEERS: ... ampe_mtk=1 ampe_mgtk=1 ...
+AT+KEYINST?
++KEYINST: n=2 [aid=1 pw=1 ...] [aid=0 pw=0 ... hw=1]
+```
+
+`ampe_mtk`/`ampe_mgtk` count AMPE-derived keys installed in the chip;
+`AT+KEYINST?` shows the pairwise key on the peer's AID and the group key on
+AID 0. Bench-measured: peering + keying in one exchange, 8/8 pings at 0% loss,
+~16 ms RTT over the keyed link.
+
+A SAE node ignores open-mesh nodes sharing the Mesh ID (and vice versa) — the
+Mesh Configuration's Authentication Protocol Identifier must match before a
+candidate is even offered to the supplicant. The two security worlds coexist
+on air without disturbing each other.
+
+`AT+SAEBRIDGE=0` makes a SAE node deaf to peer candidates (a debugging state);
+it defaults on.
+
+### Legacy shared key / open
+
 ```
 AT+MESHSEC?      → +MESHSEC: 1 (keyed)
 AT+MESHSEC=0     → open; re-peers within ~2 s
 ```
 
 Keyed uses **one hardcoded key, identical on every warthog image** — a counting
-sequence, `00 11 22 ... ee ff` — as both the pairwise and the group key. Anyone
-holding the firmware holds the key, so it is obfuscation, not security.
-
-**There is no encrypted interop with any non-warthog node.** A standard secured
-802.11s peer derives per-link keys through SAE authentication and AMPE key
-exchange. warthog implements neither, so a secured OpenMANET mesh and a keyed
-warthog cannot decrypt each other. Keyed talks to other warthogs and nothing
-else; against OpenMANET you must run open.
-
-Peering is unauthenticated in both modes regardless — the mesh is brought up
-with `MMWLAN_OPEN`, so no SAE handshake runs at all.
-
-Treat the mesh as an untrusted transport and encrypt above it.
+sequence, `00 11 22 ... ee ff`. Anyone holding the firmware holds the key.
+Against OpenMANET you must run open (or use SAE on both sides — see the
+[OpenMANET interop page](OpenMANET-Interop)).
 
 The setting persists in NVS, though a factory flash overwrites that partition,
-so a freshly reflashed node is keyed again.
-
-Per-pair key derivation (SAE/AMPE) is not implemented.
+so a freshly reflashed node is keyed again. It has no effect on a SAE build,
+which never installs the hardcoded key.
 
 ## How paths work, and why it matters
 
@@ -122,4 +159,4 @@ AT+HWMPSTAT?
 - **No forwarding.** Warthog answers path requests that target it and ignores
   the rest. Two nodes that cannot hear each other will not relay through a
   Warthog between them.
-- One fixed mesh key, no SAE.
+- SAE/AMPE requires the `warthog-mesh-sae` build; the default smoke build still peers open or with the fixed key.

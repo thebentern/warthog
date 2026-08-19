@@ -20,7 +20,7 @@ jobs:
       matrix:
         # Region builds plus the 802.11s mesh image. Each entry is the suffix
         # of a pio env (warthog-<suffix>) and of the release asset name.
-        region: [us, eu, jp, kr, au, mesh-smoke]
+        region: [us, eu, jp, kr, au, mesh-smoke, mesh-sae]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
