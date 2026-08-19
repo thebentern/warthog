@@ -197,6 +197,13 @@ struct driver_data
         bool enabled;
         uint32_t count;
         int (*beacon_work_fn)(struct driver_data *driverd);
+        /* Host beacon timer. The MM6108 firmware fires the beacon-request IRQ
+         * exactly once for a mesh VIF and never re-arms its TBTT (unlike the
+         * MM8108, whose firmware self-schedules). This timer re-triggers the
+         * same beacon-TX path at the beacon interval so mesh beacons actually
+         * appear on air. NULL / period 0 => host timer disabled. */
+        struct mmosal_timer *host_timer;
+        uint32_t period_ms;
     } beacon;
 };
 

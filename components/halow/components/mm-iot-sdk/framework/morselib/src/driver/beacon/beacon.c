@@ -11,6 +11,7 @@
 #include "driver/driver.h"
 #include "driver/morse_driver/hw.h"
 #include "mmlog.h"
+#include "mmosal.h"
 
 void morse_beacon_irq_handle(struct driver_data *driverd, uint32_t status1_reg)
 {
@@ -89,25 +90,63 @@ static int morse_beacon_work_(struct driver_data *driverd)
             return -MM_EINVAL;
         }
 
-        return morse_skbq_mmpkt_tx(mq, beacon, MORSE_SKB_CHAN_BEACON);
+        extern volatile uint32_t g_warthog_bcn_enq_ok, g_warthog_bcn_enq_err;
+        int bcn_tx = morse_skbq_mmpkt_tx(mq, beacon, MORSE_SKB_CHAN_BEACON);
+        if (bcn_tx == 0) { g_warthog_bcn_enq_ok++; } else { g_warthog_bcn_enq_err++; }
+        return bcn_tx;
     }
 
     return 0;
 }
 
-int morse_beacon_start(struct driver_data *driverd, uint16_t vif_id)
+/* Host beacon timer tick. Re-raises the same event the chip's beacon IRQ
+ * would, so morse_beacon_work_() generates and TXes a fresh beacon. Runs on
+ * the timer-service task, not an ISR, so use the non-ISR notify. */
+static void morse_beacon_host_timer_cb(struct mmosal_timer *timer)
 {
-    MMLOG_INF("Start beaconing\n");
+    struct driver_data *driverd = (struct driver_data *)mmosal_timer_get_arg(timer);
+    if (driverd != NULL && driverd->beacon.enabled)
+    {
+        driver_task_notify_event(driverd, DRV_EVT_BEACON_REQ_PEND);
+    }
+}
+
+int morse_beacon_start(struct driver_data *driverd, uint16_t vif_id, uint32_t period_ms)
+{
+    MMLOG_INF("Start beaconing (host_timer=%lums)\n", (unsigned long)period_ms);
     driverd->beacon.count = 0;
     driverd->beacon.enabled = true;
     driverd->beacon.vif_id = vif_id;
     driverd->beacon.beacon_work_fn = morse_beacon_work_;
+    driverd->beacon.period_ms = period_ms;
     driver_task_notify_event(driverd, DRV_EVT_BEACON_REQ_PEND);
 
     int ret = morse_beacon_set_irq_enabled(driverd, true);
     if (ret != 0)
     {
         MMLOG_WRN("Failed to start beaconing\n");
+    }
+
+    /* When the chip does not self-schedule its TBTT (MM6108 mesh), drive the
+     * beacon from a host timer. The IRQ enable above still stands so the
+     * chip's single kickoff IRQ is honoured; the timer supplies every
+     * subsequent beacon. */
+    if (period_ms != 0)
+    {
+        if (driverd->beacon.host_timer == NULL)
+        {
+            driverd->beacon.host_timer = mmosal_timer_create(
+                "mesh_beacon", period_ms, /*auto_reload=*/true, driverd,
+                morse_beacon_host_timer_cb);
+        }
+        if (driverd->beacon.host_timer != NULL)
+        {
+            mmosal_timer_start(driverd->beacon.host_timer);
+        }
+        else
+        {
+            MMLOG_ERR("mesh beacon: host timer create failed\n");
+        }
     }
 
     return ret;
@@ -123,6 +162,11 @@ int morse_beacon_stop(struct driver_data *driverd)
     }
     driverd->beacon.enabled = false;
     driverd->beacon.vif_id = UINT16_MAX;
+
+    if (driverd->beacon.host_timer != NULL)
+    {
+        mmosal_timer_stop(driverd->beacon.host_timer);
+    }
 
     if (ret != 0)
     {

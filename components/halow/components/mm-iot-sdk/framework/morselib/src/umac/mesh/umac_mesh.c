@@ -489,7 +489,19 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
      * MORSE_CMD_ID_BEACON_OFFLOAD 0x0053, which morselib's
      * morse_commands.h doesn't expose), and we'd need to add that
      * opcode wrapper next. */
-    ret = mmdrv_start_beaconing(vif_id);
+    /* Host beacon timer period. The MM6108 firmware fires the mesh beacon IRQ
+     * exactly once and never re-arms its TBTT, so beacons are driven from a
+     * host timer at the advertised beacon interval (1 TU = 1024 us). Peers
+     * (mac80211 / OpenMANET) discover a mesh STA from its beacons, so without
+     * this the node is invisible to a beacon-driven peer. Override the cadence
+     * with -DWARTHOG_MESH_BEACON_MS=<ms> (0 restores chip-IRQ-only). */
+    uint16_t bcn_tu = args->beacon_interval_tu ? args->beacon_interval_tu : 100;
+#ifdef WARTHOG_MESH_BEACON_MS
+    uint32_t bcn_period_ms = (uint32_t)WARTHOG_MESH_BEACON_MS;
+#else
+    uint32_t bcn_period_ms = ((uint32_t)bcn_tu * 1024u) / 1000u;
+#endif
+    ret = mmdrv_start_beaconing_period(vif_id, bcn_period_ms);
     if (ret != 0)
     {
         MMLOG_ERR("mesh: mmdrv_start_beaconing(vif_id=%u) failed: %d — "

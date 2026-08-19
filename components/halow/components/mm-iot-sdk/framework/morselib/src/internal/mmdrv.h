@@ -305,6 +305,7 @@ int mmdrv_rm_if(uint16_t vif_id);
  * @returns 0 on success or an appropriate error code.
  */
 int mmdrv_start_beaconing(uint16_t vif_id);
+int mmdrv_start_beaconing_period(uint16_t vif_id, uint32_t host_timer_period_ms);
 
 /**
  * Configure 802.11s mesh on a VIF (warthog mesh-support fork).

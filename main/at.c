@@ -370,6 +370,9 @@ volatile uint8_t g_warthog_rxtap_last_ta[6] = { 0 };
 volatile uint32_t g_warthog_bcn_req = 0;      /* chip asked for a template   */
 volatile uint32_t g_warthog_bcn_served = 0;   /* host returned a beacon      */
 volatile uint32_t g_warthog_bcn_null = 0;     /* mesh active, build returned NULL */
+volatile uint32_t g_warthog_bcn_enq_ok = 0;   /* beacon enqueued to chip TX queue */
+volatile uint32_t g_warthog_bcn_enq_err = 0;  /* beacon enqueue failed */
+volatile uint32_t g_warthog_bcn_txcomp = 0;   /* chip reported beacon TX completion */
 volatile uint32_t g_warthog_bcn_inactive = 0; /* asked while mesh not active */
 
 /* Mesh probe-response counters (AT+PRSPSTAT?). rx = probe requests received
@@ -628,9 +631,11 @@ static void cmd_meshstat(void)
 static void cmd_bcnstat(void)
 {
     char buf[128];
-    snprintf(buf, sizeof(buf), "+BCNSTAT: req=%lu served=%lu null=%lu inactive=%lu\r\n",
+    snprintf(buf, sizeof(buf), "+BCNSTAT: req=%lu served=%lu null=%lu inactive=%lu enq=%lu/%lu txcomp=%lu\r\n",
              (unsigned long)g_warthog_bcn_req, (unsigned long)g_warthog_bcn_served,
-             (unsigned long)g_warthog_bcn_null, (unsigned long)g_warthog_bcn_inactive);
+             (unsigned long)g_warthog_bcn_null, (unsigned long)g_warthog_bcn_inactive,
+             (unsigned long)g_warthog_bcn_enq_ok, (unsigned long)g_warthog_bcn_enq_err,
+             (unsigned long)g_warthog_bcn_txcomp);
     cdc_write(buf);
     reply_ok();
 }

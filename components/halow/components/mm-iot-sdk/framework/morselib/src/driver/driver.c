@@ -572,7 +572,16 @@ int mmdrv_add_if(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_typ
 
 int mmdrv_start_beaconing(uint16_t vif_id)
 {
-    return morse_beacon_start(&driver_data, vif_id);
+    return mmdrv_start_beaconing_period(vif_id, 0);
+}
+
+/* @param host_timer_period_ms  0 => rely on the chip's own recurring beacon
+ *   IRQ (correct for firmware that self-schedules TBTT). Non-zero => drive
+ *   beacons from a host timer at this period, for the MM6108 mesh case where
+ *   the chip's beacon IRQ fires only once. */
+int mmdrv_start_beaconing_period(uint16_t vif_id, uint32_t host_timer_period_ms)
+{
+    return morse_beacon_start(&driver_data, vif_id, host_timer_period_ms);
 }
 
 /* warthog mesh-support fork (step15) — BSSID_SET (opcode 0x0052). The Linux

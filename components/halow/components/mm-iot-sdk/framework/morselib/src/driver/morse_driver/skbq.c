@@ -695,7 +695,8 @@ static int __skbq_data_tx_finish(struct mmpkt_list *skbq,
 
     if (tx_sts && tx_sts->channel == MORSE_SKB_CHAN_BEACON)
     {
-
+        extern volatile uint32_t g_warthog_bcn_txcomp;
+        g_warthog_bcn_txcomp++;
         mmpkt_release(mmpkt);
         return 0;
     }

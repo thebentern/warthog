@@ -13,11 +13,12 @@
  * between our beacon and our peering frames would make peering succeed or fail
  * depending on arrival order.
  *
- * Beacon caveat: this chip does not beacon in mesh mode. The beacon IRQ fires
- * once at startup and never again (AT+BCNSTAT? reports req=1, and that one is
- * the driver's own kickoff), so the S1G beacon path below is built and served
- * but has never been observed on air. Discovery works entirely through probe
- * request/response -- see umac_mesh.c. Root cause of the missing TBTT is open.
+ * Beaconing: the MM6108 firmware fires the beacon IRQ once for a mesh VIF and
+ * never re-arms its TBTT (the MM8108 self-schedules; this one does not). A host
+ * beacon timer (morse_beacon_start / beacon.c) re-drives this template at the
+ * beacon interval, and the chip transmits each one -- AT+BCNSTAT? shows
+ * served == txcomp climbing together. So the S1G beacon below IS on air, and
+ * beacon-driven peers (mac80211 / OpenMANET) can discover the node from it.
  *
  * S1G short beacon layout (IEEE 802.11-2020 s9.3.4), 15-byte fixed header:
  *   frame_control(2) duration(2) sa(6) timestamp(4) change_seq(1)
