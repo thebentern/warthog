@@ -295,35 +295,12 @@ static void cmd_version(void)
     reply_ok();
 }
 
-/* Drop off the USB bus before resetting.
- *
- * RTC_CNTL_SW_SYS_RST leaves the USB PHY driving its pull-up, so the host never
- * sees a disconnect: it keeps the old device object, the new firmware's TinyUSB
- * never gets a fresh SET_CONFIGURATION, and the port enumerates but answers
- * nothing. That is the "alive in ioreg, mute to AT" state that costs a physical
- * replug -- and it also strands AT+DLMODE, because the host stays bound to the
- * stale CDC device instead of the ROM's USB-Serial-JTAG one.
- *
- * Releasing the pull-up first makes it an ordinary detach/attach: the host tears
- * the device down and re-enumerates whatever comes back. 50 ms is well past the
- * ~2.5 us the host needs to see SE0 and comfortably inside any reflash script's
- * timeout. */
-static void usb_detach_before_reset(void)
-{
-    if (tud_mounted())
-    {
-        tud_disconnect();
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-}
-
 static void cmd_reset(void)
 {
     cdc_write("+INFO: rebooting\r\n");
     reply_ok();
     /* Give the host a moment to drain TX before we yank the bus. */
     vTaskDelay(pdMS_TO_TICKS(200));
-    usb_detach_before_reset();
     /* Same reason cmd_dlmode() avoids esp_restart(): it runs every shutdown
      * handler and resets peripheral modules before the CPU-only soft reset, so
      * anything stuck in between -- a HaLow SPI transaction in flight, a task
@@ -350,7 +327,6 @@ static void cmd_dlmode(void)
     cdc_write("+INFO: entering ROM download mode\r\n");
     reply_ok();
     vTaskDelay(pdMS_TO_TICKS(200));
-    usb_detach_before_reset();
     /* Set the ROM download-boot flag, then reset the SYSTEM directly at the
      * RTC level. Do NOT go through esp_restart(): that runs every shutdown
      * handler, resets peripheral modules, and only then does a CPU-only soft
