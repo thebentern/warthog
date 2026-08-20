@@ -77,6 +77,8 @@ extern volatile uint8_t g_warthog_s1g_bcn_sa[6];
 int umac_mesh_tx_probe_response(const uint8_t *da);
 void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len);
 void umac_mesh_maybe_initiate_mpm(const uint8_t *ta);
+void umac_mesh_handle_probe_req_discovery(const uint8_t *ta, const uint8_t *ies,
+                                          uint32_t ies_len);
 
 /* --- RX management frame dispatch ---------------------------------------- */
 
@@ -125,6 +127,18 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
             if (frame[hdr_len] == DOT11_ACTION_CATEGORY_SELF_PROTECTED)
             {
                 g_warthog_rx_selfprot++;
+                /* AMPE interop forensics: raw peering frame body exactly as
+                 * it arrived, before hostap verification (AT+PLINKRX?). */
+                {
+                    extern volatile uint8_t g_warthog_plink_rx[192];
+                    extern volatile uint16_t g_warthog_plink_rx_len;
+                    extern volatile uint16_t g_warthog_plink_rx_full;
+                    uint32_t bl = frame_len - hdr_len;
+                    uint32_t cp = bl > 192u ? 192u : bl;
+                    memcpy((void *)g_warthog_plink_rx, frame + hdr_len, cp);
+                    g_warthog_plink_rx_len = (uint16_t)cp;
+                    g_warthog_plink_rx_full = (uint16_t)bl;
+                }
             }
             if (frame[hdr_len] == DOT11_ACTION_CATEGORY_SELF_PROTECTED &&
                 !umac_mesh_sae_active())
@@ -154,6 +168,18 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
             if (!umac_mesh_sae_active())
             {
                 umac_mesh_maybe_initiate_mpm(ta);
+            }
+            /* Under SAE, a probe request naming our mesh is a beaconless
+             * peer announcing itself (its only advertisement) -- offer it to
+             * hostap as a candidate. See umac_mesh_handle_probe_req_discovery. */
+            {
+                const uint8_t *pframe = (const uint8_t *)mmpkt_get_data_start(rxbufview);
+                uint32_t plen = mmpkt_get_data_length(rxbufview);
+                const uint32_t phdr = sizeof(struct dot11_hdr);
+                if (plen > phdr)
+                {
+                    umac_mesh_handle_probe_req_discovery(ta, pframe + phdr, plen - phdr);
+                }
             }
             break;
         }
@@ -1120,6 +1146,13 @@ void umac_mesh_handle_s1g_beacon(struct mmpktview *rxbufview)
         return;
     }
     g_warthog_s1g_bcn_rx++;
+    {
+        extern volatile uint8_t g_warthog_bcn_rx_frame[160];
+        extern volatile uint16_t g_warthog_bcn_rx_len;
+        uint32_t l = flen > 160 ? 160 : flen;
+        memcpy((void *)g_warthog_bcn_rx_frame, f, l);
+        g_warthog_bcn_rx_len = (uint16_t)flen;
+    }
     if (!umac_mesh_ies_s1g_beacon_sa(f, flen, sa) || !umac_mesh_s1g_beacon_is_our_mesh(f, flen))
     {
         return;

@@ -218,6 +218,27 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
     }
     ifmsh->mconf = mconf;
 
+    /* Management frame protection, pinned rather than inherited.
+     *
+     * This decides the size of the AMPE payload, and both ends of a link have
+     * to reach the same number independently: hostap adds the IGTK to an Open
+     * only when rsn->igtk_len is set (mesh_rsn.c:589), while a peer's driver
+     * grows its slice of the same frame only when the RSN element advertises
+     * both "MFP required" and "MFP capable". Off and required are each
+     * self-consistent; optional is the one setting where the two disagree and
+     * the peer slices the frame short, taking the MIC and Peer Management
+     * elements with it.
+     *
+     * mesh_config_create() copies this straight out of ssid->ieee80211w
+     * (mesh.c:108), which nothing in this port ever assigns -- so today it is
+     * off only because the struct happens to be zeroed. That is the value the
+     * working link already uses, so keep it, but say so, and keep it away from
+     * the one value that silently breaks the framing.
+     *
+     * If a peer ever refuses to peer without protection, this is the single
+     * line to change -- to MGMT_FRAME_PROTECTION_REQUIRED, never OPTIONAL. */
+    mconf->ieee80211w = NO_MGMT_FRAME_PROTECTION;
+
     /* Bring up mesh RSN when the config asked for SAE.
      *
      * mesh_config_create() sets mconf->security from ssid->key_mgmt
@@ -286,7 +307,56 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
         MMLOG_INF("mesh: open mesh — no SAE/AMPE\n");
     }
 
-    /* Skip mesh.c:552-611 (hw_mode lookup, basic_rates, conf_ap_ht) — those
+    /* Supported Rates. Not cosmetic -- this element decides AMPE interop.
+     *
+     * Under CONFIG_IEEE80211AH the AMPE MIC authenticates only six octets of
+     * the peering frame (mesh_rsn.c: MESH_RSN_FRAME_MIC_OFFSET 6): category,
+     * action, capability, and -- for an Open -- the first element's id and
+     * length. A Linux peer's driver rebuilds every received peering frame
+     * before its supplicant verifies the MIC, and that rebuild always forces
+     * Supported Rates first with a canned 8-rate table, so the peer computes
+     * its AAD over "01 08" no matter what we put on air. We must MIC over the
+     * same two bytes, which means our own frame has to open with an 8-rate
+     * Supported Rates element.
+     *
+     * hostapd_eid_supp_rates() emits nothing while iface->current_rates is
+     * NULL, and the function that would fill it, hostapd_prepare_rates(), is
+     * compiled out of this build (#ifndef MM_IOT), so every peering frame we
+     * have ever sent started with the RSN element instead and failed the
+     * peer's MIC check. Populate the rates the vendor driver's table encodes:
+     * 1, 2, 5.5, 6*, 11, 12*, 18, 24* Mbit/s (* = basic) serialise as
+     * 02 04 0b 8c 16 98 24 b0. Exactly eight keeps hostapd_eid_ext_supp_rates
+     * silent, so no Extended Supported Rates element follows.
+     *
+     * Heap, not static storage: hostap owns both arrays and frees them
+     * unconditionally when the interface goes down (hostapd.c:744-747, no
+     * ownership flag), so a pointer into .data would abort inside free().
+     * hostapd_prepare_rates() -- the function compiled out of this build --
+     * allocates them the same way. Nothing tears the mesh down today, which is
+     * exactly why this is worth getting right now rather than discovering it
+     * the first time a stop/restart is wired up. */
+    static const struct hostapd_rate_data k_mesh_rates[8] = {
+        { 10, 0 },  { 20, 0 },  { 55, 0 },  { 60, HOSTAPD_RATE_BASIC },
+        { 110, 0 }, { 120, HOSTAPD_RATE_BASIC },
+        { 180, 0 }, { 240, HOSTAPD_RATE_BASIC },
+    };
+    static const int k_mesh_basic_rates[4] = { 60, 120, 240, -1 };
+    ifmsh->current_rates = os_memdup(k_mesh_rates, sizeof(k_mesh_rates));
+    ifmsh->basic_rates = os_memdup(k_mesh_basic_rates, sizeof(k_mesh_basic_rates));
+    if (ifmsh->current_rates == NULL || ifmsh->basic_rates == NULL)
+    {
+        /* Peering frames would go out without the element and fail every
+         * peer's MIC check, which is a far more confusing failure than this. */
+        MMLOG_ERR("mesh: out of memory for supported rates\n");
+        os_free(ifmsh->current_rates);
+        ifmsh->current_rates = NULL;
+        os_free(ifmsh->basic_rates);
+        ifmsh->basic_rates = NULL;
+        return -1;
+    }
+    ifmsh->num_rates = (int)(sizeof(k_mesh_rates) / sizeof(k_mesh_rates[0]));
+
+    /* Skip mesh.c:552-611 (hw_mode lookup, conf_ap_ht) — those
      * need a meaningful ssid->frequency / freq->freq which we don't have in
      * the embedded path. mesh_mpm doesn't read most of that state at runtime;
      * if a NULL hits some code path we'll learn which one from the crash.

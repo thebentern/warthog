@@ -788,12 +788,90 @@ int umac_mesh_tx_probe_response(const uint8_t *da)
     if (ret >= 0)
     {
         g_warthog_prsp_tx++;
+        extern volatile uint8_t g_warthog_prsp_last_da[6];
+        memcpy((void *)g_warthog_prsp_last_da, da, 6);
     }
     else
     {
         g_warthog_prsp_fail++;
     }
     return ret;
+}
+
+/* Beaconless-peer discovery (Morse "dynamic peering").
+ *
+ * A peer running mesh_beaconless_mode never beacons: it advertises itself
+ * only by broadcasting a probe request for the Mesh ID (once ~5 s after its
+ * mesh starts, then every ~60 s -- morse_driver mesh.c,
+ * MESH_DISCOVERY_PROBE_PERIOD_S). Answering that probe (the caller does) is
+ * not enough under SAE: nothing tells hostap a candidate exists, so neither
+ * side ever initiates. Offer the requester as a candidate here.
+ *
+ * A probe request carries no Mesh Configuration element, which
+ * umac_supp_mesh_new_peer() requires, so the offer substitutes our own
+ * discovery IEs. That mirrors what the beaconless peer itself does on the
+ * other side: on receiving SAE Authentication from an unknown address, its
+ * driver fabricates a probe response from its own IE template and feeds it
+ * to mac80211 so its supplicant learns the peer, then drops the frame and
+ * relies on the initiator's retransmit (process_mesh_rx_mgmt_beaconless).
+ * The two fabrications meet in the middle: this is the designed protocol,
+ * not a trick.
+ *
+ * Only a request that names our mesh -- SSID(0) or Mesh ID(114) element
+ * matching -- is offered. Wildcard probes are scanners, not peers, and
+ * offering them would burn SAE attempts on every station in range. */
+void umac_mesh_handle_probe_req_discovery(const uint8_t *ta, const uint8_t *ies,
+                                          uint32_t ies_len)
+{
+    extern volatile uint8_t g_warthog_prq_frame[96];
+    extern volatile uint16_t g_warthog_prq_len;
+    extern volatile uint8_t g_warthog_prq_ta[6];
+    extern volatile uint32_t g_warthog_prq_named;
+    extern volatile uint32_t g_warthog_prq_offer;
+
+    uint32_t cap = ies_len > 96u ? 96u : ies_len;
+    memcpy((void *)g_warthog_prq_frame, ies, cap);
+    g_warthog_prq_len = (uint16_t)ies_len;
+    memcpy((void *)g_warthog_prq_ta, ta, 6);
+
+    if (!umac_mesh_sae_active() || !s_mesh_args_valid)
+    {
+        return;
+    }
+
+    bool named = false;
+    uint32_t off = 0;
+    while (off + 2u <= ies_len)
+    {
+        uint8_t eid = ies[off];
+        uint8_t elen = ies[off + 1];
+        if (off + 2u + elen > ies_len)
+        {
+            break;
+        }
+        if ((eid == 0u /* SSID */ || eid == 114u /* Mesh ID */) &&
+            elen == s_mesh_args.mesh_id_len &&
+            memcmp(&ies[off + 2], s_mesh_args.mesh_id, elen) == 0)
+        {
+            named = true;
+            break;
+        }
+        off += 2u + elen;
+    }
+    if (!named)
+    {
+        return;
+    }
+    g_warthog_prq_named++;
+
+    uint8_t disc[UMAC_MESH_DISCOVERY_IES_MAXLEN];
+    uint16_t disc_len = umac_mesh_build_discovery_ies(disc, (uint16_t)sizeof(disc));
+    if (disc_len == 0)
+    {
+        return;
+    }
+    g_warthog_prq_offer++;
+    umac_supp_mesh_new_peer(ta, disc, disc_len);
 }
 
 /* ---- Mesh Peering Management (MPM) ------------------------------------- *
@@ -834,12 +912,410 @@ int umac_mesh_tx_probe_response(const uint8_t *da)
 #define UMAC_MESH_ACTION_BODY_MAX 512
 
 /* Send an action body verbatim (no appended elements). */
+/* ---- Peering-frame S1G <-> 11n conversion ------------------------------- *
+ *
+ * A mac80211 peer does not put its peering frames on air in the form its
+ * supplicant built them. The vendor driver rewrites every Mesh Peering
+ * Open/Confirm on the way out (11n elements removed, S1G elements added) and
+ * rebuilds the 11n form on the way in, before its supplicant sees the frame.
+ * hostap therefore protects one form while the air carries another, which only
+ * works because the AMPE MIC covers just six octets: category, action,
+ * capability, and the first element's id and length (MESH_RSN_FRAME_MIC_OFFSET
+ * in mesh_rsn.c, under CONFIG_IEEE80211AH -- both ends of this link build with
+ * it). Everything past those six octets, including element order and the whole
+ * HT/S1G capability question, is outside the MIC by design: the rebuild could
+ * not reproduce it.
+ *
+ * The peer's rebuild always forces Supported Rates first from a fixed table,
+ * so the two authenticated element bytes are always "01 08". Our supplicant
+ * now emits the same element first (see the rates block in
+ * supplicant_core_mesh.c), so what we sign matches what the peer verifies.
+ * These two functions supply the rest of the contract:
+ *
+ *   RX -- rebuild the 11n form the peer's supplicant signed, so ours verifies
+ *         the same six octets. Without this the frame arrives S1G-first and
+ *         our AAD reads "d9 0f".
+ *   TX -- add the S1G Capabilities element, which the peer's driver requires
+ *         on a Confirm and drops the frame without.
+ *
+ * Peering Close (action 3) is never converted in either direction: its AAD
+ * reaches into the first element's value, so touching it breaks a frame type
+ * that already works.
+ */
+#define MPM_ACTION_OPEN_    1u
+#define MPM_ACTION_CONFIRM_ 2u
+
+/* AMPE trailer sizes, from the peer driver's mesh.h. The trailer is opaque --
+ * SIV plus ciphertext -- and must survive both directions byte for byte. */
+#define MPM_AMPE_OPEN_LEN_    98u
+#define MPM_AMPE_IGTK_LEN_    24u
+#define MPM_AMPE_CONFIRM_LEN_ 70u
+
+#define MPM_IE_SUPP_RATES_ 1u
+#define MPM_IE_HT_CAP_     45u
+#define MPM_IE_RSN_        48u
+#define MPM_IE_MIC_        140u
+#define MPM_IE_VENDOR_     221u
+#define MPM_IE_S1G_CAP_    217u
+#define MPM_IE_S1G_OPER_   232u
+
+/* The peer's rebuild substitutes these exact eight rates, so they are the ones
+ * both supplicants end up signing: 1, 2, 5.5, 6*, 11, 12*, 18, 24* Mbit/s. */
+static const uint8_t k_mpm_supp_rates_ie_[] = {
+    MPM_IE_SUPP_RATES_, 8, 0x02, 0x04, 0x0b, 0x8c, 0x16, 0x98, 0x24, 0xb0,
+};
+
+static uint16_t mpm_fixed_hdr_len_(uint8_t action)
+{
+    /* category, action, capability -- plus the AID a Confirm carries. */
+    return (action == MPM_ACTION_CONFIRM_) ? 6u : 4u;
+}
+
+/* RSN capabilities live after the version, group cipher and the two suite
+ * lists. Only the management-frame-protection bits matter here. */
+static bool mpm_rsn_caps_(const uint8_t *v, uint8_t vlen, uint16_t *caps)
+{
+    uint32_t off = 2u + 4u; /* version, group cipher suite */
+    uint16_t n;
+
+    if (vlen < off + 2u)
+    {
+        return false;
+    }
+    n = (uint16_t)(v[off] | ((uint16_t)v[off + 1] << 8));
+    off += 2u + 4u * (uint32_t)n; /* pairwise suite list */
+    if (off + 2u > vlen)
+    {
+        return false;
+    }
+    n = (uint16_t)(v[off] | ((uint16_t)v[off + 1] << 8));
+    off += 2u + 4u * (uint32_t)n; /* AKM suite list */
+    if (off + 2u > vlen)
+    {
+        return false;
+    }
+    *caps = (uint16_t)(v[off] | ((uint16_t)v[off + 1] << 8));
+    return true;
+}
+
+/* Size of the AMPE trailer, decided exactly as the peer decides it -- the two
+ * ends must agree or the element region and the ciphertext both slice wrong. */
+static uint16_t mpm_ampe_len_(const uint8_t *body, uint16_t body_len)
+{
+    uint8_t action = body[1];
+    uint16_t hdr = mpm_fixed_hdr_len_(action);
+    uint16_t cap;
+    uint16_t len;
+    const uint8_t *p;
+    const uint8_t *end;
+
+    if (body_len <= hdr)
+    {
+        return 0;
+    }
+    cap = (uint16_t)(body[2] | ((uint16_t)body[3] << 8));
+    if ((cap & 0x0010u) == 0u) /* Privacy clear: unprotected peering */
+    {
+        return 0;
+    }
+    if (action == MPM_ACTION_CONFIRM_)
+    {
+        return MPM_AMPE_CONFIRM_LEN_;
+    }
+
+    len = MPM_AMPE_OPEN_LEN_;
+    p = body + hdr;
+    end = body + body_len;
+    while (p + 2 <= end)
+    {
+        uint8_t eid = p[0];
+        uint8_t elen = p[1];
+        if (p + 2 + elen > end)
+        {
+            break;
+        }
+        if (eid == MPM_IE_RSN_)
+        {
+            uint16_t rsn_caps = 0;
+            /* An Open carries the group key, and a second one when management
+             * frame protection is both required and capable. */
+            if (mpm_rsn_caps_(p + 2, elen, &rsn_caps) &&
+                (rsn_caps & 0x0040u) && (rsn_caps & 0x0080u))
+            {
+                len += MPM_AMPE_IGTK_LEN_;
+            }
+            break;
+        }
+        p += 2 + elen;
+    }
+    return len;
+}
+
+/* HT Capabilities as the peer's rebuild synthesises it. Only two octets vary,
+ * both read out of the S1G Capabilities element the sender advertised. */
+static uint16_t mpm_build_ht_cap_(const uint8_t *s1g_cap, uint8_t s1g_cap_len, uint8_t *out)
+{
+    uint16_t cap_info = 0x000eu; /* greenfield-free defaults plus 20/40 support */
+    uint8_t ampdu = 0;
+
+    if (s1g_cap != NULL && s1g_cap_len >= 1u && (s1g_cap[0] & 0x1eu) != 0u)
+    {
+        cap_info |= 0x0060u; /* short GI at 20 and 40 MHz */
+    }
+    if (s1g_cap != NULL && s1g_cap_len >= 4u)
+    {
+        uint8_t c3 = s1g_cap[3];
+        ampdu = (uint8_t)(((c3 >> 3) & 0x03u) | (((c3 >> 5) & 0x07u) << 2));
+    }
+
+    out[0] = MPM_IE_HT_CAP_;
+    out[1] = 26;
+    out[2] = (uint8_t)(cap_info & 0xffu);
+    out[3] = (uint8_t)(cap_info >> 8);
+    out[4] = ampdu;
+    out[5] = 0xff; /* MCS rx_mask: one spatial stream */
+    memset(&out[6], 0, 9);
+    out[15] = 0x41; /* rx_highest */
+    out[16] = 0x00;
+    out[17] = 0x01; /* tx_params */
+    memset(&out[18], 0, 10);
+    return 28u;
+}
+
+/* Rebuild the 11n form of a received peering frame. Returns 0 when the frame
+ * is not one we convert, in which case the caller passes it through. */
+uint16_t umac_mesh_mpm_s1g_to_11n(const uint8_t *body, uint16_t body_len,
+                                  uint8_t *out, uint16_t out_cap)
+{
+    struct
+    {
+        const uint8_t *ptr;
+        uint8_t eid;
+        uint8_t len;
+    } ies[24];
+    uint8_t n_ies = 0;
+    const uint8_t *mic = NULL;
+    uint8_t mic_len = 0;
+    const uint8_t *s1g_cap = NULL;
+    uint8_t s1g_cap_len = 0;
+    uint16_t hdr;
+    uint16_t ampe;
+    uint16_t off = 0;
+    const uint8_t *p;
+    const uint8_t *end;
+    uint8_t action;
+
+    if (body == NULL || out == NULL || body_len < 6u)
+    {
+        return 0;
+    }
+    if (body[0] != MPM_CATEGORY_SELF_PROTECTED)
+    {
+        return 0;
+    }
+    action = body[1];
+    if (action != MPM_ACTION_OPEN_ && action != MPM_ACTION_CONFIRM_)
+    {
+        return 0;
+    }
+    hdr = mpm_fixed_hdr_len_(action);
+    ampe = mpm_ampe_len_(body, body_len);
+    if ((uint32_t)hdr + ampe > body_len)
+    {
+        return 0;
+    }
+
+    p = body + hdr;
+    end = body + body_len - ampe;
+    while (p + 2 <= end && n_ies < (uint8_t)(sizeof(ies) / sizeof(ies[0])))
+    {
+        uint8_t eid = p[0];
+        uint8_t elen = p[1];
+        if (p + 2 + elen > end)
+        {
+            break;
+        }
+        if (eid == MPM_IE_MIC_)
+        {
+            mic = p + 2;
+            mic_len = elen;
+        }
+        else if (eid == MPM_IE_S1G_CAP_)
+        {
+            s1g_cap = p + 2;
+            s1g_cap_len = elen;
+        }
+        else if (eid != MPM_IE_SUPP_RATES_ && eid != MPM_IE_S1G_OPER_ &&
+                 eid != MPM_IE_VENDOR_)
+        {
+            ies[n_ies].ptr = p + 2;
+            ies[n_ies].eid = eid;
+            ies[n_ies].len = elen;
+            n_ies++;
+        }
+        p += 2 + elen;
+    }
+
+    /* Rebuild only what we fully understood. A truncated element, or more
+     * elements than the table holds, would otherwise produce a frame that is
+     * silently missing something hostap needs -- Peer Management, or the MIC
+     * itself -- and a rebuild that loses the MIC fails verification in a way
+     * that looks exactly like the bug this conversion exists to fix. Handing
+     * the original frame on is no worse than not converting at all. */
+    if (p != end)
+    {
+        return 0;
+    }
+    if (ampe > 0u && mic == NULL)
+    {
+        return 0;
+    }
+
+    /* Fixed fields verbatim: they are the first four authenticated octets. */
+    if ((uint32_t)hdr + sizeof(k_mpm_supp_rates_ie_) > out_cap)
+    {
+        return 0;
+    }
+    memcpy(out, body, hdr);
+    off = hdr;
+
+    /* Supported Rates first -- this is what makes our AAD read "01 08". */
+    memcpy(out + off, k_mpm_supp_rates_ie_, sizeof(k_mpm_supp_rates_ie_));
+    off += (uint16_t)sizeof(k_mpm_supp_rates_ie_);
+
+    /* Remaining elements in ascending id order, matching the peer's rebuild. */
+    for (uint16_t want = 0; want < 256u; want++)
+    {
+        for (uint8_t i = 0; i < n_ies; i++)
+        {
+            if (ies[i].eid != (uint8_t)want)
+            {
+                continue;
+            }
+            if ((uint32_t)off + 2u + ies[i].len > out_cap)
+            {
+                return 0;
+            }
+            out[off++] = ies[i].eid;
+            out[off++] = ies[i].len;
+            memcpy(out + off, ies[i].ptr, ies[i].len);
+            off += ies[i].len;
+        }
+    }
+
+    /* HT Capabilities, then the MIC, then the AMPE trailer -- the peer's
+     * rebuild emits them in exactly this order. */
+    if ((uint32_t)off + 28u > out_cap)
+    {
+        return 0;
+    }
+    off += mpm_build_ht_cap_(s1g_cap, s1g_cap_len, out + off);
+
+    if (mic != NULL)
+    {
+        if ((uint32_t)off + 2u + mic_len > out_cap)
+        {
+            return 0;
+        }
+        out[off++] = MPM_IE_MIC_;
+        out[off++] = mic_len;
+        memcpy(out + off, mic, mic_len);
+        off += mic_len;
+    }
+    if (ampe > 0u)
+    {
+        if ((uint32_t)off + ampe > out_cap)
+        {
+            return 0;
+        }
+        memcpy(out + off, body + body_len - ampe, ampe);
+        off += ampe;
+    }
+    return off;
+}
+
+/* Add the S1G Capabilities element the peer's driver insists on. Everything
+ * else rides through untouched: the MIC does not cover it, and the peer
+ * rebuilds the element order anyway. */
+uint16_t umac_mesh_mpm_11n_to_s1g(const uint8_t *body, uint16_t body_len,
+                                  uint8_t *out, uint16_t out_cap)
+{
+    uint8_t s1g[64];
+    struct consbuf cb = CONSBUF_INIT_WITH_BUF(s1g, sizeof(s1g));
+    uint16_t hdr;
+    uint16_t off;
+    uint8_t action;
+
+    if (body == NULL || out == NULL || body_len < 6u || s_mesh_umacd == NULL)
+    {
+        return 0;
+    }
+    if (body[0] != MPM_CATEGORY_SELF_PROTECTED)
+    {
+        return 0;
+    }
+    action = body[1];
+    if (action != MPM_ACTION_OPEN_ && action != MPM_ACTION_CONFIRM_)
+    {
+        return 0;
+    }
+    hdr = mpm_fixed_hdr_len_(action);
+    if (hdr > body_len)
+    {
+        return 0;
+    }
+
+    ie_s1g_capabilities_build(s_mesh_umacd, &cb);
+    if (cb.offset == 0u || (uint32_t)body_len + cb.offset > out_cap)
+    {
+        return 0;
+    }
+
+    memcpy(out, body, hdr);
+    off = hdr;
+    memcpy(out + off, s1g, cb.offset);
+    off += (uint16_t)cb.offset;
+    memcpy(out + off, body + hdr, body_len - hdr);
+    off += (uint16_t)(body_len - hdr);
+    return off;
+}
+
 static int mesh_tx_action_raw_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL || body == NULL || body_len == 0)
     {
         return -1;
     }
+    /* AMPE interop forensics: keep the exact bytes hostap protected (the MIC
+     * covers this body), so AT+PLINKTX? can be diffed against the peer's view. */
+    if (body[0] == MPM_CATEGORY_SELF_PROTECTED)
+    {
+        extern volatile uint8_t g_warthog_plink_tx[192];
+        extern volatile uint16_t g_warthog_plink_tx_len;
+        extern volatile uint16_t g_warthog_plink_tx_full;
+        uint16_t cp = body_len > 192u ? 192u : body_len;
+        memcpy((void *)g_warthog_plink_tx, body, cp);
+        g_warthog_plink_tx_len = cp;
+        g_warthog_plink_tx_full = body_len;
+    }
+
+    /* Put the peering frame on air in the S1G form a mac80211 peer expects.
+     * The snapshot above deliberately keeps the pre-conversion bytes, since
+     * those are the ones hostap signed. */
+    static uint8_t s_mpm_tx_buf[512];
+    if (body[0] == MPM_CATEGORY_SELF_PROTECTED)
+    {
+        uint16_t n = umac_mesh_mpm_11n_to_s1g(body, body_len, s_mpm_tx_buf,
+                                              (uint16_t)sizeof(s_mpm_tx_buf));
+        if (n > 0u)
+        {
+            extern volatile uint32_t g_warthog_mpm_tx_conv;
+            g_warthog_mpm_tx_conv++;
+            body = s_mpm_tx_buf;
+            body_len = n;
+        }
+    }
+
     struct frame_data_action act = {
         .bssid = s_mesh_own_addr,
         .dst_address = da,

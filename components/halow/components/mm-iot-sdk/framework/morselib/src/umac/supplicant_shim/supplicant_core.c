@@ -391,6 +391,37 @@ void umac_supp_process_mgmt_frame(struct umac_data *umacd, struct mmpktview *rxb
     wpa_event_data.rx_mgmt.frame = mmpkt_get_data_start(rxbufview);
     wpa_event_data.rx_mgmt.frame_len = mmpkt_get_data_length(rxbufview);
 
+    /* A mesh peer sends peering frames in S1G form but signs the 11n form its
+     * driver rebuilds on receipt, so rebuild it here too -- otherwise the six
+     * octets our AMPE MIC authenticates do not match the ones the sender
+     * authenticated, and every Open fails verification. The rebuild grows the
+     * frame, so it cannot happen in place; this is the last point on the path
+     * that takes a flat pointer rather than an mmpkt. */
+    {
+        extern uint16_t umac_mesh_mpm_s1g_to_11n(const uint8_t *body, uint16_t body_len,
+                                                 uint8_t *out, uint16_t out_cap);
+        extern volatile uint32_t g_warthog_mpm_rx_conv;
+        static uint8_t s_mpm_rx_buf[640];
+        const uint8_t *f = (const uint8_t *)wpa_event_data.rx_mgmt.frame;
+        size_t flen = wpa_event_data.rx_mgmt.frame_len;
+        const size_t mgmt_hdr = 24u;
+
+        if (f != NULL && flen > mgmt_hdr && (f[0] & 0xf0u) == 0xd0u &&
+            f[mgmt_hdr] == 15u /* SELF_PROTECTED */)
+        {
+            memcpy(s_mpm_rx_buf, f, mgmt_hdr);
+            uint16_t n = umac_mesh_mpm_s1g_to_11n(f + mgmt_hdr, (uint16_t)(flen - mgmt_hdr),
+                                                  s_mpm_rx_buf + mgmt_hdr,
+                                                  (uint16_t)(sizeof(s_mpm_rx_buf) - mgmt_hdr));
+            if (n > 0u)
+            {
+                g_warthog_mpm_rx_conv++;
+                wpa_event_data.rx_mgmt.frame = s_mpm_rx_buf;
+                wpa_event_data.rx_mgmt.frame_len = mgmt_hdr + n;
+            }
+        }
+    }
+
     wpa_event_data.rx_mgmt.freq = (mmpkt_get_metadata(mmpkt).rx->freq_100khz * 100);
 
     /* Diagnostic: log the first two octets of the management frame

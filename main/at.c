@@ -404,6 +404,33 @@ volatile uint32_t g_warthog_bcn_inactive = 0; /* asked while mesh not active */
 volatile uint32_t g_warthog_prsp_rx = 0;
 volatile uint32_t g_warthog_prsp_tx = 0;
 volatile uint32_t g_warthog_prsp_fail = 0;
+volatile uint8_t g_warthog_prsp_last_da[6] = { 0 };
+volatile uint8_t g_warthog_bcn_own[160] = { 0 };
+volatile uint16_t g_warthog_bcn_own_len = 0;
+volatile uint8_t g_warthog_bcn_rx_frame[160] = { 0 };
+volatile uint16_t g_warthog_bcn_rx_len = 0;
+/* Beaconless-peer discovery: last received probe request (IEs only) and the
+ * counters for how many named our mesh / were offered to hostap as SAE
+ * candidates (AT+PRQRX?, and prq_* on AT+PRSPSTAT?). */
+volatile uint8_t g_warthog_prq_frame[96] = { 0 };
+volatile uint16_t g_warthog_prq_len = 0;
+volatile uint8_t g_warthog_prq_ta[6] = { 0 };
+volatile uint32_t g_warthog_prq_named = 0;
+volatile uint32_t g_warthog_prq_offer = 0;
+/* AMPE interop forensics: last SELF_PROTECTED (category 15) action body we
+ * transmitted (exactly what hostap's AMPE MIC covers) and the last one we
+ * received raw off the air (AT+PLINKTX? / AT+PLINKRX?). */
+volatile uint8_t g_warthog_plink_tx[192] = { 0 };
+volatile uint16_t g_warthog_plink_tx_len = 0;
+volatile uint16_t g_warthog_plink_tx_full = 0;
+volatile uint8_t g_warthog_plink_rx[192] = { 0 };
+volatile uint16_t g_warthog_plink_rx_len = 0;
+volatile uint16_t g_warthog_plink_rx_full = 0;
+/* Peering frames converted between the S1G form on air and the 11n form
+ * hostap signs (AT+PLINKSTAT?). Both must climb once a mac80211 peer is
+ * peering; TX stuck at 0 means our own frames never reached the converter. */
+volatile uint32_t g_warthog_mpm_tx_conv = 0;
+volatile uint32_t g_warthog_mpm_rx_conv = 0;
 
 /* Mesh peering (MPM) counters (AT+MPMSTAT?). */
 volatile uint32_t g_warthog_mpm_rx = 0;
@@ -667,10 +694,15 @@ static void cmd_bcnstat(void)
 /* AT+PRSPSTAT? — mesh probe-request/response counters. */
 static void cmd_prspstat(void)
 {
-    char buf[96];
-    snprintf(buf, sizeof(buf), "+PRSPSTAT: req_rx=%lu rsp_tx=%lu rsp_fail=%lu\r\n",
+    char buf[144];
+    snprintf(buf, sizeof(buf),
+             "+PRSPSTAT: req_rx=%lu rsp_tx=%lu rsp_fail=%lu last_da=%02x:%02x:%02x:%02x:%02x:%02x"
+             " prq_named=%lu prq_offer=%lu\r\n",
              (unsigned long)g_warthog_prsp_rx, (unsigned long)g_warthog_prsp_tx,
-             (unsigned long)g_warthog_prsp_fail);
+             (unsigned long)g_warthog_prsp_fail,
+             g_warthog_prsp_last_da[0], g_warthog_prsp_last_da[1], g_warthog_prsp_last_da[2],
+             g_warthog_prsp_last_da[3], g_warthog_prsp_last_da[4], g_warthog_prsp_last_da[5],
+             (unsigned long)g_warthog_prq_named, (unsigned long)g_warthog_prq_offer);
     cdc_write(buf);
     reply_ok();
 }
@@ -1657,6 +1689,53 @@ static void dispatch(char *line)
         cmd_msend(args);
     } else if (strcasecmp(verb, "PEERS") == 0 && terminator == '?') {
         cmd_peers();
+    } else if (strcasecmp(verb, "BCNDUMP") == 0 && terminator == '?') {
+        char hx[3*160 + 32]; int off = 0;
+        off += snprintf(hx + off, sizeof(hx) - off, "+BCNDUMP: len=%u ", g_warthog_bcn_own_len);
+        for (int i = 0; i < 160 && i < g_warthog_bcn_own_len && off < (int)sizeof(hx) - 4; i++)
+            off += snprintf(hx + off, sizeof(hx) - off, "%02x", g_warthog_bcn_own[i]);
+        off += snprintf(hx + off, sizeof(hx) - off, "\r\n");
+        cdc_write(hx); reply_ok();
+    } else if (strcasecmp(verb, "PLINKSTAT") == 0 && terminator == '?') {
+        char b[96];
+        snprintf(b, sizeof(b), "+PLINKSTAT: tx_conv=%lu rx_conv=%lu\r\n",
+                 (unsigned long)g_warthog_mpm_tx_conv,
+                 (unsigned long)g_warthog_mpm_rx_conv);
+        cdc_write(b); reply_ok();
+    } else if (strcasecmp(verb, "PLINKTX") == 0 && terminator == '?') {
+        char hx[3*192 + 48]; int off = 0;
+        off += snprintf(hx + off, sizeof(hx) - off, "+PLINKTX: full=%u len=%u ",
+                        g_warthog_plink_tx_full, g_warthog_plink_tx_len);
+        for (int i = 0; i < 192 && i < g_warthog_plink_tx_len && off < (int)sizeof(hx) - 4; i++)
+            off += snprintf(hx + off, sizeof(hx) - off, "%02x", g_warthog_plink_tx[i]);
+        off += snprintf(hx + off, sizeof(hx) - off, "\r\n");
+        cdc_write(hx); reply_ok();
+    } else if (strcasecmp(verb, "PLINKRX") == 0 && terminator == '?') {
+        char hx[3*192 + 48]; int off = 0;
+        off += snprintf(hx + off, sizeof(hx) - off, "+PLINKRX: full=%u len=%u ",
+                        g_warthog_plink_rx_full, g_warthog_plink_rx_len);
+        for (int i = 0; i < 192 && i < g_warthog_plink_rx_len && off < (int)sizeof(hx) - 4; i++)
+            off += snprintf(hx + off, sizeof(hx) - off, "%02x", g_warthog_plink_rx[i]);
+        off += snprintf(hx + off, sizeof(hx) - off, "\r\n");
+        cdc_write(hx); reply_ok();
+    } else if (strcasecmp(verb, "PRQRX") == 0 && terminator == '?') {
+        char hx[3*96 + 64]; int off = 0;
+        off += snprintf(hx + off, sizeof(hx) - off,
+                        "+PRQRX: ta=%02x:%02x:%02x:%02x:%02x:%02x len=%u ",
+                        g_warthog_prq_ta[0], g_warthog_prq_ta[1], g_warthog_prq_ta[2],
+                        g_warthog_prq_ta[3], g_warthog_prq_ta[4], g_warthog_prq_ta[5],
+                        g_warthog_prq_len);
+        for (int i = 0; i < 96 && i < g_warthog_prq_len && off < (int)sizeof(hx) - 4; i++)
+            off += snprintf(hx + off, sizeof(hx) - off, "%02x", g_warthog_prq_frame[i]);
+        off += snprintf(hx + off, sizeof(hx) - off, "\r\n");
+        cdc_write(hx); reply_ok();
+    } else if (strcasecmp(verb, "BCNRX") == 0 && terminator == '?') {
+        char hx[3*160 + 32]; int off = 0;
+        off += snprintf(hx + off, sizeof(hx) - off, "+BCNRX: len=%u ", g_warthog_bcn_rx_len);
+        for (int i = 0; i < 160 && i < g_warthog_bcn_rx_len && off < (int)sizeof(hx) - 4; i++)
+            off += snprintf(hx + off, sizeof(hx) - off, "%02x", g_warthog_bcn_rx_frame[i]);
+        off += snprintf(hx + off, sizeof(hx) - off, "\r\n");
+        cdc_write(hx); reply_ok();
     } else if (strcasecmp(verb, "DATASTAT") == 0 && terminator == '?') {
         cmd_datastat();
     } else if (strcasecmp(verb, "HWMPDUMP") == 0 && terminator == '?') {
