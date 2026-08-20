@@ -244,6 +244,21 @@ static void append_s1g_operation_ie_(struct umac_data *umacd, struct consbuf *bu
     uint8_t pri_chnum   = cur ? cur->primary_channel_number      : 0;
     uint8_t op_ch_idx   = cur ? cur->operating_channel_index     : 0;
 
+    /* Linux dot11ah peers derive their converted (legacy) channel from the
+     * 1MHz primary in this element, and mac80211's mesh_matches_local()
+     * requires candidates to share that channel. Our channel config uses a
+     * 2MHz-wide primary equal to the operating channel; converted, that lands
+     * one legacy channel above where a Linux mesh on the same S1G channel
+     * sits, so our beacons are silently ignored. Advertise the Linux
+     * convention instead: 1MHz primary on the lower subchannel (index 0).
+     * TX itself is unchanged -- the whole 2MHz channel is shared either way. */
+    if (op_bw_mhz == 2 && pri_bw_mhz == 2 && pri_chnum == op_ch_idx && pri_chnum > 0)
+    {
+        pri_bw_mhz = 1;
+        pri_chnum = (uint8_t)(op_ch_idx - 1);
+        pri_1m_loc = 0;
+    }
+
     /* Build channel_width byte:
      *   bit 0: pri chan width — 0 if pri=2MHz, 1 if pri=1MHz
      *   bits 1-4: op chan width = op_bw_mhz - 1  (1MHz->0, 2MHz->1, 4MHz->3,
@@ -356,5 +371,16 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
 
     MMLOG_INF("mesh beacon: S1G fmt built (FC 0x%02x%02x) — len-tagged for chip TX\n",
               MESH_S1G_BEACON_FC_HI, MESH_S1G_BEACON_FC_LO);
+    {
+        extern volatile uint8_t g_warthog_bcn_own[160];
+        extern volatile uint16_t g_warthog_bcn_own_len;
+        struct mmpktview *v = mmpkt_open(beacon);
+        const uint8_t *d = (const uint8_t *)mmpkt_get_data_start(v);
+        uint32_t l = mmpkt_get_data_length(v);
+        if (l > 160) l = 160;
+        memcpy((void *)g_warthog_bcn_own, d, l);
+        g_warthog_bcn_own_len = (uint16_t)mmpkt_get_data_length(v);
+        mmpkt_close(&v);
+    }
     return beacon;
 }
