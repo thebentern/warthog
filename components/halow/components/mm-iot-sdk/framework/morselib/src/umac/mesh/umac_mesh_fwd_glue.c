@@ -34,19 +34,14 @@ extern volatile uint32_t g_warthog_hwmp_relay_preq, g_warthog_hwmp_relay_prep, g
 static struct umac_mesh_pathtbl s_tbl;
 static struct umac_mesh_rmc s_rmc;
 static struct mmosal_mutex *s_lock;
-/* Discovery is rate-limited per target AND globally: a host behind us pinging
- * many unknown addresses must not turn into a PREQ broadcast per packet. */
-#define PREQ_TARGETS 4u
-#define PREQ_GLOBAL_MIN_MS 50u
-static struct { uint8_t target[6]; uint32_t last_ms; bool used; } s_preq[PREQ_TARGETS];
-static uint32_t s_preq_any_ms;
+/* Discovery rate limit: the tested gate in the engine. */
+static struct umac_mesh_preq_gate s_preq_gate;
 
 /* Hop cost. mac80211's airtime metric for one S1G hop lands in the low
  * thousands; a constant keeps route choice sane without a rate feed. */
 #ifndef UMAC_MESH_FWD_HOP_METRIC
 #define UMAC_MESH_FWD_HOP_METRIC 4096u
 #endif
-#define UMAC_MESH_FWD_PREQ_MIN_INTERVAL_MS 500u
 
 extern struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr);
 extern int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len);
@@ -82,6 +77,7 @@ void umac_mesh_fwd_glue_init(void)
     lock_();
     umac_mesh_pathtbl_init(&s_tbl);
     umac_mesh_rmc_init(&s_rmc);
+    umac_mesh_preq_gate_init(&s_preq_gate);
     unlock_();
     umac_mesh_ies_cap_forwarding = g_warthog_mesh_fwd ? 1u : 0u;
 }
@@ -218,31 +214,10 @@ void umac_mesh_fwd_glue_forward(struct umac_data *umacd, struct mmpktview *body,
 
 static void maybe_preq_(const uint8_t *target)
 {
-    uint32_t now = mmosal_get_time_ms();
-    if ((uint32_t)(now - s_preq_any_ms) < PREQ_GLOBAL_MIN_MS)
+    if (!umac_mesh_preq_gate_allow(&s_preq_gate, target, mmosal_get_time_ms()))
     {
         return;
     }
-    uint32_t slot = PREQ_TARGETS, oldest = 0;
-    for (uint32_t i = 0; i < PREQ_TARGETS; i++)
-    {
-        if (s_preq[i].used && memcmp(s_preq[i].target, target, 6) == 0)
-        {
-            if ((uint32_t)(now - s_preq[i].last_ms) < UMAC_MESH_FWD_PREQ_MIN_INTERVAL_MS)
-            {
-                return;
-            }
-            slot = i;
-            break;
-        }
-        if (!s_preq[i].used) { if (slot == PREQ_TARGETS) { slot = i; } }
-        else if ((int32_t)(s_preq[i].last_ms - s_preq[oldest].last_ms) < 0) { oldest = i; }
-    }
-    if (slot == PREQ_TARGETS) { slot = oldest; }
-    memcpy(s_preq[slot].target, target, 6);
-    s_preq[slot].last_ms = now;
-    s_preq[slot].used = true;
-    s_preq_any_ms = now;
     if (umac_mesh_hwmp_send_preq(target) >= 0)
     {
         g_warthog_fwd_preq_tx++;

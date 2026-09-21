@@ -275,6 +275,38 @@ int main(void)
         CHECK(umac_mesh_fwd_parse_frame(frame, n, &pf) == 0, "3-addr with unicast addr1 refused");
     }
 
+    /* ---- discovery rate limit ------------------------------------------------ */
+    {
+        struct umac_mesh_preq_gate g; umac_mesh_preq_gate_init(&g);
+        uint32_t t0 = 5000;
+        CHECK( umac_mesh_preq_gate_allow(&g, X, t0), "first PREQ for X allowed");
+        CHECK(!umac_mesh_preq_gate_allow(&g, X, t0 + 100), "X again 100 ms later: suppressed");
+        CHECK(!umac_mesh_preq_gate_allow(&g, X, t0 + UMAC_MESH_PREQ_MIN_INTERVAL_MS - 1), "one ms short of the interval: suppressed");
+        CHECK(!umac_mesh_preq_gate_allow(&g, C, t0 + 10), "a DIFFERENT target 10 ms later: the global floor suppresses it");
+        CHECK( umac_mesh_preq_gate_allow(&g, C, t0 + UMAC_MESH_PREQ_GLOBAL_MIN_MS), "and allows it at the floor");
+        CHECK( umac_mesh_preq_gate_allow(&g, X, t0 + UMAC_MESH_PREQ_MIN_INTERVAL_MS), "X allowed again after its interval");
+        /* LRU across the four slots. */
+        umac_mesh_preq_gate_init(&g);
+        const uint8_t T[6][6] = { {2,0,0,0,0,1},{2,0,0,0,0,2},{2,0,0,0,0,3},{2,0,0,0,0,4},{2,0,0,0,0,5},{2,0,0,0,0,6} };
+        uint32_t t = 10000;
+        for (int i = 0; i < 4; i++) { CHECK(umac_mesh_preq_gate_allow(&g, T[i], t), "target %d fills a slot", i); t += 100; }
+        CHECK(umac_mesh_preq_gate_allow(&g, T[4], t), "a fifth target evicts the least recently used"); t += 100;
+        CHECK(umac_mesh_preq_gate_allow(&g, T[0], t), "the evicted one (T0) is allowed again at once -- it is no longer remembered"); t += 100;
+        CHECK(!umac_mesh_preq_gate_allow(&g, T[2], t), "T2 is still remembered and suppressed");
+        /* The bound: a flood alternating eight unknown targets for one second
+         * yields at most 1000 / floor PREQs, however many targets it cycles. */
+        umac_mesh_preq_gate_init(&g);
+        int sent = 0;
+        for (uint32_t ms = 0; ms < 1000; ms += 5) { if (umac_mesh_preq_gate_allow(&g, T[(ms / 5) % 6], 20000 + ms)) sent++; }
+        CHECK(sent <= 1000 / UMAC_MESH_PREQ_GLOBAL_MIN_MS && sent >= 10, "alternating-target flood for 1 s: %d PREQs (bound %u)", sent, 1000 / UMAC_MESH_PREQ_GLOBAL_MIN_MS);
+        /* Wrap-safe clock. */
+        umac_mesh_preq_gate_init(&g);
+        CHECK( umac_mesh_preq_gate_allow(&g, X, 0xfffffff0u), "PREQ just before the clock wraps");
+        CHECK(!umac_mesh_preq_gate_allow(&g, X, 0x00000010u), "32 ms later across the wrap: still suppressed");
+        CHECK( umac_mesh_preq_gate_allow(&g, X, 0x00000010u + UMAC_MESH_PREQ_MIN_INTERVAL_MS), "and allowed after the interval, across the wrap");
+        CHECK(!umac_mesh_preq_gate_allow(NULL, X, 1) && !umac_mesh_preq_gate_allow(&g, NULL, 1), "NULLs suppressed");
+    }
+
     /* ---- round trip: what we shape, we would deliver correctly -------------- */
     {
         umac_mesh_fwd_tx(&c, HA, HW, 108, &t);

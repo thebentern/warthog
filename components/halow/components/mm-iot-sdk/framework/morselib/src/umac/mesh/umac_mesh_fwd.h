@@ -141,6 +141,35 @@ void umac_mesh_fwd_replica_ctrl(const struct umac_mesh_ctrl *native, const uint8
  */
 uint16_t umac_mesh_fwd_parse_frame(const uint8_t *hdr, uint16_t len, struct umac_mesh_rx_frame *f);
 
+/* ---- discovery rate limit ---------------------------------------------
+ *
+ * A host behind us pinging many unknown addresses must not become a PREQ
+ * broadcast per packet. Per target, one PREQ per interval; across all
+ * targets, a floor; the target table is a small LRU. The bound on PREQs
+ * per second is therefore 1000 / floor regardless of how many targets an
+ * attacker or a scanner cycles through. */
+#ifndef UMAC_MESH_PREQ_TARGETS
+#define UMAC_MESH_PREQ_TARGETS 4u
+#endif
+#ifndef UMAC_MESH_PREQ_MIN_INTERVAL_MS
+#define UMAC_MESH_PREQ_MIN_INTERVAL_MS 500u
+#endif
+#ifndef UMAC_MESH_PREQ_GLOBAL_MIN_MS
+#define UMAC_MESH_PREQ_GLOBAL_MIN_MS 50u
+#endif
+
+struct umac_mesh_preq_gate {
+    struct { uint8_t target[6]; uint32_t last_ms; bool used; } t[UMAC_MESH_PREQ_TARGETS];
+    uint32_t any_ms;
+    bool any_used;
+};
+
+void umac_mesh_preq_gate_init(struct umac_mesh_preq_gate *g);
+
+/** true: send a PREQ for @p target now, and it is recorded. false: suppressed. */
+bool umac_mesh_preq_gate_allow(struct umac_mesh_preq_gate *g, const uint8_t *target,
+                               uint32_t now_ms);
+
 /* ---- transmit --------------------------------------------------------- */
 
 enum umac_mesh_tx_shape {

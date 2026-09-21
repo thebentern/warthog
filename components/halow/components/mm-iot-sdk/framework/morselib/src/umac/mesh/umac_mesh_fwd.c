@@ -321,3 +321,55 @@ uint16_t umac_mesh_fwd_parse_frame(const uint8_t *hdr, uint16_t len, struct umac
     }
     return (uint16_t)(mac_len + 2u + used);
 }
+
+void umac_mesh_preq_gate_init(struct umac_mesh_preq_gate *g)
+{
+    if (g != NULL)
+    {
+        memset(g, 0, sizeof(*g));
+    }
+}
+
+bool umac_mesh_preq_gate_allow(struct umac_mesh_preq_gate *g, const uint8_t *target,
+                               uint32_t now_ms)
+{
+    if (g == NULL || target == NULL)
+    {
+        return false;
+    }
+    if (g->any_used && (uint32_t)(now_ms - g->any_ms) < UMAC_MESH_PREQ_GLOBAL_MIN_MS)
+    {
+        return false;
+    }
+    uint32_t slot = UMAC_MESH_PREQ_TARGETS, oldest = 0;
+    for (uint32_t i = 0; i < UMAC_MESH_PREQ_TARGETS; i++)
+    {
+        if (g->t[i].used && memcmp(g->t[i].target, target, 6) == 0)
+        {
+            if ((uint32_t)(now_ms - g->t[i].last_ms) < UMAC_MESH_PREQ_MIN_INTERVAL_MS)
+            {
+                return false;
+            }
+            slot = i;
+            break;
+        }
+        if (!g->t[i].used)
+        {
+            if (slot == UMAC_MESH_PREQ_TARGETS) { slot = i; }
+        }
+        else if ((int32_t)(g->t[i].last_ms - g->t[oldest].last_ms) < 0 || !g->t[oldest].used)
+        {
+            oldest = i;
+        }
+    }
+    if (slot == UMAC_MESH_PREQ_TARGETS)
+    {
+        slot = oldest;
+    }
+    memcpy(g->t[slot].target, target, 6);
+    g->t[slot].last_ms = now_ms;
+    g->t[slot].used = true;
+    g->any_ms = now_ms;
+    g->any_used = true;
+    return true;
+}
