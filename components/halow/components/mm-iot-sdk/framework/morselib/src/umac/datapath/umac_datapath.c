@@ -114,6 +114,8 @@ extern volatile uint32_t g_warthog_filt_reason, g_warthog_filt_drop;
 extern volatile uint32_t g_warthog_filt_hist[9];
 extern volatile uint32_t g_warthog_rx_meshctrl_stripped;
 extern volatile uint32_t g_warthog_rx_meshctrl_ae;
+extern volatile uint32_t g_warthog_rx_fwd_candidate;
+extern volatile uint8_t  g_warthog_rx_fwd_last_da[6];
 extern volatile uint32_t g_warthog_mesh_seq;
 extern volatile uint16_t g_warthog_fc_ring[32];
 extern volatile uint32_t g_warthog_fc_ring_idx;
@@ -594,6 +596,31 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             tid_index = dot11_qos_control_get_tid(qos_control->field);
         }
         mesh_ctrl_present = (le16toh(qos_control->field) & 0x0100) != 0;
+        /* Forwarding feasibility probe.
+         *
+         * A relay must receive frames whose mesh destination is somebody else.
+         * Whether the MM6108 delivers those to the host at all, or filters them
+         * on addr3, decides whether host-side forwarding is buildable -- and it
+         * is not documented either way. Count them here, before any of our own
+         * drops, so the answer is a counter read rather than an argument.
+         *
+         * fwdcand climbing while a third node is addressed means the chip does
+         * hand them up and forwarding is ours to write. Staying at zero while
+         * two peers demonstrably exchange traffic in range means the chip
+         * filters, and forwarding needs the firmware, not us. */
+        if (mesh_ctrl_present)
+        {
+            uint8_t self[6];
+            umac_interface_get_mac_addr(stad, self);
+            const uint8_t *mesh_da = dot11_get_da(header);
+            if (mesh_da != NULL &&
+                !mm_mac_addr_is_multicast(mesh_da) &&
+                !mm_mac_addr_is_equal(mesh_da, self))
+            {
+                g_warthog_rx_fwd_candidate++;
+                memcpy((void *)g_warthog_rx_fwd_last_da, mesh_da, 6);
+            }
+        }
 
 
     }

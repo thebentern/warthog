@@ -503,6 +503,11 @@ volatile uint32_t g_warthog_rx_meshctrl_stripped = 0; /* RX frames whose Mesh Co
 /* RX frames whose Mesh Control carried Address Extension -- a peer proxying for
  * a device behind it. Non-zero means a bridged peer is talking to us. */
 volatile uint32_t g_warthog_rx_meshctrl_ae = 0;
+/* Mesh data frames whose destination is a third node -- i.e. frames a relay
+ * would forward. Non-zero proves the chip delivers them to the host, which is
+ * the open question gating 802.11s forwarding. */
+volatile uint32_t g_warthog_rx_fwd_candidate = 0;
+volatile uint8_t  g_warthog_rx_fwd_last_da[6] = {0};
 volatile uint32_t g_warthog_mesh_seq = 0;
 volatile uint32_t g_warthog_nodec_group = 0, g_warthog_nodec_fc = 0, g_warthog_nodec_keyid = 0;
 volatile uint32_t g_warthog_nodec_group_n = 0, g_warthog_nodec_uni_n = 0;
@@ -955,7 +960,7 @@ static void cmd_rxchan(void)
     char buf[460];
     snprintf(buf, sizeof(buf),
              "+RXCHAN: pages=%lu data=%lu beacon=%lu mgmt=%lu cmd=%lu txstat=%lu last=0x%02lx "
-             "| shim=%lu notrunning=%lu rxframe=%lu filter=%lu meshctrl=%lu ae=%lu | rxdrop=%lu reason=%lu "
+             "| shim=%lu notrunning=%lu rxframe=%lu filter=%lu meshctrl=%lu ae=%lu fwdcand=%lu(%02x%02x%02x) | rxdrop=%lu reason=%lu "
              "ccmp_key=%lu blank=%lu replay=%lu pn=%lu | nodec grp=%lu uni=%lu "
              "last(grp=%lu fc=%04lx key=%lu ta=%02x%02x%02x)\r\n",
              (unsigned long)g_warthog_rxchan_pages, (unsigned long)g_warthog_rxchan_data,
@@ -965,6 +970,9 @@ static void cmd_rxchan(void)
              (unsigned long)g_warthog_shim_rx_notrunning, (unsigned long)g_warthog_rxframe_entry,
              (unsigned long)g_warthog_filter_entry, (unsigned long)g_warthog_rx_meshctrl_stripped,
              (unsigned long)g_warthog_rx_meshctrl_ae,
+             (unsigned long)g_warthog_rx_fwd_candidate,
+             g_warthog_rx_fwd_last_da[3], g_warthog_rx_fwd_last_da[4],
+             g_warthog_rx_fwd_last_da[5],
              (unsigned long)g_warthog_rxdrop_count, (unsigned long)g_warthog_rxdrop_reason,
              (unsigned long)g_warthog_ccmp_last_keyid, (unsigned long)g_warthog_ccmp_blank,
              (unsigned long)g_warthog_ccmp_replay, (unsigned long)g_warthog_ccmp_last_pn,

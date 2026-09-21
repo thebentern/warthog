@@ -177,17 +177,32 @@ Both are worth doing deliberately or not at all — switching either on without
 the duplicate suppression that mesh forwarding normally provides invites
 loops.
 
-## An open question before building forwarding
+## Settle the forwarding question before writing forwarding
 
-Two independent reviews disagree on whether the MM6108 will hand up a
-4-address frame whose addr3 is a third party. One reads the chip as a lower
-MAC that transmits and receives whatever header the host builds, making
-host-side forwarding straightforward; the other found a recorded chip-firmware
-addr3 filter that would make host-side RX forwarding impossible without a
-firmware change. **Settle this on hardware before committing to the design** —
-it is the difference between a two-week feature and a blocked one. The test is
-cheap: have two peers exchange traffic addressed to a third node while a
-Warthog is in range, and read whether the frames reach the host at all.
+Two independent reviews disagree on whether the MM6108 hands up a mesh data
+frame whose destination is a third party. One reads the chip as a lower MAC
+that receives whatever the host can parse; the other found a recorded
+chip-firmware addr3 filter that would make host-side forwarding impossible
+without a firmware change. That is the difference between a two-week feature
+and a blocked one, and it is not worth writing a thousand lines of relay
+logic to find out — a half-working relay blackholes traffic, which is exactly
+why the Forwarding capability bit is deliberately clear today.
+
+**The probe is in the firmware.** `AT+RXCHAN?` reports `fwdcand=N(xxxxxx)`:
+mesh data frames whose destination is neither us nor a group address, counted
+before any of our own drops, with the low three octets of the most recent
+such destination.
+
+Run it with three nodes: two peers exchanging traffic with each other, and a
+Warthog in range of both but addressed by neither.
+
+| Result | Meaning | Next step |
+|---|---|---|
+| `fwdcand` climbing | The chip delivers third-party frames. Forwarding is host-side work. | Build it: RX re-enqueue, TTL decrement, duplicate suppression by mesh sequence number, then set the Forwarding bit last. |
+| `fwdcand` stays 0 | The chip filters on the mesh destination. | Host-side forwarding is impossible; raise it with Morse Micro. Do not write the relay. |
+
+Read `ae=` in the same query: a bridged peer reaching us at all is the other
+precondition for being useful on an idiomatic OpenMANET network.
 
 ## Current on-air posture
 
