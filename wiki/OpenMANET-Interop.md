@@ -299,6 +299,44 @@ Widening the repeater in `main/mudp.c` would make discovery look like it works.
 The fix is one L2 segment with unique host addresses; see
 `docs/mesh-attachment-model.md`.
 
+## Turning on the relay: the on-air experiment, in order
+
+Everything in forwarding and bridge mode is host-tested and simulated and
+nothing in it has been on a radio. When a board is back, this is the order,
+and each step is a counter read rather than an argument:
+
+1. **Does the chip hand up third-party frames at all?** Two OpenMANET nodes
+   peered with a warthog between them, forwarding still off. Have the nodes
+   exchange unicast (they will route direct if they can hear each other, so
+   put the warthog where they cannot). `AT+RXCHAN?` — `fwdcand` climbing
+   means the MM6108 delivers 4-address data whose mesh destination is
+   someone else, and everything below is buildable. Zero while the nodes
+   demonstrably talk means the chip filters on addr3, and host-side unicast
+   relaying is impossible; only the group flood (which arrives addressed to
+   us or to the group) would work.
+2. **Path selection through the warthog.** `AT+MESHFWD=1`, `AT+RESET`. The
+   peer's beacons now see the Forwarding capability. On an OpenMANET node,
+   `iw dev wlh0 mpath dump` should show the far node with the warthog as
+   next hop. On the warthog, `AT+MESHPATH?` should list both nodes, each via
+   itself, and `AT+MESHFWDSTAT?` should show `relay preq` and `relay prep`
+   climbing. If paths never form, `parse_fail`/`not_ours` on `AT+HWMPSTAT?`
+   say whether the frames were even understood.
+3. **Data through the warthog.** Ping node to node. `AT+MESHFWDSTAT?`
+   `fwd uni` counts each relayed frame; `drop nopath` with `perr_tx` beside it
+   means a node asked us to relay somewhere we have no route. Then a
+   broadcast (ARP will do): `fwd grp` should count once per frame, `drop dup`
+   should catch the echo.
+4. **Hosts across the relay.** A laptop behind each node; ping laptop to
+   laptop. `AT+MESHPATH?` should show both laptops as `host=... behind=...`.
+5. **Bridge mode.** `AT+MESHBRIDGE=1`, `AT+RESET`. The warthog's USB host
+   should get a lease from the OpenMANET node's dnsmasq (or nothing, on a
+   warthog-only mesh — that is the documented cost), and mDNS/CoT discovery
+   between the laptop and a node's host is the thing this mode exists for.
+
+`tools/bench/openmanet_interop.py --fwd` sets step 2 up and reads steps 2–4;
+`--bridge` adds step 5. Both report; neither asserts, because none of it has
+a measured baseline yet.
+
 ## Vanilla OpenWrt
 
 The same procedure applies to stock OpenWrt with a Morse Micro driver — nothing

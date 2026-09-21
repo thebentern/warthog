@@ -462,6 +462,7 @@ The CDC console (`/dev/cu.usbmodemXXXX`) carries all ESP-IDF logs after USB-OTG 
 | 5 | Polish (LEDs, AT, NVS) | ✅ partial — LED state machine, AT commands, NVS persistence shipped. Windows RNDIS, NCM (iOS) and a web UI deferred. |
 | 6 | 802.11s mesh over HaLow | ✅ peering, data plane and HWMP path selection; 3-node warthog mesh verified |
 | 7 | OpenMANET / OpenWrt interop | ✅ unencrypted mesh: 0–3% loss, 8–19 ms against OpenMANET 1.8.0. SAE/AMPE peering also verified cross-vendor; its data plane is not — see [`docs/mesh-openmanet.md`](docs/mesh-openmanet.md) |
+| 8 | 802.11s forwarding + L2 bridge | 🧪 implemented, host-tested and simulated (`sim_mesh`: relay, flood, proxy, link loss, TTL); **no forwarded or bridged frame has been on a radio** — see [Mesh Mode](wiki/Mesh-Mode.md#forwarding) |
 
 SAE/AMPE is implemented: the `warthog-mesh-sae` build derives a per-link MTK
 per peer, and peering interoperates with stock OpenMANET. One limit applies:
@@ -479,8 +480,12 @@ Implemented but not measured on air: 802.11s forwarding (`AT+MESHFWD=1` — path
 selection relayed, unicast and group data relayed, proxied endpoints learned,
 link loss announced; host-tested and simulated, see [Mesh Mode](wiki/Mesh-Mode.md#forwarding)).
 
-Not implemented: per-transmitter group keys, layer-2 bridging of the tethered
-client, multicast across the mesh on a leaf, Windows RNDIS, and a web UI.
+Implemented but not measured on air, likewise: L2 bridge mode (`AT+MESHBRIDGE=1`
+— USB, Wi-Fi AP and mesh as one segment, NAT off; builds on every env with the
+lwIP bridge compiled in, has not carried a packet).
+
+Not implemented: per-transmitter group keys, multicast across the mesh on a
+leaf, Windows RNDIS, and a web UI.
 
 ### What is measured, and what is not
 

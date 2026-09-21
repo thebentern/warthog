@@ -171,6 +171,10 @@ def main():
                     help="encrypted mesh; without it, the open mesh stock OpenMANET ships")
     ap.add_argument("--negative", action="store_true",
                     help="also run the mismatch cases")
+    ap.add_argument("--fwd", action="store_true",
+                    help="turn 802.11s forwarding on (AT+MESHFWD=1) and report the relay state")
+    ap.add_argument("--bridge", action="store_true",
+                    help="turn L2 bridge mode on (AT+MESHBRIDGE=1); implies --fwd")
     ap.add_argument("--settle", type=int, default=90)
     ap.add_argument("--audit-only", action="store_true",
                     help="read the peers and report; change nothing. Safe to "
@@ -213,6 +217,8 @@ def main():
     for w in a.warthog:
         t = at(w, ["AT+MESHEN=1", "AT+MESHID=%s" % a.mesh_id] +
                   (["AT+MESHPASS=%s" % a.passphrase] if a.sae else []) +
+                  (["AT+MESHFWD=1"] if (a.fwd or a.bridge) else ["AT+MESHFWD=0"]) +
+                  (["AT+MESHBRIDGE=1"] if a.bridge else ["AT+MESHBRIDGE=0"]) +
                   ["AT+MESHCHAN?"])
         applied = "applied=yes" in t
         check("warthog-chan-applied/%s" % w.split("/")[-1], applied,
@@ -262,6 +268,12 @@ def main():
             m = re.search(re.escape(tag) + r"(\S+)", t)
             if m:
                 print("        %s%s" % (tag, m.group(1)))
+        # Relay state: reported, never asserted -- nothing here has a measured
+        # baseline yet, and the first run IS the baseline.
+        if a.fwd or a.bridge:
+            for line in at(w, ["AT+MESHFWDSTAT?", "AT+MESHPATH?"]).splitlines():
+                if line.strip().startswith(("+MESHFWDSTAT:", "+MESHPATH:")):
+                    print("        %s" % line.strip())
 
     print("\n== 4. data plane ==")
     for pi, b in zip(a.pi, binds):
