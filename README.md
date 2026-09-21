@@ -308,6 +308,9 @@ AT+WIFIAP?                  → +WIFIAP: ssid="warthog" chan=6 (psk hidden) / OK
 AT+MESHEN=1                 → join a mesh instead of a HaLow AP; AT+RESET to apply
 AT+MESHID=halowmesh         → mesh ID, must match every peer exactly
 AT+MESHPASS=secret          → SAE passphrase (SAE builds); length-only readback
+AT+MESHCHAN=42,923000000,69,2,2
+                            → pin the S1G channel as a set; region builds ship unpinned
+AT+MESHCFG?                 → everything a peer matches on, plus what Warthog won't do
 AT+DNS=8.8.8.8              → set the DNS handed to USB + AP clients via DHCP
 AT+DNS?                     → +DNS: 1.1.1.1 / OK
 AT+RESET                    → reboot

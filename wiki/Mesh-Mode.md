@@ -96,7 +96,14 @@ pio run -e warthog-mesh-sae -t upload
 > table refused the set and the radio fell back, which is the usual cause of
 > "peers with nothing and looks like a range problem". A refused set is
 > discarded rather than retried every boot. `AT+MESHCHAN=default` restores the
-> build-time pin.
+> build-time pin on a mesh env, and on a region env returns the radio to the
+> full country list.
+>
+> **The mesh envs pin a channel; the region envs do not.** A region build
+> carries the whole country list, so until you set `AT+MESHCHAN=` its operating
+> channel is neither chosen nor observable — pin one before expecting it to
+> meet a mesh. `AT+MESHCFG?` reports the channel that actually applied, which
+> is not the same thing as the one configured.
 >
 > **Region is still build-time.** The mesh envs hard-code `WARTHOG_REGION_US` and pin
 > the radio to S1G channel 42 (923.0 MHz, 2 MHz, global op class 69). That

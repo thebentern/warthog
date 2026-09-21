@@ -34,11 +34,16 @@ For a peer-to-peer mesh instead of a station uplink, build
 `warthog-mesh-smoke` and read [Mesh Mode](Mesh-Mode) first.
 
 > **A region env can join a mesh at runtime** — `AT+MESHEN=1`, then
-> `AT+RESET`. Set the mesh ID and passphrase the same way (`AT+MESHID=`,
-> `AT+MESHPASS=`); all three persist. **Channel and bandwidth are still
-> build-time**, and the mesh defaults are S1G channel 42 (923.0 MHz, 2 MHz),
-> so if your OpenMANET peer is on another channel you still need a rebuild
-> with the pin overridden. See [Mesh Mode](Mesh-Mode).
+> `AT+RESET`. Mesh ID, passphrase and channel are set the same way
+> (`AT+MESHID=`, `AT+MESHPASS=`, `AT+MESHCHAN=`); all persist to NVS.
+>
+> **A region build ships with no channel pinned** — it carries the whole
+> country list, so its operating channel is neither chosen nor observable, and
+> meeting a mesh on it is luck. Pin one to match your peer:
+> `AT+MESHCHAN=<chan>,<freq_hz>,<gclass>,<sclass>,<bw>`, then `AT+RESET`. The
+> channel must exist in the country's regulatory table; one that does not is
+> refused and logged rather than forced. `AT+MESHCFG?` reports what actually
+> applied. See [Mesh Mode](Mesh-Mode).
 
 ## 4. Flash
 
