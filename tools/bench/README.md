@@ -53,3 +53,38 @@ Baselines to compare against, not targets:
 A few percent packet loss is normal on this link. What is NOT normal: a pair
 that fails in every round, estab dropping below the peer count, or `no_slot` /
 `expired` climbing while all boards are up and in range.
+
+## openmanet_interop.py — Warthog against real OpenMANET
+
+The other scripts here drive warthogs only, which cannot show interop. This
+one puts OpenMANET nodes in the loop, configures both sides the idiomatic way
+(uci, not a hand-run supplicant) and asserts, exiting non-zero on failure.
+
+```bash
+./openmanet_interop.py \
+  --pi root@10.41.254.1 --pi-bind 10.41.0.230 \
+  --pi root@10.41.254.1 --pi-bind 10.41.0.214 \
+  --warthog /dev/cu.usbmodem11101 \
+  --sae --negative
+```
+
+`--pi-bind` is not optional in practice: both Pis answer on 10.41.254.1 over
+their own USB gadget, so the source address is what selects which one you
+reach.
+
+It writes uci on the peer — point it at bench hardware.
+
+What it covers, and what it deliberately only reports:
+
+- **Asserts** peer configured, warthog channel pin actually applied, peering
+  on both sides, and ICMP in both directions.
+- **Reports** `ae=`, `fwdcand=` and `nodec grp=` without asserting. These are
+  the numbers that decide what to build next rather than pass/fail states:
+  `ae>0` means a bridged peer is reaching us, `fwdcand>0` means the chip
+  delivers third-party frames and 802.11s forwarding is host-side work, and
+  `nodec grp` climbing means group frames are arriving undecryptable.
+- `--negative` exercises the mismatch cases the scope calls for: an
+  out-of-band frequency, an illegal bandwidth, and an empty mesh ID.
+
+Not yet covered: wrong-passphrase and gate-reboot behaviour, and multicast
+(CoT/mDNS do not cross Warthog at all — see the README).

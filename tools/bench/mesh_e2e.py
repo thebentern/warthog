@@ -56,8 +56,18 @@ def check(name, ok, detail): RESULTS.append((name,ok,detail)); print("  [%s] %s 
 
 print("== 1. peering ==")
 for k in sorted(P):
+    # AT+MPMPEERS? renders warthog's own MPM table, which is deliberately not
+    # driven on a SAE build -- hostap owns peering there, so the string is
+    # "(none)" and counting estab=1 in it always reported zero links. Fall
+    # back to AT+PEERS?, which is maintained on both paths.
     links=one(k,b'AT+MPMPEERS?','MPMPEERS'); n=links.count('estab=1')
-    check("peering/%s"%k, n==len(P)-1, "%d/%d links established"%(n,len(P)-1))
+    if n==0:
+        m=re.search(r'count=(\d+)',one(k,b'AT+PEERS?','PEERS'))
+        n=int(m.group(1)) if m else 0
+        src="AT+PEERS?"
+    else:
+        src="AT+MPMPEERS?"
+    check("peering/%s"%k, n==len(P)-1, "%d/%d links established (%s)"%(n,len(P)-1,src))
 
 print("\n== 2. datapath peers ==")
 IP={}
