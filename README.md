@@ -100,9 +100,20 @@ around it:
   application-layer repeater (`main/mudp.c`) forwards exactly one group —
   Meshtastic's `239.0.0.69:4403` — between the USB, AP and HaLow netifs.
   Nothing else is repeated.
-- **ATAK / CoT multicast discovery on `239.2.3.1:6969` will not work.** It is
-  not in the repeater, so CoT peers do not find each other across Warthog.
-  Point-to-point CoT to a known address still works; discovery does not.
+- **ATAK / CoT multicast discovery on `239.2.3.1:6969` will not work**, and
+  adding it to the repeater would not fix it. Every Warthog NATs its tethered
+  host to the same addresses — `WARTHOG_USB_GW_IP` is the compile-time constant
+  `192.168.4.1` on every unit — so two hosts on opposite sides of a mesh are
+  both `192.168.4.x`. A CoT event carries the sender's address in its payload,
+  so repeating the group would deliver a contact whose address, on the
+  receiver's side, is the receiver's own subnet. That is worse than not
+  finding each other: it is finding each other wrongly. The same applies to
+  mDNS/SD, whose A records would advertise unroutable addresses.
+
+  Point-to-point CoT to a known, routable address still works; discovery does
+  not. What would fix it is one L2 segment with unique host addresses —
+  bridging rather than NAT — see `docs/mesh-attachment-model.md`, not a bigger
+  repeater.
 - **Inbound connections need explicit forwarding.** Upstream devices cannot
   reach the tethered host by address, because it is behind NAT.
 

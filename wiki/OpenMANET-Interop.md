@@ -276,6 +276,15 @@ nodes, does not run a routing protocol, does not bridge the tethered client
 onto the mesh at layer 2, and does not carry multicast across. A node that
 peers correctly is still a leaf.
 
+`multicast=no` is not a missing feature flag. Every Warthog NATs its tethered
+host to the same compile-time addresses (`192.168.4.1` on USB), so two hosts on
+opposite sides of a mesh are both `192.168.4.x`. Protocols that carry the
+sender's address in the payload — CoT, mDNS/SD — would therefore be repeated
+into a contact the receiver cannot reach, or worse, one that aliases itself.
+Widening the repeater in `main/mudp.c` would make discovery look like it works.
+The fix is one L2 segment with unique host addresses; see
+`docs/mesh-attachment-model.md`.
+
 ## Vanilla OpenWrt
 
 The same procedure applies to stock OpenWrt with a Morse Micro driver — nothing

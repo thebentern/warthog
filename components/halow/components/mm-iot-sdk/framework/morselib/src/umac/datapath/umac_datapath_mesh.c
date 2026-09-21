@@ -927,8 +927,28 @@ static void mesh_queue_one_(struct umac_data *umacd, struct umac_sta_data *stad,
  *
  * Both halves are unblocked by the same thing: host software CCMP, which keys
  * off the transmitter address in software and so is not bound by the chip's
- * single slot. Until that exists, an OpenMANET peer's genuine group frames
- * would fail on our side exactly as our own did. */
+ * single slot.
+ *
+ * Host CCMP now EXISTS (umac_mesh_rx_host_ccmp, and the RX gate has no
+ * multicast exclusion -- it resolves the stad from the TA, so group frames are
+ * in scope). It is not a reason to change this path yet, for two reasons that
+ * have to be cleared in order:
+ *
+ *   1. It compiles only in warthog-mesh-sae-swccmp{,-on}. The region images
+ *      and warthog-mesh-sae do not have it.
+ *   2. `swccmp ok` has never been observed above zero on air, for unicast or
+ *      group. Until it has, host CCMP is a compiled hypothesis.
+ *
+ * The experiment that decides this, in order: bring up two swccmp-on boards,
+ * confirm AT+SWCCMP? shows ok > 0 on ordinary unicast, and only then try a
+ * real group frame. Emitting standard group frames before step one trades a
+ * path measured to work for one that is merely argued to.
+ *
+ * Emitting them also needs more than a key: a standard 802.11s group frame is
+ * 3-address (umac_mesh_ies_build_data_hdr3_group, which has no callers yet)
+ * plus a Mesh Control field, where this path emits a fixed-length 4-address
+ * header and no Mesh Control. That is a variable-length TX header, not a
+ * flag. */
 static void mesh_enqueue_tx_frame(struct umac_data *umacd,
                                   struct umac_sta_data *stad,
                                   struct mmpkt *txbuf)
