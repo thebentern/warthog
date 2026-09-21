@@ -70,6 +70,53 @@ AT+MPING=10.77.199.248,4
 +MPING: 4 sent, 4 received, 0% loss
 ```
 
+## Forwarding
+
+`AT+MESHFWD=1` then `AT+RESET` turns a node from a leaf into a relay. What
+changes, all of it 802.11s as mac80211 does it:
+
+- **Path selection is relayed.** A PREQ for a third party is rebroadcast with
+  the hop cost added; the path back to its originator is installed via
+  whoever handed it over. A PREP is carried back along that path. A PERR from
+  our next hop for a destination deactivates the path and is passed on; a
+  PERR from a node that is not our next hop is ignored, so a third party
+  cannot knock out routes it is not on. The same request heard twice — via a
+  second neighbour, replayed, or forged with a stale number — is neither
+  answered nor forwarded.
+- **Data is relayed.** A unicast whose mesh destination is someone else goes
+  to that destination's next hop at TTL − 1; with no path, a PERR goes back
+  to the sender. A group frame is delivered locally and rebroadcast once at
+  TTL − 1, with its original source and sequence number kept so every relay's
+  duplicate cache sees the same identity — that cache is what stops two
+  relays in range of each other rebroadcasting a frame to each other until
+  TTL runs out. Under the chip's group-key constraint the rebroadcast goes
+  out as one unicast per peer (excluding the sender) carrying the group
+  address in Address Extension, which a mac80211 receiver rebuilds into the
+  real Ethernet frame and floods on its bridge.
+- **Proxied endpoints are learned.** A frame that arrived with Address
+  Extension teaches which mesh node the real source sits behind; a later
+  frame to that host goes to that node with both ends in AE 2.
+- **Losing a neighbour** drops every path through it and announces each
+  destination with a PERR at its sequence number + 1 — the +1 is what makes
+  every other node accept the announcement as newer than what it holds.
+- **The Mesh Configuration capability** advertises Forwarding only while the
+  gate is on, so a peer never routes through a node that will drop its
+  frames.
+
+Read the state with `AT+MESHPATH?` and the counters with `AT+MESHFWDSTAT?`.
+
+**How much of this is verified.** Every decision above is a freestanding
+function the host suite tests directly, and `sim_mesh` drives a 3–4 node
+mesh through the shipping code: unicast through a relay exactly once, a
+flood reaching every node exactly once and never storming, hosts behind
+opposite ends reaching each other with their real addresses, a lost link
+announced and acted on, TTL dying where it should, and a leaf relaying
+nothing. What is **not** verified is the radio: whether the MM6108 hands up
+a 4-address frame whose mesh destination is a third party (`AT+RXCHAN?`
+`fwdcand`), and whether it transmits one whose addr4 is not its own. Both
+need a board. Until then forwarding is compiled, simulated and off by
+default.
+
 ## Encryption
 
 Warthog has three mesh security levels. Which one the image can speak is a

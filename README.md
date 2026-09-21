@@ -469,9 +469,12 @@ on any image, region envs included, and the mesh ID, passphrase and channel are
 runtime settings. The mesh envs remain useful because they pin a channel and
 fix the identity at build time.
 
-Not implemented: mesh forwarding (a node answers path requests aimed at it and
-relays nothing), per-transmitter group keys, layer-2 bridging of the tethered
-client, multicast across the mesh, Windows RNDIS, and a web UI.
+Implemented but not measured on air: 802.11s forwarding (`AT+MESHFWD=1` — path
+selection relayed, unicast and group data relayed, proxied endpoints learned,
+link loss announced; host-tested and simulated, see [Mesh Mode](wiki/Mesh-Mode.md#forwarding)).
+
+Not implemented: per-transmitter group keys, layer-2 bridging of the tethered
+client, multicast across the mesh on a leaf, Windows RNDIS, and a web UI.
 
 ### What is measured, and what is not
 
@@ -489,9 +492,13 @@ proxied endpoints crossing the mesh on air.
 where possible host-tested, but has not run on a radio: receive-side Address
 Extension against a real bridged peer, DHCP-first netif bring-up, runtime
 channel configuration on a region build, per-peer RSSI/SNR/bandwidth, the
-`fwdcand` forwarding-feasibility counter, and the peering watchdog's output
+`fwdcand` forwarding-feasibility counter, the peering watchdog's output
 (its cause-selection is unit-tested on the host; its log lines have never
-fired on hardware). Host software CCMP has **never been observed working on
+fired on hardware), and the whole of 802.11s forwarding — every decision in
+it is host-tested and a multi-node simulator drives the shipping code through
+relay, flood, proxy, link-loss and TTL scenarios, but no forwarded frame has
+been on a radio, and whether the chip delivers third-party frames to the host
+at all is the `fwdcand` question above. Host software CCMP has **never been observed working on
 air** — `swccmp ok` has not been seen above zero, for unicast or group. That
 802.11w MFP is negotiated and the IGTK installed is readable from the source
 and the linked image; that the chip applies BIP on air is not.

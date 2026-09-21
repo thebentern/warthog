@@ -468,6 +468,13 @@ volatile uint32_t g_warthog_mesh_key_fail = 0;
  * the two actually opened the gate was never isolated. AT+MESHSEC= flips this
  * at runtime and re-peers, so the two can be told apart on hardware. */
 volatile uint32_t g_warthog_mesh_secure = 1;
+/* Forwarding and bridge gates, seeded from NVS in mesh.c before the mesh starts. */
+volatile uint32_t g_warthog_mesh_fwd = 0, g_warthog_mesh_bridge = 0;
+volatile uint32_t g_warthog_fwd_uni = 0, g_warthog_fwd_grp = 0, g_warthog_fwd_nomem = 0;
+volatile uint32_t g_warthog_fwd_drop_own = 0, g_warthog_fwd_drop_dup = 0, g_warthog_fwd_drop_ttl = 0;
+volatile uint32_t g_warthog_fwd_drop_nopath = 0, g_warthog_fwd_drop_nofwd = 0, g_warthog_fwd_drop_bad = 0;
+volatile uint32_t g_warthog_fwd_perr_tx = 0, g_warthog_fwd_preq_tx = 0;
+volatile uint32_t g_warthog_hwmp_relay_preq = 0, g_warthog_hwmp_relay_prep = 0, g_warthog_hwmp_relay_perr = 0;
 
 /* Data-plane counters (AT+DATASTAT?). rxtap_data = data frames the chip
  * delivered; stad_hit/miss = whether the peer table resolved the sender;
@@ -967,7 +974,12 @@ static void cmd_meshcfg(void)
     }
     /* Stated, not implied. Each of these is a real limitation an OpenMANET
      * operator will otherwise discover on the drone. */
-    cdc_write("+MESHCFG: forwarding=no routing=none l2=no(NAT) multicast=no batman=no\r\n");
+    snprintf(line, sizeof(line), "+MESHCFG: forwarding=%s routing=%s l2=%s multicast=%s batman=no\r\n",
+             g_warthog_mesh_fwd ? "yes(802.11s)" : "no",
+             g_warthog_mesh_fwd ? "hwmp" : "none",
+             g_warthog_mesh_bridge ? "bridge" : "no(NAT)",
+             g_warthog_mesh_fwd ? "relayed" : "no");
+    cdc_write(line);
     reply_ok();
 }
 
@@ -1854,6 +1866,26 @@ static void dispatch(char *line)
             cdc_write("+MESHFWD: stored; takes effect on next boot (AT+RESET)\r\n");
             reply_ok();
         } else { reply_error("usage: AT+MESHFWD=<0|1>"); }
+    } else if (strcasecmp(verb, "MESHPATH") == 0 && terminator == '?') {
+        static char big[1400];
+        int w = mmwlan_mesh_fwd_render(big, sizeof(big));
+        if (w <= 0) { cdc_write("+MESHPATH: (empty)\r\n"); } else { cdc_write(big); }
+        reply_ok();
+    } else if (strcasecmp(verb, "MESHFWDSTAT") == 0 && terminator == '?') {
+        char line[320];
+        snprintf(line, sizeof(line),
+                 "+MESHFWDSTAT: on=%lu fwd uni=%lu grp=%lu nomem=%lu | drop own=%lu dup=%lu ttl=%lu "
+                 "nopath=%lu nofwd=%lu bad=%lu | perr_tx=%lu preq_tx=%lu | relay preq=%lu prep=%lu perr=%lu\r\n",
+                 (unsigned long)g_warthog_mesh_fwd, (unsigned long)g_warthog_fwd_uni,
+                 (unsigned long)g_warthog_fwd_grp, (unsigned long)g_warthog_fwd_nomem,
+                 (unsigned long)g_warthog_fwd_drop_own, (unsigned long)g_warthog_fwd_drop_dup,
+                 (unsigned long)g_warthog_fwd_drop_ttl, (unsigned long)g_warthog_fwd_drop_nopath,
+                 (unsigned long)g_warthog_fwd_drop_nofwd, (unsigned long)g_warthog_fwd_drop_bad,
+                 (unsigned long)g_warthog_fwd_perr_tx, (unsigned long)g_warthog_fwd_preq_tx,
+                 (unsigned long)g_warthog_hwmp_relay_preq, (unsigned long)g_warthog_hwmp_relay_prep,
+                 (unsigned long)g_warthog_hwmp_relay_perr);
+        cdc_write(line);
+        reply_ok();
     } else if (strcasecmp(verb, "MESHFWD") == 0 && terminator == '?') {
         char line[64];
         snprintf(line, sizeof(line), "+MESHFWD: %u\r\n", (unsigned)warthog_cfg_get_mesh_fwd());

@@ -32,16 +32,13 @@
 #define MESH_AUTH_NONE 0x00
 #define MESH_AUTH_SAE 0x01
 #define MESH_FORMATION_INFO 0x00
-/* Accepting Additional Mesh Peerings (bit 0) only.
- *
- * Forwarding (bit 3) is deliberately NOT set. We do not forward: there is no
- * path table, no PERR, and umac_mesh_handle_hwmp() returns on any path request
- * that does not target us. Advertising the bit invites a mac80211 peer to pick
- * us as an intermediate hop, and every frame it routed through us would be
- * dropped -- a blackhole that only appears once a third node joins and cannot
- * hear the others directly. Set it in the same commit that implements
- * forwarding, not before. */
+/* Accepting Additional Mesh Peerings (bit 0), plus Forwarding (bit 3) only
+ * when the relay is on. Advertising forwarding invites a mac80211 peer to
+ * route through us; with the relay off that is a blackhole, so the bit
+ * follows the runtime gate exactly. */
 #define MESH_CAPABILITY 0x01
+#define MESH_CAPABILITY_FORWARDING 0x08
+uint8_t umac_mesh_ies_cap_forwarding = 0;
 
 /* Supported Rates, mandatory 5 GHz OFDM set. dot11ah presents S1G as 5 GHz, so
  * this is the set a peer expects. Units are 500 kbps; the MSB marks a rate
@@ -83,7 +80,8 @@ uint16_t umac_mesh_ies_build_mesh_config(uint8_t *out, uint16_t out_len, bool sa
     out[n++] = MESH_SYNC_NEIGHBOR;
     out[n++] = sae ? MESH_AUTH_SAE : MESH_AUTH_NONE;
     out[n++] = MESH_FORMATION_INFO;
-    out[n++] = MESH_CAPABILITY;
+    out[n++] = (uint8_t)(MESH_CAPABILITY |
+                         (umac_mesh_ies_cap_forwarding ? MESH_CAPABILITY_FORWARDING : 0u));
     return n;
 }
 

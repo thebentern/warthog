@@ -18,6 +18,8 @@
 #include "umac/datapath/umac_datapath.h"
 #include "umac/mesh/umac_mesh.h"
 #include "umac/mesh/umac_mesh_ctrl.h"
+#include "umac/mesh/umac_mesh_fwd.h"
+#include "umac/mesh/umac_mesh_fwd_glue.h"
 #include "umac/datapath/umac_datapath_private.h"
 #include "umac/data/umac_data.h"
 #include "umac/datapath/datapath_defrag.h"
@@ -118,6 +120,7 @@ extern volatile uint32_t g_warthog_rx_meshctrl_ae;
 extern volatile uint32_t g_warthog_rx_fwd_candidate;
 extern volatile uint8_t  g_warthog_rx_fwd_last_da[6];
 extern volatile uint32_t g_warthog_mesh_seq;
+extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge;
 extern volatile uint16_t g_warthog_fc_ring[32];
 extern volatile uint32_t g_warthog_fc_ring_idx;
 extern volatile uint32_t g_warthog_rxdrop_reason;
@@ -584,6 +587,8 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     /* Address Extension endpoints, when the sender proxied for another device. */
     uint8_t ae_da[6], ae_sa[6];
     bool have_ae_da = false, have_ae_sa = false;
+    struct umac_mesh_fwd_rx_result fwd_res = { 0 };
+    bool fwd_active = false;
 
     if (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_DATA)
     {
@@ -756,6 +761,26 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             }
             g_warthog_rx_meshctrl_ae++;
         }
+        /* Relay on: decide now, while the Mesh Control is still in place.
+         * A frame the engine cannot parse falls through to the strip below
+         * exactly as before, so the tolerant path is unchanged. */
+        if (g_warthog_mesh_fwd)
+        {
+            struct umac_mesh_ctrl mcs; uint16_t used = 0;
+            if (umac_mesh_ctrl_parse(mc, (uint16_t)mmpkt_get_data_length(rxbufview), &mcs, &used))
+            {
+                umac_mesh_fwd_glue_rx(umacd, stad, header, data_hdr, &mcs, &fwd_res);
+                fwd_active = true;
+                if (fwd_res.verdict == UMAC_MESH_FWD_DROP)
+                {
+                    if (fwd_res.send_perr)
+                    {
+                        umac_mesh_fwd_glue_send_perr(&fwd_res);
+                    }
+                    { g_warthog_rxdrop_reason = (uint32_t)(100 + fwd_res.drop); g_warthog_rxdrop_count++; goto drop; }
+                }
+            }
+        }
         if (mmpkt_remove_from_start(rxbufview, 6 + ae_len) == NULL)
         {
             { g_warthog_rxdrop_reason = 91; g_warthog_rxdrop_count++; goto drop; }
@@ -835,6 +860,19 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
 
 
     mmpkt_remove_from_start(rxbufview, UMAC_802_1_HEADER_LEN);
+
+    /* Relay: a copy of the body goes on toward the next hop (or every peer
+     * but the sender, for a group frame); a frame for someone else stops
+     * here after that. */
+    if (fwd_active && (fwd_res.verdict == UMAC_MESH_FWD_FORWARD ||
+                       fwd_res.verdict == UMAC_MESH_FWD_DELIVER_AND_FORWARD))
+    {
+        umac_mesh_fwd_glue_forward(umacd, rxbufview, llc_ethertype, header, data_hdr, &fwd_res);
+        if (fwd_res.verdict == UMAC_MESH_FWD_FORWARD)
+        {
+            { g_warthog_rxdrop_reason = 99; g_warthog_rxdrop_count++; goto drop; }
+        }
+    }
 
 
     enum mmwlan_vif vif = MMWLAN_VIF_UNSPECIFIED;
@@ -2085,7 +2123,15 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 
     MMOSAL_DEV_ASSERT(data->ops != NULL);
 
+    if (data->ops == &datapath_ops_mesh)
+    {
+        umac_datapath_mesh_set_cur_tx_md(tx_metadata);
+    }
     data->ops->construct_80211_data_header(stad, header_8023, &data_hdr);
+    if (data->ops == &datapath_ops_mesh)
+    {
+        umac_datapath_mesh_set_cur_tx_md(NULL);
+    }
     const uint32_t data_hdr_len = dot11_data_hdr_get_len(&data_hdr);
 
 
@@ -2177,12 +2223,21 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     if (data->ops == &datapath_ops_mesh)
     {
         qos_ctrl.field |= (uint16_t)0x0100; /* Mesh Control Present */
-        /* Same six octets as before, through the codec the host tests pin. */
-        struct umac_mesh_ctrl mc = { .flags = 0, .ttl = UMAC_MESH_CTRL_TTL,
-                                     .seq = g_warthog_mesh_seq++ };
-        uint8_t mesh_ctrl[UMAC_MESH_CTRL_LEN_MAX];
-        uint16_t mc_len = umac_mesh_ctrl_build(mesh_ctrl, sizeof(mesh_ctrl), &mc);
-        mmpkt_prepend_data(txbufview, mesh_ctrl, mc_len);
+        if (tx_metadata->mesh.mc_len != 0)
+        {
+            /* A relayed or proxied frame brings its own: original sequence
+             * number and source, ttl already decremented, AE as needed. */
+            mmpkt_prepend_data(txbufview, tx_metadata->mesh.mc, tx_metadata->mesh.mc_len);
+        }
+        else
+        {
+            /* Same six octets as before, through the codec the host tests pin. */
+            struct umac_mesh_ctrl mc = { .flags = 0, .ttl = UMAC_MESH_CTRL_TTL,
+                                         .seq = g_warthog_mesh_seq++ };
+            uint8_t mesh_ctrl[UMAC_MESH_CTRL_LEN_MAX];
+            uint16_t mc_len = umac_mesh_ctrl_build(mesh_ctrl, sizeof(mesh_ctrl), &mc);
+            mmpkt_prepend_data(txbufview, mesh_ctrl, mc_len);
+        }
     }
 
     bool host_encrypted = false;
@@ -2353,6 +2408,13 @@ enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
 
     struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(txbuf);
     tx_metadata->enc = is_eapol ? enc : ENCRYPTION_ENABLED;
+    /* Locally originated: no sidecar unless the classifier sets one. Alloc
+     * does not promise zeroed metadata, so clear it here every time. */
+    memset(&tx_metadata->mesh, 0, sizeof(tx_metadata->mesh));
+    if (data->ops == &datapath_ops_mesh && (g_warthog_mesh_fwd || g_warthog_mesh_bridge))
+    {
+        umac_mesh_fwd_glue_tx_classify(txbuf, header_8023->dest_addr, header_8023->src_addr);
+    }
 
     if (is_eapol && !data->ops->is_stad_tx_paused(stad))
     {

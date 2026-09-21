@@ -59,6 +59,14 @@ or RAM; both fit with room to spare.
    management path instead, which the defect does not touch.
 2. **HWMP is already half-present.** The mesh port answers path requests
    aimed at it today. Forwarding is the missing branch, not a new subsystem.
+> **Update.** The forwarding layer described below as future work now exists
+> behind `AT+MESHFWD=1`: HWMP relay (PREQ/PREP/PERR), data-plane forwarding
+> with duplicate suppression, proxied endpoints via Address Extension, and
+> link-loss PERRs — all as freestanding, host-tested decision code with a
+> multi-node simulator over it. It is compiled and off by default; nothing in
+> it has been on a radio, and the `fwdcand` measurement below still decides
+> whether the chip will let a relay see the frames at all.
+
 3. **OpenMANET interoperates at the 802.11s layer without batman-adv.** The
    verified cross-vendor result (`docs/mesh-openmanet.md`) is plain 802.11s.
    batman-adv is a routing layer *on top* of the L2 mesh, not a precondition

@@ -84,6 +84,9 @@ const uint8_t *umac_mesh_ies_supported_rates(uint8_t *len_out);
 
 uint16_t umac_mesh_ies_build_mesh_config(uint8_t *out, uint16_t out_len, bool sae);
 
+/** Set to 1 when this node forwards; the Mesh Configuration capability follows it. */
+extern uint8_t umac_mesh_ies_cap_forwarding;
+
 /**
  * Build a Mesh Peering action-frame body (everything after the 802.11 header).
  *

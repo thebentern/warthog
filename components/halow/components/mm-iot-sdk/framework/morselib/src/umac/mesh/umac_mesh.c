@@ -1673,6 +1673,12 @@ static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_l
     return mmdrv_tx_frame(frm, /*is_mgmt=*/true);
 }
 
+/* Exposed for the forwarding glue; umac_mesh_tx_action() already exists above. */
+const uint8_t *umac_mesh_own_addr(void)
+{
+    return s_mesh_own_addr;
+}
+
 /* Ask @p da for a path to itself.
  *
  * Emitting this is what makes US reachable: a peer that accepts a PREQ installs
@@ -1721,6 +1727,16 @@ void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta)
      * fact working. We do not act on it: mac80211 installs the path to us
      * from our own PREQ's originator block, which is the whole point of
      * emitting one. */
+    /* Relay on: the forwarding engine owns PREQ, PREP and PERR. Off: the
+     * original responder below, untouched. */
+    extern volatile uint32_t g_warthog_mesh_fwd;
+    if (g_warthog_mesh_fwd)
+    {
+        extern void umac_mesh_fwd_glue_hwmp_rx(const uint8_t *body, uint16_t len,
+                                               const uint8_t *ta, uint32_t *own_sn);
+        umac_mesh_fwd_glue_hwmp_rx(body, len, ta, &s_hwmp_sn);
+        return;
+    }
     if (len >= 3u && body[2] == HWMP_EID_PREP)
     {
         g_warthog_hwmp_prep_rx++;

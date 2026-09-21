@@ -19,6 +19,7 @@
 
 #include "mmwlan.h"
 #include "mmwlan_mesh.h"
+#include "umac/mesh/umac_mesh_fwd_glue.h"
 #include "mmlog.h"
 #include "mmosal.h"
 #include <stdio.h>
@@ -49,6 +50,10 @@ static void umac_mesh_start_evt_handler(struct umac_data *umacd, const struct um
 
 enum mmwlan_status mmwlan_mesh_enable(const struct mmwlan_mesh_args *args)
 {
+    /* Forwarding tables and the Mesh Configuration capability bit must exist
+     * before the first beacon and the first PREQ; the app has seeded the gates
+     * by now. Cheap when forwarding is off. */
+    umac_mesh_fwd_glue_init();
     enum mmwlan_status status = MMWLAN_ERROR;
     struct umac_data *umacd = umac_data_get_umacd();
     struct umac_root_data *root = umac_data_get_root(umacd);
@@ -106,4 +111,9 @@ extern int umac_mesh_probe_opcode(uint16_t opcode);
 int mmwlan_mesh_probe_opcode(uint16_t opcode)
 {
     return umac_mesh_probe_opcode(opcode);
+}
+
+int mmwlan_mesh_fwd_render(char *buf, uint32_t len)
+{
+    return umac_mesh_fwd_glue_render(buf, len);
 }

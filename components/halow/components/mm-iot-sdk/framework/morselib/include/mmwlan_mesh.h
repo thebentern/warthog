@@ -117,6 +117,9 @@ int mmwlan_mesh_tx_broadcast_probe(void);
  */
 int mmwlan_mesh_probe_opcode(uint16_t opcode);
 
+/** Render the forwarding path and proxy tables for AT+MESHPATH?. @returns bytes written. */
+int mmwlan_mesh_fwd_render(char *buf, uint32_t len);
+
 #ifdef __cplusplus
 }
 #endif

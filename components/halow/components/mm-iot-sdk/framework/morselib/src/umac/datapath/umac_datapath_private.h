@@ -80,3 +80,11 @@ void umac_datapath_process_rx_action_frame(struct umac_data *umacd,
 enum mmwlan_status umac_datapath_wait_for_tx_ready_(struct umac_datapath_data *data,
                                                     uint32_t timeout_ms,
                                                     uint16_t mask);
+
+/* Warthog mesh: the header builder only receives the 802.3 header, so the
+ * dequeue path hands it the packet's metadata (relayed/proxied endpoints)
+ * for the duration of the call. */
+struct mmdrv_tx_metadata;
+void umac_datapath_mesh_set_cur_tx_md(const struct mmdrv_tx_metadata *md);
+const struct mmdrv_tx_metadata *umac_datapath_mesh_cur_tx_md(void);
+struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr);

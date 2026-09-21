@@ -754,6 +754,11 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
     return MMWLAN_SUCCESS;
 }
 
+struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr)
+{
+    return addr != NULL ? mesh_find_peer_(addr) : NULL;
+}
+
 void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
 {
     for (int i = 0; i < MESH_MAX_PEERS; i++)
@@ -762,6 +767,15 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
             (peer_addr == NULL || umac_sta_data_matches_peer_addr(s_peers[i], peer_addr)))
         {
             struct umac_sta_data *stad = s_peers[i];
+            /* Paths through this neighbour die with it; the relay announces them. */
+            {
+                extern volatile uint32_t g_warthog_mesh_fwd;
+                extern void umac_mesh_fwd_glue_peer_lost(const uint8_t *peer);
+                if (g_warthog_mesh_fwd)
+                {
+                    umac_mesh_fwd_glue_peer_lost(umac_sta_data_peek_peer_addr(stad));
+                }
+            }
             s_peers[i] = NULL;
             /* Tell the chip the station is gone, then drain the queue. */
             (void)mmdrv_update_sta_state(umac_sta_data_get_vif_id(stad),
@@ -844,6 +858,25 @@ static struct umac_sta_data *mesh_lookup_stad_by_tx_dest_addr(struct umac_data *
     if (stad != NULL)
     {
         return stad;
+    }
+    /* Relay or bridge on: a destination that is not a neighbour goes to the
+     * path's next hop. No path yet: a PREQ goes out and this frame is dropped
+     * for the upper layer to retry, as it does for an unanswered ARP. */
+    {
+        extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge;
+        extern const uint8_t *umac_mesh_fwd_glue_next_hop(const uint8_t *dest);
+        if (g_warthog_mesh_fwd || g_warthog_mesh_bridge)
+        {
+            const uint8_t *nh = umac_mesh_fwd_glue_next_hop(dest_addr);
+            if (nh != NULL)
+            {
+                return mesh_find_peer_(nh);
+            }
+            if (!mm_mac_addr_is_multicast(dest_addr))
+            {
+                return NULL;
+            }
+        }
     }
     for (int i = 0; i < MESH_MAX_PEERS; i++)
     {
@@ -977,10 +1010,17 @@ static void mesh_enqueue_tx_frame(struct umac_data *umacd,
     if (group)
     {
         /* Copy to every peer except the one we were handed, which takes the
-         * original. A failed copy drops that peer's replica only. */
+         * original. A failed copy drops that peer's replica only. A relayed
+         * group frame also skips the neighbour it came from. */
+        const struct mmdrv_tx_metadata *md0 = mmdrv_get_tx_metadata(txbuf);
         for (int i = 0; i < MESH_MAX_PEERS; i++)
         {
             if (s_peers[i] == NULL || s_peers[i] == stad)
+            {
+                continue;
+            }
+            if (md0->mesh.exclude_valid &&
+                umac_sta_data_matches_peer_addr(s_peers[i], md0->mesh.exclude_ta))
             {
                 continue;
             }
@@ -1053,6 +1093,10 @@ static bool mesh_dequeue_tx_frame(struct umac_data *umacd,
  * every mesh-mode frame, and the RX side strips it. This builder is the MAC
  * header only.
  */
+static const struct mmdrv_tx_metadata *s_cur_tx_md;
+void umac_datapath_mesh_set_cur_tx_md(const struct mmdrv_tx_metadata *md) { s_cur_tx_md = md; }
+const struct mmdrv_tx_metadata *umac_datapath_mesh_cur_tx_md(void) { return s_cur_tx_md; }
+
 static void mesh_construct_80211_data_header(struct umac_sta_data *stad,
                                              const struct umac_8023_hdr *hdr_8023,
                                              struct dot11_data_hdr *data_hdr)
@@ -1075,7 +1119,19 @@ static void mesh_construct_80211_data_header(struct umac_sta_data *stad,
      * several peers. The IP payload is untouched, so a multicast datagram is
      * still delivered by the receiver's IP layer. */
     const uint8_t *da = mm_mac_addr_is_multicast(hdr_8023->dest_addr) ? ra : hdr_8023->dest_addr;
-    umac_mesh_ies_build_data_hdr4(hdr, ra, ta, da, hdr_8023->src_addr);
+    const uint8_t *sa = hdr_8023->src_addr;
+    /* A relayed or proxied frame carries its mesh endpoints in the sidecar:
+     * addr4 is the ORIGINAL mesh source, not us, and addr3 the mesh DA. */
+    const struct mmdrv_tx_metadata *md = umac_datapath_mesh_cur_tx_md();
+    if (md != NULL && md->mesh.addr_valid)
+    {
+        sa = md->mesh.mesh_sa;
+        if (!mm_mac_addr_is_multicast(md->mesh.mesh_da))
+        {
+            da = md->mesh.mesh_da;
+        }
+    }
+    umac_mesh_ies_build_data_hdr4(hdr, ra, ta, da, sa);
     memcpy(&data_hdr->base.frame_control, &hdr[0], 2);
     mac_addr_copy(data_hdr->base.addr1, &hdr[4]);
     mac_addr_copy(data_hdr->base.addr2, &hdr[10]);

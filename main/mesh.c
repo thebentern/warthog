@@ -365,8 +365,14 @@ void warthog_mesh_smoke_test(void)
     /* Restore the persisted data-plane setting before any peer is added --
      * umac_datapath_mesh_add_peer() reads it at ESTAB, so setting it later
      * would only affect peers that happen to arrive afterwards. */
-    extern volatile uint32_t g_warthog_mesh_secure;
+    extern volatile uint32_t g_warthog_mesh_secure, g_warthog_mesh_fwd, g_warthog_mesh_bridge;
     g_warthog_mesh_secure = warthog_cfg_get_mesh_secure();
+    g_warthog_mesh_fwd = warthog_cfg_get_mesh_fwd();
+    g_warthog_mesh_bridge = warthog_cfg_get_mesh_bridge();
+    /* The gates are read by mmwlan_mesh_enable(), which initialises the
+     * forwarding tables and the capability bit before the first beacon. */
+    ESP_LOGW(TAG, "mesh: forwarding %s, bridge %s",
+             g_warthog_mesh_fwd ? "ON" : "off", g_warthog_mesh_bridge ? "ON" : "off");
     ESP_LOGW(TAG, "mesh data plane: %s (persisted)",
              g_warthog_mesh_secure ? "keyed" : "open");
 
