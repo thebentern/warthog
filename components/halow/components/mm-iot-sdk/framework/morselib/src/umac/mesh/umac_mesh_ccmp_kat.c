@@ -75,6 +75,40 @@ void umac_mesh_ccmp_kat_run(void)
     g_warthog_ccmp_kat_ran++;
 
     /* 1: the vector, separate buffers. */
+    /* Validate the SHIPPING implementation first.
+     *
+     * These stages used to run last, behind four stages of hostap's reference
+     * aes_ccm_*. That ordering meant a failure anywhere in the reference --
+     * which the datapath does not use -- reported ok=0 without ever exercising
+     * warthog_ccm_ae/ad, the functions software CCMP actually depends on. The
+     * cheap ordering is the one where the code we ship is tested even if the
+     * reference is unavailable. */
+    stage = 5;
+    {
+        uint8_t b[sizeof(PT) + 16];
+        uint8_t bmic[8];
+        memcpy(b, PT, sizeof(PT));
+        if (warthog_ccm_ae(K, N, 8, AAD, sizeof(AAD), b, sizeof(PT), bmic) != 0 ||
+            memcmp(b, CT, sizeof(CT)) != 0 || memcmp(bmic, MIC, sizeof(MIC)) != 0)
+        {
+            goto fail;
+        }
+        if (warthog_ccm_ad(K, N, 8, AAD, sizeof(AAD), b, sizeof(CT), MIC) != 0 ||
+            memcmp(b, PT, sizeof(PT)) != 0)
+        {
+            goto fail;
+        }
+        uint8_t badmic[8];
+        memcpy(badmic, MIC, sizeof(badmic));
+        badmic[7] ^= 0x80;
+        memcpy(b, CT, sizeof(CT));
+        if (warthog_ccm_ad(K, N, 8, AAD, sizeof(AAD), b, sizeof(CT), badmic) == 0)
+        {
+            goto fail;
+        }
+    }
+
+
     stage = 1;
     memset(buf, 0, sizeof(buf));
     if (aes_ccm_ae(K, sizeof(K), N, 8, PT, sizeof(PT), AAD, sizeof(AAD), buf, mic) != 0 ||
@@ -144,30 +178,6 @@ void umac_mesh_ccmp_kat_run(void)
      * on the same vector -- including in place, and including refusing a
      * tampered MIC. An optimisation that produces different ciphertext is not
      * an optimisation. */
-    stage = 5;
-    {
-        uint8_t b[sizeof(PT) + 16];
-        uint8_t bmic[8];
-        memcpy(b, PT, sizeof(PT));
-        if (warthog_ccm_ae(K, N, 8, AAD, sizeof(AAD), b, sizeof(PT), bmic) != 0 ||
-            memcmp(b, CT, sizeof(CT)) != 0 || memcmp(bmic, MIC, sizeof(MIC)) != 0)
-        {
-            goto fail;
-        }
-        if (warthog_ccm_ad(K, N, 8, AAD, sizeof(AAD), b, sizeof(CT), MIC) != 0 ||
-            memcmp(b, PT, sizeof(PT)) != 0)
-        {
-            goto fail;
-        }
-        uint8_t badmic[8];
-        memcpy(badmic, MIC, sizeof(badmic));
-        badmic[7] ^= 0x80;
-        memcpy(b, CT, sizeof(CT));
-        if (warthog_ccm_ad(K, N, 8, AAD, sizeof(AAD), b, sizeof(CT), badmic) == 0)
-        {
-            goto fail;
-        }
-    }
 
     /* Split fixed cost from per-block cost.
      *

@@ -35,7 +35,7 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
            ../src/dot11ah/debug.c
 
 TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
-           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccmp_hdr test_s1g_beacon test_mesh_hwmp
+           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp
 
 # The shipping mesh byte-layout code, compiled straight out of the vendored SDK.
 # These tests link the REAL firmware source, not a copy of it -- umac_mesh_ies.c
@@ -90,6 +90,10 @@ CCMSRC := $(HOSTAP)/src/crypto/aes-ccm.c $(HOSTAP)/src/crypto/aes-internal.c \
 test_aes_ccm: test_aes_ccm.c $(CCMSRC)
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-parameter -Wno-sign-compare \
 	  -Ihostcompat -I$(HOSTAP)/src/utils -I$(HOSTAP)/src/crypto -I$(HOSTAP)/src -I$(HOSTAP) $^ -o $@
+
+test_ccm_crosscheck: test_ccm_crosscheck.c $(SDKMESH)/umac_mesh_ccm.c $(CCMSRC)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-parameter -Wno-sign-compare \
+	  -Ihostcompat -I$(SDKMESH) -I$(HOSTAP)/src/utils -I$(HOSTAP)/src/crypto -I$(HOSTAP)/src -I$(HOSTAP) $^ -o $@
 
 test_mesh_data_hdr: test_mesh_data_hdr.c $(MESHIES)
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
