@@ -17,6 +17,7 @@
 #include "mmwlan_internal.h"
 #include "umac/datapath/umac_datapath.h"
 #include "umac/mesh/umac_mesh.h"
+#include "umac/mesh/umac_mesh_ctrl.h"
 #include "umac/datapath/umac_datapath_private.h"
 #include "umac/data/umac_data.h"
 #include "umac/datapath/datapath_defrag.h"
@@ -2176,17 +2177,12 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     if (data->ops == &datapath_ops_mesh)
     {
         qos_ctrl.field |= (uint16_t)0x0100; /* Mesh Control Present */
-        uint8_t mesh_ctrl[6] = {
-            0x00,                       /* flags: no address extension        */
-            UMAC_MESH_CTRL_TTL,         /* TTL                                */
-            0, 0, 0, 0                  /* mesh sequence number, LE           */
-        };
-        uint32_t seq = g_warthog_mesh_seq++;
-        mesh_ctrl[2] = (uint8_t)(seq);
-        mesh_ctrl[3] = (uint8_t)(seq >> 8);
-        mesh_ctrl[4] = (uint8_t)(seq >> 16);
-        mesh_ctrl[5] = (uint8_t)(seq >> 24);
-        mmpkt_prepend_data(txbufview, mesh_ctrl, sizeof(mesh_ctrl));
+        /* Same six octets as before, through the codec the host tests pin. */
+        struct umac_mesh_ctrl mc = { .flags = 0, .ttl = UMAC_MESH_CTRL_TTL,
+                                     .seq = g_warthog_mesh_seq++ };
+        uint8_t mesh_ctrl[UMAC_MESH_CTRL_LEN_MAX];
+        uint16_t mc_len = umac_mesh_ctrl_build(mesh_ctrl, sizeof(mesh_ctrl), &mc);
+        mmpkt_prepend_data(txbufview, mesh_ctrl, mc_len);
     }
 
     bool host_encrypted = false;

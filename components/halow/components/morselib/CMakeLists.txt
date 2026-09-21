@@ -57,6 +57,9 @@ set(SRCS
     ${ROOT_DIR}/src/umac/mesh/umac_mesh_ies.c
     ${ROOT_DIR}/src/umac/mesh/umac_mesh_plink_tbl.c
     ${ROOT_DIR}/src/umac/mesh/umac_mesh_hwmp.c
+    ${ROOT_DIR}/src/umac/mesh/umac_mesh_ctrl.c
+    ${ROOT_DIR}/src/umac/mesh/umac_mesh_rmc.c
+    ${ROOT_DIR}/src/umac/mesh/umac_mesh_pathtbl.c
     ${ROOT_DIR}/src/umac/mesh/umac_mesh_ccmp_kat.c
     ${ROOT_DIR}/src/umac/mesh/umac_mesh_ccm.c
     ${ROOT_DIR}/src/umac/mesh/umac_mesh_ccmp_hdr.c
