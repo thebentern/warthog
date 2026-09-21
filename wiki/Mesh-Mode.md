@@ -28,7 +28,8 @@ node in the mesh** — a mismatch is silent, producing no error and no peers:
 | `WARTHOG_PIN_S1G_BW_MHZ` | `2` |
 | `WARTHOG_PIN_S1G_GLOBAL_OP_CLASS` | `69` |
 
-Channel 42 at 2 MHz is OpenMANET's default, which is why it is Warthog's — see
+Channel 42 at 2 MHz is what Warthog pins by default. It must match your peer
+exactly — read the peer's actual setting rather than assuming a default; see
 [OpenMANET Interop](OpenMANET-Interop).
 
 ## Addressing

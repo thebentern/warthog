@@ -123,7 +123,11 @@ Earlier bench findings, still relevant:
   when running SAE** (`wpa_supplicant_s1g` with `key_mgmt=SAE`; observed in
   its probe responses). Warthog's candidate gate therefore refuses to
   initiate toward it. `AT+SAEBRIDGE=2` overrides the gate for exactly this
-  case.
+  case. **Note (2026-09-20): the verified three-node run peered
+  without setting it.** Either the gate no longer trips against current
+  OpenMANET, or the beacon path now satisfies discovery. Try without it first.
+  Also be aware `AT+SAEBRIDGE` is RAM-only — it resets to 1 on every boot, so
+  anything depending on it is unusable on an unattended node.
 - `sae_pwe=1` (H2E-only) is OpenMANET's shipped default; Warthog sends
   hunt-and-peck Commits, so set `sae_pwe=0` or `2` on the Linux side.
 - The Morse supplicant rejects `MESH_PEER_ADD` even with `user_mpm=1` +

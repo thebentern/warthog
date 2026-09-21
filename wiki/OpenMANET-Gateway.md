@@ -69,7 +69,10 @@ AT+MPMPEERS?
 `estab=1` with a non-zero `plid` is a complete handshake with the Pi.
 
 That is the whole warthog side. Channel, bandwidth and mesh ID are already set
-to OpenMANET's defaults (S1G ch 42, 2 MHz, `halowmesh`) in the build.
+in the build to S1G ch 42, 2 MHz, mesh ID `halowmesh`. These are Warthog's
+values, not necessarily your peer's — OpenMANET's mesh wizard ships different
+defaults (`openmanet-mesh`, and its own channel), so read the peer's actual
+configuration and match it.
 
 ## Setup — OpenMANET
 

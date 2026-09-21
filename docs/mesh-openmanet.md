@@ -38,7 +38,8 @@ across the whole mesh are compile-time flags in `platformio.ini`:
 | `WARTHOG_PIN_S1G_GLOBAL_OP_CLASS` | `69` | yes |
 | `WARTHOG_MESH_BEACON_TU` | `1000` | no |
 
-S1G channel 42 at 2 MHz is OpenMANET's default, which is why it is Warthog's.
+S1G channel 42 at 2 MHz is what Warthog pins by default. Verify your peer's
+actual channel (`morse_cli -i wlh0 channel`) and match it; do not assume.
 Change any of the first five and you must change them on every node, Warthog and
 Linux alike — a mismatch produces a silent non-event, not an error.
 
