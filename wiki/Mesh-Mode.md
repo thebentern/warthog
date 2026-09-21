@@ -72,8 +72,8 @@ AT+MPING=10.77.199.248,4
 
 ## Encryption
 
-Warthog has three mesh security levels. Pick one at build time and, for the
-legacy shared key, at runtime:
+Warthog has three mesh security levels. Which one the image can speak is a
+build choice; the passphrase and the legacy shared key are runtime settings:
 
 | Mode | Build | What it is |
 |---|---|---|
@@ -129,8 +129,11 @@ pio run -e warthog-mesh-sae -t upload
 > trusting a link.
 
 
-The passphrase defaults to `warthog-mesh` and is set at build time with
-`-DWARTHOG_MESH_PASSPHRASE='"your-passphrase"'`. Every node on the mesh needs
+Set the passphrase with `AT+MESHPASS=<pass>` (persisted, next boot);
+`AT+MESHPASS?` reports its length and never its value. Until one is set the
+node uses the build default `warthog-mesh`, which anyone holding the image
+knows — override it with `-DWARTHOG_MESH_PASSPHRASE='"your-passphrase"'` if
+images must be safe before they are configured. Every node on the mesh needs
 the same one.
 
 On boot the node authenticates each SAE peer it discovers (SAE Commit/Confirm,

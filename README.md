@@ -65,8 +65,9 @@ Warthog is not one device role. A node runs an **uplink** and presents
 | **Mesh uplink** | 802.11s peer-to-peer, no infrastructure | `AT+MESHEN=1` on any build; `warthog-mesh-sae` for SAE/AMPE |
 
 Both downstream surfaces are live at once. The two uplink modes are mutually
-exclusive; which one runs is a runtime setting (`AT+MESHEN`), though SAE/AMPE
-and the mesh channel pin are still chosen at build time.
+exclusive; which one runs is a runtime setting (`AT+MESHEN`), as are the mesh
+ID, passphrase and channel. Whether the build speaks SAE/AMPE at all is still
+chosen at build time.
 
 ### Warthog is a mesh leaf, not a relay
 
@@ -334,9 +335,9 @@ pio run -e warthog-mesh-smoke -t upload    # open: for stock (unencrypted) OpenM
 
 The encrypted build runs real 802.11s security — SAE authentication
 (Dragonfly, group 19) and AMPE key exchange, with per-link pairwise and group
-keys installed in the radio. All nodes share a passphrase set at build time
-(`-DWARTHOG_MESH_PASSPHRASE='"..."'`, default `warthog-mesh`). Peering, keying
-and addressing are automatic.
+keys installed in the radio. All nodes share one passphrase: `AT+MESHPASS=` at
+runtime, defaulting to the build's `WARTHOG_MESH_PASSPHRASE` (`warthog-mesh`)
+until one is set. Peering, keying and addressing are automatic.
 
 Nodes address themselves statically from their own MAC — `10.77.<mac[4]>.<mac[5]>/16`
 — so `3c:1a:cc:4c:83:a5` is `10.77.131.165`. There is no DHCP on the mesh.
