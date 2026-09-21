@@ -14,6 +14,7 @@
 #include "mmhalow.h"
 #include "cfg.h"
 #include "mesh_diag.h"
+#include "mesh_bridge.h"
 
 /* 802.11s security. Default OFF: stock OpenMANET ships encryption='none', and
  * an open mesh is what it must be matched with. The warthog-mesh-sae env turns
@@ -119,7 +120,9 @@ extern volatile unsigned int g_warthog_hostap_estab;
 static bool s_mesh_netif_up;
 static void mesh_netif_up_(void)
 {
-    esp_netif_t *netif = mmhalow_get_netif();
+    /* In bridge mode the bridge is the L3 interface; the mesh netif is a port. */
+    esp_netif_t *netif = warthog_mesh_bridge_active() ? warthog_mesh_bridge_netif()
+                                                      : mmhalow_get_netif();
     if (netif == NULL || s_mesh_netif_up) {
         return;
     }

@@ -4,6 +4,7 @@ idf_component_register(
         "halow.c"
         "mesh.c"
         "mesh_diag.c"
+        "mesh_bridge.c"
         "usb_net.c"
         "wifi_ap.c"
         "nat.c"

@@ -88,6 +88,12 @@ that is 802.11s HWMP forwarding, and it is not built yet. See
 
 ### Warthog routes, it does not bridge
 
+> **Unless `AT+MESHBRIDGE=1`.** Bridge mode puts USB, the Wi-Fi AP and the
+> mesh on one L2 segment and turns NAT off; it exists precisely to remove the
+> limitations below, and it is compiled but not yet measured on air. See
+> [Mesh Mode](wiki/Mesh-Mode.md#bridge-mode). Everything in this section
+> describes the default, NAT mode.
+
 Every surface is its own IP subnet and Warthog NAPTs between them
 (`main/nat.c`). The tethered host is **not** on the same layer-2 segment as
 anything upstream, and that has consequences worth knowing before you design
@@ -111,9 +117,9 @@ around it:
   mDNS/SD, whose A records would advertise unroutable addresses.
 
   Point-to-point CoT to a known, routable address still works; discovery does
-  not. What would fix it is one L2 segment with unique host addresses —
-  bridging rather than NAT — see `docs/mesh-attachment-model.md`, not a bigger
-  repeater.
+  not. What fixes it is one L2 segment with unique host addresses — bridging
+  rather than NAT — which is what `AT+MESHBRIDGE=1` now provides (compiled,
+  not yet measured on air), not a bigger repeater.
 - **Inbound connections need explicit forwarding.** Upstream devices cannot
   reach the tethered host by address, because it is behind NAT.
 

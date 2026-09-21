@@ -13,6 +13,9 @@
 #include "led.h"
 #include "nat.h"
 #include "region.h"
+#include "mesh_bridge.h"
+#include "mmhalow.h"
+#include "mmwlan.h"
 #include "usb_net.h"
 #include "wifi_ap.h"
 
@@ -63,6 +66,15 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(750));
     (void)warthog_wifi_ap_start();
 
+    /* Bridge mode replaces NAT and the multicast repeater with one L2 segment. */
+    if (warthog_cfg_get_mesh_bridge()) {
+        uint8_t mesh_mac[6] = { 0 };
+        mmwlan_get_mac_addr(mesh_mac);
+        esp_err_t be = warthog_mesh_bridge_start(mmhalow_get_netif(), mesh_mac);
+        if (be != ESP_OK) {
+            ESP_LOGE(TAG, "bridge mode requested but not started (%s); NAT mode", esp_err_to_name(be));
+        }
+    }
     ESP_ERROR_CHECK(warthog_nat_start());
     /* Multicast repeater: bridges 239.0.0.69:4403 (Meshtastic's UDP transport)
      * between the USB, Wi-Fi AP and HaLow-mesh netifs. lwIP does not forward

@@ -117,6 +117,37 @@ a 4-address frame whose mesh destination is a third party (`AT+RXCHAN?`
 need a board. Until then forwarding is compiled, simulated and off by
 default.
 
+## Bridge mode
+
+`AT+MESHBRIDGE=1` then `AT+RESET` replaces NAT with one layer-2 segment. The
+USB netif, the Wi-Fi AP and the mesh netif become ports of an lwIP bridge
+whose MAC is the mesh MAC; the bridge is the node's L3 interface and takes a
+DHCP lease from the mesh (an OpenMANET node's dnsmasq) or the static
+`10.77.x.y` fallback, exactly as the mesh netif did.
+
+What this buys: a tethered host's frames leave the mesh carrying the host's
+own MAC in Address Extension and come back the same way, and its address
+comes from the mesh's DHCP server, so two hosts on opposite sides of a mesh
+are distinct. That is the precondition CoT and mDNS discovery were missing —
+under NAT every warthog's host is `192.168.4.x`, and the addresses those
+protocols carry in their payloads alias the receiver's own subnet.
+
+What it costs: the USB and AP DHCP servers stop, so a tethered host gets an
+address only if the mesh has a DHCP server (on a warthog-only mesh, use a
+static or link-local address); NAT and the Meshtastic multicast repeater are
+off, because the bridge floods L2 multicast itself; and the node needs
+`CONFIG_ESP_NETIF_BRIDGE_EN`, which the shipped `sdkconfig.defaults` now sets.
+An image built without it logs the fact and stays in NAT mode rather than
+pretending.
+
+**How much of this is verified.** The address logic — which frames get
+Address Extension, which mesh node a host sits behind, what a receiver
+delivers — is the same freestanding code the simulator drives (scenario 4:
+hosts behind opposite ends reach each other with their real addresses). The
+lwIP bridge itself and its interaction with the USB and AP drivers are
+compiled and reasoned, not run. Until a board is on the bench this is a mode
+that builds, not one that has carried a packet.
+
 ## Encryption
 
 Warthog has three mesh security levels. Which one the image can speak is a

@@ -1,4 +1,5 @@
 #include "nat.h"
+#include "mesh_bridge.h"
 
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -32,6 +33,9 @@ static esp_netif_t *get_netif(const char *key)
 
 static void enforce_state(void)
 {
+    if (warthog_mesh_bridge_active()) {
+        return; /* one L2 segment; there is nothing to translate */
+    }
     esp_netif_t *halow = get_netif("WIFI_STA_DEF");
     if (!halow) {
         return;

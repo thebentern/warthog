@@ -123,3 +123,8 @@ CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=32
 # Reboot silently instead: the flash core dump still gets written, RTC
 # survives the SW reset, and the board comes back up readable.
 CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y
+
+# L2 bridge mode (AT+MESHBRIDGE=1): USB, Wi-Fi AP and mesh as ports of one
+# lwIP bridge. Off at runtime by default; this only compiles it in.
+CONFIG_ESP_NETIF_BRIDGE_EN=y
+CONFIG_LWIP_NUM_NETIF_CLIENT_DATA=1

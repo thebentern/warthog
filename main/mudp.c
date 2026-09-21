@@ -24,6 +24,7 @@
  */
 
 #include "mudp.h"
+#include "mesh_bridge.h"
 
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -158,6 +159,10 @@ static void mudp_task(void *arg)
 
 esp_err_t warthog_mudp_start(void)
 {
+    if (warthog_mesh_bridge_active()) {
+        ESP_LOGI(TAG, "bridge mode: L2 multicast crosses the bridge; repeater not started");
+        return ESP_OK;
+    }
     int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s < 0) {
         ESP_LOGE(TAG, "socket failed errno=%d", errno);
