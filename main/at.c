@@ -507,6 +507,51 @@ volatile uint32_t g_warthog_rx_meshctrl_ae = 0;
  * would forward. Non-zero proves the chip delivers them to the host, which is
  * the open question gating 802.11s forwarding. */
 volatile uint32_t g_warthog_rx_fwd_candidate = 0;
+
+/* Per-peer RSSI, the thing that makes a mesh link diagnosable rather than
+ * merely present. Aggregate counters say traffic moves; they do not say which
+ * neighbour is marginal. Small fixed table, no allocation, written from the
+ * RX path and read by AT+MESHRSSI?. */
+#define WARTHOG_RSSI_PEERS 6
+struct warthog_peer_rssi {
+    uint8_t  mac[6];
+    int16_t  last;
+    int16_t  min;
+    int16_t  max;
+    uint32_t frames;
+    bool     used;
+};
+static struct warthog_peer_rssi s_peer_rssi[WARTHOG_RSSI_PEERS];
+
+void warthog_mesh_rssi_note(const uint8_t *ta, int16_t rssi)
+{
+    if (ta == NULL) {
+        return;
+    }
+    int free_slot = -1;
+    for (int i = 0; i < WARTHOG_RSSI_PEERS; i++) {
+        if (s_peer_rssi[i].used) {
+            if (memcmp(s_peer_rssi[i].mac, ta, 6) == 0) {
+                s_peer_rssi[i].last = rssi;
+                if (rssi < s_peer_rssi[i].min) { s_peer_rssi[i].min = rssi; }
+                if (rssi > s_peer_rssi[i].max) { s_peer_rssi[i].max = rssi; }
+                s_peer_rssi[i].frames++;
+                return;
+            }
+        } else if (free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (free_slot < 0) {
+        return; /* more neighbours than slots; keep the ones we know */
+    }
+    memcpy(s_peer_rssi[free_slot].mac, ta, 6);
+    s_peer_rssi[free_slot].last = rssi;
+    s_peer_rssi[free_slot].min = rssi;
+    s_peer_rssi[free_slot].max = rssi;
+    s_peer_rssi[free_slot].frames = 1;
+    s_peer_rssi[free_slot].used = true;
+}
 volatile uint8_t  g_warthog_rx_fwd_last_da[6] = {0};
 volatile uint32_t g_warthog_mesh_seq = 0;
 volatile uint32_t g_warthog_nodec_group = 0, g_warthog_nodec_fc = 0, g_warthog_nodec_keyid = 0;
@@ -1656,6 +1701,24 @@ static void dispatch(char *line)
         } else {
             reply_error("usage: AT+MESHEN=<0|1>");
         }
+    } else if (strcasecmp(verb, "MESHRSSI") == 0 && terminator == '?') {
+        char line[128];
+        int shown = 0;
+        for (int i = 0; i < WARTHOG_RSSI_PEERS; i++) {
+            if (!s_peer_rssi[i].used) { continue; }
+            snprintf(line, sizeof(line),
+                     "+MESHRSSI: %02x:%02x:%02x:%02x:%02x:%02x last=%d min=%d max=%d frames=%lu\r\n",
+                     s_peer_rssi[i].mac[0], s_peer_rssi[i].mac[1], s_peer_rssi[i].mac[2],
+                     s_peer_rssi[i].mac[3], s_peer_rssi[i].mac[4], s_peer_rssi[i].mac[5],
+                     (int)s_peer_rssi[i].last, (int)s_peer_rssi[i].min,
+                     (int)s_peer_rssi[i].max, (unsigned long)s_peer_rssi[i].frames);
+            cdc_write(line);
+            shown++;
+        }
+        if (shown == 0) {
+            cdc_write("+MESHRSSI: no neighbours heard yet\r\n");
+        }
+        reply_ok();
     } else if (strcasecmp(verb, "MESHCHAN") == 0 && terminator == '=') {
         /* chan,freq_hz,global_class,s1g_class,bw_mhz -- one set, because class
          * and bandwidth belong to the channel. "default" clears the override. */

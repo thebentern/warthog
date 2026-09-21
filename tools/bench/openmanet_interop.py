@@ -150,6 +150,9 @@ def main():
         n = int(m.group(1)) if m else 0
         check("peering/%s" % w.split("/")[-1], n >= want, "count=%d/%d" % (n, want))
         # Diagnostics that are meaningless to assert on but decide what to do next.
+        for line in at(w, ["AT+MESHRSSI?"]).splitlines():
+            if line.strip().startswith("+MESHRSSI:"):
+                print("        %s" % line.strip())
         for tag in ("ae=", "fwdcand=", "nodec grp="):
             m = re.search(re.escape(tag) + r"(\S+)", t)
             if m:
