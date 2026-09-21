@@ -37,7 +37,9 @@ static struct umac_mesh_path *find_(struct umac_mesh_pathtbl *t, const uint8_t *
     return NULL;
 }
 
-/* A free slot, else an expired one, else the one expiring soonest. */
+/* A free slot, else an expired or inactive one. A live path is never evicted
+ * for a newcomer: HWMP is unauthenticated, and a stream of forged originators
+ * must not be able to push real routes out (mac80211 refuses with -ENOSPC). */
 static struct umac_mesh_path *alloc_(struct umac_mesh_pathtbl *t, uint32_t now_ms)
 {
     struct umac_mesh_path *victim = NULL;
@@ -48,11 +50,8 @@ static struct umac_mesh_path *alloc_(struct umac_mesh_pathtbl *t, uint32_t now_m
         {
             return e;
         }
-        if (past_(now_ms, e->exp_ms))
-        {
-            return e;
-        }
-        if (victim == NULL || (int32_t)(e->exp_ms - victim->exp_ms) < 0)
+        bool dead = past_(now_ms, e->exp_ms) || !(e->flags & UMAC_MESH_PATH_ACTIVE);
+        if (dead && (victim == NULL || (int32_t)(e->exp_ms - victim->exp_ms) < 0))
         {
             victim = e;
         }

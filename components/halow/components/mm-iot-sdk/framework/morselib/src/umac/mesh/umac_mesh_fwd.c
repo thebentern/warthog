@@ -27,10 +27,18 @@ void umac_mesh_fwd_rx(const struct umac_mesh_fwd_ctx *c, const struct umac_mesh_
     }
     uint8_t ae = umac_mesh_ctrl_ae(&f->mc);
     const uint8_t *mesh_sa = f->group ? f->addr3 : f->addr4;
+    memcpy(r->mesh_sa, mesh_sa, 6);
+    memcpy(r->mesh_da, f->group ? f->addr1 : f->addr3, 6);
 
     if (eq_(mesh_sa, c->own_addr))
     {
         drop_(r, UMAC_MESH_FWD_DROP_OWN);
+        return;
+    }
+    /* mac80211: a Mesh Control ttl of 0 is dropped outright, group or not. */
+    if (f->mc.ttl == 0u)
+    {
+        drop_(r, UMAC_MESH_FWD_DROP_TTL0);
         return;
     }
 

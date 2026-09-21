@@ -34,8 +34,12 @@ extern volatile uint32_t g_warthog_hwmp_relay_preq, g_warthog_hwmp_relay_prep, g
 static struct umac_mesh_pathtbl s_tbl;
 static struct umac_mesh_rmc s_rmc;
 static struct mmosal_mutex *s_lock;
-static uint32_t s_last_preq_ms;
-static uint8_t s_last_preq_target[6];
+/* Discovery is rate-limited per target AND globally: a host behind us pinging
+ * many unknown addresses must not turn into a PREQ broadcast per packet. */
+#define PREQ_TARGETS 4u
+#define PREQ_GLOBAL_MIN_MS 50u
+static struct { uint8_t target[6]; uint32_t last_ms; bool used; } s_preq[PREQ_TARGETS];
+static uint32_t s_preq_any_ms;
 
 /* Hop cost. mac80211's airtime metric for one S1G hop lands in the low
  * thousands; a constant keeps route choice sane without a rate feed. */
@@ -155,14 +159,12 @@ void umac_mesh_fwd_glue_forward(struct umac_data *umacd, struct mmpktview *body,
         g_warthog_fwd_nomem++;
         return;
     }
-    /* Rebuild as the 802.3 frame the TX entry expects. The mesh endpoints go
-     * in the sidecar; dst/src here only feed the group/unicast choice. */
-    const uint8_t *mesh_sa = group ? hdr->addr3 : dot11_get_sa_data(dhdr);
-    const uint8_t *mesh_da = group ? r->fwd_ra : dot11_get_da(hdr);
-    if (group && umac_mesh_ctrl_ae(&r->fwd_mc) == UMAC_MESH_CTRL_AE_A4)
-    {
-        mesh_sa = hdr->addr3;
-    }
+    /* Rebuild as the 802.3 frame the TX entry expects. The mesh endpoints are
+     * the ENGINE's view -- on a replica addr3 is the previous hop, not the
+     * source, and the duplicate cache downstream is keyed on the source. */
+    (void)dhdr;
+    const uint8_t *mesh_sa = r->mesh_sa;
+    const uint8_t *mesh_da = r->mesh_da;
     struct umac_8023_hdr h8023;
     memcpy(h8023.dest_addr, mesh_da, 6);
     memcpy(h8023.src_addr, mesh_sa, 6);
@@ -197,7 +199,10 @@ void umac_mesh_fwd_glue_forward(struct umac_data *umacd, struct mmpktview *body,
     struct umac_sta_data *stad = NULL;
     if (group)
     {
-        stad = data->ops->lookup_stad_by_tx_dest_addr(umacd, mesh_da);
+        /* The original replica must not go back to whoever sent it; the
+         * fan-out in mesh_enqueue_tx_frame excludes the sender for the copies. */
+        extern struct umac_sta_data *umac_datapath_mesh_first_peer_except(const uint8_t *excl);
+        stad = umac_datapath_mesh_first_peer_except(dot11_get_ta(hdr));
     }
     else
     {
@@ -216,22 +221,38 @@ void umac_mesh_fwd_glue_forward(struct umac_data *umacd, struct mmpktview *body,
 static void maybe_preq_(const uint8_t *target)
 {
     uint32_t now = mmosal_get_time_ms();
-    if (memcmp(target, s_last_preq_target, 6) == 0 &&
-        (uint32_t)(now - s_last_preq_ms) < UMAC_MESH_FWD_PREQ_MIN_INTERVAL_MS)
+    if ((uint32_t)(now - s_preq_any_ms) < PREQ_GLOBAL_MIN_MS)
     {
         return;
     }
-    memcpy(s_last_preq_target, target, 6);
-    s_last_preq_ms = now;
+    uint32_t slot = PREQ_TARGETS, oldest = 0;
+    for (uint32_t i = 0; i < PREQ_TARGETS; i++)
+    {
+        if (s_preq[i].used && memcmp(s_preq[i].target, target, 6) == 0)
+        {
+            if ((uint32_t)(now - s_preq[i].last_ms) < UMAC_MESH_FWD_PREQ_MIN_INTERVAL_MS)
+            {
+                return;
+            }
+            slot = i;
+            break;
+        }
+        if (!s_preq[i].used) { if (slot == PREQ_TARGETS) { slot = i; } }
+        else if ((int32_t)(s_preq[i].last_ms - s_preq[oldest].last_ms) < 0) { oldest = i; }
+    }
+    if (slot == PREQ_TARGETS) { slot = oldest; }
+    memcpy(s_preq[slot].target, target, 6);
+    s_preq[slot].last_ms = now;
+    s_preq[slot].used = true;
+    s_preq_any_ms = now;
     if (umac_mesh_hwmp_send_preq(target) >= 0)
     {
         g_warthog_fwd_preq_tx++;
     }
 }
 
-const uint8_t *umac_mesh_fwd_glue_next_hop(const uint8_t *dest)
+bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6])
 {
-    static uint8_t nh[6];
     struct umac_mesh_fwd_ctx c = fctx_();
     struct umac_mesh_fwd_tx_result t;
     lock_();
@@ -239,14 +260,14 @@ const uint8_t *umac_mesh_fwd_glue_next_hop(const uint8_t *dest)
     unlock_();
     if (t.ok && t.shape == UMAC_MESH_TX_UNICAST_4ADDR)
     {
-        memcpy(nh, t.ra, 6);
-        return nh;
+        memcpy(out, t.ra, 6);
+        return true;
     }
     if (t.need_path)
     {
         maybe_preq_(t.path_target);
     }
-    return NULL;
+    return false;
 }
 
 void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, const uint8_t *sa)
@@ -258,22 +279,37 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
     umac_mesh_fwd_tx(&c, da, sa, g_warthog_mesh_seq, &t);
     unlock_();
     struct mmdrv_tx_metadata *md = mmdrv_get_tx_metadata(txbuf);
-    /* Only a proxied frame needs the sidecar; an ordinary one keeps the
-     * default Mesh Control and the default addresses. */
-    if (umac_mesh_ctrl_ae(&t.mc) == UMAC_MESH_CTRL_AE_NONE && !t.need_path)
-    {
-        return;
-    }
     if (t.need_path)
     {
         maybe_preq_(t.path_target);
     }
+    if (t.shape == UMAC_MESH_TX_GROUP_3ADDR)
+    {
+        /* Group frames still go out as one unicast per peer on this chip. So
+         * the receiver can tell a broadcast from a unicast to itself -- and a
+         * second warthog can re-flood it -- the group DA and the source ride
+         * in AE 2, the form the receive side recognises as a group replica.
+         * Without it a warthog's own broadcasts stop at the first hop, and a
+         * bridged host's went out as AE 1 on a 4-address frame, a shape
+         * nobody accepts. */
+        struct umac_mesh_ctrl mc = t.mc;
+        mc.flags = (uint8_t)((t.mc.flags & ~UMAC_MESH_CTRL_AE_MASK) | UMAC_MESH_CTRL_AE_A5A6);
+        memcpy(mc.eaddr1, da, 6);
+        memcpy(mc.eaddr2, sa, 6);
+        g_warthog_mesh_seq++;
+        md->mesh.mc_len = (uint8_t)umac_mesh_ctrl_build(md->mesh.mc, sizeof(md->mesh.mc), &mc);
+        md->mesh.addr_valid = 1;
+        memcpy(md->mesh.mesh_da, da, 6);
+        memcpy(md->mesh.mesh_sa, c.own_addr, 6);
+        return;
+    }
+    /* Unicast: only a proxied frame needs the sidecar. */
     if (umac_mesh_ctrl_ae(&t.mc) != UMAC_MESH_CTRL_AE_NONE)
     {
         g_warthog_mesh_seq++;
         md->mesh.mc_len = (uint8_t)umac_mesh_ctrl_build(md->mesh.mc, sizeof(md->mesh.mc), &t.mc);
         md->mesh.addr_valid = 1;
-        memcpy(md->mesh.mesh_da, t.shape == UMAC_MESH_TX_GROUP_3ADDR ? da : t.addr3, 6);
+        memcpy(md->mesh.mesh_da, t.addr3, 6);
         memcpy(md->mesh.mesh_sa, c.own_addr, 6);
     }
 }
@@ -286,6 +322,13 @@ void umac_mesh_fwd_glue_hwmp_rx(const uint8_t *body, uint16_t len, const uint8_t
         .link_metric = UMAC_MESH_FWD_HOP_METRIC, .path_lifetime_ms = UMAC_MESH_PATH_LIFETIME_MS,
         .now_ms = mmosal_get_time_ms(), .own_sn = own_sn,
     };
+    /* mac80211 processes path selection only from an ESTAB peer; anyone else
+     * on the channel could otherwise poison the table or trigger PERRs. */
+    if (umac_datapath_mesh_find_peer(ta) == NULL)
+    {
+        g_warthog_fwd_drop_bad++;
+        return;
+    }
     struct umac_mesh_hwmp_action a; enum umac_mesh_hwmp_drop why;
     lock_();
     (void)umac_mesh_hwmp_relay(&c, body, len, ta, &a, &why);

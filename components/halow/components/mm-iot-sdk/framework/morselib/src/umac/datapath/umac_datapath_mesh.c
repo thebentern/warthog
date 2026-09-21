@@ -759,6 +759,21 @@ struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr)
     return addr != NULL ? mesh_find_peer_(addr) : NULL;
 }
 
+/* Any established peer other than @p excl, for the original copy of a relayed
+ * group frame; NULL when the sender is our only neighbour. */
+struct umac_sta_data *umac_datapath_mesh_first_peer_except(const uint8_t *excl)
+{
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        if (s_peers[i] != NULL &&
+            (excl == NULL || !umac_sta_data_matches_peer_addr(s_peers[i], excl)))
+        {
+            return s_peers[i];
+        }
+    }
+    return NULL;
+}
+
 void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
 {
     for (int i = 0; i < MESH_MAX_PEERS; i++)
@@ -864,11 +879,11 @@ static struct umac_sta_data *mesh_lookup_stad_by_tx_dest_addr(struct umac_data *
      * for the upper layer to retry, as it does for an unanswered ARP. */
     {
         extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge;
-        extern const uint8_t *umac_mesh_fwd_glue_next_hop(const uint8_t *dest);
+        extern bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6]);
         if (g_warthog_mesh_fwd || g_warthog_mesh_bridge)
         {
-            const uint8_t *nh = umac_mesh_fwd_glue_next_hop(dest_addr);
-            if (nh != NULL)
+            uint8_t nh[6];
+            if (umac_mesh_fwd_glue_next_hop(dest_addr, nh))
             {
                 return mesh_find_peer_(nh);
             }

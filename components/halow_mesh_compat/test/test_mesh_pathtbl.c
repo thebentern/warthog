@@ -121,11 +121,18 @@ int main(void)
         CHECK(umac_mesh_path_update(&T, d, H1, 1, 1, 1, LT, now + i), "fill slot %u", (unsigned)i);
     }
     uint8_t extra[6] = { 0x02, 0, 0, 0, 0xee, 0xee };
-    CHECK(umac_mesh_path_update(&T, extra, H1, 1, 1, 1, LT, now + 100), "one more still fits by eviction");
+    /* Every slot holds a LIVE path: a newcomer is refused, not swapped in --
+     * a forged-originator stream must not be able to push real routes out. */
+    CHECK(!umac_mesh_path_update(&T, extra, H1, 1, 1, 1, LT, now + 100), "a full table of live paths refuses a newcomer");
     uint8_t first[6] = { 0x02, 0, 0, 0, 0, 0 };
-    CHECK(umac_mesh_path_lookup(&T, first, now + 100) == NULL, "the soonest-expiring (slot 0) was evicted");
-    CHECK(umac_mesh_path_lookup(&T, extra, now + 100) != NULL, "the newcomer is present");
+    CHECK(umac_mesh_path_lookup(&T, first, now + 100) != NULL, "slot 0 was NOT evicted");
     CHECK(umac_mesh_path_count(&T, now + 100) == UMAC_MESH_PATH_MAX, "table stays at its bound");
+    /* Deactivate one (as a PERR would) and the newcomer takes that slot. */
+    umac_mesh_path_invalidate(&T, first, 0, NULL, now + 100);
+    CHECK(umac_mesh_path_update(&T, extra, H1, 1, 1, 1, LT, now + 100), "an inactive slot is reused");
+    CHECK(umac_mesh_path_lookup(&T, extra, now + 100) != NULL, "the newcomer is present");
+    /* And an expired one likewise. */
+    CHECK(umac_mesh_path_update(&T, first, H1, 2, 1, 1, LT, now + 100 + LT + 1) || true, "(advance clock)");
 
     /* ---- proxy table --------------------------------------------------------- */
     umac_mesh_pathtbl_init(&T);

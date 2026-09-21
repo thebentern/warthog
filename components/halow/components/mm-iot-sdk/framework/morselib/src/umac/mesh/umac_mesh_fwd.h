@@ -64,6 +64,7 @@ enum umac_mesh_fwd_drop {
     UMAC_MESH_FWD_DROP_TTL,
     UMAC_MESH_FWD_DROP_NO_PATH,   /* a PERR goes back instead */
     UMAC_MESH_FWD_DROP_BAD_AE,    /* AE mode that makes no sense for the shape */
+    UMAC_MESH_FWD_DROP_TTL0,      /* arrived with ttl 0: mac80211 drops these */
 };
 
 struct umac_mesh_fwd_rx_result {
@@ -76,6 +77,10 @@ struct umac_mesh_fwd_rx_result {
      * and the body are carried unchanged. */
     uint8_t fwd_ra[6];
     struct umac_mesh_ctrl fwd_mc;
+    /* The frame's mesh endpoints as the engine understood them -- a relay
+     * must carry THESE forward, not whatever the previous hop put in addr3. */
+    uint8_t mesh_da[6];
+    uint8_t mesh_sa[6];
     /* NO_PATH: a PERR to send back to the transmitter. */
     bool send_perr;
     uint8_t perr_to[6];

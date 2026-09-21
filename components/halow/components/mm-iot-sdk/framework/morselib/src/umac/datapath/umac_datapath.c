@@ -48,7 +48,12 @@ static const uint8_t snap_802_1h[] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
 
 /* +6 for the 802.11s Mesh Control field, which mesh mode prepends. Harmless
  * headroom for STA/AP. */
-#define MAX_QOS_DATA_MAC_HEADER_LEN (sizeof(struct dot11_data_hdr) + sizeof(struct dot11_qos_ctrl) + 6)
+/* Headroom for the largest data header this path can build: 4-address MAC,
+ * QoS, an 18-byte Mesh Control with Address Extension, and a CCMP header when
+ * the host encrypts. Sized for 6 octets of Mesh Control, the first proxied or
+ * relayed frame overran it and mmpkt_prepend asserted. */
+#define MAX_QOS_DATA_MAC_HEADER_LEN (sizeof(struct dot11_data_hdr) + sizeof(struct dot11_qos_ctrl) + \
+                                     UMAC_MESH_CTRL_LEN_MAX + DOT11_CCMP_HEADER_LEN)
 
 
 #define ETHERTYPE_THRESHOLD 1536
@@ -853,10 +858,21 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
 
     /* Prefer the Address Extension endpoints when the sender proxied for
      * someone: they are the real ends of the conversation. */
-    umac_datapath_generate_8023_header(have_ae_da ? ae_da : dot11_get_da(header),
-                                       have_ae_sa ? ae_sa : dot11_get_sa_data(data_hdr),
-                                       llc_ethertype,
-                                       &header_8023);
+    /* With the relay on, the engine already decided the endpoints (and, for
+     * a group replica, that the DA is the group); its answer is the one the
+     * host tests pin. */
+    if (fwd_active)
+    {
+        umac_datapath_generate_8023_header(fwd_res.deliver_da, fwd_res.deliver_sa,
+                                           llc_ethertype, &header_8023);
+    }
+    else
+    {
+        umac_datapath_generate_8023_header(have_ae_da ? ae_da : dot11_get_da(header),
+                                           have_ae_sa ? ae_sa : dot11_get_sa_data(data_hdr),
+                                           llc_ethertype,
+                                           &header_8023);
+    }
 
 
     mmpkt_remove_from_start(rxbufview, UMAC_802_1_HEADER_LEN);

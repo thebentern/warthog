@@ -73,6 +73,7 @@ int main(void)
     struct umac_mesh_rx_frame g = group_from(A, A, 10, 31, 0, NULL);
     umac_mesh_fwd_rx(&c, &g, &r);
     CHECK(r.verdict == UMAC_MESH_FWD_DELIVER_AND_FORWARD, "group from A: deliver AND forward");
+    CHECK(memcmp(r.mesh_sa, A, 6) == 0 && memcmp(r.mesh_da, BC, 6) == 0, "group result carries mesh SA=A (the source, not the hop)");
     CHECK(memcmp(r.deliver_da, BC, 6) == 0 && memcmp(r.deliver_sa, A, 6) == 0, "delivered as bcast from A");
     CHECK(memcmp(r.fwd_ra, BC, 6) == 0 && r.fwd_mc.ttl == 30 && r.fwd_mc.seq == 10, "rebroadcast to bcast, ttl 30, same seq");
     umac_mesh_fwd_rx(&c, &g, &r);
@@ -85,6 +86,13 @@ int main(void)
     struct umac_mesh_rx_frame viaB = group_from(A, B, 10, 30, 0, NULL);
     umac_mesh_fwd_rx(&c, &viaB, &r);
     CHECK(r.verdict == UMAC_MESH_FWD_DROP && r.drop == UMAC_MESH_FWD_DROP_DUP, "A's frame via B with the same seq is a duplicate -- no loop");
+    /* ttl 0: dropped outright, as mac80211 does. */
+    struct umac_mesh_rx_frame zero = group_from(A, A, 15, 0, 0, NULL);
+    umac_mesh_fwd_rx(&c, &zero, &r);
+    CHECK(r.verdict == UMAC_MESH_FWD_DROP && r.drop == UMAC_MESH_FWD_DROP_TTL0, "group at ttl 0 is dropped, not delivered");
+    struct umac_mesh_rx_frame zero_u = uni(W, A, W, A, 16, 0, 0, NULL, NULL);
+    umac_mesh_fwd_rx(&c, &zero_u, &r);
+    CHECK(r.verdict == UMAC_MESH_FWD_DROP && r.drop == UMAC_MESH_FWD_DROP_TTL0, "unicast at ttl 0 is dropped too");
     /* ttl 1: delivered, not forwarded. */
     struct umac_mesh_rx_frame low = group_from(A, A, 11, 1, 0, NULL);
     umac_mesh_fwd_rx(&c, &low, &r);
@@ -125,6 +133,7 @@ int main(void)
     umac_mesh_fwd_rx(&c, &f3, &r);
     CHECK(r.verdict == UMAC_MESH_FWD_FORWARD, "unicast for C is forwarded");
     CHECK(memcmp(r.fwd_ra, B, 6) == 0, "to B, the next hop for C");
+    CHECK(memcmp(r.mesh_da, C, 6) == 0 && memcmp(r.mesh_sa, A, 6) == 0, "result carries mesh DA=C, SA=A for the relay to keep");
     CHECK(r.fwd_mc.ttl == 30 && r.fwd_mc.seq == 30 && umac_mesh_ctrl_ae(&r.fwd_mc) == 0, "ttl-1, seq and AE carried");
     /* Direct peer without a path entry: still forwardable. */
     struct umac_mesh_rx_frame f4 = uni(W, A, B, A, 31, 31, 0, NULL, NULL);
