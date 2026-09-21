@@ -93,6 +93,11 @@ changes, all of it 802.11s as mac80211 does it:
   out as one unicast per peer (excluding the sender) carrying the group
   address in Address Extension, which a mac80211 receiver rebuilds into the
   real Ethernet frame and floods on its bridge.
+- **Discovery is rate-limited.** A frame for a destination with no path
+  triggers a PREQ and is dropped for the upper layer to retry, as an
+  unanswered ARP already is; PREQs go out at most once per target per 500 ms
+  and at most one every 50 ms overall, so a host scanning unknown addresses
+  cannot turn the node into a broadcast source.
 - **Proxied endpoints are learned.** A frame that arrived with Address
   Extension teaches which mesh node the real source sits behind; a later
   frame to that host goes to that node with both ends in AE 2.
