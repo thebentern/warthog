@@ -85,7 +85,12 @@ legacy shared key, at runtime:
 pio run -e warthog-mesh-sae -t upload
 ```
 
-> **Region and channel.** The mesh envs hard-code `WARTHOG_REGION_US` and pin
+> **Mesh ID, passphrase and mesh mode are runtime settings.** `AT+MESHEN=1`
+> turns mesh on (any build, including the region envs), `AT+MESHID=<id>` and
+> `AT+MESHPASS=<pass>` set the credentials. All persist to NVS and take effect
+> on the next boot. `AT+MESHPASS?` reports only the length, deliberately.
+>
+> **Region and channel are not.** The mesh envs hard-code `WARTHOG_REGION_US` and pin
 > the radio to S1G channel 42 (923.0 MHz, 2 MHz, global op class 69). That
 > matches OpenMANET's US default, which is why it is the default here. Outside
 > the US, or against a peer on another channel, override the pin — the five

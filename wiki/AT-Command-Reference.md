@@ -61,6 +61,12 @@ Everything here persists in NVS and outranks the build-time default.
 
 | Command | | Purpose |
 |---|---|---|
+| `AT+MESHEN=<0\|1>` | [op] | Start the mesh instead of associating as a station. Persisted; takes effect on the next boot. Works on any build, including the region envs — this is how a stock image joins a mesh. |
+| `AT+MESHEN?` | [op] | Whether mesh mode is on. The capability envs always report 1. |
+| `AT+MESHID=<id>` | [op] | Mesh ID, 1–32 chars. Persisted; next boot. Must match every peer exactly — a mismatch peers with nothing and reads as a radio fault. |
+| `AT+MESHID?` | [op] | Current mesh ID. |
+| `AT+MESHPASS=<pass>` | [op] | SAE passphrase, 1–63 chars. Persisted; next boot. Must match every peer. |
+| `AT+MESHPASS?` | [op] | Length only, never the value — this console mirrors the logs. |
 | `AT+MPMPEERS?` | [op] | Peer links and handshake state. The first thing to read on a mesh. |
 | `AT+MESHSEC=<0\|1>` | [op] | Data plane open (0) or keyed (1). Re-peers within ~2 s. Persisted in NVS. |
 | `AT+MESHSEC?` | [op] | Current setting. No effect on the SAE build (keys come from AMPE). |
@@ -148,6 +154,10 @@ deployment.
 ## Worked example: bringing up a mesh link
 
 ```
+AT+MESHEN=1                      mesh instead of a station uplink
+AT+MESHID=halowmesh              must match the peer exactly
+AT+MESHPASS=<passphrase>         SAE builds only; must match the peer
+AT+RESET                         the three above take effect on boot
 AT+MESHSEC=0                     match an unencrypted peer
 AT+MPMPEERS?                     confirm estab=1 and a non-zero plid
 AT+HWMPSTAT?                     confirm preq_tx climbing, parse_fail=0

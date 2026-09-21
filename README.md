@@ -62,10 +62,11 @@ Warthog is not one device role. A node runs an **uplink** and presents
 | **Host** | Gives the machine it is plugged into a USB Ethernet adapter (`192.168.4.1/24`) | always on |
 | **Client** | 2.4 GHz AP so phones and IoT clients share the uplink (`192.168.5.1/24`) | always on |
 | **Station uplink** | Joins an existing HaLow access point | default builds |
-| **Mesh uplink** | 802.11s peer-to-peer, no infrastructure | `warthog-mesh-sae` (encrypted) / `warthog-mesh-smoke` (open) |
+| **Mesh uplink** | 802.11s peer-to-peer, no infrastructure | `AT+MESHEN=1` on any build; `warthog-mesh-sae` for SAE/AMPE |
 
 Both downstream surfaces are live at once. The two uplink modes are mutually
-exclusive and selected at build time.
+exclusive; which one runs is a runtime setting (`AT+MESHEN`), though SAE/AMPE
+and the mesh channel pin are still chosen at build time.
 
 ### Warthog is a mesh leaf, not a relay
 
@@ -304,6 +305,9 @@ AT+HALOW=MyAP,secret        → store HaLow creds in NVS; AT+RESET to apply
 AT+HALOW?                   → +HALOW: ssid="MyAP" (psk hidden) / OK
 AT+WIFIAP=warthog,xyz,11    → change AP SSID/PSK/channel
 AT+WIFIAP?                  → +WIFIAP: ssid="warthog" chan=6 (psk hidden) / OK
+AT+MESHEN=1                 → join a mesh instead of a HaLow AP; AT+RESET to apply
+AT+MESHID=halowmesh         → mesh ID, must match every peer exactly
+AT+MESHPASS=secret          → SAE passphrase (SAE builds); length-only readback
 AT+DNS=8.8.8.8              → set the DNS handed to USB + AP clients via DHCP
 AT+DNS?                     → +DNS: 1.1.1.1 / OK
 AT+RESET                    → reboot
