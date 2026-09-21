@@ -67,6 +67,47 @@ Warthog is not one device role. A node runs an **uplink** and presents
 Both downstream surfaces are live at once. The two uplink modes are mutually
 exclusive and selected at build time.
 
+### Warthog is a mesh leaf, not a relay
+
+A Warthog joins a mesh and talks to its peers. It does **not** forward frames
+between two other nodes, so it cannot extend a mesh's reach — a Warthog placed
+between two nodes that cannot hear each other does not connect them.
+
+This is absent at every layer, not merely unverified: the RX data path
+delivers to the local host or drops, with no branch that re-enqueues a frame
+whose mesh destination is somebody else; the Mesh Control TTL is written on
+transmit and never read or decremented on receive; and the multicast repeater
+explicitly refuses to re-send a datagram out the interface it arrived on
+(`main/mudp.c`).
+
+If you need a relay — an airborne node extending coverage, for instance —
+that is 802.11s HWMP forwarding, and it is not built yet. See
+[`docs/mesh-attachment-model.md`](docs/mesh-attachment-model.md).
+
+### Warthog routes, it does not bridge
+
+Every surface is its own IP subnet and Warthog NAPTs between them
+(`main/nat.c`). The tethered host is **not** on the same layer-2 segment as
+anything upstream, and that has consequences worth knowing before you design
+around it:
+
+- **Link-local and broadcast discovery does not cross Warthog.** mDNS/DNS-SD,
+  SSDP, NetBIOS and anything else that finds peers by broadcasting on the
+  local segment will not see devices on the other side.
+- **Multicast does not cross either, with one exception.** A small
+  application-layer repeater (`main/mudp.c`) forwards exactly one group —
+  Meshtastic's `239.0.0.69:4403` — between the USB, AP and HaLow netifs.
+  Nothing else is repeated.
+- **ATAK / CoT multicast discovery on `239.2.3.1:6969` will not work.** It is
+  not in the repeater, so CoT peers do not find each other across Warthog.
+  Point-to-point CoT to a known address still works; discovery does not.
+- **Inbound connections need explicit forwarding.** Upstream devices cannot
+  reach the tethered host by address, because it is behind NAT.
+
+If your application depends on layer-2 adjacency or broadcast discovery, this
+is the limitation to design around — use known addresses, a server both sides
+reach, or an overlay (see [Security](#security)).
+
 ## USB setup, end to end
 
 Three commands from a fresh checkout to a working link. The screenshots below
@@ -408,6 +449,69 @@ uplink, and no region env compiles mesh.
 
 Not implemented: mesh forwarding (a node answers path requests aimed at it and
 relays nothing), per-transmitter group keys, Windows RNDIS, and a web UI.
+
+## Security
+
+**Treat the mesh as an untrusted transport and protect traffic above it.** That
+is not a placeholder caveat; it follows from how 802.11s works and from what
+this firmware currently ships.
+
+### 802.11s SAE is hop-by-hop, never end-to-end
+
+SAE authenticates a *link*. Each mesh hop decrypts a frame and re-encrypts it
+for the next hop, so every node a packet traverses sees it in the clear. A
+mesh is a group of peers that all hold the same passphrase, which means:
+
+- **No per-node identity.** Possession of the passphrase is the whole
+  credential. Any device holding it is a full member.
+- **No revocation.** Removing a node means changing the passphrase on every
+  other node — for Warthog today that is a rebuild and reflash, because the
+  passphrase is a compile-time value (see below).
+- **Any member can decrypt anything traversing it.** A compromised or captured
+  node reads all traffic routed through it, and can inject.
+
+This is a property of 802.11s, not a Warthog limitation. OpenMANET nodes on the
+same mesh are in exactly the same position.
+
+### What each mode actually gives you
+
+| Mode | Peering | Data plane | Use |
+|---|---|---|---|
+| Default mesh build | open, unauthenticated | cleartext | interop testing; this is what talks to stock OpenMANET today |
+| `AT+MESHSEC=1` | open, unauthenticated | CCMP under a **public constant** | exercising the CCMP path only |
+| `warthog-mesh-sae` | SAE (Dragonfly) | CCMP under a per-link AMPE MTK | the only mode with real link security |
+
+The `AT+MESHSEC=1` key is `00 11 22 33 … ff` — a counting sequence compiled
+into every Warthog image. It is not a secret, anyone with the firmware has it,
+and it exists only so the CCMP data path can be exercised. It also cannot
+interoperate: a peer deriving real keys can neither read those frames nor be
+read by them.
+
+### The SAE passphrase is in the binary
+
+`WARTHOG_MESH_PASSPHRASE` defaults to `warthog-mesh` (`main/mesh.c:23`) and is
+overridden at build time, not at runtime:
+
+```bash
+pio run -e warthog-mesh-sae --build-flag='-UWARTHOG_MESH_PASSPHRASE' \
+                            --build-flag='-DWARTHOG_MESH_PASSPHRASE=\"your-passphrase\"'
+```
+
+Anyone with a firmware image has the passphrase for every mesh that image
+joins. Build per-deployment images, and treat a published or shared image as a
+published passphrase.
+
+### For anything that actually needs confidentiality
+
+Run an end-to-end tunnel over the bridged segment and let the mesh be plumbing:
+
+- **WireGuard** between the endpoints that matter — per-peer keys, real
+  identity, revocation by removing a key.
+- **Reticulum** if you want end-to-end encryption plus its own routing over a
+  transport you do not trust.
+
+Either gives you the per-node identity and revocation that 802.11s SAE
+structurally cannot.
 
 ## Licensing
 

@@ -33,6 +33,13 @@ pio run -e warthog-au
 For a peer-to-peer mesh instead of a station uplink, build
 `warthog-mesh-smoke` and read [Mesh Mode](Mesh-Mode) first.
 
+> **The region envs above cannot join a mesh.** They associate to a HaLow AP
+> and there is no runtime switch into mesh mode — mesh is selected at build
+> time. The mesh envs are also **US-region and pinned to S1G channel 42
+> (923.0 MHz, 2 MHz)**, so outside the US you must override the pin to a
+> channel your regulator and your OpenMANET peer both use. See
+> [Mesh Mode](Mesh-Mode).
+
 ## 4. Flash
 
 The HaLow add-on uses USB-OTG, so the usual auto-reset does not work. Put the

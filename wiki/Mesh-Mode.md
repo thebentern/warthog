@@ -84,6 +84,28 @@ legacy shared key, at runtime:
 pio run -e warthog-mesh-sae -t upload
 ```
 
+> **Region and channel.** The mesh envs hard-code `WARTHOG_REGION_US` and pin
+> the radio to S1G channel 42 (923.0 MHz, 2 MHz, global op class 69). That
+> matches OpenMANET's US default, which is why it is the default here. Outside
+> the US, or against a peer on another channel, override the pin — the five
+> values move together, because operating class and bandwidth belong to the
+> channel and a mismatch peers with nothing while looking like a radio fault:
+>
+> ```bash
+> pio run -e warthog-mesh-sae \
+>   --build-flag='-UWARTHOG_REGION_US' --build-flag='-DWARTHOG_REGION_EU=1' \
+>   --build-flag='-UWARTHOG_PIN_S1G_CHAN'          --build-flag='-DWARTHOG_PIN_S1G_CHAN=<ch>' \
+>   --build-flag='-UWARTHOG_PIN_S1G_FREQ_HZ'       --build-flag='-DWARTHOG_PIN_S1G_FREQ_HZ=<hz>' \
+>   --build-flag='-UWARTHOG_PIN_S1G_GLOBAL_OP_CLASS' --build-flag='-DWARTHOG_PIN_S1G_GLOBAL_OP_CLASS=<n>' \
+>   --build-flag='-UWARTHOG_PIN_S1G_BW_MHZ'        --build-flag='-DWARTHOG_PIN_S1G_BW_MHZ=<mhz>'
+> ```
+>
+> Take the values from your peer: `morse_cli -i wlh0 channel` on an OpenMANET
+> node prints the operating frequency, bandwidth and primary width it is
+> actually using. Confirm the result the same way on the Warthog side before
+> trusting a link.
+
+
 The passphrase defaults to `warthog-mesh` and is set at build time with
 `-DWARTHOG_MESH_PASSPHRASE='"your-passphrase"'`. Every node on the mesh needs
 the same one.

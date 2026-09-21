@@ -55,32 +55,69 @@ Nothing to configure at runtime — the node authenticates (SAE, group 19),
 exchanges per-link keys (AMPE) and peers on its own. Verify with `AT+SAERX?`
 (`ESTAB=1`) and `AT+MPMPEERS?` (`ampe_mtk=1 ampe_mgtk=1`).
 
-OpenMANET side — mesh SAE is standard `wpa_supplicant`, not `iw`:
-
-```
-# /etc/wpa_supplicant-mesh.conf
-network={
-    ssid="halowmesh"          # the Mesh ID — must match Warthog's
-    mode=5
-    frequency=5180            # your S1G channel mapping
-    key_mgmt=SAE
-    sae_password="warthog-mesh"
-    ieee80211w=2
-}
-```
+OpenMANET side — use `uci`. This is the idiomatic path and the one verified on
+hardware; a hand-run `wpa_supplicant` fights netifd and loses its config on the
+next `wifi` event.
 
 ```sh
-wpa_supplicant -i wlh0 -c /etc/wpa_supplicant-mesh.conf -B
+uci set wireless.radio1.disabled='0'
+uci set wireless.default_radio1.mode='mesh'
+uci set wireless.default_radio1.mesh_id='halowmesh'      # must match Warthog
+uci set wireless.default_radio1.encryption='sae'
+uci set wireless.default_radio1.key='warthog-mesh'       # must match Warthog
+uci set wireless.default_radio1.sae_pwe='2'              # see below
+uci commit wireless
+
+uci set mesh11sd.mesh_beaconless.mesh_beacon_less_mode='1'
+uci set mesh11sd.mesh_dynamic_peering.enabled='1'
+uci commit mesh11sd
+
+wifi down radio1 && wifi up radio1                       # NOT `wifi reload`
 ```
 
-On OpenWrt, the equivalent uci is `encryption='sae'` +
-`key='warthog-mesh'` on the mesh interface section (hostapd/wpa_supplicant
-must be the `-mesh`/full variants, which OpenMANET ships).
+Three traps, all of which cost real bench time:
 
-Warthog↔Warthog SAE is hardware-validated (single-exchange peering, AMPE keys
-in the chip, 0% loss over the CCMP link). Warthog↔OpenMANET SAE runs the same
-hostap code on both ends but has not yet completed on hardware. What bench
-testing established so far:
+1. **`wifi reload` silently ignores `mesh11sd` changes.** netifd only
+   regenerates `/var/run/wpa_supplicant-wlh0.conf` when the *wireless* config
+   changes. Check the file's mtime — a stale one means your change never
+   applied. Cycle the radio instead.
+2. **Beaconless mode is not optional on the MM6108.** With beaconing on, the
+   chip firmware faults on the mesh-beacon path: two `HW has stopped` events
+   and `wlh0` goes down. Beaconless gives 0 crashes over a 6-minute soak.
+   Note the uci name (`mesh_beacon_less_mode`) differs from the supplicant
+   name it becomes (`mesh_beaconless_mode`).
+3. **After a chip fault, only a reboot recovers it.** The driver leaks its
+   `vif0` sysfs node, so every later `add_interface` returns `EEXIST`. A
+   `morse_cli reset` of the chip does *not* clear it — the stale state is
+   host-side. (`morse_cli reset` also needs `MM_RESET_PIN`, which
+   `/etc/profile.d/morse_cli.sh` exports; a non-interactive SSH never sources
+   it.)
+
+Verify the peer side with:
+
+```sh
+iw dev wlh0 station dump | grep -E '^Station|plink:'   # expect ESTAB
+morse_cli -i wlh0 channel                              # expect 923000 kHz
+logread | grep MESH-PEER-CONNECTED
+```
+
+**Status (2026-09-20): Warthog↔OpenMANET SAE peering is verified on hardware.**
+A three-node mesh — two OpenMANET Pis and one Warthog — reached `ESTAB` on
+every link, with the Warthog holding two distinct AMPE pairwise keys at once
+(`AT+KEYINST?` showing `aid=1 pw=1` and `aid=2 pw=1`). The peer's own log shows
+`mesh plink with <warthog> established` / `MESH-PEER-CONNECTED`, at −2 dBm and
+135–150 Mbit/s VHT-MCS6/7.
+
+**The encrypted data plane does not yet pass traffic cross-vendor.** ICMP is
+0/30 and every undecryptable frame is group-addressed (`AT+RXCHAN?` shows
+`nodec grp` climbing 1:1 with pings while `uni` stays 0). Two group-key
+defects are responsible: the chip holds one VIF-wide MGTK latched at aid 0
+while every 802.11s peer generates its own, and Warthog's own TX MGTK was
+being dropped as an unknown peer. The second is fixed; neither is yet
+confirmed on air. **For cross-vendor data today, use the unencrypted mesh
+above.**
+
+Earlier bench findings, still relevant:
 
 - **OpenMANET's kernel-MPM mesh advertises Authentication Protocol 0 even
   when running SAE** (`wpa_supplicant_s1g` with `key_mgmt=SAE`; observed in
@@ -104,9 +141,8 @@ never re-arms it, so early builds did not beacon and were invisible to a
 beacon-driven peer. A host beacon timer now re-drives the beacon at the
 interval; `AT+BCNSTAT?` shows `served`/`txcomp` climbing together (~1.15/s),
 i.e. the chip transmits every beacon. Warthog↔Warthog SAE is fully verified;
-the Warthog↔OpenMANET SAE handshake over these beacons is pending a clean
-bench run (the resident OpenMANET node's MM8108 receiver needs re-pinning to
-its channel after a reboot — a Pi-side issue, not Warthog's).
+the Warthog↔OpenMANET SAE handshake over these beacons has since completed on
+hardware (see the status note above).
 
 `AT+SAERX?` on the Warthog shows the SAE conversation state and which peer it
 is talking to.
