@@ -1048,10 +1048,10 @@ static bool mesh_dequeue_tx_frame(struct umac_data *umacd,
  * (dot11_is_4addr_hdr / dot11_get_sa_data read addr4), so nothing changes on
  * receive.
  *
- * A Mesh Control field (s9.2.4.7.3) is NOT inserted. It is required for
- * multi-hop forwarding (TTL, sequence number, address extension) and would
- * need the RX side to strip it. Single-hop peers do not need it, and adding
- * it is the first job of the forwarding layer.
+ * The Mesh Control field (s9.2.4.7.3) is NOT built here: the generic TX
+ * path in umac_datapath.c prepends a 6-byte one (flags 0, TTL, seq) for
+ * every mesh-mode frame, and the RX side strips it. This builder is the MAC
+ * header only.
  */
 static void mesh_construct_80211_data_header(struct umac_sta_data *stad,
                                              const struct umac_8023_hdr *hdr_8023,
