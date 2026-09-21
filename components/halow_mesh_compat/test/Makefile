@@ -35,7 +35,7 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
            ../src/dot11ah/debug.c
 
 TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
-           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mesh_ctrl
+           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mesh_ctrl test_mesh_rmc
 
 # The shipping mesh byte-layout code, compiled straight out of the vendored SDK.
 # These tests link the REAL firmware source, not a copy of it -- umac_mesh_ies.c
@@ -66,6 +66,9 @@ region:
 MAINDIR := ../../../main
 test_mesh_diag: test_mesh_diag.c $(MAINDIR)/mesh_diag.c
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $^ -o $@
+
+test_mesh_rmc: test_mesh_rmc.c $(SDKMESH)/umac_mesh_rmc.c
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
 
 test_mesh_ctrl: test_mesh_ctrl.c $(SDKMESH)/umac_mesh_ctrl.c
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
@@ -116,6 +119,7 @@ freestanding:
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_hwmp.c && echo "ok   umac_mesh_hwmp.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/mesh_diag.c && echo "ok   mesh_diag.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_ctrl.c && echo "ok   umac_mesh_ctrl.c is freestanding"
+	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_rmc.c && echo "ok   umac_mesh_rmc.c is freestanding"
 
 test_s1g_ieee80211: test_s1g_ieee80211.c ../src/dot11ah/s1g_ieee80211.c $(COMPAT)
 	$(CC) $(CFLAGS) $(INCS) $^ -o $@
