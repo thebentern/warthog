@@ -91,4 +91,12 @@ int umac_keys_get_active_key_id(struct umac_sta_data *stad, enum umac_key_type k
 
 void umac_keys_increment_tx_seq(struct umac_sta_data *stad, uint8_t key_id);
 
+/**
+ * Read the current transmit sequence for @p key_type.
+ *
+ * Software CCMP needs the packet number BEFORE the frame is sent, whereas the
+ * chip-encrypted path only ever had to bump it afterwards.
+ */
+uint64_t umac_keys_get_tx_seq(struct umac_sta_data *stad, enum umac_key_type key_type);
+
 

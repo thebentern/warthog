@@ -60,6 +60,7 @@ set(SRCS
     ${ROOT_DIR}/src/umac/mesh/umac_mesh_ccmp_kat.c
     ${ROOT_DIR}/src/umac/mesh/umac_mesh_ccm.c
     ${ROOT_DIR}/src/umac/mesh/umac_mesh_ccmp_hdr.c
+    ${ROOT_DIR}/src/umac/mesh/umac_mesh_rx_crypto.c
     ${ROOT_DIR}/src/umac/keys/connection_keys.c
     ${ROOT_DIR}/src/umac/keys/umac_keys.c
     ${ROOT_DIR}/src/umac/ps/umac_ps.c

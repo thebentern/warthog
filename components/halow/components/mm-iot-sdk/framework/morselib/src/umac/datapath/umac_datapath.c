@@ -605,7 +605,22 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
 
     if (dot11_frame_control_get_protected(header->frame_control))
     {
+        bool sw_decrypted = false;
         if (!(rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED))
+        {
+#ifdef WARTHOG_MESH_HOST_CCMP
+            /* The chip could not decrypt this -- which on a mesh is the normal
+             * case, because it holds one pairwise key and AMPE gives every link
+             * its own. Try the host's per-peer key. On success the buffer is
+             * left looking exactly like a chip-decrypted frame, so the strip
+             * and replay checks below run unchanged. */
+            extern bool umac_mesh_rx_host_ccmp(struct umac_sta_data *stad,
+                                               const struct dot11_hdr *hdr,
+                                               struct mmpktview *view);
+            sw_decrypted = umac_mesh_rx_host_ccmp(stad, header, rxbufview);
+#endif
+        }
+        if (!(rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED) && !sw_decrypted)
         {
 
             /* Record WHAT failed to decrypt: group vs unicast RA, the sender,
@@ -2104,6 +2119,27 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
         mmpkt_prepend_data(txbufview, mesh_ctrl, sizeof(mesh_ctrl));
     }
 
+    bool host_encrypted = false;
+#ifdef WARTHOG_MESH_HOST_CCMP
+    /* Encrypt here, before the header goes on, so the CCMP header is a prepend
+     * rather than an insert into the middle of the buffer. The chip holds one
+     * pairwise key while AMPE gives every link its own, so on a mesh with more
+     * than one peer the chip cannot be the one doing this. */
+    if (data->ops == &datapath_ops_mesh && key_id >= 0 && stad != NULL)
+    {
+        extern bool umac_mesh_tx_host_ccmp(struct umac_sta_data *stad, uint8_t key_id,
+                                           const uint8_t *mac_hdr, const uint8_t *qos,
+                                           const uint8_t pn[6], struct mmpktview *view);
+        uint64_t seq = umac_keys_get_tx_seq(stad, UMAC_KEY_TYPE_PAIRWISE);
+        uint8_t pn[6] = { (uint8_t)(seq >> 40), (uint8_t)(seq >> 32), (uint8_t)(seq >> 24),
+                          (uint8_t)(seq >> 16), (uint8_t)(seq >> 8),  (uint8_t)seq };
+        host_encrypted = umac_mesh_tx_host_ccmp(stad, (uint8_t)key_id,
+                                                (const uint8_t *)&data_hdr,
+                                                (const uint8_t *)&qos_ctrl.field,
+                                                pn, txbufview);
+    }
+#endif
+
     MMLOG_VRB("Add QOS CNTL bytes\n");
     mmpkt_prepend_data(txbufview, (uint8_t *)&qos_ctrl.field, sizeof(qos_ctrl));
     mmpkt_prepend_data(txbufview, (uint8_t *)&data_hdr, data_hdr_len);
@@ -2111,7 +2147,12 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     tx_metadata->flags = 0;
     if (key_id >= 0)
     {
-        tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
+        /* Asking the chip to encrypt what the host already encrypted would
+         * put CCMP over CCMP and the peer would reject every frame. */
+        if (!host_encrypted)
+        {
+            tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
+        }
         umac_keys_increment_tx_seq(stad, key_id);
     }
 

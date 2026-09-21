@@ -405,6 +405,28 @@ volatile uint16_t g_warthog_plink_rx_full = 0;
 /* Peering frames converted between the S1G form on air and the 11n form
  * hostap signs (AT+PLINKSTAT?). Both must climb once a mac80211 peer is
  * peering; TX stuck at 0 means our own frames never reached the converter. */
+/* Software CCMP on the mesh RX path (AT+SWCCMP?). ok climbing while the peer
+ * pings is the whole point; micfail climbing instead means the two ends built
+ * different AAD, and last_aad is the first thing to compare. */
+/* AT+SWCCMP=1 arms it. A build may arm it at boot instead
+ * (-DWARTHOG_MESH_HOST_CCMP_DEFAULT_ON=1), which is what makes the feature
+ * testable on a board whose console is unreachable: the peer's traffic is
+ * then the only instrument needed. */
+#ifndef WARTHOG_MESH_HOST_CCMP_DEFAULT_ON
+#define WARTHOG_MESH_HOST_CCMP_DEFAULT_ON 0
+#endif
+volatile uint32_t g_warthog_host_ccmp_on = WARTHOG_MESH_HOST_CCMP_DEFAULT_ON;
+volatile uint32_t g_warthog_swccmp_tried = 0;
+volatile uint32_t g_warthog_swccmp_tx_ok = 0;
+volatile uint32_t g_warthog_swccmp_tx_fail = 0;
+volatile uint32_t g_warthog_swccmp_ok = 0;
+volatile uint32_t g_warthog_swccmp_micfail = 0;
+volatile uint32_t g_warthog_swccmp_nokey = 0;
+volatile uint32_t g_warthog_swccmp_badhdr = 0;
+volatile uint32_t g_warthog_swccmp_short = 0;
+volatile uint32_t g_warthog_swccmp_last_keyid = 0;
+volatile uint32_t g_warthog_swccmp_last_aadlen = 0;
+volatile uint8_t g_warthog_swccmp_last_aad[32] = { 0 };
 volatile uint32_t g_warthog_mpm_tx_conv = 0;
 volatile uint32_t g_warthog_mpm_rx_conv = 0;
 
@@ -1672,6 +1694,26 @@ static void dispatch(char *line)
             off += snprintf(hx + off, sizeof(hx) - off, "%02x", g_warthog_bcn_own[i]);
         off += snprintf(hx + off, sizeof(hx) - off, "\r\n");
         cdc_write(hx); reply_ok();
+    } else if (strcasecmp(verb, "SWCCMP") == 0 && terminator == '=') {
+        g_warthog_host_ccmp_on = (args != NULL && atoi(trim(args)) != 0) ? 1u : 0u;
+        char b[64];
+        snprintf(b, sizeof(b), "+SWCCMP: host ccmp %s\r\n",
+                 g_warthog_host_ccmp_on ? "ON" : "OFF");
+        cdc_write(b); reply_ok();
+    } else if (strcasecmp(verb, "SWCCMP") == 0 && terminator == '?') {
+        char b[3*32 + 190]; int off = 0;
+        off += snprintf(b + off, sizeof(b) - off,
+                        "+SWCCMP: on=%lu tried=%lu ok=%lu micfail=%lu tx_ok=%lu tx_fail=%lu nokey=%lu badhdr=%lu short=%lu keyid=%lu aadlen=%lu aad=",
+                        (unsigned long)g_warthog_host_ccmp_on, (unsigned long)g_warthog_swccmp_tried,
+                        (unsigned long)g_warthog_swccmp_ok, (unsigned long)g_warthog_swccmp_micfail,
+                        (unsigned long)g_warthog_swccmp_tx_ok, (unsigned long)g_warthog_swccmp_tx_fail,
+                        (unsigned long)g_warthog_swccmp_nokey, (unsigned long)g_warthog_swccmp_badhdr,
+                        (unsigned long)g_warthog_swccmp_short, (unsigned long)g_warthog_swccmp_last_keyid,
+                        (unsigned long)g_warthog_swccmp_last_aadlen);
+        for (uint32_t i = 0; i < 32 && i < g_warthog_swccmp_last_aadlen && off < (int)sizeof(b) - 4; i++)
+            off += snprintf(b + off, sizeof(b) - off, "%02x", g_warthog_swccmp_last_aad[i]);
+        off += snprintf(b + off, sizeof(b) - off, "\r\n");
+        cdc_write(b); reply_ok();
     } else if (strcasecmp(verb, "PLINKSTAT") == 0 && terminator == '?') {
         char b[96];
         snprintf(b, sizeof(b), "+PLINKSTAT: tx_conv=%lu rx_conv=%lu\r\n",

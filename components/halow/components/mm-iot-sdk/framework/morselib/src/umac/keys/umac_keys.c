@@ -155,6 +155,12 @@ int umac_keys_get_active_key_id(struct umac_sta_data *stad, enum umac_key_type k
     return connection_keys_get_active_key_id(&sta_data->keys, key_type);
 }
 
+uint64_t umac_keys_get_tx_seq(struct umac_sta_data *stad, enum umac_key_type key_type)
+{
+    struct umac_keys_sta_data *sta_data = umac_sta_data_get_keys(stad);
+    return connection_keys_get_tx_seq(&sta_data->keys, key_type);
+}
+
 void umac_keys_increment_tx_seq(struct umac_sta_data *stad, uint8_t key_id)
 {
     struct umac_keys_sta_data *sta_data = umac_sta_data_get_keys(stad);
