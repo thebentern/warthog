@@ -1609,6 +1609,46 @@ static void dispatch(char *line)
         cmd_meshsec(args);
     } else if (strcasecmp(verb, "MESHSEC") == 0 && terminator == '?') {
         cmd_meshsec_q();
+    } else if (strcasecmp(verb, "MESHID") == 0 && terminator == '=') {
+        esp_err_t e = warthog_cfg_set_mesh_id(args);
+        if (e == ESP_OK) { reply_ok(); }
+        else if (e == ESP_ERR_INVALID_SIZE) { reply_error("mesh ID must be 1..32 chars"); }
+        else { reply_error("nvs write failed"); }
+    } else if (strcasecmp(verb, "MESHID") == 0 && terminator == '?') {
+        char v[WARTHOG_CFG_MESH_ID_MAXLEN + 1] = {0};
+        warthog_cfg_get_mesh_id(v, sizeof(v));
+        char line[96];
+        snprintf(line, sizeof(line), "+MESHID: %s\r\n", v);
+        cdc_write(line);
+        reply_ok();
+    } else if (strcasecmp(verb, "MESHPASS") == 0 && terminator == '=') {
+        esp_err_t e = warthog_cfg_set_mesh_pass(args);
+        if (e == ESP_OK) { reply_ok(); }
+        else if (e == ESP_ERR_INVALID_SIZE) { reply_error("passphrase must be 1..63 chars"); }
+        else { reply_error("nvs write failed"); }
+    } else if (strcasecmp(verb, "MESHPASS") == 0 && terminator == '?') {
+        /* Length only. Echoing a passphrase to a console that mirrors logs is
+         * how it ends up in a paste of an unrelated bug report. */
+        char v[WARTHOG_CFG_MESH_PASS_MAXLEN + 1] = {0};
+        warthog_cfg_get_mesh_pass(v, sizeof(v));
+        char line[64];
+        snprintf(line, sizeof(line), "+MESHPASS: set, %u chars\r\n", (unsigned)strlen(v));
+        cdc_write(line);
+        reply_ok();
+    } else if (strcasecmp(verb, "MESHEN") == 0 && terminator == '=') {
+        unsigned long v = strtoul(args, NULL, 10);
+        esp_err_t e = warthog_cfg_set_mesh_enable((uint8_t)v);
+        if (e == ESP_OK) {
+            cdc_write("+MESHEN: stored; takes effect on next boot (AT+RESET)\r\n");
+            reply_ok();
+        } else {
+            reply_error("usage: AT+MESHEN=<0|1>");
+        }
+    } else if (strcasecmp(verb, "MESHEN") == 0 && terminator == '?') {
+        char line[64];
+        snprintf(line, sizeof(line), "+MESHEN: %u\r\n", (unsigned)warthog_cfg_get_mesh_enable());
+        cdc_write(line);
+        reply_ok();
     } else if (strcasecmp(verb, "COREDUMP") == 0 && terminator == '?') {
         cmd_coredump();
     } else if (strcasecmp(verb, "SAESTAGE") == 0 && terminator == '?') {

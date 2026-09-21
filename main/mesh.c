@@ -331,9 +331,18 @@ void warthog_mesh_smoke_test(void)
 #define WARTHOG_MESH_BEACON_TU 100
 #endif
     struct mmwlan_mesh_args args = MMWLAN_MESH_ARGS_INIT;
-    static const char MESH_ID[] = WARTHOG_MESH_ID;
-    args.mesh_id_len = (uint8_t)(sizeof(MESH_ID) - 1);
-    memcpy(args.mesh_id, MESH_ID, args.mesh_id_len);
+    /* Runtime-settable (AT+MESHID), falling back to the build-time value. */
+    char mesh_id[WARTHOG_CFG_MESH_ID_MAXLEN + 1] = {0};
+    warthog_cfg_get_mesh_id(mesh_id, sizeof(mesh_id));
+    size_t mesh_id_len = strlen(mesh_id);
+    if (mesh_id_len == 0 || mesh_id_len > sizeof(args.mesh_id)) {
+        ESP_LOGE(TAG, "mesh: mesh ID must be 1..%u chars, got %u -- not starting",
+                 (unsigned)sizeof(args.mesh_id), (unsigned)mesh_id_len);
+        return;
+    }
+    args.mesh_id_len = (uint8_t)mesh_id_len;
+    memcpy(args.mesh_id, mesh_id, mesh_id_len);
+    ESP_LOGW(TAG, "mesh: id '%s' (%u chars)", mesh_id, (unsigned)mesh_id_len);
     /* Mesh security.
      *
      * MMWLAN_SAE runs real 802.11s security: SAE (dragonfly) authentication
@@ -350,11 +359,13 @@ void warthog_mesh_smoke_test(void)
 #if WARTHOG_MESH_SAE
     args.security_type = MMWLAN_SAE;
     {
-        const char *pw = WARTHOG_MESH_PASSPHRASE;
+        /* Runtime-settable (AT+MESHPASS), falling back to the build default. */
+        char pw[WARTHOG_CFG_MESH_PASS_MAXLEN + 1] = {0};
+        warthog_cfg_get_mesh_pass(pw, sizeof(pw));
         size_t pw_len = strlen(pw);
         if (pw_len == 0 || pw_len >= sizeof(args.passphrase)) {
-            ESP_LOGE(TAG, "mesh: WARTHOG_MESH_PASSPHRASE must be 1..%u chars",
-                     (unsigned)(sizeof(args.passphrase) - 1));
+            ESP_LOGE(TAG, "mesh: passphrase must be 1..%u chars, got %u -- not starting",
+                     (unsigned)(sizeof(args.passphrase) - 1), (unsigned)pw_len);
             return;
         }
         memcpy(args.passphrase, pw, pw_len);

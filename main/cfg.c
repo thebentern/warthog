@@ -157,6 +157,108 @@ esp_err_t warthog_cfg_set_ap(const char *ssid, const char *psk, int channel)
     return err;
 }
 
+/* Mesh identity/credentials. Build-time values remain the fallback, so an
+ * unconfigured board is identical to one built before these existed. */
+#ifndef WARTHOG_MESH_ID
+#define WARTHOG_MESH_ID "warthog-mesh-test"
+#endif
+#ifndef WARTHOG_MESH_PASSPHRASE
+#define WARTHOG_MESH_PASSPHRASE "warthog-mesh"
+#endif
+
+esp_err_t warthog_cfg_get_mesh_id(char *out, size_t out_len)
+{
+    return get_string_or_default("mesh_id", WARTHOG_MESH_ID, out, out_len);
+}
+
+esp_err_t warthog_cfg_set_mesh_id(const char *mesh_id)
+{
+    if (!mesh_id) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t n = strlen(mesh_id);
+    /* 802.11s Mesh ID is 0..32 octets, but an empty one peers with nothing
+     * and looks like a radio fault, so refuse it here rather than on air. */
+    if (n == 0 || n > WARTHOG_CFG_MESH_ID_MAXLEN) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_str(h, "mesh_id", mesh_id);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t warthog_cfg_get_mesh_pass(char *out, size_t out_len)
+{
+    return get_string_or_default("mesh_pass", WARTHOG_MESH_PASSPHRASE, out, out_len);
+}
+
+esp_err_t warthog_cfg_set_mesh_pass(const char *pass)
+{
+    if (!pass) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t n = strlen(pass);
+    if (n == 0 || n > WARTHOG_CFG_MESH_PASS_MAXLEN) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_str(h, "mesh_pass", pass);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+uint8_t warthog_cfg_get_mesh_enable(void)
+{
+#ifdef WARTHOG_MESH_SMOKE
+    /* The capability envs exist to run mesh; do not let stale NVS disable it. */
+    return 1;
+#else
+    nvs_handle_t h;
+    uint8_t en = 0; /* station uplink, the historical default */
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v;
+        if (nvs_get_u8(h, "mesh_en", &v) == ESP_OK && v <= 1) {
+            en = v;
+        }
+        nvs_close(h);
+    }
+    return en;
+#endif
+}
+
+esp_err_t warthog_cfg_set_mesh_enable(uint8_t enable)
+{
+    if (enable > 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, "mesh_en", enable);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
 uint8_t warthog_cfg_get_mesh_secure(void)
 {
     nvs_handle_t h;

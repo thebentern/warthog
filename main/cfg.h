@@ -50,5 +50,28 @@ esp_err_t warthog_cfg_set_dns(const char *dns);
 uint8_t   warthog_cfg_get_mesh_secure(void);
 esp_err_t warthog_cfg_set_mesh_secure(uint8_t secure);
 
+/* Mesh identity and credentials, runtime-settable.
+ *
+ * These used to be compile-time only, which meant a mesh ID or passphrase
+ * mismatch against a peer cost a rebuild and reflash -- and a mismatch is the
+ * most common field failure, because it peers with nothing while looking like
+ * a radio fault. Getters fall back to the build-time defaults, so existing
+ * images behave exactly as before until something is set. */
+#define WARTHOG_CFG_MESH_ID_MAXLEN 32
+#define WARTHOG_CFG_MESH_PASS_MAXLEN 63
+
+esp_err_t warthog_cfg_get_mesh_id(char *out, size_t out_len);
+esp_err_t warthog_cfg_set_mesh_id(const char *mesh_id);
+esp_err_t warthog_cfg_get_mesh_pass(char *out, size_t out_len);
+esp_err_t warthog_cfg_set_mesh_pass(const char *pass);
+
+/* Start the mesh instead of associating as a station.
+ *
+ * Mesh used to be reachable only from the capability build envs, so a region
+ * image could never join one no matter how it was configured. Default is 0
+ * (station), preserving existing behaviour; the mesh envs force it on. */
+uint8_t   warthog_cfg_get_mesh_enable(void);
+esp_err_t warthog_cfg_set_mesh_enable(uint8_t enable);
+
 /* Wipe the entire "warthog" NVS namespace. */
 esp_err_t warthog_cfg_erase(void);

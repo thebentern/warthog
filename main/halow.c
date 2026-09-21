@@ -112,15 +112,16 @@ esp_err_t warthog_halow_start(void)
              HALOW_MAX_TX_DBM, (int)txp);
 #endif
 
-#ifdef WARTHOG_MESH_SMOKE
-    /* Diagnostic build (warthog-mesh-smoke env): probe whether the chip
-     * firmware accepts a mesh VIF, then stop — skip STA association so the
-     * mesh attempt owns the single VIF. See docs/history/mesh-port-scope.md. */
-    warthog_mesh_smoke_test();
-    /* No STA association in this build — don't let app_main stall waiting. */
-    xEventGroupSetBits(s_halow_events, HALOW_LINK_BIT);
-    return ESP_OK;
-#endif
+    /* Mesh instead of station. Selected at runtime (AT+MESHEN=1, persisted) or
+     * forced on by the capability envs; the mesh owns the single VIF, so the
+     * STA association below is skipped entirely. */
+    if (warthog_cfg_get_mesh_enable()) {
+        ESP_LOGW(TAG, "mesh mode enabled — skipping STA association");
+        warthog_mesh_smoke_test();
+        /* Don't let app_main stall waiting for a link that never associates. */
+        xEventGroupSetBits(s_halow_events, HALOW_LINK_BIT);
+        return ESP_OK;
+    }
 
     char ssid[33] = {0};
     char psk[65] = {0};
