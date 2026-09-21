@@ -9,8 +9,10 @@ deployments, convoys, anything that has to come up on its own.
 
 ## Building for mesh
 
-Mesh is chosen at build time, not at runtime, and is mutually exclusive with
-station mode:
+Mesh is mutually exclusive with station mode, but it is a runtime choice:
+`AT+MESHEN=1` then `AT+RESET` turns it on for any build, region images
+included. The mesh envs exist because they pin a channel and fix the identity
+at build time, so a bench of boards agrees with no configuration at all:
 
 ```bash
 pio run -e warthog-mesh-smoke -t upload

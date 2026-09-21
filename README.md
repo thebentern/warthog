@@ -472,8 +472,9 @@ mesh is a group of peers that all hold the same passphrase, which means:
 - **No per-node identity.** Possession of the passphrase is the whole
   credential. Any device holding it is a full member.
 - **No revocation.** Removing a node means changing the passphrase on every
-  other node — for Warthog today that is a rebuild and reflash, because the
-  passphrase is a compile-time value (see below).
+  other node. On Warthog that is `AT+MESHPASS=` plus a reboot per node — no
+  reflash — but it is still every node, and there is no way to exclude one
+  device without re-keying all the others.
 - **Any member can decrypt anything traversing it.** A compromised or captured
   node reads all traffic routed through it, and can inject.
 
@@ -494,19 +495,40 @@ and it exists only so the CCMP data path can be exercised. It also cannot
 interoperate: a peer deriving real keys can neither read those frames nor be
 read by them.
 
-### The SAE passphrase is in the binary
+### The default SAE passphrase is in the binary
 
-`WARTHOG_MESH_PASSPHRASE` defaults to `warthog-mesh` (`main/mesh.c:23`) and is
-overridden at build time, not at runtime:
+The passphrase is a runtime setting — `AT+MESHPASS=<pass>` stores it in NVS and
+it takes effect on the next boot. `AT+MESHPASS?` reports its length and never
+its value.
+
+What is in the binary is the *default*: `WARTHOG_MESH_PASSPHRASE`, which is
+`warthog-mesh` unless the build overrides it. A node that has never been given
+a passphrase is therefore on a passphrase that anyone holding the image knows.
+Set one before deploying, and treat a published or shared image as a published
+default. The build-time override still exists if you would rather ship images
+that are safe before they are configured:
 
 ```bash
 pio run -e warthog-mesh-sae --build-flag='-UWARTHOG_MESH_PASSPHRASE' \
                             --build-flag='-DWARTHOG_MESH_PASSPHRASE=\"your-passphrase\"'
 ```
 
-Anyone with a firmware image has the passphrase for every mesh that image
-joins. Build per-deployment images, and treat a published or shared image as a
-published passphrase.
+### Management frame protection (802.11w)
+
+MFP is negotiated on the SAE build. The mesh join path sets PMF to *required*
+(`umac/supplicant_shim/config.c:452`), which is what mac80211 and hostap do for
+a secured mesh, so the RSN capabilities Warthog advertises match what an
+OpenMANET peer expects. hostap's `mesh_rsn` generates a TX IGTK and installs it
+through the driver shim as `WPA_ALG_BIP_CMAC_128`, the shim handles that
+algorithm (`umac/supplicant_shim/driver.c:879`), and the BIP primitives are
+linked into the image. Warthog's AMPE parser accounts for the peer's IGTK when
+the peer advertises MFP capable and required (`umac/mesh/umac_mesh.c:1105`).
+
+**Not measured.** That the key is generated, installed and negotiated is
+readable from the source and the linked image. Whether the MM6108 actually
+applies BIP to robust management frames on air has never been observed here —
+it is the same open question as the group CCMP key, and it needs a radio and a
+peer to answer.
 
 ### For anything that actually needs confidentiality
 
