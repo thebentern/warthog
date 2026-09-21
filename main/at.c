@@ -1648,6 +1648,56 @@ static void dispatch(char *line)
         } else {
             reply_error("usage: AT+MESHEN=<0|1>");
         }
+    } else if (strcasecmp(verb, "MESHCHAN") == 0 && terminator == '=') {
+        /* chan,freq_hz,global_class,s1g_class,bw_mhz -- one set, because class
+         * and bandwidth belong to the channel. "default" clears the override. */
+        if (strcasecmp(args, "default") == 0) {
+            if (warthog_cfg_clear_mesh_chan() == ESP_OK) {
+                cdc_write("+MESHCHAN: cleared; build-time pin on next boot\r\n");
+                reply_ok();
+            } else {
+                reply_error("nvs erase failed");
+            }
+        } else {
+            struct warthog_mesh_chan c = {0};
+            unsigned ch = 0, gc = 0, oc = 0, bw = 0; unsigned long hz = 0;
+            if (sscanf(args, "%u,%lu,%u,%u,%u", &ch, &hz, &gc, &oc, &bw) != 5) {
+                reply_error("usage: AT+MESHCHAN=<chan>,<freq_hz>,<global_class>,<s1g_class>,<bw_mhz>");
+            } else {
+                c.chan = (uint16_t)ch; c.freq_hz = (uint32_t)hz;
+                c.global_op_class = (uint8_t)gc; c.op_class = (uint8_t)oc;
+                c.bw_mhz = (uint8_t)bw;
+                esp_err_t e = warthog_cfg_set_mesh_chan(&c);
+                if (e == ESP_OK) {
+                    cdc_write("+MESHCHAN: stored; applied on next boot, and discarded "
+                              "if the regulatory table rejects it\r\n");
+                    reply_ok();
+                } else {
+                    reply_error("rejected: freq must be 750-950 MHz, bw 1|2|4|8, "
+                                "chan/classes non-zero");
+                }
+            }
+        }
+    } else if (strcasecmp(verb, "MESHCHAN") == 0 && terminator == '?') {
+        extern int g_warthog_chan_pin_status;
+        struct warthog_mesh_chan c;
+        char line[224];
+        if (warthog_cfg_get_mesh_chan(&c)) {
+            snprintf(line, sizeof(line),
+                     "+MESHCHAN: stored chan=%u freq=%lu gclass=%u sclass=%u bw=%u | "
+                     "applied=%s (set_channel_list=%d)\r\n",
+                     (unsigned)c.chan, (unsigned long)c.freq_hz,
+                     (unsigned)c.global_op_class, (unsigned)c.op_class, (unsigned)c.bw_mhz,
+                     g_warthog_chan_pin_status == 0 ? "yes" : "NO",
+                     g_warthog_chan_pin_status);
+        } else {
+            snprintf(line, sizeof(line),
+                     "+MESHCHAN: build-time pin | applied=%s (set_channel_list=%d)\r\n",
+                     g_warthog_chan_pin_status == 0 ? "yes" : "NO",
+                     g_warthog_chan_pin_status);
+        }
+        cdc_write(line);
+        reply_ok();
     } else if (strcasecmp(verb, "MESHDHCP") == 0 && terminator == '=') {
         unsigned long v = strtoul(args, NULL, 10);
         if (warthog_cfg_set_mesh_dhcp((uint8_t)v) == ESP_OK) { reply_ok(); }

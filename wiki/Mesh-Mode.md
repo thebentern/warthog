@@ -90,7 +90,15 @@ pio run -e warthog-mesh-sae -t upload
 > `AT+MESHPASS=<pass>` set the credentials. All persist to NVS and take effect
 > on the next boot. `AT+MESHPASS?` reports only the length, deliberately.
 >
-> **Region and channel are not.** The mesh envs hard-code `WARTHOG_REGION_US` and pin
+> **Channel is settable too, as a set:**
+> `AT+MESHCHAN=42,923000000,69,2,2` then `AT+RESET`. Read it back with
+> `AT+MESHCHAN?` — it reports `applied=yes|NO`, and `NO` means the regulatory
+> table refused the set and the radio fell back, which is the usual cause of
+> "peers with nothing and looks like a range problem". A refused set is
+> discarded rather than retried every boot. `AT+MESHCHAN=default` restores the
+> build-time pin.
+>
+> **Region is still build-time.** The mesh envs hard-code `WARTHOG_REGION_US` and pin
 > the radio to S1G channel 42 (923.0 MHz, 2 MHz, global op class 69). That
 > matches OpenMANET's US default, which is why it is the default here. Outside
 > the US, or against a peer on another channel, override the pin — the five

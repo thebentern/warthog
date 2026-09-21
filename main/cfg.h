@@ -87,5 +87,28 @@ esp_err_t warthog_cfg_set_mesh_enable(uint8_t enable);
 uint8_t   warthog_cfg_get_mesh_dhcp(void);
 esp_err_t warthog_cfg_set_mesh_dhcp(uint8_t on);
 
+/* S1G channel pin, stored and returned as a set.
+ *
+ * Channel, frequency, operating class and bandwidth are not independent --
+ * class and bandwidth belong to the channel, and a mismatched set peers with
+ * nothing while looking like a radio fault. They are written atomically and
+ * only ever read together, so a half-applied change cannot exist.
+ *
+ * Returns false when nothing is stored, in which case the build-time pin is
+ * used. Values are sanity-checked on the way in, but the chip's regulatory
+ * database is the final arbiter: a set it rejects at boot is discarded and the
+ * build-time pin used instead, rather than transmitting something unvetted. */
+struct warthog_mesh_chan {
+    uint32_t freq_hz;
+    uint16_t chan;
+    uint8_t  global_op_class;
+    uint8_t  op_class;
+    uint8_t  bw_mhz;
+};
+
+bool      warthog_cfg_get_mesh_chan(struct warthog_mesh_chan *out);
+esp_err_t warthog_cfg_set_mesh_chan(const struct warthog_mesh_chan *in);
+esp_err_t warthog_cfg_clear_mesh_chan(void);
+
 /* Wipe the entire "warthog" NVS namespace. */
 esp_err_t warthog_cfg_erase(void);

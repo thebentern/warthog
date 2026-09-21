@@ -17,6 +17,7 @@
  * an EU image transmitting on 902-928 MHz. Keep this deriving from the build
  * region, not from Kconfig. */
 #include "region.h"
+#include "cfg.h"
 #ifndef WARTHOG_COUNTRY_CODE
 #define WARTHOG_COUNTRY_CODE CONFIG_HALOW_COUNTRY_CODE
 #endif
@@ -257,20 +258,66 @@ esp_err_t mmhalow_init(const wifi_init_config_t *config)
           WARTHOG_PIN_S1G_OP_CLASS, WARTHOG_PIN_S1G_CHAN, WARTHOG_PIN_S1G_BW_MHZ,
           WARTHOG_PIN_S1G_EIRP_DBM, 0, 0, 0 },
     };
-    static const struct mmwlan_s1g_channel_list warthog_pinned_list = {
+    static struct mmwlan_s1g_channel_list warthog_pinned_list = {
         .country_code = WARTHOG_COUNTRY_CODE,
         .num_channels = 1,
         .channels = warthog_pinned_chan,
     };
+
+    /* A stored channel set overrides the build-time pin. It is applied as a
+     * unit -- class and bandwidth belong to the channel -- and if the chip's
+     * regulatory table rejects it we fall back to the build-time pin rather
+     * than boot with nothing, or worse, with something unvetted. */
+    static struct mmwlan_s1g_channel warthog_nvs_chan[1];
+    struct warthog_mesh_chan stored;
+    bool have_stored = warthog_cfg_get_mesh_chan(&stored);
+    if (have_stored)
+    {
+        warthog_nvs_chan[0] = warthog_pinned_chan[0];
+        warthog_nvs_chan[0].centre_freq_hz    = stored.freq_hz;
+        warthog_nvs_chan[0].global_operating_class = stored.global_op_class;
+        warthog_nvs_chan[0].s1g_operating_class    = stored.op_class;
+        warthog_nvs_chan[0].s1g_chan_num      = (uint8_t)stored.chan;
+        warthog_nvs_chan[0].bw_mhz            = stored.bw_mhz;
+        warthog_pinned_list.channels = warthog_nvs_chan;
+        ESP_LOGW(TAG, "PINNED S1G chan %u (%u Hz, %u MHz BW) -- from NVS",
+                 (unsigned)stored.chan, (unsigned)stored.freq_hz,
+                 (unsigned)stored.bw_mhz);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "PINNED S1G chan %d (%u Hz, %d MHz BW) -- single-channel list",
+                 (int)WARTHOG_PIN_S1G_CHAN, (unsigned)WARTHOG_PIN_S1G_FREQ_HZ,
+                 (int)WARTHOG_PIN_S1G_BW_MHZ);
+    }
     channel_list = &warthog_pinned_list;
-    ESP_LOGW(TAG, "PINNED S1G chan %d (%u Hz, %d MHz BW) -- single-channel list",
-             (int)WARTHOG_PIN_S1G_CHAN, (unsigned)WARTHOG_PIN_S1G_FREQ_HZ,
-             (int)WARTHOG_PIN_S1G_BW_MHZ);
 #endif
 
     ESP_LOGI(TAG, "Setting Channel List %s", WARTHOG_COUNTRY_CODE);
     enum mmwlan_status chan_st = mmwlan_set_channel_list(channel_list);
     ESP_LOGI(TAG, "mmwlan_set_channel_list -> %d (0=SUCCESS)", (int)chan_st);
+#ifdef WARTHOG_PIN_S1G_CHAN
+    /* Fail loudly and fall back. A rejected channel set is the most common
+     * field failure and it presents as a range problem, so it must not pass
+     * silently -- and a stored set the regulatory table refuses must not be
+     * left in place across reboots. */
+    if (chan_st != MMWLAN_SUCCESS && have_stored)
+    {
+        ESP_LOGE(TAG, "STORED S1G channel REJECTED by the regulatory table "
+                      "(status=%d) -- discarding it and using the built-in pin",
+                 (int)chan_st);
+        (void)warthog_cfg_clear_mesh_chan();
+        warthog_pinned_list.channels = warthog_pinned_chan;
+        chan_st = mmwlan_set_channel_list(channel_list);
+        ESP_LOGE(TAG, "fallback mmwlan_set_channel_list -> %d", (int)chan_st);
+    }
+    if (chan_st != MMWLAN_SUCCESS)
+    {
+        ESP_LOGE(TAG, "S1G channel list NOT applied (status=%d): the radio is on "
+                      "the regulatory default, not the configured channel, and will "
+                      "peer with nothing that expects it", (int)chan_st);
+    }
+#endif
     /* Stash for later reporting: this runs before the USB CDC console exists,
      * so the log line above is invisible to a host attaching after boot. */
     g_warthog_chan_pin_status = (int)chan_st;

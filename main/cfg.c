@@ -259,6 +259,77 @@ esp_err_t warthog_cfg_set_mesh_enable(uint8_t enable)
     return err;
 }
 
+/* S1G occupies roughly 750-950 MHz across all regions. This is a sanity bound
+ * to catch a typo, not a regulatory check -- mmwlan_set_channel_list() applies
+ * the real one against the country's table at boot. */
+#define WARTHOG_S1G_FREQ_MIN_HZ 750000000u
+#define WARTHOG_S1G_FREQ_MAX_HZ 950000000u
+
+bool warthog_cfg_get_mesh_chan(struct warthog_mesh_chan *out)
+{
+    if (!out) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    struct warthog_mesh_chan tmp = {0};
+    size_t len = sizeof(tmp);
+    bool ok = (nvs_get_blob(h, "mesh_chan", &tmp, &len) == ESP_OK && len == sizeof(tmp));
+    nvs_close(h);
+    if (ok) {
+        *out = tmp;
+    }
+    return ok;
+}
+
+esp_err_t warthog_cfg_set_mesh_chan(const struct warthog_mesh_chan *in)
+{
+    if (!in) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (in->freq_hz < WARTHOG_S1G_FREQ_MIN_HZ || in->freq_hz > WARTHOG_S1G_FREQ_MAX_HZ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* S1G bandwidths are 1, 2, 4, 8 and 16 MHz; the MM6108 does not do 16. */
+    if (in->bw_mhz != 1 && in->bw_mhz != 2 && in->bw_mhz != 4 && in->bw_mhz != 8) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (in->chan == 0 || in->global_op_class == 0 || in->op_class == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_blob(h, "mesh_chan", in, sizeof(*in));
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t warthog_cfg_clear_mesh_chan(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_erase_key(h, "mesh_chan");
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = ESP_OK;
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
 uint8_t warthog_cfg_get_mesh_dhcp(void)
 {
     nvs_handle_t h;
