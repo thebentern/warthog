@@ -932,9 +932,10 @@ static void cmd_meshcfg(void)
              WARTHOG_REGION_NAME, WARTHOG_COUNTRY_CODE);
     cdc_write(line);
     snprintf(line, sizeof(line),
-             "+MESHCFG: enable=%u secure=%u dhcp=%u id='%s' pass=%u chars\r\n",
+             "+MESHCFG: enable=%u secure=%u dhcp=%u fwd=%u bridge=%u id='%s' pass=%u chars\r\n",
              (unsigned)warthog_cfg_get_mesh_enable(), (unsigned)warthog_cfg_get_mesh_secure(),
-             (unsigned)warthog_cfg_get_mesh_dhcp(), id, (unsigned)strlen(pw));
+             (unsigned)warthog_cfg_get_mesh_dhcp(), (unsigned)warthog_cfg_get_mesh_fwd(),
+             (unsigned)warthog_cfg_get_mesh_bridge(), id, (unsigned)strlen(pw));
     cdc_write(line);
     if (g_warthog_applied_chan == 0) {
         snprintf(line, sizeof(line),
@@ -1845,6 +1846,28 @@ static void dispatch(char *line)
                      g_warthog_chan_pin_status == 0 ? "yes" : "NO",
                      g_warthog_chan_pin_status);
         }
+        cdc_write(line);
+        reply_ok();
+    } else if (strcasecmp(verb, "MESHFWD") == 0 && terminator == '=') {
+        unsigned long v = strtoul(args, NULL, 10);
+        if (warthog_cfg_set_mesh_fwd((uint8_t)v) == ESP_OK) {
+            cdc_write("+MESHFWD: stored; takes effect on next boot (AT+RESET)\r\n");
+            reply_ok();
+        } else { reply_error("usage: AT+MESHFWD=<0|1>"); }
+    } else if (strcasecmp(verb, "MESHFWD") == 0 && terminator == '?') {
+        char line[64];
+        snprintf(line, sizeof(line), "+MESHFWD: %u\r\n", (unsigned)warthog_cfg_get_mesh_fwd());
+        cdc_write(line);
+        reply_ok();
+    } else if (strcasecmp(verb, "MESHBRIDGE") == 0 && terminator == '=') {
+        unsigned long v = strtoul(args, NULL, 10);
+        if (warthog_cfg_set_mesh_bridge((uint8_t)v) == ESP_OK) {
+            cdc_write("+MESHBRIDGE: stored; takes effect on next boot (AT+RESET)\r\n");
+            reply_ok();
+        } else { reply_error("usage: AT+MESHBRIDGE=<0|1>"); }
+    } else if (strcasecmp(verb, "MESHBRIDGE") == 0 && terminator == '?') {
+        char line[64];
+        snprintf(line, sizeof(line), "+MESHBRIDGE: %u\r\n", (unsigned)warthog_cfg_get_mesh_bridge());
         cdc_write(line);
         reply_ok();
     } else if (strcasecmp(verb, "MESHDHCP") == 0 && terminator == '=') {

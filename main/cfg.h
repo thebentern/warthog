@@ -87,6 +87,16 @@ esp_err_t warthog_cfg_set_mesh_enable(uint8_t enable);
 uint8_t   warthog_cfg_get_mesh_dhcp(void);
 esp_err_t warthog_cfg_set_mesh_dhcp(uint8_t on);
 
+/* 802.11s forwarding: relay other nodes' data and HWMP through this node.
+ * Default off -- the proven leaf behaviour. Next boot. */
+uint8_t   warthog_cfg_get_mesh_fwd(void);
+esp_err_t warthog_cfg_set_mesh_fwd(uint8_t on);
+
+/* L2 bridge mode: put the USB and AP netifs on the mesh segment instead of
+ * NATing them. Default off -- NAT is the proven path. Next boot. */
+uint8_t   warthog_cfg_get_mesh_bridge(void);
+esp_err_t warthog_cfg_set_mesh_bridge(uint8_t on);
+
 /* S1G channel pin, stored and returned as a set.
  *
  * Channel, frequency, operating class and bandwidth are not independent --

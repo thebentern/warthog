@@ -362,6 +362,70 @@ esp_err_t warthog_cfg_set_mesh_dhcp(uint8_t on)
     return err;
 }
 
+uint8_t warthog_cfg_get_mesh_fwd(void)
+{
+    nvs_handle_t h;
+    uint8_t on = 0;
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v;
+        if (nvs_get_u8(h, "mesh_fwd", &v) == ESP_OK && v <= 1) {
+            on = v;
+        }
+        nvs_close(h);
+    }
+    return on;
+}
+
+esp_err_t warthog_cfg_set_mesh_fwd(uint8_t on)
+{
+    if (on > 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, "mesh_fwd", on);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+uint8_t warthog_cfg_get_mesh_bridge(void)
+{
+    nvs_handle_t h;
+    uint8_t on = 0;
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v;
+        if (nvs_get_u8(h, "mesh_br", &v) == ESP_OK && v <= 1) {
+            on = v;
+        }
+        nvs_close(h);
+    }
+    return on;
+}
+
+esp_err_t warthog_cfg_set_mesh_bridge(uint8_t on)
+{
+    if (on > 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, "mesh_br", on);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
 uint8_t warthog_cfg_get_mesh_secure(void)
 {
     nvs_handle_t h;
