@@ -86,3 +86,4 @@ components/halow_mesh_compat/test/linkcheck_all
 *.bak
 *.orig
 *.rej
+components/halow_mesh_compat/test/sim_mesh
