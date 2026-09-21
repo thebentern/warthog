@@ -99,7 +99,9 @@ changes, all of it 802.11s as mac80211 does it:
 - **The first frame of a flow waits for the PREP.** A unicast to a node with
   no path yet is held (up to 4 frames, 2 per destination, 2 s) and sent when
   the path is installed, as mac80211 does, instead of being lost the way an
-  unanswered ARP is.
+  unanswered ARP is. Held frames are released or dropped both when a
+  path-selection frame arrives and on the 2 s service tick, so a peer that
+  never answers cannot park transmit buffers.
 - **Discovery is rate-limited.** A frame for a destination with no path
   triggers a PREQ and is dropped for the upper layer to retry, as an
   unanswered ARP already is; PREQs go out at most once per target per 500 ms
@@ -197,7 +199,10 @@ static or link-local address); NAT and the Meshtastic multicast repeater are
 off, because the bridge floods L2 multicast itself; and the node needs
 `CONFIG_ESP_NETIF_BRIDGE_EN`, which the shipped `sdkconfig.defaults` now sets.
 An image built without it logs the fact and stays in NAT mode rather than
-pretending.
+pretending — and so does a bridge that fails to build for any other reason:
+the mesh netif then takes its own address, so the node still has L3 over the
+mesh. Nothing is torn down until the bridge is whole, and the setting is read
+once at boot, so a node never waits on a bridge that is not coming.
 
 **How much of this is verified.** The address logic — which frames get
 Address Extension, which mesh node a host sits behind, what a receiver

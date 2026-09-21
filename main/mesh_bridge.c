@@ -23,11 +23,28 @@
 
 static const char *TAG = "warthog.bridge";
 static esp_netif_t *s_br;
+static bool s_failed;
+static esp_err_t warthog_mesh_bridge_start_(esp_netif_t *mesh_netif, const uint8_t mac[6]);
 
 bool warthog_mesh_bridge_active(void) { return s_br != NULL; }
 esp_netif_t *warthog_mesh_bridge_netif(void) { return s_br; }
 
+bool warthog_mesh_bridge_pending(void)
+{
+    extern volatile uint32_t g_warthog_mesh_bridge; /* cached at mesh enable */
+    return g_warthog_mesh_bridge && s_br == NULL && !s_failed;
+}
+
 esp_err_t warthog_mesh_bridge_start(esp_netif_t *mesh_netif, const uint8_t mac[6])
+{
+    esp_err_t e = warthog_mesh_bridge_start_(mesh_netif, mac);
+    if (e != ESP_OK) {
+        s_failed = true; /* releases mesh_netif_up_ to the NAT fallback */
+    }
+    return e;
+}
+
+static esp_err_t warthog_mesh_bridge_start_(esp_netif_t *mesh_netif, const uint8_t mac[6])
 {
 #if CONFIG_ESP_NETIF_BRIDGE_EN
     if (s_br != NULL) {

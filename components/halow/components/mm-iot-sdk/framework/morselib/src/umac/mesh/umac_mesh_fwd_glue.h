@@ -46,6 +46,14 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
  *  if held; the caller must then not release it. */
 bool umac_mesh_fwd_glue_tx_pending(struct umac_data *umacd, struct mmpkt *txbuf, const uint8_t *dest);
 
+/** Periodic (2 s): release held frames whose discovery never answered. */
+void umac_mesh_fwd_glue_tick(void);
+
+/** The glue's table lock, for the one HWMP sequence-number writer outside
+ *  this file (the keepalive PREQ in umac_mesh.c). */
+void umac_mesh_fwd_glue_lock(void);
+void umac_mesh_fwd_glue_unlock(void);
+
 /** Next hop for a non-neighbour destination into @p out; false = none (a PREQ was sent). */
 bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6]);
 

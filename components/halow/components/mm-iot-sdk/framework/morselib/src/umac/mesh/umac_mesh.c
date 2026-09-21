@@ -695,6 +695,17 @@ void umac_mesh_service_tick(void)
     }
     umac_datapath_mesh_service_rekey(); /* AT+REKEY=<n>, serviced here */
 
+    /* Frames held for discovery: released or dropped here too, so a peer that
+     * never answers does not park TX buffers until the next HWMP frame. */
+    {
+        extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge;
+        extern void umac_mesh_fwd_glue_tick(void);
+        if (g_warthog_mesh_fwd || g_warthog_mesh_bridge)
+        {
+            umac_mesh_fwd_glue_tick();
+        }
+    }
+
     /* Validate AES-CCM through the shipping mbedtls path, once. The host test
      * links hostap's software AES, so this is the only thing that exercises
      * crypto_mbedtls_mm.c -- whose aes_encrypt_init() built a DECRYPTION key
@@ -1693,8 +1704,13 @@ uint32_t *umac_mesh_hwmp_own_sn_ptr(void)
 int umac_mesh_hwmp_send_preq(const uint8_t *da)
 {
     uint8_t body[HWMP_PREQ_BODY_LEN];
+    /* s_hwmp_sn is also advanced by the relay on the event loop and by the
+     * forwarding glue on the netif task; one lock for every writer. */
+    extern void umac_mesh_fwd_glue_lock(void), umac_mesh_fwd_glue_unlock(void);
+    umac_mesh_fwd_glue_lock();
     uint16_t n = umac_mesh_hwmp_build_preq(body, sizeof(body), s_mesh_own_addr, ++s_hwmp_sn,
                                            ++s_hwmp_preq_id, da, UMAC_MESH_HWMP_LIFETIME_TU);
+    umac_mesh_fwd_glue_unlock();
     if (n == 0)
     {
         return -1;

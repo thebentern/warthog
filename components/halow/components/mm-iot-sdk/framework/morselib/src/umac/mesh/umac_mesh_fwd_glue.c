@@ -250,67 +250,85 @@ void umac_mesh_fwd_glue_forward(struct umac_data *umacd, struct mmpktview *body,
 
 static void maybe_preq_(const uint8_t *target)
 {
-    if (!umac_mesh_preq_gate_allow(&s_preq_gate, target, mmosal_get_time_ms()))
-    {
-        return;
-    }
-    /* Broadcast, through the engine: the target is not a neighbour, so a
-     * unicast PREQ to it would reach nobody. */
+    /* Reached from the netif task (TX) and the event loop (flush); the gate,
+     * our HWMP sequence number and the PREQ id are shared with the relay, so
+     * the decision and the body are made under the lock, the send outside. */
     uint8_t body[HWMP_PREQ_BODY_LEN], ra[6];
-    uint16_t n = umac_mesh_fwd_originate_preq(body, sizeof(body), umac_mesh_own_addr(),
-                                              umac_mesh_hwmp_own_sn_ptr(), &s_hwmp_preq_id, target,
-                                              4882u, ra);
+    uint16_t n = 0;
+    lock_();
+    if (umac_mesh_preq_gate_allow(&s_preq_gate, target, mmosal_get_time_ms()))
+    {
+        /* Broadcast, through the engine: the target is not a neighbour, so a
+         * unicast PREQ to it would reach nobody. */
+        n = umac_mesh_fwd_originate_preq(body, sizeof(body), umac_mesh_own_addr(),
+                                         umac_mesh_hwmp_own_sn_ptr(), &s_hwmp_preq_id, target,
+                                         4882u, ra);
+    }
+    unlock_();
     if (n != 0 && umac_mesh_tx_action(ra, body, n) >= 0)
     {
         g_warthog_fwd_preq_tx++;
     }
 }
 
-/* Frames held for discovery whose path now exists go out the way a fresh
- * TX would: classified, then queued to the next hop. Expired ones are
- * dropped. Called after every path-selection frame is processed. */
+void umac_mesh_fwd_glue_lock(void) { lock_(); }
+void umac_mesh_fwd_glue_unlock(void) { unlock_(); }
+
+/* An 802.3 frame from the TX entry, now that @p ra is its next hop: queued
+ * the way a fresh TX would be, classified first. @returns false (frame not
+ * taken) when @p ra is not a peer. Same peer-record lifetime as every other
+ * enqueue in this file: del_peer on another task can free the record
+ * between the lookup and the queue -- a shape the SDK's own TX path shares. */
+static bool send_now_(struct umac_data *umacd, struct mmpkt *pkt, const uint8_t *ra)
+{
+    struct umac_sta_data *stad = umac_datapath_mesh_find_peer(ra);
+    if (stad == NULL)
+    {
+        return false;
+    }
+    uint8_t da[6], sa[6];
+    struct mmpktview *v = mmpkt_open(pkt);
+    const struct umac_8023_hdr *h = (const struct umac_8023_hdr *)mmpkt_get_data_start(v);
+    memcpy(da, h->dest_addr, 6);
+    memcpy(sa, h->src_addr, 6);
+    mmpkt_close(&v);
+    struct mmdrv_tx_metadata *md = mmdrv_get_tx_metadata(pkt);
+    md->enc = ENCRYPTION_ENABLED;
+    memset(&md->mesh, 0, sizeof(md->mesh));
+    umac_mesh_fwd_glue_tx_classify(pkt, da, sa);
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    data->ops->enqueue_tx_frame(umacd, stad, pkt);
+    umac_core_evt_wake(umacd);
+    return true;
+}
+
+/* Frames held for discovery whose path now exists go out; expired ones are
+ * dropped. Called after every path-selection frame and from the 2 s service
+ * tick, so an unanswered discovery still gives its buffers back on time. */
 static void flush_pending_(void)
 {
-    struct umac_data *umacd = s_pend_umacd;
-    if (umacd == NULL || umac_mesh_pending_count(&s_pend) == 0)
-    {
-        return;
-    }
     struct umac_mesh_fwd_ctx c = fctx_();
     struct umac_mesh_pending_out out[UMAC_MESH_PENDING_MAX];
     lock_();
-    uint32_t n = umac_mesh_pending_take(&s_pend, &c, out, UMAC_MESH_PENDING_MAX);
+    struct umac_data *umacd = s_pend_umacd;
+    uint32_t n = (umacd != NULL) ? umac_mesh_pending_take(&s_pend, &c, out, UMAC_MESH_PENDING_MAX) : 0;
     unlock_();
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-    bool queued = false;
     for (uint32_t i = 0; i < n; i++)
     {
         struct mmpkt *pkt = (struct mmpkt *)out[i].handle;
-        struct umac_sta_data *stad = out[i].ok ? umac_datapath_mesh_find_peer(out[i].ra) : NULL;
-        if (stad == NULL)
+        if (out[i].ok && send_now_(umacd, pkt, out[i].ra))
         {
-            mmpkt_release(pkt);
-            g_warthog_fwd_pend_drop++;
+            g_warthog_fwd_pend_tx++;
             continue;
         }
-        uint8_t da[6], sa[6];
-        struct mmpktview *v = mmpkt_open(pkt);
-        const struct umac_8023_hdr *h = (const struct umac_8023_hdr *)mmpkt_get_data_start(v);
-        memcpy(da, h->dest_addr, 6);
-        memcpy(sa, h->src_addr, 6);
-        mmpkt_close(&v);
-        struct mmdrv_tx_metadata *md = mmdrv_get_tx_metadata(pkt);
-        md->enc = ENCRYPTION_ENABLED;
-        memset(&md->mesh, 0, sizeof(md->mesh));
-        umac_mesh_fwd_glue_tx_classify(pkt, da, sa);
-        data->ops->enqueue_tx_frame(umacd, stad, pkt);
-        g_warthog_fwd_pend_tx++;
-        queued = true;
+        mmpkt_release(pkt);
+        g_warthog_fwd_pend_drop++;
     }
-    if (queued)
-    {
-        umac_core_evt_wake(umacd);
-    }
+}
+
+void umac_mesh_fwd_glue_tick(void)
+{
+    flush_pending_();
 }
 
 bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6])
@@ -447,6 +465,7 @@ bool umac_mesh_fwd_glue_tx_pending(struct umac_data *umacd, struct mmpkt *txbuf,
     void *evicted = NULL;
     bool held = false;
     lock_();
+    s_pend_umacd = umacd; /* before the push is visible to a flush */
     umac_mesh_fwd_tx(&c, dest, c.own_addr, 0, &t);
     if (!t.ok && t.need_path)
     {
@@ -461,9 +480,16 @@ bool umac_mesh_fwd_glue_tx_pending(struct umac_data *umacd, struct mmpkt *txbuf,
     }
     if (held)
     {
-        s_pend_umacd = umacd;
+        return true;
     }
-    return held;
+    /* The PREP beat us here: the lookup that sent the PREQ found no peer,
+     * the event loop installed the path meanwhile. Send, do not drop. */
+    if (t.ok && t.shape == UMAC_MESH_TX_UNICAST_4ADDR && send_now_(umacd, txbuf, t.ra))
+    {
+        g_warthog_fwd_pend_tx++;
+        return true;
+    }
+    return false;
 }
 
 void umac_mesh_fwd_glue_peer_lost(const uint8_t *peer)

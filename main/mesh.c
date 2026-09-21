@@ -121,9 +121,10 @@ static bool s_mesh_netif_up;
 static void mesh_netif_up_(void)
 {
     /* In bridge mode the bridge is the L3 interface; the mesh netif is a port.
-     * A peer can reach ESTAB before app_main has built the bridge, so decide by
-     * the persisted gate and wait: the probe task calls this every 2 s. */
-    if (warthog_cfg_get_mesh_bridge() && !warthog_mesh_bridge_active()) {
+     * A peer can reach ESTAB before app_main has built the bridge, so wait
+     * while the start is still to come (the probe task calls this every 2 s);
+     * once it has failed the mesh netif takes the address itself, NAT mode. */
+    if (warthog_mesh_bridge_pending()) {
         return;
     }
     esp_netif_t *netif = warthog_mesh_bridge_active() ? warthog_mesh_bridge_netif()

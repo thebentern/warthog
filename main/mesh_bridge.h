@@ -9,4 +9,8 @@
  * the mesh segment with their own MACs instead of behind NAT. */
 esp_err_t   warthog_mesh_bridge_start(esp_netif_t *mesh_netif, const uint8_t mac[6]);
 bool        warthog_mesh_bridge_active(void);
+/* Bridge mode is on for this boot and start has neither succeeded nor failed
+ * yet: the mesh netif must wait for it. False once it has failed, so the NAT
+ * fallback runs; runtime state, never the persisted key. */
+bool        warthog_mesh_bridge_pending(void);
 esp_netif_t *warthog_mesh_bridge_netif(void);
