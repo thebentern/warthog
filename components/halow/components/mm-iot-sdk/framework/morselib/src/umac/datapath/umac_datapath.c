@@ -113,6 +113,7 @@ extern volatile uint32_t g_warthog_filter_entry;
 extern volatile uint32_t g_warthog_filt_reason, g_warthog_filt_drop;
 extern volatile uint32_t g_warthog_filt_hist[9];
 extern volatile uint32_t g_warthog_rx_meshctrl_stripped;
+extern volatile uint32_t g_warthog_rx_meshctrl_ae;
 extern volatile uint32_t g_warthog_mesh_seq;
 extern volatile uint16_t g_warthog_fc_ring[32];
 extern volatile uint32_t g_warthog_fc_ring_idx;
@@ -577,6 +578,9 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
     struct umac_8023_hdr header_8023 = { 0 };
     bool mesh_ctrl_present = false;
+    /* Address Extension endpoints, when the sender proxied for another device. */
+    uint8_t ae_da[6], ae_sa[6];
+    bool have_ae_da = false, have_ae_sa = false;
 
     if (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_DATA)
     {
@@ -681,11 +685,40 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             { g_warthog_rxdrop_reason = 90; g_warthog_rxdrop_count++; goto drop; }
         }
         uint32_t ae_len = 0;
-        switch (mc[0] & 0x03)
+        uint8_t ae_mode = mc[0] & 0x03;
+        switch (ae_mode)
         {
             case 0x01: ae_len = 6;  break; /* AE_A4 */
             case 0x02: ae_len = 12; break; /* AE_A5_A6 */
             default:   ae_len = 0;  break;
+        }
+        /* Address Extension carries the PROXIED endpoints: a peer bridging a
+         * mesh interface to a LAN sends frames whose real source is a device
+         * behind it, not the mesh node. Without reading these the frame is
+         * delivered as if the mesh node originated it, the true source is
+         * lost, and replies go to the wrong host. Capture them before the
+         * strip -- mc is invalidated by it. */
+        if (ae_len != 0)
+        {
+            if (!umac_datapath_validate_buf_len(rxbufview, 6 + ae_len))
+            {
+                { g_warthog_rxdrop_reason = 92; g_warthog_rxdrop_count++; goto drop; }
+            }
+            if (ae_mode == 0x01)
+            {
+                /* AE 1: one address, the proxied source. */
+                memcpy(ae_sa, mc + 6, 6);
+                have_ae_sa = true;
+            }
+            else
+            {
+                /* AE 2: proxied destination then proxied source. */
+                memcpy(ae_da, mc + 6, 6);
+                memcpy(ae_sa, mc + 12, 6);
+                have_ae_da = true;
+                have_ae_sa = true;
+            }
+            g_warthog_rx_meshctrl_ae++;
         }
         if (mmpkt_remove_from_start(rxbufview, 6 + ae_len) == NULL)
         {
@@ -757,8 +790,10 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         { g_warthog_rxdrop_reason = 12; g_warthog_rxdrop_count++; goto drop; }
     }
 
-    umac_datapath_generate_8023_header(dot11_get_da(header),
-                                       dot11_get_sa_data(data_hdr),
+    /* Prefer the Address Extension endpoints when the sender proxied for
+     * someone: they are the real ends of the conversation. */
+    umac_datapath_generate_8023_header(have_ae_da ? ae_da : dot11_get_da(header),
+                                       have_ae_sa ? ae_sa : dot11_get_sa_data(data_hdr),
                                        llc_ethertype,
                                        &header_8023);
 

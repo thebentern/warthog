@@ -500,6 +500,9 @@ volatile uint32_t g_warthog_txst_data_last_flags = 0;
  * observation point on the host: a page counted here was pushed by the chip. */
 volatile uint32_t g_warthog_shim_rx = 0, g_warthog_shim_rx_notrunning = 0;
 volatile uint32_t g_warthog_rx_meshctrl_stripped = 0; /* RX frames whose Mesh Control we removed */
+/* RX frames whose Mesh Control carried Address Extension -- a peer proxying for
+ * a device behind it. Non-zero means a bridged peer is talking to us. */
+volatile uint32_t g_warthog_rx_meshctrl_ae = 0;
 volatile uint32_t g_warthog_mesh_seq = 0;
 volatile uint32_t g_warthog_nodec_group = 0, g_warthog_nodec_fc = 0, g_warthog_nodec_keyid = 0;
 volatile uint32_t g_warthog_nodec_group_n = 0, g_warthog_nodec_uni_n = 0;
@@ -952,7 +955,7 @@ static void cmd_rxchan(void)
     char buf[460];
     snprintf(buf, sizeof(buf),
              "+RXCHAN: pages=%lu data=%lu beacon=%lu mgmt=%lu cmd=%lu txstat=%lu last=0x%02lx "
-             "| shim=%lu notrunning=%lu rxframe=%lu filter=%lu meshctrl=%lu | rxdrop=%lu reason=%lu "
+             "| shim=%lu notrunning=%lu rxframe=%lu filter=%lu meshctrl=%lu ae=%lu | rxdrop=%lu reason=%lu "
              "ccmp_key=%lu blank=%lu replay=%lu pn=%lu | nodec grp=%lu uni=%lu "
              "last(grp=%lu fc=%04lx key=%lu ta=%02x%02x%02x)\r\n",
              (unsigned long)g_warthog_rxchan_pages, (unsigned long)g_warthog_rxchan_data,
@@ -961,6 +964,7 @@ static void cmd_rxchan(void)
              (unsigned long)g_warthog_rxchan_last, (unsigned long)g_warthog_shim_rx,
              (unsigned long)g_warthog_shim_rx_notrunning, (unsigned long)g_warthog_rxframe_entry,
              (unsigned long)g_warthog_filter_entry, (unsigned long)g_warthog_rx_meshctrl_stripped,
+             (unsigned long)g_warthog_rx_meshctrl_ae,
              (unsigned long)g_warthog_rxdrop_count, (unsigned long)g_warthog_rxdrop_reason,
              (unsigned long)g_warthog_ccmp_last_keyid, (unsigned long)g_warthog_ccmp_blank,
              (unsigned long)g_warthog_ccmp_replay, (unsigned long)g_warthog_ccmp_last_pn,
