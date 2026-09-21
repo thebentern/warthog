@@ -458,16 +458,46 @@ The CDC console (`/dev/cu.usbmodemXXXX`) carries all ESP-IDF logs after USB-OTG 
 | 7 | OpenMANET / OpenWrt interop | ✅ unencrypted mesh: 0–3% loss, 8–19 ms against OpenMANET 1.8.0. SAE/AMPE peering also verified cross-vendor; its data plane is not — see [`docs/mesh-openmanet.md`](docs/mesh-openmanet.md) |
 
 SAE/AMPE is implemented: the `warthog-mesh-sae` build derives a per-link MTK
-per peer, and peering interoperates with stock OpenMANET. Two limits apply.
-The **encrypted** data plane is warthog-to-warthog only — against OpenMANET the
+per peer, and peering interoperates with stock OpenMANET. One limit applies:
+the **encrypted** data plane is warthog-to-warthog only — against OpenMANET the
 verified result is the unencrypted mesh above, because the chip holds one
 VIF-wide group key while every 802.11s peer generates its own, so
-group-addressed frames from a second peer cannot be decrypted in hardware. And
-the mesh envs are capability builds, not shipping firmware: they skip the STA
-uplink, and no region env compiles mesh.
+group-addressed frames from a second peer cannot be decrypted in hardware.
+
+Mesh is no longer confined to the capability builds: `AT+MESHEN=1` enables it
+on any image, region envs included, and the mesh ID, passphrase and channel are
+runtime settings. The mesh envs remain useful because they pin a channel and
+fix the identity at build time.
 
 Not implemented: mesh forwarding (a node answers path requests aimed at it and
-relays nothing), per-transmitter group keys, Windows RNDIS, and a web UI.
+relays nothing), per-transmitter group keys, layer-2 bridging of the tethered
+client, multicast across the mesh, Windows RNDIS, and a web UI.
+
+### What is measured, and what is not
+
+The ✅ above means "observed on hardware", and it is worth being precise about
+when, because a large amount of the current tree has not been on a radio.
+
+**Measured on hardware.** Phases 0–5 as described. A 3-node warthog 802.11s
+mesh, and cross-vendor SAE/AMPE peering to an OpenMANET node, on 2026-09-20.
+The unencrypted data-plane figures in phase 7, against OpenMANET **1.8.0**. On
+2026-09-21, an OpenMANET **24.10** (`r28739-d9340319c6`) baseline: the peer's
+mesh configuration, the absence of a batman fabric on an un-wizarded node, and
+proxied endpoints crossing the mesh on air.
+
+**Not measured.** Everything added on 2026-09-21 is compiled, reviewed and
+where possible host-tested, but has not run on a radio: receive-side Address
+Extension against a real bridged peer, DHCP-first netif bring-up, runtime
+channel configuration on a region build, per-peer RSSI/SNR/bandwidth, the
+`fwdcand` forwarding-feasibility counter, and the peering watchdog's output
+(its cause-selection is unit-tested on the host; its log lines have never
+fired on hardware). Host software CCMP has **never been observed working on
+air** — `swccmp ok` has not been seen above zero, for unicast or group. That
+802.11w MFP is negotiated and the IGTK installed is readable from the source
+and the linked image; that the chip applies BIP on air is not.
+
+If you are deciding whether to trust this for something that matters, that
+second paragraph is the honest answer.
 
 ## Security
 
