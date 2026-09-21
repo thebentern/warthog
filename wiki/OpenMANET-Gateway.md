@@ -68,11 +68,22 @@ AT+MPMPEERS?
 
 `estab=1` with a non-zero `plid` is a complete handshake with the Pi.
 
-That is the whole warthog side. Channel, bandwidth and mesh ID are already set
-in the build to S1G ch 42, 2 MHz, mesh ID `halowmesh`. These are Warthog's
-values, not necessarily your peer's — OpenMANET's mesh wizard ships different
-defaults (`openmanet-mesh`, and its own channel), so read the peer's actual
-configuration and match it.
+That is the whole warthog side. Channel, bandwidth and mesh ID default to S1G
+ch 42, 2 MHz, mesh ID `halowmesh`, and are settable at runtime with
+`AT+MESHCHAN=` / `AT+MESHID=`.
+
+Measured against OpenMANET 24.10 (`r28739-d9340319c6`) on a Pi 4 with a Morse
+MM6108, those defaults already match the peer:
+
+```
+wireless.radio1.channel='42'          wireless.radio1.country='US'
+wireless.default_radio1.mesh_id='halowmesh'
+wireless.default_radio1.encryption='sae'
+```
+
+Do not take that as a guarantee across releases or profiles — read the peer's
+actual configuration and match it. `AT+MESHCFG?` prints Warthog's side of the
+same comparison.
 
 ## Setup — OpenMANET
 

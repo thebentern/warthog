@@ -179,6 +179,20 @@ OpenWrt puts `wlh0` in `br-lan`. A bridged mesh interface cannot hold its own
 address, and traffic entering the mesh from a bridge is *proxied* traffic, which
 802.11s handles through a different mechanism than locally-originated frames.
 
+The proxying half is confirmed on air. Capturing on `wlh0` of one OpenMANET
+24.10 node while a laptop behind the other node's bridge sent mDNS shows the
+frame crossing the mesh with the **laptop's** source MAC, not the Pi's — an
+endpoint behind the bridge, carried over 802.11s, which is what Mesh Address
+Extension exists to express. Warthog reads AE on receive as of
+`3868453`; that it does so correctly against this peer is not yet measured.
+
+Note for anyone trying to capture this themselves: **monitor mode is not
+available on the HaLow radio while the mesh is up.** Adding a monitor VIF
+succeeds but it never gets a channel, and tuning it returns `command failed:
+Resource busy (-16)`. Capture on `wlh0` itself, which gives decrypted 802.3
+frames — enough to see proxied source MACs, not enough to read the Mesh
+Control field.
+
 Symptom: an address configured on `wlh0` is ignored, `iw dev wlh0 mpath dump`
 stays empty, and the peer's per-station `tx packets` counter sits at exactly 5 —
 its Open and Confirm — no matter how much traffic you offer.

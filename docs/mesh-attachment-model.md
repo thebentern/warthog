@@ -66,24 +66,38 @@ or RAM; both fit with room to spare.
 
 ### What not having batman-adv actually costs — read this part
 
-An idiomatic OpenMANET node does not run bare 802.11s. Its mesh wizard
-enslaves the HaLow interface to a batman device: `proto=batadv_hardif
-master=bat0`, with `bat0` running `routing_algo=BATMAN_V`. Everything else on
-the box keys off `bat0` — mesh status reads `batctl meshif bat0 originators`,
-the ATAK/CoT page tunes `bat0`'s multicast mode for CoT flooding, meshtasticd
-pins node identity to it, and `alfred` runs over the HaLow bridge.
+This section previously asserted that an idiomatic OpenMANET node enslaves its
+HaLow interface to `bat0` and that connecting a Warthog therefore means
+dismantling the peer's batman fabric. **That was asserted, not observed, and
+the observed default contradicts it.**
 
-Warthog speaks bare 802.11s with a self-assigned `10.77.x.y/16`. So on an
-untouched OpenMANET node the radio link can be perfect and Warthog is still
-**not on the fabric**: absent from `batctl originators`, unreachable by the
-CoT multicast path, outside the L2 domain the other tooling assumes.
+Measured 2026-09-21 on two Pi 4 / MM6108 nodes running OpenMANET 24.10
+(`r28739-d9340319c6`), untouched apart from the mesh credentials:
 
-Worse, the two are mutually exclusive as currently documented. Warthog's own
-setup instructions require the peer's mesh interface to be un-enslaved
-(`ip link set wlh0 nomaster`) and given its own 10.77 address — which pulls it
-out of `bat0`. **Connecting a Warthog today means dismantling the batman
-fabric on that node.** That is the real cost of having no batman-adv, and it
-is larger than "some routing metadata is missing".
+```
+# ip -br link show type batadv   -> (nothing)
+# ip addr show bat0              -> Device "bat0" does not exist.
+# ls /sys/class/net/br-lan/brif/ -> eth0  phy1-ap0  wlh0
+# lsmod | grep batman            -> batman_adv 208896 0      <- refcount 0
+# uci show network.bat0          -> network.bat0.multicast_mode='0'   (no proto, no device)
+```
+
+So on this release the HaLow mesh interface `wlh0` is a **direct member of
+`br-lan`**, alongside `eth0` and the 5 GHz AP. batman-adv is built and loaded
+but has no devices and is not in the data path. `network.bat0` is a stub the
+image ships; something — a profile, or the wizard under options not exercised
+here — would have to instantiate it.
+
+What this changes: for a peer in this configuration, Warthog does **not** have
+to dismantle anything, because there is no batman fabric to dismantle. The
+fabric mismatch is real only against a node that has actually been put on
+`bat0`, and that is a configuration to check rather than an assumption to
+design around. Check it with `ip addr show bat0` before believing either
+story.
+
+What remains true regardless: Warthog speaks bare 802.11s with a self-assigned
+`10.77.x.y/16` and does not forward, so against a node that *is* on `bat0` it
+is absent from `batctl originators` and outside that L2 domain.
 
 Two ways out, and they are genuinely different products:
 
