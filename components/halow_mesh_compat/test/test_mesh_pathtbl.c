@@ -82,20 +82,22 @@ int main(void)
     umac_mesh_pathtbl_init(&T);
     now = 50000;
     umac_mesh_path_update(&T, D, H1, 20, 100, 1, LT, now);
-    CHECK(!umac_mesh_path_invalidate(&T, D, 19, now), "PERR with an OLDER sn is ignored (stale error)");
+    CHECK(!umac_mesh_path_invalidate(&T, D, 25, H2, now), "PERR from a node that is NOT our next hop is ignored, even with a newer sn");
+    CHECK(umac_mesh_path_lookup(&T, D, now) != NULL, "a third party cannot knock out our path");
+    CHECK(!umac_mesh_path_invalidate(&T, D, 19, H1, now), "PERR with an OLDER sn is ignored (stale error)");
     CHECK(umac_mesh_path_lookup(&T, D, now) != NULL, "path survives it");
-    CHECK(!umac_mesh_path_invalidate(&T, D, 20, now), "PERR with the SAME sn is ignored too (mac80211: must be newer)");
-    CHECK( umac_mesh_path_invalidate(&T, D, 21, now), "PERR with a newer sn deactivates");
+    CHECK(!umac_mesh_path_invalidate(&T, D, 20, H1, now), "PERR with the SAME sn is ignored too (mac80211: must be newer)");
+    CHECK( umac_mesh_path_invalidate(&T, D, 21, H1, now), "PERR with a newer sn deactivates");
     CHECK(umac_mesh_path_lookup(&T, D, now) == NULL, "path is gone");
-    CHECK(!umac_mesh_path_invalidate(&T, D, 22, now), "a second PERR changes nothing -> must not be re-forwarded");
+    CHECK(!umac_mesh_path_invalidate(&T, D, 22, H1, now), "a second PERR changes nothing -> must not be re-forwarded");
     umac_mesh_path_update(&T, D, H1, 30, 100, 1, LT, now);
-    CHECK( umac_mesh_path_invalidate(&T, D, 0, now), "PERR with sn 0 (unknown) always deactivates");
+    CHECK( umac_mesh_path_invalidate(&T, D, 0, NULL, now), "PERR with sn 0 (unknown) from anyone-checked-by-caller (NULL) deactivates");
     CHECK(umac_mesh_path_lookup(&T, D, now) == NULL, "gone again");
     /* mac80211 parity: an INACTIVE path does not reject on sn. After a PERR
      * the next advertisement rebuilds, even at an older number -- the sn
      * defence protects live paths, and recovery must not wait on it. */
     CHECK( umac_mesh_path_update(&T, D, H1, 22, 100, 1, LT, now), "after a PERR, sn 22 rebuilds although we held 30");
-    CHECK( umac_mesh_path_invalidate(&T, D, 23, now), "PERR at 23 deactivates the rebuilt path");
+    CHECK( umac_mesh_path_invalidate(&T, D, 23, H1, now), "PERR at 23 deactivates the rebuilt path");
     CHECK( umac_mesh_path_update(&T, D, H1, 23, 100, 1, LT, now), "an advertisement at the PERR's own sn rebuilds it");
     CHECK(!umac_mesh_path_update(&T, D, H1, 22, 100, 1, LT, now), "but once ACTIVE again, an older sn is rejected");
 
@@ -147,7 +149,7 @@ int main(void)
     /* ---- NULL safety ------------------------------------------------------- */
     CHECK(umac_mesh_path_lookup(NULL, D, now) == NULL, "NULL table lookup");
     CHECK(!umac_mesh_path_update(&T, NULL, H1, 1, 1, 1, LT, now), "NULL dst update");
-    CHECK(!umac_mesh_path_invalidate(NULL, D, 1, now), "NULL table invalidate");
+    CHECK(!umac_mesh_path_invalidate(NULL, D, 1, H1, now), "NULL table invalidate");
     CHECK(umac_mesh_proxy_lookup(&T, NULL, now) == NULL, "NULL ext lookup");
 
     printf("sizeof(struct umac_mesh_pathtbl) = %u bytes\n", (unsigned)sizeof(struct umac_mesh_pathtbl));

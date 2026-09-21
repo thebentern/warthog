@@ -137,7 +137,7 @@ bool umac_mesh_path_update(struct umac_mesh_pathtbl *t, const uint8_t *dst,
 }
 
 bool umac_mesh_path_invalidate(struct umac_mesh_pathtbl *t, const uint8_t *dst,
-                               uint32_t sn, uint32_t now_ms)
+                               uint32_t sn, const uint8_t *from, uint32_t now_ms)
 {
     if (t == NULL || dst == NULL)
     {
@@ -147,6 +147,10 @@ bool umac_mesh_path_invalidate(struct umac_mesh_pathtbl *t, const uint8_t *dst,
     if (e == NULL || !(e->flags & UMAC_MESH_PATH_ACTIVE) || past_(now_ms, e->exp_ms))
     {
         return false;
+    }
+    if (from != NULL && !eq_(e->next_hop, from))
+    {
+        return false; /* not from our next hop for this destination */
     }
     /* mac80211 mesh_path_error rx: act when we hold no valid sn, the PERR's
      * is newer, or it is 0 (unknown). An OLDER sn is a stale error and is

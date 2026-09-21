@@ -80,14 +80,16 @@ bool umac_mesh_path_update(struct umac_mesh_pathtbl *t, const uint8_t *dst,
                            uint8_t hop_count, uint32_t lifetime_ms, uint32_t now_ms);
 
 /**
- * Apply a PERR naming @p dst with @p sn. Deactivates the path if it is active
- * and the PERR is not older than what we hold (sn newer, sn 0, or ours has no
- * valid sn). @returns true when a path was deactivated -- the signal to forward
- * the PERR onward; a PERR that changed nothing must not be forwarded, or two
- * relays echo it forever.
+ * Apply a PERR naming @p dst with @p sn, received from @p from. Deactivates
+ * the path only if it is active, @p from IS its next hop (mac80211: a node
+ * not on our path cannot knock it out; NULL skips the check for a local
+ * loss), and the PERR is not older than what we hold (sn newer, sn 0, or ours
+ * has no valid sn). @returns true when a path was deactivated -- the signal
+ * to forward the PERR onward; a PERR that changed nothing must not be
+ * forwarded, or two relays echo it forever.
  */
 bool umac_mesh_path_invalidate(struct umac_mesh_pathtbl *t, const uint8_t *dst,
-                               uint32_t sn, uint32_t now_ms);
+                               uint32_t sn, const uint8_t *from, uint32_t now_ms);
 
 /** Drop every active path whose next hop is @p next_hop (a peer went away).
  *  @returns how many were dropped. */
