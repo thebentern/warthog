@@ -116,20 +116,33 @@ destination) beyond the four 802.11 addresses. Warthog does not implement it:
 on receive." The measured symptom on the peer is its per-station `tx packets`
 freezing at exactly 5.
 
-So keeping the operator's `bat0` intact needs, in order:
+**Receive-side AE is now implemented** (`umac_datapath.c`, counter `ae=` on
+`AT+RXCHAN?`). Warthog delivers a proxied frame to the right host instead of
+attributing it to the mesh node, and a non-zero `ae=` is the direct way to
+see that a bridged peer is reaching us — a condition previously visible only
+as a symptom on the peer.
 
-1. **Address Extension on receive** — accept and parse AE frames instead of
-   rejecting them, so proxied traffic from a bridged peer is delivered.
-2. **Address Extension on transmit** — set it for anything Warthog forwards
-   on behalf of its tethered client, which is also what makes the client
-   visible to the rest of the mesh.
-3. **Mesh gate behaviour** — announce that Warthog bridges to a non-mesh
-   segment, so peers know to send it traffic for addresses it proxies.
+What is left is **not** simply "AE on transmit". Transmit-side AE has nothing
+to carry today, because Warthog NAPTs its tethered client: `main/nat.c` puts
+NAPT on the inside netifs and rewrites the source to the HaLow address, so
+every frame Warthog sends is genuinely its own. It never proxies for anyone.
 
-Warthog taking a DHCP lease on the mesh (added alongside this note) removes
-the *addressing* half of the requirement and is worth having on its own, but
-it does not by itself make a bridged peer work. Do not read it as closing
-this gap.
+So transmit-side AE only becomes useful paired with one of:
+
+- **Forwarding** — relaying another node's traffic means re-emitting frames
+  whose endpoints are not ours, which is exactly what AE encodes. This is the
+  drone-relay path.
+- **Bridging the tethered client instead of NATing it** — an architectural
+  change (see the README's "Warthog routes, it does not bridge"), after which
+  the client is a real proxied endpoint that AE must announce.
+
+And either of those additionally wants **mesh gate announcement**, so peers
+know to send Warthog traffic for the addresses it proxies.
+
+Warthog taking a DHCP lease on the mesh removes the *addressing* half of the
+bridged-peer requirement and is worth having on its own, but neither it nor
+receive-side AE lets a Warthog fully participate on a peer that keeps its
+mesh interface enslaved. Do not read either as closing this gap.
 
 ## Prerequisite: group-addressed frames
 
