@@ -224,3 +224,100 @@ bool umac_mesh_fwd_normalise_replica(struct umac_mesh_rx_frame *f)
     memset(f->mc.eaddr2, 0, 6);
     return true;
 }
+
+uint16_t umac_mesh_fwd_tx_header(const struct umac_mesh_tx_hdr_in *in,
+                                 uint8_t out[UMAC_MESH_DATA_HDR4_LEN])
+{
+    if (in == NULL || out == NULL || in->ra == NULL || in->own == NULL ||
+        in->dst8023 == NULL || in->src8023 == NULL)
+    {
+        return 0;
+    }
+    if (in->grp_std && is_group_(in->dst8023))
+    {
+        /* addr3 is the MESH SOURCE, which a relay must keep: mac80211's
+         * forwarder changes only TA and TTL, and every cache downstream is
+         * keyed on it. Only a frame we originate has us there. */
+        const uint8_t *msa = (in->sidecar_valid && in->mesh_sa != NULL) ? in->mesh_sa : in->own;
+        return umac_mesh_ies_build_data_hdr3_group(out, in->dst8023, in->own, msa);
+    }
+    const uint8_t *da = is_group_(in->dst8023) ? in->ra : in->dst8023;
+    const uint8_t *sa = in->src8023;
+    if (in->sidecar_valid && in->mesh_da != NULL && in->mesh_sa != NULL)
+    {
+        sa = in->mesh_sa;
+        if (!is_group_(in->mesh_da))
+        {
+            da = in->mesh_da;
+        }
+    }
+    return umac_mesh_ies_build_data_hdr4(out, in->ra, in->own, da, sa);
+}
+
+void umac_mesh_fwd_replica_ctrl(const struct umac_mesh_ctrl *native, const uint8_t *group_da,
+                                const uint8_t *src, struct umac_mesh_ctrl *out)
+{
+    if (native == NULL || group_da == NULL || src == NULL || out == NULL)
+    {
+        return;
+    }
+    *out = *native;
+    out->flags = (uint8_t)((native->flags & ~UMAC_MESH_CTRL_AE_MASK) | UMAC_MESH_CTRL_AE_A5A6);
+    memcpy(out->eaddr1, group_da, 6);
+    memcpy(out->eaddr2, src, 6);
+}
+
+uint16_t umac_mesh_fwd_parse_frame(const uint8_t *hdr, uint16_t len, struct umac_mesh_rx_frame *f)
+{
+    if (hdr == NULL || f == NULL || len < 24u + 2u + UMAC_MESH_CTRL_LEN_MIN)
+    {
+        return 0;
+    }
+    uint16_t fc = (uint16_t)(hdr[0] | (hdr[1] << 8));
+    if (((fc >> 2) & 0x3u) != 2u || ((fc >> 4) & 0xfu) != 8u)
+    {
+        return 0; /* not QoS data */
+    }
+    bool to_ds = (fc & 0x0100u) != 0u, from_ds = (fc & 0x0200u) != 0u;
+    uint16_t mac_len;
+    memset(f, 0, sizeof(*f));
+    if (to_ds && from_ds)
+    {
+        mac_len = 30u;
+        f->group = false;
+        memcpy(f->addr4, &hdr[24], 6);
+    }
+    else if (from_ds)
+    {
+        mac_len = 24u;
+        f->group = true;
+    }
+    else
+    {
+        return 0; /* neither mesh shape */
+    }
+    memcpy(f->addr1, &hdr[4], 6);
+    memcpy(f->addr2, &hdr[10], 6);
+    memcpy(f->addr3, &hdr[16], 6);
+    if (len < mac_len + 2u + UMAC_MESH_CTRL_LEN_MIN)
+    {
+        return 0;
+    }
+    uint16_t qos = (uint16_t)(hdr[mac_len] | (hdr[mac_len + 1] << 8));
+    if ((qos & 0x0100u) == 0u)
+    {
+        return 0; /* no Mesh Control: not a mesh data frame */
+    }
+    uint16_t used = 0;
+    if (!umac_mesh_ctrl_parse(&hdr[mac_len + 2], (uint16_t)(len - mac_len - 2u), &f->mc, &used))
+    {
+        return 0;
+    }
+    /* A 3-address frame whose addr1 is not a group address is not a mesh
+     * group frame; the 4-address form is how unicast travels. */
+    if (f->group && !is_group_(f->addr1))
+    {
+        return 0;
+    }
+    return (uint16_t)(mac_len + 2u + used);
+}

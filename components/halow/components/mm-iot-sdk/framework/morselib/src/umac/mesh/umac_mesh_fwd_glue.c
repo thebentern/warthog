@@ -171,15 +171,20 @@ void umac_mesh_fwd_glue_forward(struct umac_data *umacd, struct mmpktview *body,
     md->enc = ENCRYPTION_ENABLED;
     md->tid = 0;
     struct umac_mesh_ctrl mc = r->fwd_mc;
-    if (group)
+    extern volatile uint32_t g_warthog_mesh_grp;
+    if (group && g_warthog_mesh_grp)
+    {
+        /* Standard group frame: the native Mesh Control goes out once on a
+         * 3-address frame; the sender drops its own rebroadcast as a
+         * duplicate. AE 2 here would be refused by every receiver. */
+    }
+    else if (group)
     {
         /* Replicated as unicast per peer: the group DA and the source ride
          * in AE 2 so a mac80211 receiver rebuilds the real Ethernet frame. */
         const uint8_t *src = umac_mesh_ctrl_ae(&r->fwd_mc) == UMAC_MESH_CTRL_AE_A4
                                  ? r->fwd_mc.eaddr1 : mesh_sa;
-        mc.flags = (uint8_t)((r->fwd_mc.flags & ~UMAC_MESH_CTRL_AE_MASK) | UMAC_MESH_CTRL_AE_A5A6);
-        memcpy(mc.eaddr1, mesh_da, 6);
-        memcpy(mc.eaddr2, src, 6);
+        umac_mesh_fwd_replica_ctrl(&r->fwd_mc, mesh_da, src, &mc);
         md->mesh.exclude_valid = 1;
         memcpy(md->mesh.exclude_ta, dot11_get_ta(hdr), 6);
     }
@@ -192,9 +197,10 @@ void umac_mesh_fwd_glue_forward(struct umac_data *umacd, struct mmpktview *body,
     if (group)
     {
         /* The original replica must not go back to whoever sent it; the
-         * fan-out in mesh_enqueue_tx_frame excludes the sender for the copies. */
+         * fan-out in mesh_enqueue_tx_frame excludes the sender for the copies.
+         * A standard group frame is one broadcast and any peer's queue will do. */
         extern struct umac_sta_data *umac_datapath_mesh_first_peer_except(const uint8_t *excl);
-        stad = umac_datapath_mesh_first_peer_except(dot11_get_ta(hdr));
+        stad = umac_datapath_mesh_first_peer_except(g_warthog_mesh_grp ? NULL : dot11_get_ta(hdr));
     }
     else
     {
@@ -296,10 +302,8 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
          * Without it a warthog's own broadcasts stop at the first hop, and a
          * bridged host's went out as AE 1 on a 4-address frame, a shape
          * nobody accepts. */
-        struct umac_mesh_ctrl mc = t.mc;
-        mc.flags = (uint8_t)((t.mc.flags & ~UMAC_MESH_CTRL_AE_MASK) | UMAC_MESH_CTRL_AE_A5A6);
-        memcpy(mc.eaddr1, da, 6);
-        memcpy(mc.eaddr2, sa, 6);
+        struct umac_mesh_ctrl mc;
+        umac_mesh_fwd_replica_ctrl(&t.mc, da, sa, &mc);
         g_warthog_mesh_seq++;
         md->mesh.mc_len = (uint8_t)umac_mesh_ctrl_build(md->mesh.mc, sizeof(md->mesh.mc), &mc);
         md->mesh.addr_valid = 1;

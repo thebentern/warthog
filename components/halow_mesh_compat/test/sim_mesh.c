@@ -52,8 +52,11 @@ struct frame {
     int from;                 /* node index of the transmitter */
     uint8_t ta[6];
     uint8_t ra[6];
-    /* data */
-    struct umac_mesh_rx_frame d;
+    /* data: the on-air header bytes -- MAC, QoS Control, Mesh Control -- built
+     * by the same umac_mesh_fwd_tx_header()/umac_mesh_ctrl_build() the
+     * firmware uses, and parsed back with umac_mesh_fwd_parse_frame(). */
+    uint8_t bytes[64];
+    uint16_t len;
     uint32_t payload;         /* an id, so a delivery can be matched to its send */
     /* action */
     uint8_t body[HWMP_PREQ_BODY_LEN];
@@ -69,6 +72,7 @@ static struct {
     uint32_t now;
     uint32_t steps;
     bool overflow;
+    bool grp_std;             /* AT+MESHGRP=1: standard 3-address group frames */
 } S;
 
 static const uint8_t BC[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
@@ -129,6 +133,26 @@ static struct umac_mesh_hwmp_ctx hctx(int i)
     return c;
 }
 
+/* Put one data frame on the air exactly as the firmware would shape it. */
+static void emit_data(int from, const uint8_t *ra, const uint8_t *dst8023, const uint8_t *src8023,
+                      bool sidecar, const uint8_t *mesh_da, const uint8_t *mesh_sa,
+                      const struct umac_mesh_ctrl *mc, uint32_t payload)
+{
+    struct frame f; memset(&f, 0, sizeof(f));
+    f.kind = F_DATA; f.from = from; memcpy(f.ta, S.n[from].addr, 6); memcpy(f.ra, ra, 6);
+    f.payload = payload;
+    struct umac_mesh_tx_hdr_in in = { .ra = ra, .own = S.n[from].addr, .dst8023 = dst8023,
+                                      .src8023 = src8023, .sidecar_valid = sidecar,
+                                      .mesh_da = mesh_da, .mesh_sa = mesh_sa, .grp_std = S.grp_std };
+    uint16_t n = umac_mesh_fwd_tx_header(&in, f.bytes);
+    if (n == 0) { printf("FAIL emit: header refused\n"); failures++; return; }
+    f.bytes[n] = 0x00; f.bytes[n + 1] = 0x01; n += 2; /* QoS: tid 0, Mesh Control Present */
+    uint16_t m = umac_mesh_ctrl_build(&f.bytes[n], (uint16_t)(sizeof(f.bytes) - n), mc);
+    if (m == 0) { printf("FAIL emit: mesh control refused\n"); failures++; return; }
+    f.len = (uint16_t)(n + m);
+    push(&f);
+}
+
 static void queue_action(int from, const uint8_t *ra, const uint8_t *body, uint16_t len)
 {
     struct frame f; memset(&f, 0, sizeof(f));
@@ -154,24 +178,44 @@ static void receive(int me, const struct frame *f)
         }
         return;
     }
+    /* Bytes -> frame, as the firmware's receive path does it. */
+    struct umac_mesh_rx_frame pf;
+    if (umac_mesh_fwd_parse_frame(f->bytes, f->len, &pf) == 0) { printf("FAIL parse at node %d\n", me); failures++; return; }
+    if (!pf.group && !eq(pf.addr1, n->addr)) return; /* the chip does not deliver unicast for others */
+    (void)umac_mesh_fwd_normalise_replica(&pf);
     struct umac_mesh_fwd_ctx c = fctx(me);
     struct umac_mesh_fwd_rx_result r;
-    umac_mesh_fwd_rx(&c, &f->d, &r);
+    umac_mesh_fwd_rx(&c, &pf, &r);
     if (r.drop == UMAC_MESH_FWD_DROP_DUP) n->dup++;
     if (r.drop == UMAC_MESH_FWD_DROP_TTL) n->ttl_drop++;
     if (r.verdict == UMAC_MESH_FWD_DELIVER || r.verdict == UMAC_MESH_FWD_DELIVER_AND_FORWARD) {
         if (n->nlog < LOGMAX) {
             memcpy(n->log[n->nlog].da, r.deliver_da, 6); memcpy(n->log[n->nlog].sa, r.deliver_sa, 6);
-            n->log[n->nlog].seq = f->payload; n->log[n->nlog].group = f->d.group; n->nlog++;
+            n->log[n->nlog].seq = f->payload; n->log[n->nlog].group = pf.group; n->nlog++;
         }
     }
     if (r.verdict == UMAC_MESH_FWD_FORWARD || r.verdict == UMAC_MESH_FWD_DELIVER_AND_FORWARD) {
-        struct frame g = *f;
-        g.from = me; memcpy(g.ta, n->addr, 6); memcpy(g.ra, r.fwd_ra, 6);
-        memcpy(g.d.addr1, r.fwd_ra, 6); memcpy(g.d.addr2, n->addr, 6);
-        g.d.mc = r.fwd_mc;
-        n->fwd_data++;
-        push(&g);
+        bool group = (r.fwd_ra[0] & 0x01) != 0;
+        if (!group) {
+            emit_data(me, r.fwd_ra, r.mesh_da, r.mesh_sa, true, r.mesh_da, r.mesh_sa, &r.fwd_mc, f->payload);
+            n->fwd_data++;
+        } else if (S.grp_std) {
+            /* One standard broadcast with the native Mesh Control. */
+            emit_data(me, r.fwd_ra, r.mesh_da, r.mesh_sa, true, r.mesh_da, r.mesh_sa, &r.fwd_mc, f->payload);
+            n->fwd_data++;
+        } else {
+            /* One unicast replica per neighbour except the sender, AE 2 carrying
+             * the group and the real source -- exactly glue_forward(). */
+            const uint8_t *src = umac_mesh_ctrl_ae(&r.fwd_mc) == UMAC_MESH_CTRL_AE_A4 ? r.fwd_mc.eaddr1 : r.mesh_sa;
+            struct umac_mesh_ctrl rep; umac_mesh_fwd_replica_ctrl(&r.fwd_mc, r.mesh_da, src, &rep);
+            int sent = 0;
+            for (int j = 0; j < S.nn; j++) {
+                if (j == me || !S.adj[me][j] || eq(S.n[j].addr, f->ta)) continue;
+                emit_data(me, S.n[j].addr, r.mesh_da, r.mesh_sa, true, r.mesh_da, r.mesh_sa, &rep, f->payload);
+                sent++;
+            }
+            if (sent) n->fwd_data++;
+        }
     }
     if (r.send_perr) { n->perr_sent++; queue_action(me, r.perr_to, r.perr_body, r.perr_len); }
 }
@@ -210,14 +254,21 @@ static bool send(int i, const uint8_t *da, const uint8_t *sa, uint32_t payload)
     struct umac_mesh_fwd_tx_result t;
     umac_mesh_fwd_tx(&c, da, sa, S.n[i].mesh_seq++, &t);
     if (!t.ok) return false;
-    struct frame f; memset(&f, 0, sizeof(f));
-    f.kind = F_DATA; f.from = i; memcpy(f.ta, S.n[i].addr, 6); memcpy(f.ra, t.ra, 6);
-    f.payload = payload;
-    f.d.group = (t.shape == UMAC_MESH_TX_GROUP_3ADDR);
-    memcpy(f.d.addr1, t.ra, 6); memcpy(f.d.addr2, S.n[i].addr, 6);
-    memcpy(f.d.addr3, t.addr3, 6); memcpy(f.d.addr4, t.addr4, 6);
-    f.d.mc = t.mc;
-    push(&f);
+    if (t.shape == UMAC_MESH_TX_GROUP_3ADDR) {
+        if (S.grp_std) {
+            emit_data(i, da, da, sa, true, da, S.n[i].addr, &t.mc, payload);
+        } else {
+            /* tx_classify: the replica marker; the builder: one copy per peer. */
+            struct umac_mesh_ctrl rep; umac_mesh_fwd_replica_ctrl(&t.mc, da, sa, &rep);
+            for (int j = 0; j < S.nn; j++) {
+                if (j == i || !S.adj[i][j]) continue;
+                emit_data(i, S.n[j].addr, da, sa, true, da, S.n[i].addr, &rep, payload);
+            }
+        }
+        return true;
+    }
+    bool ae = umac_mesh_ctrl_ae(&t.mc) != UMAC_MESH_CTRL_AE_NONE;
+    emit_data(i, t.ra, da, sa, ae, t.addr3, S.n[i].addr, &t.mc, payload);
     return true;
 }
 
@@ -271,8 +322,11 @@ int main(void)
         CHECK(delivered(i, 2001, BC, S.n[0].addr) == 1, "node %d got the broadcast exactly once", i);
     CHECK(delivered(0, 2001, NULL, NULL) == 0, "A did not get its own broadcast back");
     CHECK(S.n[1].fwd_data == 1 && S.n[2].fwd_data == 1, "each relay rebroadcast once");
-    CHECK(S.n[3].fwd_data == 1, "B (the end) also rebroadcasts once -- it cannot know it is the end");
-    CHECK(S.n[1].dup >= 1, "W1 saw its own frame come back via W2 and dropped it as duplicate/own");
+    CHECK(S.n[3].fwd_data == 0, "B (the end) has no neighbour but the sender, so it emits nothing -- as the firmware would");
+    /* With per-peer replicas the sender is excluded, so on a line nothing echoes
+     * back and the cache is never even consulted; the triangle and the standard
+     * broadcasts are where it earns its keep. */
+    CHECK(S.n[1].dup == 0, "no echo reaches W1 on a line: sender exclusion did its job (dup %u)", S.n[1].dup);
 
     /* ================= 3. Triangle: RMC stops the storm =================== */
     printf("--- scenario 3: triangle A - W - B with A - B ---\n");
@@ -340,12 +394,10 @@ int main(void)
     printf("--- scenario 7: TTL ---\n");
     sim_reset(4, true); link(0, 1); link(1, 2); link(2, 3);
     {
-        /* Originate a broadcast with ttl 2 by hand. */
-        struct frame f; memset(&f, 0, sizeof(f));
-        f.kind = F_DATA; f.from = 0; memcpy(f.ta, S.n[0].addr, 6); memcpy(f.ra, BC, 6); f.payload = 7001;
-        f.d.group = true; memcpy(f.d.addr1, BC, 6); memcpy(f.d.addr2, S.n[0].addr, 6); memcpy(f.d.addr3, S.n[0].addr, 6);
-        f.d.mc.ttl = 2; f.d.mc.seq = 1;
-        push(&f);
+        /* Originate a broadcast with ttl 2: one replica per neighbour, AE 2. */
+        struct umac_mesh_ctrl nat = { .flags = 0, .ttl = 2, .seq = 1 }, rep;
+        umac_mesh_fwd_replica_ctrl(&nat, BC, S.n[0].addr, &rep);
+        emit_data(0, S.n[1].addr, BC, S.n[0].addr, true, BC, S.n[0].addr, &rep, 7001);
     }
     CHECK(run(), "drains");
     CHECK(delivered(1, 7001, NULL, NULL) == 1, "W1 (ttl 2) delivered");
@@ -355,30 +407,70 @@ int main(void)
 
     /* ================= 8. Storm detector actually detects ================= */
     printf("--- scenario 8: the cap catches a storm (self-check) ---\n");
-    sim_reset(3, true); link(0, 1); link(1, 2); link(0, 2);
+    /* On a TRIANGLE, sender exclusion turns a defeated-cache flood into a
+     * single chain that TTL bounds -- the cache is not the only safety. So the
+     * self-check needs a topology exclusion cannot linearise: a 4-node full
+     * mesh, where every relay still fans out to two. */
+    sim_reset(4, true); for (int a = 0; a < 4; a++) for (int b = a + 1; b < 4; b++) link(a, b);
     {
         /* A group frame from a ghost source (so the OWN check cannot save
          * anyone), and every receive is given a fresh seq so the cache never
          * matches. Without duplicate suppression a triangle must storm. */
-        struct frame f; memset(&f, 0, sizeof(f));
-        f.kind = F_DATA; f.from = 0; memcpy(f.ta, S.n[0].addr, 6); memcpy(f.ra, BC, 6); f.payload = 8001;
-        f.d.group = true; memcpy(f.d.addr1, BC, 6); memcpy(f.d.addr2, S.n[0].addr, 6);
-        const uint8_t ghost[6] = { 0x02, 0xde, 0xad, 0, 0, 1 }; memcpy(f.d.addr3, ghost, 6);
-        f.d.mc.ttl = 200; f.d.mc.seq = 1;
-        push(&f);
+        const uint8_t ghost[6] = { 0x02, 0xde, 0xad, 0, 0, 1 };
+        struct umac_mesh_ctrl nat = { .flags = 0, .ttl = 200, .seq = 1 }, rep;
+        umac_mesh_fwd_replica_ctrl(&nat, BC, ghost, &rep);
+        for (int j = 1; j < 4; j++) emit_data(0, S.n[j].addr, BC, ghost, true, BC, ghost, &rep, 8001);
         uint32_t steps = 0; bool stormed = false;
         while (S.qh < S.qt) {
             struct frame g = S.q[S.qh++ % QMAX];
             if (++steps > RUN_CAP || S.overflow) { stormed = true; break; }
+            /* defeat the cache: rewrite the Mesh Control seq in the bytes (LE32 at MAC+2+2) */
+            uint16_t fc = (uint16_t)(g.bytes[0] | (g.bytes[1] << 8));
+            uint16_t off = (uint16_t)((((fc & 0x0300u) == 0x0300u) ? 30 : 24) + 2 + 2);
+            uint32_t sq = steps * 10;
+            g.bytes[off] = (uint8_t)sq; g.bytes[off+1] = (uint8_t)(sq >> 8); g.bytes[off+2] = (uint8_t)(sq >> 16); g.bytes[off+3] = (uint8_t)(sq >> 24);
             for (int j = 0; j < S.nn; j++) {
                 if (j == g.from || !S.adj[g.from][j]) continue;
-                g.d.mc.seq = steps * 10 + (uint32_t)j; /* defeat the cache */
                 receive(j, &g);
             }
         }
-        CHECK(stormed, "with the cache defeated the triangle storms and the detector trips (steps %u, overflow %d)", steps, (int)S.overflow);
-        CHECK(S.n[1].fwd_data > 50 || S.n[2].fwd_data > 50, "and the relays really were re-forwarding (W %u, B %u)", S.n[1].fwd_data, S.n[2].fwd_data);
+        CHECK(stormed, "with the cache defeated the full mesh storms and the detector trips (steps %u, overflow %d)", steps, (int)S.overflow);
+        CHECK(S.n[1].fwd_data > 50 || S.n[2].fwd_data > 50, "and the relays really were re-forwarding (%u, %u)", S.n[1].fwd_data, S.n[2].fwd_data);
     }
+    {
+        /* And the positive: on a triangle the same sabotage is bounded by
+         * exclusion and TTL alone -- it drains without the cache. */
+        sim_reset(3, true); link(0, 1); link(1, 2); link(0, 2);
+        const uint8_t ghost[6] = { 0x02, 0xde, 0xad, 0, 0, 2 };
+        struct umac_mesh_ctrl nat = { .flags = 0, .ttl = 200, .seq = 1 }, rep;
+        umac_mesh_fwd_replica_ctrl(&nat, BC, ghost, &rep);
+        for (int j = 1; j < 3; j++) emit_data(0, S.n[j].addr, BC, ghost, true, BC, ghost, &rep, 8002);
+        uint32_t steps = 0; bool stormed = false;
+        while (S.qh < S.qt) {
+            struct frame g = S.q[S.qh++ % QMAX];
+            if (++steps > RUN_CAP || S.overflow) { stormed = true; break; }
+            uint16_t fc = (uint16_t)(g.bytes[0] | (g.bytes[1] << 8));
+            uint16_t off = (uint16_t)((((fc & 0x0300u) == 0x0300u) ? 30 : 24) + 2 + 2);
+            uint32_t sq = steps * 10;
+            g.bytes[off] = (uint8_t)sq; g.bytes[off+1] = (uint8_t)(sq >> 8); g.bytes[off+2] = (uint8_t)(sq >> 16); g.bytes[off+3] = (uint8_t)(sq >> 24);
+            for (int j = 0; j < S.nn; j++) { if (j == g.from || !S.adj[g.from][j]) continue; receive(j, &g); }
+        }
+        CHECK(!stormed && steps < 600, "triangle with the cache defeated still drains: sender exclusion + TTL bound it (%u steps)", steps);
+    }
+
+    /* ================= 9. grp_std: standard 3-address broadcasts ========= */
+    printf("--- scenario 9: group flood as standard 3-address frames (AT+MESHGRP=1) ---\n");
+    sim_reset(4, true); link(0, 1); link(1, 2); link(2, 3); S.grp_std = true;
+    CHECK(send(0, BC, S.n[0].addr, 9001), "A broadcasts one 3-address frame");
+    CHECK(run(), "drains, %u steps", S.steps);
+    for (int i = 1; i < 4; i++)
+        CHECK(delivered(i, 9001, BC, S.n[0].addr) == 1, "node %d got it exactly once", i);
+    CHECK(S.n[1].fwd_data == 1 && S.n[2].fwd_data == 1 && S.n[3].fwd_data == 1,
+          "every node rebroadcasts once -- a standard frame goes to everyone, the sender drops its echo");
+    CHECK(S.n[1].dup >= 1 && S.n[2].dup >= 1, "the echoes were caught by the caches");
+    CHECK(delivered(0, 9001, NULL, NULL) == 0, "A never delivered its own broadcast");
+    /* NOTE: keys are not modelled here; under SAE a standard group frame decrypts
+     * only where the receiver holds the sender's group key -- see scenario 10. */
 
     printf("\n%s\n", failures ? "SIMULATION FAILED" : "SIMULATION PASSED");
     return failures ? 1 : 0;

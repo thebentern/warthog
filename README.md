@@ -71,6 +71,12 @@ chosen at build time.
 
 ### Warthog is a mesh leaf, not a relay
 
+> **Unless `AT+MESHFWD=1`.** Forwarding mode relays path selection and data
+> for other nodes and advertises the capability; it is implemented,
+> host-tested and simulated, and has not been on a radio. See
+> [Mesh Mode](wiki/Mesh-Mode.md#forwarding). This section describes the
+> default.
+
 A Warthog joins a mesh and talks to its peers. It does **not** forward frames
 between two other nodes, so it cannot extend a mesh's reach — a Warthog placed
 between two nodes that cannot hear each other does not connect them.

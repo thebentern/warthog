@@ -200,6 +200,81 @@ int main(void)
         CHECK(!umac_mesh_fwd_normalise_replica(&plain), "no AE is left alone");
     }
 
+    /* ---- on-air shaping: the header bytes the firmware emits ---------------- */
+    {
+        uint8_t h[UMAC_MESH_DATA_HDR4_LEN];
+        /* Plain unicast W -> A: 4-address, addr3 = A, addr4 = W. */
+        struct umac_mesh_tx_hdr_in in = { .ra = A, .own = W, .dst8023 = A, .src8023 = W };
+        CHECK(umac_mesh_fwd_tx_header(&in, h) == 30, "unicast header is 30 octets");
+        CHECK(h[0] == 0x88 && h[1] == 0x03, "FC = QoS data, ToDS+FromDS (88 03)");
+        CHECK(memcmp(&h[4], A, 6) == 0 && memcmp(&h[10], W, 6) == 0 && memcmp(&h[16], A, 6) == 0 && memcmp(&h[24], W, 6) == 0,
+              "addr1=A addr2=W addr3=A addr4=W");
+        /* Replicated group frame to peer A: addr3 is the PEER (the chip filters on it). */
+        struct umac_mesh_tx_hdr_in g = { .ra = A, .own = W, .dst8023 = BC, .src8023 = W };
+        CHECK(umac_mesh_fwd_tx_header(&g, h) == 30 && memcmp(&h[16], A, 6) == 0 && memcmp(&h[24], W, 6) == 0,
+              "replicated group frame: 4-addr, addr3 = the peer, addr4 = us");
+        /* Standard group frame: 3-address, addr1 = group, addr3 = us. */
+        g.grp_std = true;
+        CHECK(umac_mesh_fwd_tx_header(&g, h) == 24, "grp_std group header is 24 octets");
+        CHECK(h[0] == 0x88 && h[1] == 0x02, "FC = QoS data, FromDS only (88 02)");
+        CHECK(memcmp(&h[4], BC, 6) == 0 && memcmp(&h[10], W, 6) == 0 && memcmp(&h[16], W, 6) == 0, "addr1=bcast addr2=W addr3=W");
+        /* Relayed STANDARD group frame from A through W: addr3 stays A, TA is W. */
+        struct umac_mesh_tx_hdr_in rs = { .ra = BC, .own = W, .dst8023 = BC, .src8023 = A,
+                                          .sidecar_valid = true, .mesh_da = BC, .mesh_sa = A, .grp_std = true };
+        CHECK(umac_mesh_fwd_tx_header(&rs, h) == 24 && memcmp(&h[10], W, 6) == 0 && memcmp(&h[16], A, 6) == 0,
+              "relayed 3-addr group frame: addr2 = W (TA), addr3 = A (the original mesh source)");
+        /* Relayed unicast A -> C through W: sidecar keeps the ORIGINAL endpoints. */
+        struct umac_mesh_tx_hdr_in rl = { .ra = B, .own = W, .dst8023 = C, .src8023 = A,
+                                          .sidecar_valid = true, .mesh_da = C, .mesh_sa = A };
+        CHECK(umac_mesh_fwd_tx_header(&rl, h) == 30 && memcmp(&h[4], B, 6) == 0 && memcmp(&h[10], W, 6) == 0 &&
+              memcmp(&h[16], C, 6) == 0 && memcmp(&h[24], A, 6) == 0, "relayed: RA=B TA=W addr3=C addr4=A (not us)");
+        /* Relayed group replica: sidecar mesh_da is the group, so addr3 stays the peer. */
+        struct umac_mesh_tx_hdr_in rg = { .ra = B, .own = W, .dst8023 = BC, .src8023 = A,
+                                          .sidecar_valid = true, .mesh_da = BC, .mesh_sa = A };
+        CHECK(umac_mesh_fwd_tx_header(&rg, h) == 30 && memcmp(&h[16], B, 6) == 0 && memcmp(&h[24], A, 6) == 0,
+              "relayed group replica: addr3 = the peer, addr4 = the original source A");
+        CHECK(umac_mesh_fwd_tx_header(NULL, h) == 0, "NULL input refused");
+    }
+    /* ---- replica Mesh Control rule ------------------------------------------ */
+    {
+        struct umac_mesh_ctrl nat = { .flags = 0, .ttl = 30, .seq = 77 }, rep;
+        umac_mesh_fwd_replica_ctrl(&nat, BC, HW, &rep);
+        CHECK(umac_mesh_ctrl_ae(&rep) == UMAC_MESH_CTRL_AE_A5A6 && rep.ttl == 30 && rep.seq == 77, "replica keeps ttl/seq, gains AE 2");
+        CHECK(memcmp(rep.eaddr1, BC, 6) == 0 && memcmp(rep.eaddr2, HW, 6) == 0, "AE 2 = group DA, real source");
+    }
+    /* ---- frame parser: bytes -> rx_frame, the receive side of the same layout - */
+    {
+        uint8_t frame[80]; struct umac_mesh_rx_frame pf; uint16_t n = 0, used;
+        struct umac_mesh_tx_hdr_in in = { .ra = W, .own = A, .dst8023 = W, .src8023 = A };
+        n = umac_mesh_fwd_tx_header(&in, frame);
+        frame[n] = 0x00; frame[n + 1] = 0x01; n += 2;             /* QoS: tid 0, Mesh Control Present */
+        struct umac_mesh_ctrl mc = { .flags = UMAC_MESH_CTRL_AE_A5A6, .ttl = 9, .seq = 5 };
+        memcpy(mc.eaddr1, HW, 6); memcpy(mc.eaddr2, HA, 6);
+        n += umac_mesh_ctrl_build(&frame[n], 32, &mc);
+        used = umac_mesh_fwd_parse_frame(frame, n, &pf);
+        CHECK(used == 30 + 2 + 18, "4-addr + QoS + AE2 parses to 50 octets (got %u)", used);
+        CHECK(!pf.group && memcmp(pf.addr1, W, 6) == 0 && memcmp(pf.addr2, A, 6) == 0 && memcmp(pf.addr3, W, 6) == 0 && memcmp(pf.addr4, A, 6) == 0,
+              "addresses recovered");
+        CHECK(pf.mc.ttl == 9 && pf.mc.seq == 5 && memcmp(pf.mc.eaddr2, HA, 6) == 0, "Mesh Control recovered");
+        umac_mesh_fwd_rx(&c, &pf, &r);
+        CHECK(r.verdict == UMAC_MESH_FWD_DELIVER && memcmp(r.deliver_da, HW, 6) == 0 && memcmp(r.deliver_sa, HA, 6) == 0,
+              "and the parsed frame is delivered HW<-HA");
+        /* group form */
+        struct umac_mesh_tx_hdr_in gi = { .ra = BC, .own = A, .dst8023 = BC, .src8023 = A, .grp_std = true };
+        n = umac_mesh_fwd_tx_header(&gi, frame); frame[n] = 0x00; frame[n + 1] = 0x01; n += 2;
+        struct umac_mesh_ctrl gm = { .flags = 0, .ttl = 31, .seq = 6 };
+        n += umac_mesh_ctrl_build(&frame[n], 32, &gm);
+        CHECK(umac_mesh_fwd_parse_frame(frame, n, &pf) == 24 + 2 + 6 && pf.group && memcmp(pf.addr3, A, 6) == 0, "3-addr group parses: 32 octets, SA = A");
+        /* refusals */
+        CHECK(umac_mesh_fwd_parse_frame(frame, 31, &pf) == 0, "short frame refused");
+        frame[25] = 0x00; /* clear Mesh Control Present */
+        CHECK(umac_mesh_fwd_parse_frame(frame, n, &pf) == 0, "no Mesh Control Present bit: refused");
+        frame[25] = 0x01; frame[1] = 0x01; /* ToDS only */
+        CHECK(umac_mesh_fwd_parse_frame(frame, n, &pf) == 0, "ToDS-only is not a mesh shape");
+        frame[1] = 0x02; frame[4] = 0x02; /* 3-addr with a unicast addr1 */
+        CHECK(umac_mesh_fwd_parse_frame(frame, n, &pf) == 0, "3-addr with unicast addr1 refused");
+    }
+
     /* ---- round trip: what we shape, we would deliver correctly -------------- */
     {
         umac_mesh_fwd_tx(&c, HA, HW, 108, &t);

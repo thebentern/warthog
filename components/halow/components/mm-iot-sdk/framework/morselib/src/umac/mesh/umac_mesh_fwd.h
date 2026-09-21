@@ -14,6 +14,7 @@
 
 #include "umac_mesh_ctrl.h"
 #include "umac_mesh_hwmp.h"
+#include "umac_mesh_ies.h"
 #include "umac_mesh_pathtbl.h"
 #include "umac_mesh_rmc.h"
 
@@ -98,6 +99,47 @@ void umac_mesh_fwd_rx(const struct umac_mesh_fwd_ctx *c, const struct umac_mesh_
  * the proxied source. @returns true if it was such a replica.
  */
 bool umac_mesh_fwd_normalise_replica(struct umac_mesh_rx_frame *f);
+
+/* ---- on-air shaping: the bytes the firmware emits, testable ------------ */
+
+/** Inputs to the MAC-header decision the SDK builder makes at dequeue time. */
+struct umac_mesh_tx_hdr_in {
+    const uint8_t *ra;        /* next hop: the peer this copy goes to */
+    const uint8_t *own;       /* TA, and mesh SA absent a sidecar */
+    const uint8_t *dst8023;   /* 802.3 destination */
+    const uint8_t *src8023;   /* 802.3 source */
+    bool sidecar_valid;       /* relayed or proxied: mesh_da/mesh_sa apply */
+    const uint8_t *mesh_da;
+    const uint8_t *mesh_sa;
+    bool grp_std;             /* standard 3-address group frames */
+};
+
+/**
+ * The MAC header the firmware puts on air for a mesh data frame. Byte for
+ * byte what umac_datapath_mesh's builder emits: with grp_std a multicast
+ * 802.3 destination becomes a 3-address group frame whose addr3 is the
+ * sidecar's mesh source when relaying, else us; otherwise 4-address,
+ * addr3 the destination (the peer itself for a replicated group frame, or
+ * the sidecar's mesh DA), addr4 the source (the sidecar's mesh SA when set).
+ * @returns 24 or 30, or 0 on a NULL input.
+ */
+uint16_t umac_mesh_fwd_tx_header(const struct umac_mesh_tx_hdr_in *in,
+                                 uint8_t out[UMAC_MESH_DATA_HDR4_LEN]);
+
+/**
+ * The Mesh Control a group frame carries when it is replicated as one
+ * unicast per peer: @p native's ttl/seq/flags with AE 2 holding the group DA
+ * and the real source, so a receiver can tell it from a unicast to itself.
+ */
+void umac_mesh_fwd_replica_ctrl(const struct umac_mesh_ctrl *native, const uint8_t *group_da,
+                                const uint8_t *src, struct umac_mesh_ctrl *out);
+
+/**
+ * Parse a mesh data frame from its Frame Control: 3- or 4-address MAC header,
+ * QoS Control with Mesh Control Present, then the Mesh Control. Refuses
+ * anything else. @returns bytes consumed up to the body, or 0.
+ */
+uint16_t umac_mesh_fwd_parse_frame(const uint8_t *hdr, uint16_t len, struct umac_mesh_rx_frame *f);
 
 /* ---- transmit --------------------------------------------------------- */
 

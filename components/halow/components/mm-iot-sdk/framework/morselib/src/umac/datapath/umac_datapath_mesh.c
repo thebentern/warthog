@@ -32,6 +32,7 @@
 #include "mmwlan_internal.h"
 #include "umac/datapath/umac_datapath_data.h"
 #include "umac/datapath/umac_datapath_private.h"
+#include "umac/mesh/umac_mesh_fwd.h"
 #include "umac/data/umac_data.h"
 #include "umac/supplicant_shim/umac_supp_shim.h"
 #include "dot11/dot11.h"
@@ -1141,40 +1142,31 @@ static void mesh_construct_80211_data_header(struct umac_sta_data *stad,
      * with the pairwise key, the only crypto path this chip handles across
      * several peers. The IP payload is untouched, so a multicast datagram is
      * still delivered by the receiver's IP layer. */
+    /* The shaping decision lives in the freestanding engine so the host
+     * simulator emits the same bytes; this only copies them into the SDK
+     * struct. A relayed or proxied frame's mesh endpoints ride in the sidecar. */
     extern volatile uint32_t g_warthog_mesh_grp;
-    if (g_warthog_mesh_grp && mm_mac_addr_is_multicast(hdr_8023->dest_addr))
-    {
-        /* Standard 802.11s group frame: 3-address, addr1 = the group,
-         * addr3 = the mesh source (us). Any proxied source rides in AE 1 from
-         * the sidecar; the 24-byte length follows from the FC bits. */
-        uint8_t h3[UMAC_MESH_DATA_HDR3_LEN];
-        umac_mesh_ies_build_data_hdr3_group(h3, hdr_8023->dest_addr, ta, ta);
-        memcpy(&data_hdr->base.frame_control, &h3[0], 2);
-        mac_addr_copy(data_hdr->base.addr1, &h3[4]);
-        mac_addr_copy(data_hdr->base.addr2, &h3[10]);
-        mac_addr_copy(data_hdr->base.addr3, &h3[16]);
-        memset(data_hdr->addr4, 0, 6);
-        return;
-    }
-    const uint8_t *da = mm_mac_addr_is_multicast(hdr_8023->dest_addr) ? ra : hdr_8023->dest_addr;
-    const uint8_t *sa = hdr_8023->src_addr;
-    /* A relayed or proxied frame carries its mesh endpoints in the sidecar:
-     * addr4 is the ORIGINAL mesh source, not us, and addr3 the mesh DA. */
     const struct mmdrv_tx_metadata *md = umac_datapath_mesh_cur_tx_md();
-    if (md != NULL && md->mesh.addr_valid)
-    {
-        sa = md->mesh.mesh_sa;
-        if (!mm_mac_addr_is_multicast(md->mesh.mesh_da))
-        {
-            da = md->mesh.mesh_da;
-        }
-    }
-    umac_mesh_ies_build_data_hdr4(hdr, ra, ta, da, sa);
+    struct umac_mesh_tx_hdr_in in = {
+        .ra = ra, .own = ta, .dst8023 = hdr_8023->dest_addr, .src8023 = hdr_8023->src_addr,
+        .sidecar_valid = (md != NULL && md->mesh.addr_valid),
+        .mesh_da = md != NULL ? md->mesh.mesh_da : NULL,
+        .mesh_sa = md != NULL ? md->mesh.mesh_sa : NULL,
+        .grp_std = g_warthog_mesh_grp != 0,
+    };
+    uint16_t n = umac_mesh_fwd_tx_header(&in, hdr);
     memcpy(&data_hdr->base.frame_control, &hdr[0], 2);
     mac_addr_copy(data_hdr->base.addr1, &hdr[4]);
     mac_addr_copy(data_hdr->base.addr2, &hdr[10]);
     mac_addr_copy(data_hdr->base.addr3, &hdr[16]);
-    mac_addr_copy(data_hdr->addr4, &hdr[24]);
+    if (n == UMAC_MESH_DATA_HDR4_LEN)
+    {
+        mac_addr_copy(data_hdr->addr4, &hdr[24]);
+    }
+    else
+    {
+        memset(data_hdr->addr4, 0, 6);
+    }
 }
 
 /* The freestanding builder hard-codes the FC bit positions; pin them to the
