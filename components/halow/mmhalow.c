@@ -26,6 +26,13 @@
 #include <string.h>
 
 int g_warthog_chan_pin_status = -1;
+/* The channel actually in force once the pin, the NVS override and the
+ * fallback have resolved. A peer matches on all five, and the configured set
+ * is not the same thing as the applied one -- which is the whole bug. */
+uint32_t g_warthog_applied_freq_hz = 0;
+uint16_t g_warthog_applied_chan = 0;
+int16_t  g_warthog_applied_gclass = 0, g_warthog_applied_sclass = 0;
+uint8_t  g_warthog_applied_bw_mhz = 0;
 
 static const char *TAG = "Morse Micro HaLow NetIF";
 
@@ -291,6 +298,50 @@ esp_err_t mmhalow_init(const wifi_init_config_t *config)
                  (int)WARTHOG_PIN_S1G_BW_MHZ);
     }
     channel_list = &warthog_pinned_list;
+#else
+    /* No build-time pin. Mesh is runtime-enablable on every region build, so
+     * a stored channel has to work here too -- it used to be read only under
+     * the pin, which meant AT+MESHCHAN= was accepted and then silently
+     * ignored on exactly the images people ship.
+     *
+     * The row comes out of the country's regulatory table rather than being
+     * assembled by hand, so duty cycle, EIRP and airtime stay the regulator's
+     * and only the channel is ours to choose. */
+    static struct mmwlan_s1g_channel warthog_nvs_chan[1];
+    static struct mmwlan_s1g_channel_list warthog_nvs_list;
+    struct warthog_mesh_chan stored;
+    bool have_stored = warthog_cfg_get_mesh_chan(&stored);
+    if (have_stored && channel_list != NULL)
+    {
+        const struct mmwlan_s1g_channel *row = NULL;
+        for (unsigned i = 0; i < channel_list->num_channels; i++)
+        {
+            if (channel_list->channels[i].s1g_chan_num == (uint8_t)stored.chan &&
+                channel_list->channels[i].bw_mhz == stored.bw_mhz)
+            {
+                row = &channel_list->channels[i];
+                break;
+            }
+        }
+        if (row != NULL)
+        {
+            warthog_nvs_chan[0] = *row;
+            memcpy(warthog_nvs_list.country_code, channel_list->country_code,
+                   sizeof(warthog_nvs_list.country_code));
+            warthog_nvs_list.num_channels = 1;
+            warthog_nvs_list.channels = warthog_nvs_chan;
+            channel_list = &warthog_nvs_list;
+            ESP_LOGW(TAG, "PINNED S1G chan %u (%u MHz BW) -- from NVS, %s regulatory row",
+                     (unsigned)stored.chan, (unsigned)stored.bw_mhz, WARTHOG_COUNTRY_CODE);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "STORED S1G chan %u @ %u MHz is not in the %s regulatory table "
+                          "-- discarding it; the radio stays on the full country list",
+                     (unsigned)stored.chan, (unsigned)stored.bw_mhz, WARTHOG_COUNTRY_CODE);
+            (void)warthog_cfg_clear_mesh_chan();
+        }
+    }
 #endif
 
     ESP_LOGI(TAG, "Setting Channel List %s", WARTHOG_COUNTRY_CODE);
@@ -321,6 +372,15 @@ esp_err_t mmhalow_init(const wifi_init_config_t *config)
     /* Stash for later reporting: this runs before the USB CDC console exists,
      * so the log line above is invisible to a host attaching after boot. */
     g_warthog_chan_pin_status = (int)chan_st;
+    if (chan_st == MMWLAN_SUCCESS && channel_list != NULL && channel_list->num_channels == 1)
+    {
+        const struct mmwlan_s1g_channel *live = &channel_list->channels[0];
+        g_warthog_applied_freq_hz = live->centre_freq_hz;
+        g_warthog_applied_chan    = live->s1g_chan_num;
+        g_warthog_applied_gclass  = live->global_operating_class;
+        g_warthog_applied_sclass  = live->s1g_operating_class;
+        g_warthog_applied_bw_mhz  = live->bw_mhz;
+    }
 
     /* Boot the WLAN interface so that we can retrieve the firmware version. */
     struct mmwlan_boot_args boot_args = MMWLAN_BOOT_ARGS_INIT;

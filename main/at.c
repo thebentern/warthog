@@ -14,6 +14,7 @@
 
 #include "at.h"
 #include "cfg.h"
+#include "region.h"
 
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -893,6 +894,55 @@ static void cmd_mping(char *args)
              (unsigned long)ctx.sent, (unsigned long)ctx.recv,
              ctx.sent ? (unsigned long)(100 * (ctx.sent - ctx.recv) / ctx.sent) : 100UL);
     cdc_write(buf);
+    reply_ok();
+}
+
+/* AT+MESHCFG? -- every value a peer matches on, plus what this node will not
+ * do. Interop failures are mismatches, and comparing them one AT verb at a
+ * time is how they get missed; the capability lines are here so nobody has to
+ * infer them from behaviour. */
+static void cmd_meshcfg(void)
+{
+    extern int g_warthog_chan_pin_status;
+    extern uint32_t g_warthog_applied_freq_hz;
+    extern uint16_t g_warthog_applied_chan;
+    extern int16_t  g_warthog_applied_gclass, g_warthog_applied_sclass;
+    extern uint8_t  g_warthog_applied_bw_mhz;
+    extern volatile uint32_t g_warthog_rxchan_beacon;
+
+    char line[256];
+    char id[WARTHOG_CFG_MESH_ID_MAXLEN + 1] = {0};
+    char pw[WARTHOG_CFG_MESH_PASS_MAXLEN + 1] = {0};
+    warthog_cfg_get_mesh_id(id, sizeof(id));
+    warthog_cfg_get_mesh_pass(pw, sizeof(pw));
+
+    snprintf(line, sizeof(line), "+MESHCFG: region=%s country=%s\r\n",
+             WARTHOG_REGION_NAME, WARTHOG_COUNTRY_CODE);
+    cdc_write(line);
+    snprintf(line, sizeof(line),
+             "+MESHCFG: enable=%u secure=%u dhcp=%u id='%s' pass=%u chars\r\n",
+             (unsigned)warthog_cfg_get_mesh_enable(), (unsigned)warthog_cfg_get_mesh_secure(),
+             (unsigned)warthog_cfg_get_mesh_dhcp(), id, (unsigned)strlen(pw));
+    cdc_write(line);
+    if (g_warthog_applied_chan == 0) {
+        snprintf(line, sizeof(line),
+                 "+MESHCFG: applied chan=NONE -- full %s regulatory list, operating "
+                 "channel not pinned and not observable (set_channel_list=%d)\r\n",
+                 WARTHOG_COUNTRY_CODE, g_warthog_chan_pin_status);
+    } else {
+        snprintf(line, sizeof(line),
+                 "+MESHCFG: applied chan=%u freq=%lu bw=%u gclass=%d sclass=%d (set_channel_list=%d)\r\n",
+                 (unsigned)g_warthog_applied_chan, (unsigned long)g_warthog_applied_freq_hz,
+                 (unsigned)g_warthog_applied_bw_mhz, (int)g_warthog_applied_gclass,
+                 (int)g_warthog_applied_sclass, g_warthog_chan_pin_status);
+    }
+    cdc_write(line);
+    snprintf(line, sizeof(line), "+MESHCFG: peers=%u beacons_heard=%lu\r\n",
+             (unsigned)mmwlan_mesh_get_peer_count(), (unsigned long)g_warthog_rxchan_beacon);
+    cdc_write(line);
+    /* Stated, not implied. Each of these is a real limitation an OpenMANET
+     * operator will otherwise discover on the drone. */
+    cdc_write("+MESHCFG: forwarding=no routing=none l2=no(NAT) multicast=no batman=no\r\n");
     reply_ok();
 }
 
@@ -1779,6 +1829,8 @@ static void dispatch(char *line)
                  (unsigned)warthog_cfg_get_mesh_dhcp());
         cdc_write(line);
         reply_ok();
+    } else if (strcasecmp(verb, "MESHCFG") == 0 && terminator == '?') {
+        cmd_meshcfg();
     } else if (strcasecmp(verb, "MESHEN") == 0 && terminator == '?') {
         char line[64];
         snprintf(line, sizeof(line), "+MESHEN: %u\r\n", (unsigned)warthog_cfg_get_mesh_enable());

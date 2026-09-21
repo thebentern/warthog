@@ -149,6 +149,12 @@ def main():
         m = re.search(r"count=(\d+)", t)
         n = int(m.group(1)) if m else 0
         check("peering/%s" % w.split("/")[-1], n >= want, "count=%d/%d" % (n, want))
+        # When a node did not peer, the config surface says which of the two
+        # causes it is -- printed only then, so a passing run stays readable.
+        if n < want:
+            for line in at(w, ["AT+MESHCFG?"]).splitlines():
+                if line.strip().startswith("+MESHCFG:"):
+                    print("        %s" % line.strip())
         # Diagnostics that are meaningless to assert on but decide what to do next.
         for line in at(w, ["AT+MESHRSSI?"]).splitlines():
             if line.strip().startswith("+MESHRSSI:"):

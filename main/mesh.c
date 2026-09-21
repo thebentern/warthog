@@ -1,5 +1,6 @@
 #include "mesh.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -51,6 +52,63 @@ static const char *TAG = "warthog.mesh";
  * -- umac internals -- so at 5 it could preempt the evtloop mid-handle_mpm(),
  * which mutates the same MPM link-id state and builds frames of its own. */
 #define MESH_PROBE_BURST_TASK_PRIO  3
+
+/* Peering watchdog.
+ *
+ * A node whose channel, mesh ID, operating class or security does not match
+ * the rest of the mesh beacons happily and alone, forever, and says nothing.
+ * That is the failure an operator actually hits, so name it: the bus-level
+ * beacon count splits the two causes apart. Zero beacons means nothing is
+ * audible -- wrong channel or bandwidth, or out of range. Beacons but no
+ * peers means we hear the mesh and refuse to join it, which is the mesh ID,
+ * the operating class or the security mode. */
+#define MESH_PEER_GRACE_TICKS  10   /* ~20 s before the first complaint */
+#define MESH_PEER_NAG_TICKS    30   /* ~60 s between repeats */
+
+static char s_mesh_id_active[WARTHOG_CFG_MESH_ID_MAXLEN + 1];
+static uint16_t s_mesh_beacon_tu;
+
+static void mesh_report_unpeered(void)
+{
+    extern volatile uint32_t g_warthog_rxchan_beacon;
+    extern int g_warthog_chan_pin_status;
+    extern uint32_t g_warthog_applied_freq_hz;
+    extern uint16_t g_warthog_applied_chan;
+    extern int16_t  g_warthog_applied_gclass, g_warthog_applied_sclass;
+    extern uint8_t  g_warthog_applied_bw_mhz;
+
+    uint32_t beacons = g_warthog_rxchan_beacon;
+
+    ESP_LOGE(TAG, "NOT PEERED. Every value below must match the rest of the mesh:");
+    ESP_LOGE(TAG, "  mesh id   '%s'", s_mesh_id_active);
+    if (g_warthog_applied_chan == 0) {
+        ESP_LOGE(TAG, "  channel   NOT PINNED -- the radio has the whole %s list, so its "
+                      "operating channel is neither chosen nor observable. A mesh needs "
+                      "one channel: set AT+MESHCHAN=.", WARTHOG_COUNTRY_CODE);
+    } else {
+        ESP_LOGE(TAG, "  channel   %u @ %lu Hz, %u MHz BW, class %d/%d, country %s",
+                 (unsigned)g_warthog_applied_chan, (unsigned long)g_warthog_applied_freq_hz,
+                 (unsigned)g_warthog_applied_bw_mhz, (int)g_warthog_applied_gclass,
+                 (int)g_warthog_applied_sclass, WARTHOG_COUNTRY_CODE);
+    }
+    ESP_LOGE(TAG, "  beacon    %u TU", (unsigned)s_mesh_beacon_tu);
+    ESP_LOGE(TAG, "  security  %s", WARTHOG_MESH_SAE ? "SAE/AMPE" : "open");
+    if (g_warthog_chan_pin_status != 0) {
+        ESP_LOGE(TAG, "  -> the channel list was REJECTED (status=%d), so the radio is "
+                      "NOT on the channel above", g_warthog_chan_pin_status);
+    } else if (g_warthog_applied_chan == 0) {
+        ESP_LOGE(TAG, "  -> pin the channel before reading anything else into this; "
+                      "an unpinned radio meeting a mesh is luck, not configuration.");
+    } else if (beacons == 0) {
+        ESP_LOGE(TAG, "  -> 0 beacons heard: nothing is audible. Wrong channel or "
+                      "bandwidth, or out of range. Check the channel first.");
+    } else {
+        ESP_LOGE(TAG, "  -> %lu beacons heard but 0 peers: the mesh is audible and we "
+                      "will not join it. Check mesh ID, operating class and security.",
+                 (unsigned long)beacons);
+    }
+    ESP_LOGE(TAG, "  AT+MESHCFG? reports the same over the console.");
+}
 
 /* Bring the HaLow netif up over the mesh link.
  *
@@ -132,6 +190,26 @@ static void mesh_probe_burst_task(void *arg)
          * keep the netif down forever, leaving a keyed link with no L3). */
         if (g_warthog_mpm_estab || g_warthog_hostap_estab) {
             mesh_netif_up_();
+        }
+
+        /* Watchdog: complain once after the grace period, then periodically,
+         * and say so once when a peer finally appears. */
+        {
+            static uint32_t unpeered = 0;
+            static bool complained = false;
+            if (mmwlan_mesh_get_peer_count() > 0) {
+                if (complained) {
+                    ESP_LOGW(TAG, "peered: %u peer(s) -- the mismatch reports above are resolved",
+                             (unsigned)mmwlan_mesh_get_peer_count());
+                    complained = false;
+                }
+                unpeered = 0;
+            } else if (++unpeered == MESH_PEER_GRACE_TICKS ||
+                       (unpeered > MESH_PEER_GRACE_TICKS &&
+                        ((unpeered - MESH_PEER_GRACE_TICKS) % MESH_PEER_NAG_TICKS) == 0)) {
+                mesh_report_unpeered();
+                complained = true;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(MESH_PROBE_BURST_PERIOD_MS));
     }
@@ -371,6 +449,7 @@ void warthog_mesh_smoke_test(void)
     args.mesh_id_len = (uint8_t)mesh_id_len;
     memcpy(args.mesh_id, mesh_id, mesh_id_len);
     ESP_LOGW(TAG, "mesh: id '%s' (%u chars)", mesh_id, (unsigned)mesh_id_len);
+    snprintf(s_mesh_id_active, sizeof(s_mesh_id_active), "%s", mesh_id);
     /* Mesh security.
      *
      * MMWLAN_SAE runs real 802.11s security: SAE (dragonfly) authentication
@@ -404,6 +483,7 @@ void warthog_mesh_smoke_test(void)
     args.security_type = MMWLAN_OPEN;
 #endif
     args.beacon_interval_tu = WARTHOG_MESH_BEACON_TU;
+    s_mesh_beacon_tu = args.beacon_interval_tu;
 
     enum mmwlan_status st = mmwlan_mesh_enable(&args);
 

@@ -61,9 +61,10 @@ Everything here persists in NVS and outranks the build-time default.
 
 | Command | | Purpose |
 |---|---|---|
+| `AT+MESHCFG?` | [op] | **Read this first when a node will not join.** Every value a peer matches on — region, country, mesh ID, applied channel/bandwidth/operating class, security, DHCP — plus peers and beacons heard, plus what Warthog does not do (`forwarding=no routing=none l2=no(NAT) multicast=no batman=no`). Comparing these one verb at a time is how mismatches get missed. |
 | `AT+MESHEN=<0\|1>` | [op] | Start the mesh instead of associating as a station. Persisted; takes effect on the next boot. Works on any build, including the region envs — this is how a stock image joins a mesh. |
 | `AT+MESHCHAN=<chan>,<freq_hz>,<gclass>,<sclass>,<bw>` | [op] | Pin the S1G channel as a set — class and bandwidth belong to the channel, so they move together. Persisted; applied on next boot. `AT+MESHCHAN=default` clears it. |
-| `AT+MESHCHAN?` | [op] | Stored set, **and whether it actually applied**. `applied=NO` means the regulatory table refused it and the radio is on its default — the usual cause of "peers with nothing, looks like range". |
+| `AT+MESHCHAN?` | [op] | Stored set, **and whether it actually applied**. `applied=NO` means the regulatory table refused it and the radio is on its default — the usual cause of "peers with nothing, looks like range". On a region build the stored channel is matched against the country's regulatory row, so duty cycle, EIRP and airtime stay the regulator's; a channel that is not in the table is discarded rather than forced. |
 | `AT+MESHDHCP=<0\|1>` | [op] | Take a DHCP lease on the mesh if one is offered (default 1), else go straight to the static `10.77.x.y`. A peer that keeps its mesh interface bridged runs a DHCP server on that bridge. |
 | `AT+MESHEN?` | [op] | Whether mesh mode is on. The capability envs always report 1. |
 | `AT+MESHID=<id>` | [op] | Mesh ID, 1–32 chars. Persisted; next boot. Must match every peer exactly — a mismatch peers with nothing and reads as a radio fault. |

@@ -236,6 +236,39 @@ AT+HWMPSTAT?     path requests sent, answered, and parse failures
 AT+MPING=10.77.191.116,8
 ```
 
+## When a node will not join
+
+A mismatched node beacons happily and alone. Nothing about the radio looks
+wrong, so this reads as a range problem and gets chased as one. Warthog says so
+instead: about 20 seconds after the mesh starts, and every minute after that
+while it has no peers, it logs every value a peer matches on and which of the
+two causes it is. The same thing is available on demand:
+
+```
+AT+MESHCFG?
++MESHCFG: region=US country=US
++MESHCFG: enable=1 secure=1 dhcp=1 id='openmanet-mesh' pass=12 chars
++MESHCFG: applied chan=42 freq=923000000 bw=2 gclass=69 sclass=2 (set_channel_list=0)
++MESHCFG: peers=0 beacons_heard=0
++MESHCFG: forwarding=no routing=none l2=no(NAT) multicast=no batman=no
+```
+
+`beacons_heard` splits the causes apart, and it is the only number worth
+reading first:
+
+| Reading | Means | Check |
+|---|---|---|
+| `applied chan=NONE` | The radio has the whole country list; its operating channel is neither chosen nor observable | Region builds ship unpinned. Set `AT+MESHCHAN=<chan>,<freq_hz>,<gclass>,<sclass>,<bw>` to match the peer and reboot. An unpinned radio meeting a mesh is luck, not configuration. |
+| `set_channel_list` non-zero | The channel was refused; the radio is **not** on the channel printed above | The channel must exist in the country's regulatory table. `AT+MESHCHAN=default` restores the build-time pin. |
+| `beacons_heard=0` | Nothing is audible | Channel, bandwidth, or range. Compare `applied chan`/`bw` against `uci get wireless.default_radio0.channel` on the peer. Fix this before looking at anything else. |
+| `beacons_heard>0`, `peers=0` | The mesh is audible and Warthog will not join it | Mesh ID (exact match, case included), operating class, or security mode. An open Warthog will not peer with an SAE mesh, and vice versa. |
+| `peers>0` but no traffic | Peered; this is a data-plane question | `AT+RXCHAN?` and `AT+MPING=<peer>,8`. |
+
+The capability line is not a placeholder. Warthog does not forward for other
+nodes, does not run a routing protocol, does not bridge the tethered client
+onto the mesh at layer 2, and does not carry multicast across. A node that
+peers correctly is still a leaf.
+
 ## Vanilla OpenWrt
 
 The same procedure applies to stock OpenWrt with a Morse Micro driver — nothing
