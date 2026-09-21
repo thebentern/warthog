@@ -4,7 +4,17 @@ Living tracker for porting the Linux GPL `morse_driver` softmac + mac80211
 mesh stack so the MM6108 can run as a softmac radio (thin-LMAC firmware) with
 host-side 802.11s mesh. Updated as each unit lands.
 
-## Why this approach
+> **Superseded — this port is not needed.** Its premise below (that fullmac
+> cannot do mesh) was disproved. The MM6108's shipping fullmac firmware does
+> accept `MORSE_CMD_INTERFACE_TYPE_MESH`, and Warthog now runs 802.11s mesh
+> point mode on it via `components/halow/.../umac/mesh/` — including SAE/AMPE
+> peering against stock OpenMANET. Nothing in this directory is built. It is
+> kept for the history of how the softmac route was scoped and costed.
+>
+> Current state lives in `../../docs/mesh-openmanet.md` and
+> `../../wiki/Mesh-Mode.md`.
+
+## Why this approach (historical — premise disproved)
 
 The MM6108 **fullmac** firmware + morselib (what the warthog STA build uses)
 cannot do mesh — confirmed by 58 phases of investigation plus Morse Micro's

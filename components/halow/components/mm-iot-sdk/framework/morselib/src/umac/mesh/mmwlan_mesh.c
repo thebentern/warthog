@@ -6,12 +6,11 @@
  * names are on librarymangler.py's protected list (`mmwlan*` glob), so they
  * survive un-mangled and are callable from application code.
  *
- * Skeleton: enable() validates args and delegates to umac_mesh_enable_mesh(),
- * which currently returns MMWLAN_UNAVAILABLE. The umac core start/stop dance
- * (mmwlan_ap_enable() does this via the file-static
- * umac_stop_core_if_no_interface) is deferred until umac_mesh_enable_mesh()
- * actually drives the chip — at which point the start/stop belongs inside the
- * umac event handler, not here. See docs/history/mesh-port-scope.md.
+ * enable() validates args and delegates to umac_mesh_enable_mesh(), which
+ * drives the chip MESH_CONFIG path and brings the mesh VIF up. The umac core
+ * start/stop dance (mmwlan_ap_enable() does this via the file-static
+ * umac_stop_core_if_no_interface) still belongs inside the umac event handler
+ * rather than here, and is not wired up. See docs/mesh-openmanet.md.
  */
 
 /* Per-file MMLOG override to INF — see the note in umac_mesh.c. Must precede

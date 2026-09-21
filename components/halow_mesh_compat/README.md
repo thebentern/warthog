@@ -5,7 +5,23 @@ mesh-capable code path that vendors selected portions of the upstream
 Linux driver and provides a thin shim mapping Linux kernel APIs to
 ESP-IDF / FreeRTOS equivalents.
 
-## Status: scaffold
+## Status: superseded — not needed, not built
+
+The firmware prerequisite this port waited on turned out to be already met.
+The MM6108's shipping fullmac firmware accepts
+`MORSE_CMD_INTERFACE_TYPE_MESH`, and Warthog runs 802.11s mesh point mode on
+it directly — see `components/halow/.../umac/mesh/`, `../../docs/mesh-openmanet.md`
+and `../../wiki/Mesh-Mode.md`. SAE/AMPE peering against stock OpenMANET is
+working; the remaining gap is the group-key (MGTK) path, not the driver model.
+
+Only the host-side test harness under `test/` is live: it builds and runs on
+the host (`cd test && make`) and covers the mesh data header, CCMP header,
+AES-CCM and a cross-check of the shipping cipher against hostap's reference.
+Nothing else here is compiled into any firmware image.
+
+The text below is kept for the history of how the softmac route was scoped.
+
+### Original plan (historical — premise disproved)
 
 This component is **scaffolded but not implemented**. It contains the
 directory layout, license file, build files, and shim header — but no

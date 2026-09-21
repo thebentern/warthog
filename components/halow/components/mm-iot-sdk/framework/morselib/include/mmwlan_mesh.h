@@ -10,9 +10,11 @@
  * Licensed GPL-3.0 to match the morselib sources it links against; the
  * upstream component's Apache-2.0 covers only its CMake/wrapper glue.
  *
- * Status: skeleton. mmwlan_mesh_enable() validates args and returns
- * MMWLAN_UNAVAILABLE until the umac/mesh state machine + chip MESH_CONFIG
- * command path are implemented. See docs/history/mesh-port-scope.md.
+ * Status: implemented. mmwlan_mesh_enable() adds the mesh VIF and drives the
+ * chip MESH_CONFIG path; SAE/AMPE peering interoperates with stock OpenMANET.
+ * The group-key (MGTK) path is the known gap: the chip has one VIF-wide slot
+ * while every 802.11s peer generates its own, so group-addressed RX from a
+ * second peer needs the host CCMP path. See docs/mesh-openmanet.md.
  */
 
 #pragma once

@@ -394,12 +394,20 @@ The CDC console (`/dev/cu.usbmodemXXXX`) carries all ESP-IDF logs after USB-OTG 
 | 3 | 2.4 GHz Wi-Fi AP | ✅ SSID `warthog` visible |
 | 4 | lwIP NAPT bridge | ✅ end-to-end internet verified (host → USB → HaLow → upstream → 8.8.8.8) |
 | 5 | Polish (LEDs, AT, NVS) | ✅ partial — LED state machine, AT commands, NVS persistence shipped. Windows RNDIS, NCM (iOS) and a web UI deferred. |
-| 6 | 802.11s mesh over HaLow | ✅ peering, data plane and HWMP path selection; 3-node mesh verified |
-| 7 | OpenMANET / OpenWrt interop | ✅ 0–3% loss, 8–19 ms against OpenMANET 1.8.0 — see [`docs/mesh-openmanet.md`](docs/mesh-openmanet.md) |
+| 6 | 802.11s mesh over HaLow | ✅ peering, data plane and HWMP path selection; 3-node warthog mesh verified |
+| 7 | OpenMANET / OpenWrt interop | ✅ unencrypted mesh: 0–3% loss, 8–19 ms against OpenMANET 1.8.0. SAE/AMPE peering also verified cross-vendor; its data plane is not — see [`docs/mesh-openmanet.md`](docs/mesh-openmanet.md) |
+
+SAE/AMPE is implemented: the `warthog-mesh-sae` build derives a per-link MTK
+per peer, and peering interoperates with stock OpenMANET. Two limits apply.
+The **encrypted** data plane is warthog-to-warthog only — against OpenMANET the
+verified result is the unencrypted mesh above, because the chip holds one
+VIF-wide group key while every 802.11s peer generates its own, so
+group-addressed frames from a second peer cannot be decrypted in hardware. And
+the mesh envs are capability builds, not shipping firmware: they skip the STA
+uplink, and no region env compiles mesh.
 
 Not implemented: mesh forwarding (a node answers path requests aimed at it and
-relays nothing), SAE/AMPE key derivation (the keyed mesh uses one shared key),
-Windows RNDIS, and a web UI.
+relays nothing), per-transmitter group keys, Windows RNDIS, and a web UI.
 
 ## Licensing
 
