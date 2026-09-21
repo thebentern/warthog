@@ -15,6 +15,7 @@
 #include "at.h"
 #include "cfg.h"
 #include "region.h"
+#include "mesh_diag.h"
 
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -519,12 +520,19 @@ struct warthog_peer_rssi {
     int16_t  last;
     int16_t  min;
     int16_t  max;
+    /* Noise gives SNR, which is what actually predicts whether a link holds;
+     * bandwidth is here because a neighbour transmitting at a width we did not
+     * configure is an interop mismatch, not a weak signal. This driver's RX
+     * metadata (struct mmdrv_rx_metadata) carries no MCS, so per-peer MCS is
+     * not reportable -- see the note on AT+MESHRSSI? in the wiki. */
+    int8_t   noise;
+    uint8_t  bw_mhz;
     uint32_t frames;
     bool     used;
 };
 static struct warthog_peer_rssi s_peer_rssi[WARTHOG_RSSI_PEERS];
 
-void warthog_mesh_rssi_note(const uint8_t *ta, int16_t rssi)
+void warthog_mesh_rssi_note(const uint8_t *ta, int16_t rssi, int8_t noise, uint8_t bw_mhz)
 {
     if (ta == NULL) {
         return;
@@ -536,6 +544,8 @@ void warthog_mesh_rssi_note(const uint8_t *ta, int16_t rssi)
                 s_peer_rssi[i].last = rssi;
                 if (rssi < s_peer_rssi[i].min) { s_peer_rssi[i].min = rssi; }
                 if (rssi > s_peer_rssi[i].max) { s_peer_rssi[i].max = rssi; }
+                s_peer_rssi[i].noise = noise;
+                s_peer_rssi[i].bw_mhz = bw_mhz;
                 s_peer_rssi[i].frames++;
                 return;
             }
@@ -550,6 +560,8 @@ void warthog_mesh_rssi_note(const uint8_t *ta, int16_t rssi)
     s_peer_rssi[free_slot].last = rssi;
     s_peer_rssi[free_slot].min = rssi;
     s_peer_rssi[free_slot].max = rssi;
+    s_peer_rssi[free_slot].noise = noise;
+    s_peer_rssi[free_slot].bw_mhz = bw_mhz;
     s_peer_rssi[free_slot].frames = 1;
     s_peer_rssi[free_slot].used = true;
 }
@@ -910,7 +922,7 @@ static void cmd_meshcfg(void)
     extern uint8_t  g_warthog_applied_bw_mhz;
     extern volatile uint32_t g_warthog_rxchan_beacon;
 
-    char line[256];
+    char line[320];
     char id[WARTHOG_CFG_MESH_ID_MAXLEN + 1] = {0};
     char pw[WARTHOG_CFG_MESH_PASS_MAXLEN + 1] = {0};
     warthog_cfg_get_mesh_id(id, sizeof(id));
@@ -937,9 +949,21 @@ static void cmd_meshcfg(void)
                  (int)g_warthog_applied_sclass, g_warthog_chan_pin_status);
     }
     cdc_write(line);
+    unsigned peers = (unsigned)mmwlan_mesh_get_peer_count();
     snprintf(line, sizeof(line), "+MESHCFG: peers=%u beacons_heard=%lu\r\n",
-             (unsigned)mmwlan_mesh_get_peer_count(), (unsigned long)g_warthog_rxchan_beacon);
+             peers, (unsigned long)g_warthog_rxchan_beacon);
     cdc_write(line);
+    {
+        struct warthog_mesh_diag_in in = {
+            .peers           = peers,
+            .chan_pin_status = g_warthog_chan_pin_status,
+            .applied_chan    = g_warthog_applied_chan,
+            .beacons_heard   = g_warthog_rxchan_beacon,
+        };
+        snprintf(line, sizeof(line), "+MESHCFG: %s\r\n",
+                 warthog_mesh_diag_text(warthog_mesh_diagnose(&in)));
+        cdc_write(line);
+    }
     /* Stated, not implied. Each of these is a real limitation an OpenMANET
      * operator will otherwise discover on the drone. */
     cdc_write("+MESHCFG: forwarding=no routing=none l2=no(NAT) multicast=no batman=no\r\n");
@@ -1757,11 +1781,15 @@ static void dispatch(char *line)
         for (int i = 0; i < WARTHOG_RSSI_PEERS; i++) {
             if (!s_peer_rssi[i].used) { continue; }
             snprintf(line, sizeof(line),
-                     "+MESHRSSI: %02x:%02x:%02x:%02x:%02x:%02x last=%d min=%d max=%d frames=%lu\r\n",
+                     "+MESHRSSI: %02x:%02x:%02x:%02x:%02x:%02x last=%d min=%d max=%d "
+                     "noise=%d snr=%d bw=%u frames=%lu\r\n",
                      s_peer_rssi[i].mac[0], s_peer_rssi[i].mac[1], s_peer_rssi[i].mac[2],
                      s_peer_rssi[i].mac[3], s_peer_rssi[i].mac[4], s_peer_rssi[i].mac[5],
                      (int)s_peer_rssi[i].last, (int)s_peer_rssi[i].min,
-                     (int)s_peer_rssi[i].max, (unsigned long)s_peer_rssi[i].frames);
+                     (int)s_peer_rssi[i].max, (int)s_peer_rssi[i].noise,
+                     (int)(s_peer_rssi[i].last - s_peer_rssi[i].noise),
+                     (unsigned)s_peer_rssi[i].bw_mhz,
+                     (unsigned long)s_peer_rssi[i].frames);
             cdc_write(line);
             shown++;
         }

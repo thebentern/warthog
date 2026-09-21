@@ -250,8 +250,15 @@ AT+MESHCFG?
 +MESHCFG: enable=1 secure=1 dhcp=1 id='openmanet-mesh' pass=12 chars
 +MESHCFG: applied chan=42 freq=923000000 bw=2 gclass=69 sclass=2 (set_channel_list=0)
 +MESHCFG: peers=0 beacons_heard=0
++MESHCFG: 0 beacons heard: nothing is audible. Wrong channel or bandwidth, or out of range. Check the channel first
 +MESHCFG: forwarding=no routing=none l2=no(NAT) multicast=no batman=no
 ```
+
+The second-to-last line is the diagnosis, and the firmware logs the same one
+unprompted while it has no peers. Its cause-selection is unit-tested on the
+host (`components/halow_mesh_compat/test/test_mesh_diag.c`) — ordering
+included, because reporting a later cause while an earlier one holds sends you
+after the wrong thing.
 
 `beacons_heard` splits the causes apart, and it is the only number worth
 reading first:

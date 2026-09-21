@@ -72,7 +72,7 @@ Everything here persists in NVS and outranks the build-time default.
 | `AT+MESHPASS=<pass>` | [op] | SAE passphrase, 1–63 chars. Persisted; next boot. Must match every peer. |
 | `AT+MESHPASS?` | [op] | Length only, never the value — this console mirrors the logs. |
 | `AT+MPMPEERS?` | [op] | Peer links and handshake state. The first thing to read on a mesh. |
-| `AT+MESHRSSI?` | [op] | Per-neighbour signal: last, min, max and frame count. Min/max matter more than last — a link that averages fine but dips to −90 is the one that drops under load. |
+| `AT+MESHRSSI?` | [op] | Per-neighbour signal: last, min, max, noise, SNR, the bandwidth that neighbour transmitted at, and a frame count. Min/max matter more than last — a link that averages fine but dips to −90 is the one that drops under load. A `bw=` that differs from your own is a configuration mismatch, not a weak link. **No MCS:** this driver's RX metadata (`struct mmdrv_rx_metadata`) carries RSSI, noise, frequency and bandwidth and no rate, so per-peer MCS is not reportable. |
 | `AT+MESHSEC=<0\|1>` | [op] | Data plane open (0) or keyed (1). Re-peers within ~2 s. Persisted in NVS. |
 | `AT+MESHSEC?` | [op] | Current setting. No effect on the SAE build (keys come from AMPE). |
 | `AT+SAERX?` | [diag] | SAE/AMPE conversation state on the encrypted build: auth frames in/out, SAE FSM state, peering FSM, `ESTAB` count, which peer is being offered. |

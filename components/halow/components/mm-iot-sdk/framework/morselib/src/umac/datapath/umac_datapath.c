@@ -613,8 +613,10 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             /* Per-peer signal. Aggregate counters say traffic moves; they do
              * not say which neighbour is marginal, which is what you need when
              * a mesh works from one node and not another. */
-            extern void warthog_mesh_rssi_note(const uint8_t *ta, int16_t rssi);
-            warthog_mesh_rssi_note(dot11_get_ta(header), rx_metadata->rssi);
+            extern void warthog_mesh_rssi_note(const uint8_t *ta, int16_t rssi,
+                                               int8_t noise, uint8_t bw_mhz);
+            warthog_mesh_rssi_note(dot11_get_ta(header), rx_metadata->rssi,
+                                   rx_metadata->noise_dbm, rx_metadata->bw_mhz);
 
             uint8_t self[6];
             umac_interface_get_mac_addr(stad, self);

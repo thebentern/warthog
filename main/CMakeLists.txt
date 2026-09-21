@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "halow.c"
         "mesh.c"
+        "mesh_diag.c"
         "usb_net.c"
         "wifi_ap.c"
         "nat.c"

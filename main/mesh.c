@@ -13,6 +13,7 @@
 #include "lwip/ip4_addr.h"
 #include "mmhalow.h"
 #include "cfg.h"
+#include "mesh_diag.h"
 
 /* 802.11s security. Default OFF: stock OpenMANET ships encryption='none', and
  * an open mesh is what it must be matched with. The warthog-mesh-sae env turns
@@ -68,7 +69,7 @@ static const char *TAG = "warthog.mesh";
 static char s_mesh_id_active[WARTHOG_CFG_MESH_ID_MAXLEN + 1];
 static uint16_t s_mesh_beacon_tu;
 
-static void mesh_report_unpeered(void)
+static void mesh_report_unpeered(unsigned int peers)
 {
     extern volatile uint32_t g_warthog_rxchan_beacon;
     extern int g_warthog_chan_pin_status;
@@ -77,14 +78,18 @@ static void mesh_report_unpeered(void)
     extern int16_t  g_warthog_applied_gclass, g_warthog_applied_sclass;
     extern uint8_t  g_warthog_applied_bw_mhz;
 
-    uint32_t beacons = g_warthog_rxchan_beacon;
+    struct warthog_mesh_diag_in in = {
+        .peers           = peers,
+        .chan_pin_status = g_warthog_chan_pin_status,
+        .applied_chan    = g_warthog_applied_chan,
+        .beacons_heard   = g_warthog_rxchan_beacon,
+    };
+    enum warthog_mesh_diag d = warthog_mesh_diagnose(&in);
 
     ESP_LOGE(TAG, "NOT PEERED. Every value below must match the rest of the mesh:");
     ESP_LOGE(TAG, "  mesh id   '%s'", s_mesh_id_active);
     if (g_warthog_applied_chan == 0) {
-        ESP_LOGE(TAG, "  channel   NOT PINNED -- the radio has the whole %s list, so its "
-                      "operating channel is neither chosen nor observable. A mesh needs "
-                      "one channel: set AT+MESHCHAN=.", WARTHOG_COUNTRY_CODE);
+        ESP_LOGE(TAG, "  channel   NOT PINNED (country %s)", WARTHOG_COUNTRY_CODE);
     } else {
         ESP_LOGE(TAG, "  channel   %u @ %lu Hz, %u MHz BW, class %d/%d, country %s",
                  (unsigned)g_warthog_applied_chan, (unsigned long)g_warthog_applied_freq_hz,
@@ -93,20 +98,8 @@ static void mesh_report_unpeered(void)
     }
     ESP_LOGE(TAG, "  beacon    %u TU", (unsigned)s_mesh_beacon_tu);
     ESP_LOGE(TAG, "  security  %s", WARTHOG_MESH_SAE ? "SAE/AMPE" : "open");
-    if (g_warthog_chan_pin_status != 0) {
-        ESP_LOGE(TAG, "  -> the channel list was REJECTED (status=%d), so the radio is "
-                      "NOT on the channel above", g_warthog_chan_pin_status);
-    } else if (g_warthog_applied_chan == 0) {
-        ESP_LOGE(TAG, "  -> pin the channel before reading anything else into this; "
-                      "an unpinned radio meeting a mesh is luck, not configuration.");
-    } else if (beacons == 0) {
-        ESP_LOGE(TAG, "  -> 0 beacons heard: nothing is audible. Wrong channel or "
-                      "bandwidth, or out of range. Check the channel first.");
-    } else {
-        ESP_LOGE(TAG, "  -> %lu beacons heard but 0 peers: the mesh is audible and we "
-                      "will not join it. Check mesh ID, operating class and security.",
-                 (unsigned long)beacons);
-    }
+    ESP_LOGE(TAG, "  heard     %lu beacons", (unsigned long)g_warthog_rxchan_beacon);
+    ESP_LOGE(TAG, "  -> %s.", warthog_mesh_diag_text(d));
     ESP_LOGE(TAG, "  AT+MESHCFG? reports the same over the console.");
 }
 
@@ -207,7 +200,7 @@ static void mesh_probe_burst_task(void *arg)
             } else if (++unpeered == MESH_PEER_GRACE_TICKS ||
                        (unpeered > MESH_PEER_GRACE_TICKS &&
                         ((unpeered - MESH_PEER_GRACE_TICKS) % MESH_PEER_NAG_TICKS) == 0)) {
-                mesh_report_unpeered();
+                mesh_report_unpeered(0);
                 complained = true;
             }
         }
