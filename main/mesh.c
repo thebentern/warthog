@@ -286,7 +286,13 @@ void warthog_mesh_smoke_test(void)
      * scan uses the ordinary, known-good STA receive path on the same pinned
      * channel, so if ANY beacon is on air we will see it here. Run before the
      * mesh VIF is added, while the chip is still in its default state. */
+#ifndef WARTHOG_SKIP_SCAN_PROBE
+    /* The probe wedges on some chip firmware: the completion callback never
+     * fires and the bounded wait never returns, so the VIF is never added. */
     warthog_mesh_scan_probe();
+#else
+    ESP_LOGW(TAG, "scan probe skipped (WARTHOG_SKIP_SCAN_PROBE)");
+#endif
 
 #ifdef WARTHOG_SCAN_ONLY
     /* Receiver-isolation build: keep sweeping and never enter mesh mode, so a

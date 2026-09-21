@@ -658,6 +658,39 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
     {
         return MMWLAN_INVALID_ARGUMENT;
     }
+    /* Our own TX MGTK arrives against the broadcast address, not a peer, so the
+     * peer lookup below would reject it and leave our broadcasts keyed wrong. */
+    if (!pairwise && (peer_addr[0] & 0x01) != 0)
+    {
+        struct umac_sta_data *any = NULL;
+        for (int i = 0; i < MESH_MAX_PEERS; i++)
+        {
+            if (s_peers[i] != NULL)
+            {
+                any = s_peers[i];
+                break;
+            }
+        }
+        if (any == NULL)
+        {
+            MMLOG_WRN("mesh: own MGTK arrived before any peer; deferring\n");
+            return MMWLAN_ERROR;
+        }
+        struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = key_id,
+                                     .length = key_len, .tx_pn = 0 };
+        memcpy(kc.key, key, key_len);
+        if (mmdrv_install_key(umac_sta_data_get_vif_id(any), 0, &kc) != 0)
+        {
+            MMLOG_WRN("mesh: own MGTK chip install failed\n");
+            return MMWLAN_ERROR;
+        }
+        s_group_key_in_chip = true;
+        g_warthog_ampe_mgtk_installed++;
+        MMLOG_INF("mesh: own TX MGTK installed in chip group slot (key_id %u)\n",
+                  (unsigned)key_id);
+        return MMWLAN_SUCCESS;
+    }
+
     struct umac_sta_data *stad = mesh_find_peer_(peer_addr);
     if (stad == NULL)
     {
@@ -675,7 +708,24 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
     {
         s_mesh_key_epoch++;
         k.tx_seq = (uint64_t)s_mesh_key_epoch << 20;
+#ifdef WARTHOG_MESH_AMPE_NO_CHIP_KEY
+        /* Same feasibility probe as WARTHOG_MESH_NO_CHIP_KEY above, on the
+         * path that actually matters: AMPE. Keep the MTK in the host keychain
+         * and withhold it from the chip, so the chip cannot decrypt this peer
+         * and we learn whether it hands the frame up undecrypted -- which is
+         * where software CCMP would hook -- or eats it in firmware, which
+         * would end the idea. Unlike CRYPTO_IN_HOST, which this build accepts
+         * and ignores, withholding the key needs nothing from the firmware.
+         *
+         * Expect TX to this peer to stop working on such a build. That is the
+         * cost of asking the RX question on its own. */
+        enum mmwlan_status st =
+            connection_keys_install_key(&umac_sta_data_get_keys(stad)->keys, &k)
+                ? MMWLAN_SUCCESS
+                : MMWLAN_ERROR;
+#else
         enum mmwlan_status st = umac_keys_install_key(stad, vif_id, &k);
+#endif
         if (st != MMWLAN_SUCCESS)
         {
             MMLOG_WRN("mesh: AMPE MTK install failed %d\n", (int)st);
@@ -696,18 +746,9 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
         MMLOG_WRN("mesh: AMPE MGTK keychain install failed\n");
         return MMWLAN_ERROR;
     }
-    if (!s_group_key_in_chip)
-    {
-        struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = k.key_id,
-                                     .length = k.key_len, .tx_pn = 0 };
-        memcpy(kc.key, k.key_data, k.key_len);
-        if (mmdrv_install_key(vif_id, 0, &kc) != 0)
-        {
-            MMLOG_WRN("mesh: AMPE MGTK chip install failed\n");
-            return MMWLAN_ERROR;
-        }
-        s_group_key_in_chip = true;
-    }
+    /* A peer's RX MGTK stays host-only: every peer generates its own, the chip
+     * has one VIF-wide slot, and that slot belongs to our TX key. */
+    (void)vif_id;
     g_warthog_ampe_mgtk_installed++;
     MMLOG_INF("mesh: AMPE MGTK installed (key_id %u)\n", (unsigned)k.key_id);
     return MMWLAN_SUCCESS;

@@ -675,6 +675,66 @@ enum mmwlan_status umac_mesh_disable_mesh(struct umac_data *umacd)
  * board's mmdrv_host_process_rx_frame#N also climbs, the chip can RX foreign-
  * BSSID mgmt frames in mesh mode — meaning the path to peering is OPEN and
  * Linux-style mesh_beaconless mode would work. */
+/* Periodic mesh housekeeping.
+ *
+ * These used to live inside umac_mesh_maybe_initiate_mpm(), which every caller
+ * gates on !umac_mesh_sae_active() -- correct for peering, because hostap owns
+ * the handshake under SAE and two state machines racing the same link ids is a
+ * real bug, but it also meant none of this ran on a SAE build. AT+REKEY queued
+ * forever (REKEYSTAT done=0 pending=3), AT+CCMPKAT? reported ran=0 and
+ * AT+CRYPTOHOST? answered with its own initialisers rather than the chip --
+ * all of it looked like a chip that refused, and none of it had executed.
+ *
+ * Driven from the probe burst instead, which runs on every build and on
+ * warthog's own clock rather than a peer's. */
+void umac_mesh_service_tick(void)
+{
+    if (s_mesh_umacd == NULL || !s_mesh_args_valid)
+    {
+        return;
+    }
+    umac_datapath_mesh_service_rekey(); /* AT+REKEY=<n>, serviced here */
+
+    /* Validate AES-CCM through the shipping mbedtls path, once. The host test
+     * links hostap's software AES, so this is the only thing that exercises
+     * crypto_mbedtls_mm.c -- whose aes_encrypt_init() built a DECRYPTION key
+     * schedule until recently, which would make every result silently wrong. */
+    if (g_warthog_ccmp_kat_ran == 0)
+    {
+        umac_mesh_ccmp_kat_run();
+    }
+
+    /* AT+CRYPTOHOST=<0|1> / ? -- same flag-and-service pattern, because main
+     * cannot call into the morselib archive directly. Set, then read back:
+     * a firmware that ignores an unknown parameter can still answer the SET
+     * with success, so only the read-back says whether it took. */
+    {
+        uint32_t req = g_warthog_cryptohost_req;
+        if (req != 0)
+        {
+            g_warthog_cryptohost_req = 0;
+            uint32_t val = 0xffffffffu;
+            int rc = 0;
+            if (req == 3)
+            {
+                rc = mmdrv_get_crypto_in_host(s_mesh_vif_id, &val);
+            }
+            else
+            {
+                rc = mmdrv_set_crypto_in_host(s_mesh_vif_id, req == 1, &val);
+                if (rc == 0)
+                {
+                    (void)mmdrv_get_crypto_in_host(s_mesh_vif_id, &val);
+                }
+            }
+            g_warthog_cryptohost_rc = (uint32_t)rc;
+            g_warthog_cryptohost_val = val;
+            g_warthog_cryptohost_done++;
+        }
+    }
+
+}
+
 int umac_mesh_tx_broadcast_probe(void)
 {
     static uint32_t s_call_count = 0;
@@ -689,6 +749,8 @@ int umac_mesh_tx_broadcast_probe(void)
         }
         return -1;
     }
+
+    umac_mesh_service_tick();
 
     struct frame_data_probe_request preq = {
         .bssid = mac_addr_broadcast,
@@ -1721,46 +1783,6 @@ void umac_mesh_maybe_initiate_mpm(const uint8_t *ta)
     }
     const uint32_t now_ms = (uint32_t)mmosal_get_time_ms();
     mpm_expire_stale_(now_ms);
-    umac_datapath_mesh_service_rekey(); /* AT+REKEY=<n>, serviced here */
-
-    /* Validate AES-CCM through the shipping mbedtls path, once. The host test
-     * links hostap's software AES, so this is the only thing that exercises
-     * crypto_mbedtls_mm.c -- whose aes_encrypt_init() built a DECRYPTION key
-     * schedule until recently, which would make every result silently wrong. */
-    if (g_warthog_ccmp_kat_ran == 0)
-    {
-        umac_mesh_ccmp_kat_run();
-    }
-
-    /* AT+CRYPTOHOST=<0|1> / ? -- same flag-and-service pattern, because main
-     * cannot call into the morselib archive directly. Set, then read back:
-     * a firmware that ignores an unknown parameter can still answer the SET
-     * with success, so only the read-back says whether it took. */
-    {
-        uint32_t req = g_warthog_cryptohost_req;
-        if (req != 0)
-        {
-            g_warthog_cryptohost_req = 0;
-            uint32_t val = 0xffffffffu;
-            int rc = 0;
-            if (req == 3)
-            {
-                rc = mmdrv_get_crypto_in_host(s_mesh_vif_id, &val);
-            }
-            else
-            {
-                rc = mmdrv_set_crypto_in_host(s_mesh_vif_id, req == 1, &val);
-                if (rc == 0)
-                {
-                    (void)mmdrv_get_crypto_in_host(s_mesh_vif_id, &val);
-                }
-            }
-            g_warthog_cryptohost_rc = (uint32_t)rc;
-            g_warthog_cryptohost_val = val;
-            g_warthog_cryptohost_done++;
-        }
-    }
-
     /* Keep a path to us alive at every established peer.
      *
      * The peer's path expires after dot11MeshHWMPactivePathTimeout (5 s by
