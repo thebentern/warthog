@@ -163,3 +163,153 @@ bool umac_mesh_hwmp_targets_us(const struct hwmp_preq *preq, const uint8_t *own_
     }
     return memcmp(preq->target_addr, own_addr, HWMP_ADDR_LEN) == 0;
 }
+
+/* ---- Forwarding ------------------------------------------------------- */
+
+static void wr16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xffu);
+    p[1] = (uint8_t)((v >> 8) & 0xffu);
+}
+
+static uint16_t rd16(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+uint8_t umac_mesh_hwmp_element_id(const uint8_t *body, uint16_t len)
+{
+    if (body == NULL || len < 4u || body[0] != HWMP_CATEGORY_MESH ||
+        body[1] != HWMP_ACTION_PATH_SELECTION)
+    {
+        return 0u;
+    }
+    return body[2];
+}
+
+bool umac_mesh_hwmp_parse_prep(const uint8_t *body, uint16_t len, struct hwmp_prep *out)
+{
+    if (body == NULL || out == NULL || len < HWMP_PREP_BODY_LEN)
+    {
+        return false;
+    }
+    if (body[0] != HWMP_CATEGORY_MESH || body[1] != HWMP_ACTION_PATH_SELECTION ||
+        body[2] != HWMP_EID_PREP)
+    {
+        return false;
+    }
+    if (body[3] < HWMP_PREP_ELEM_LEN || (uint16_t)(4 + body[3]) > len)
+    {
+        return false;
+    }
+    if ((body[4] & HWMP_FLAG_AE) != 0u)
+    {
+        return false;
+    }
+    out->flags = body[4];
+    out->hop_count = body[5];
+    out->ttl = body[6];
+    memcpy(out->target_addr, &body[7], HWMP_ADDR_LEN);
+    out->target_sn = rd32(&body[13]);
+    out->lifetime = rd32(&body[17]);
+    out->metric = rd32(&body[21]);
+    memcpy(out->orig_addr, &body[25], HWMP_ADDR_LEN);
+    out->orig_sn = rd32(&body[31]);
+    return true;
+}
+
+uint16_t umac_mesh_hwmp_build_preq_fwd(uint8_t *out, uint16_t out_len,
+                                       const struct hwmp_preq *preq, uint32_t link_metric)
+{
+    if (out == NULL || preq == NULL || out_len < HWMP_PREQ_BODY_LEN || preq->ttl <= 1u)
+    {
+        return 0;
+    }
+    out[0] = HWMP_CATEGORY_MESH;
+    out[1] = HWMP_ACTION_PATH_SELECTION;
+    out[2] = HWMP_EID_PREQ;
+    out[3] = HWMP_PREQ_ELEM_LEN;
+    out[4] = preq->flags;
+    out[5] = (uint8_t)(preq->hop_count + 1u);
+    out[6] = (uint8_t)(preq->ttl - 1u);
+    wr32(&out[7], preq->preq_id);
+    memcpy(&out[11], preq->orig_addr, HWMP_ADDR_LEN);
+    wr32(&out[17], preq->orig_sn);
+    wr32(&out[21], preq->lifetime);
+    wr32(&out[25], preq->metric + link_metric);
+    out[29] = 1u;
+    out[30] = preq->target_flags;
+    memcpy(&out[31], preq->target_addr, HWMP_ADDR_LEN);
+    wr32(&out[37], preq->target_sn);
+    return HWMP_PREQ_BODY_LEN;
+}
+
+uint16_t umac_mesh_hwmp_build_prep_fwd(uint8_t *out, uint16_t out_len,
+                                       const struct hwmp_prep *prep, uint32_t link_metric)
+{
+    if (out == NULL || prep == NULL || out_len < HWMP_PREP_BODY_LEN || prep->ttl <= 1u)
+    {
+        return 0;
+    }
+    out[0] = HWMP_CATEGORY_MESH;
+    out[1] = HWMP_ACTION_PATH_SELECTION;
+    out[2] = HWMP_EID_PREP;
+    out[3] = HWMP_PREP_ELEM_LEN;
+    out[4] = prep->flags;
+    out[5] = (uint8_t)(prep->hop_count + 1u);
+    out[6] = (uint8_t)(prep->ttl - 1u);
+    memcpy(&out[7], prep->target_addr, HWMP_ADDR_LEN);
+    wr32(&out[13], prep->target_sn);
+    wr32(&out[17], prep->lifetime);
+    wr32(&out[21], prep->metric + link_metric);
+    memcpy(&out[25], prep->orig_addr, HWMP_ADDR_LEN);
+    wr32(&out[31], prep->orig_sn);
+    return HWMP_PREP_BODY_LEN;
+}
+
+uint16_t umac_mesh_hwmp_build_perr(uint8_t *out, uint16_t out_len, uint8_t ttl,
+                                   const uint8_t *dest_addr, uint32_t dest_sn, uint16_t reason)
+{
+    if (out == NULL || dest_addr == NULL || out_len < HWMP_PERR_BODY_LEN)
+    {
+        return 0;
+    }
+    out[0] = HWMP_CATEGORY_MESH;
+    out[1] = HWMP_ACTION_PATH_SELECTION;
+    out[2] = HWMP_EID_PERR;
+    out[3] = HWMP_PERR_ELEM_LEN;
+    out[4] = ttl;
+    out[5] = 1u;    /* number of destinations */
+    out[6] = 0x00;  /* flags: no AE */
+    memcpy(&out[7], dest_addr, HWMP_ADDR_LEN);
+    wr32(&out[13], dest_sn);
+    wr16(&out[17], reason);
+    return HWMP_PERR_BODY_LEN;
+}
+
+bool umac_mesh_hwmp_parse_perr(const uint8_t *body, uint16_t len, struct hwmp_perr *out)
+{
+    if (body == NULL || out == NULL || len < HWMP_PERR_BODY_LEN)
+    {
+        return false;
+    }
+    if (body[0] != HWMP_CATEGORY_MESH || body[1] != HWMP_ACTION_PATH_SELECTION ||
+        body[2] != HWMP_EID_PERR)
+    {
+        return false;
+    }
+    if (body[3] < HWMP_PERR_ELEM_LEN || (uint16_t)(4 + body[3]) > len)
+    {
+        return false;
+    }
+    if (body[5] != 1u || (body[6] & HWMP_PERR_FLAG_AE) != 0u)
+    {
+        return false; /* one destination, no AE, or we cannot represent it */
+    }
+    out->ttl = body[4];
+    out->flags = body[6];
+    memcpy(out->dest_addr, &body[7], HWMP_ADDR_LEN);
+    out->dest_sn = rd32(&body[13]);
+    out->reason = rd16(&body[17]);
+    return true;
+}

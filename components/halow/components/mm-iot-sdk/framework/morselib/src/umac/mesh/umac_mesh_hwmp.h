@@ -158,6 +158,74 @@ uint32_t umac_mesh_hwmp_next_own_sn(uint32_t cur, const struct hwmp_preq *preq);
 /** True when @p preq asks for a path to @p own_addr, i.e. we must answer. */
 bool umac_mesh_hwmp_targets_us(const struct hwmp_preq *preq, const uint8_t *own_addr);
 
+/* ---- Forwarding ----------------------------------------------------------
+ *
+ * A relay re-emits a PREQ it does not own and a PREP it is not the originator
+ * of. mac80211 refuses to forward at ttl <= 1 and emits ttl - 1, hop_count + 1
+ * and metric + its own last-hop cost; everything else is copied verbatim so
+ * the endpoints can match request to reply. */
+
+/** Element ID and lengths for PERR, one destination, no AE. */
+#define HWMP_EID_PERR 132
+#define HWMP_PERR_ELEM_LEN 15
+#define HWMP_PERR_BODY_LEN 19
+/** PERR flags octet: bit 6 = Address Extension (refused). */
+#define HWMP_PERR_FLAG_AE 0x40
+/** Reason codes mac80211 uses (IEEE 802.11-2020 table 9-49). */
+#define HWMP_REASON_MESH_PATH_ERROR_NO_FORWARDING 62
+#define HWMP_REASON_MESH_PATH_ERROR_DEST_UNREACHABLE 63
+
+/** A parsed PREP. Naming is the frame's: target answered, originator asked. */
+struct hwmp_prep {
+    uint8_t flags;
+    uint8_t hop_count;
+    uint8_t ttl;
+    uint8_t target_addr[HWMP_ADDR_LEN];
+    uint32_t target_sn;
+    uint32_t lifetime;
+    uint32_t metric;
+    uint8_t orig_addr[HWMP_ADDR_LEN];
+    uint32_t orig_sn;
+};
+
+/** A parsed PERR with its single destination. */
+struct hwmp_perr {
+    uint8_t ttl;
+    uint8_t flags;
+    uint8_t dest_addr[HWMP_ADDR_LEN];
+    uint32_t dest_sn;
+    uint16_t reason;
+};
+
+/** Parse a PREP action body. Refuses AE and short bodies, like the PREQ parse. */
+bool umac_mesh_hwmp_parse_prep(const uint8_t *body, uint16_t len, struct hwmp_prep *out);
+
+/**
+ * Re-emit @p preq as a relay would: ttl - 1, hop_count + 1, metric +
+ * @p link_metric, all else verbatim (same preq_id, originator, target).
+ * @returns bytes written, or 0 when preq->ttl <= 1 -- the frame must die here.
+ */
+uint16_t umac_mesh_hwmp_build_preq_fwd(uint8_t *out, uint16_t out_len,
+                                       const struct hwmp_preq *preq, uint32_t link_metric);
+
+/** Same for a PREP being carried back toward its originator. */
+uint16_t umac_mesh_hwmp_build_prep_fwd(uint8_t *out, uint16_t out_len,
+                                       const struct hwmp_prep *prep, uint32_t link_metric);
+
+/**
+ * Build a PERR naming one unreachable destination. @p dest_sn is the last
+ * sequence number we held for it, so receivers can invalidate the right path
+ * and not a newer one.
+ */
+uint16_t umac_mesh_hwmp_build_perr(uint8_t *out, uint16_t out_len, uint8_t ttl,
+                                   const uint8_t *dest_addr, uint32_t dest_sn, uint16_t reason);
+
+/** Parse a PERR. Accepts exactly one destination without AE; refuses the rest. */
+bool umac_mesh_hwmp_parse_perr(const uint8_t *body, uint16_t len, struct hwmp_perr *out);
+
+/** Which path-selection element a category-13 body carries, or 0. */
+uint8_t umac_mesh_hwmp_element_id(const uint8_t *body, uint16_t len);
+
 #ifdef __cplusplus
 }
 #endif

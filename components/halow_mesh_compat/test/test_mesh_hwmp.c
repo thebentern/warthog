@@ -211,6 +211,99 @@ int main(void)
     CHECK(hwmp_sn_gt(1u, 0xffffffffu), "1 is newer than 0xffffffff (two past wrap)");
     CHECK(!hwmp_sn_gt(0xfffffffeu, 1u), "0xfffffffe is not newer than 1");
 
+    /* ---- forwarding: PREP parse ----------------------------------------- */
+    {
+        struct hwmp_preq q; struct hwmp_prep p; uint8_t bq[64], bp[64];
+        umac_mesh_hwmp_build_preq(bq, sizeof(bq), PI, 100, 7, US, 4882);
+        CHECK(umac_mesh_hwmp_parse_preq(bq, HWMP_PREQ_BODY_LEN, &q), "fwd: PREQ parses");
+        uint16_t n = umac_mesh_hwmp_build_prep(bp, sizeof(bp), &q, US, 55);
+        CHECK(umac_mesh_hwmp_parse_prep(bp, n, &p), "PREP parses");
+        CHECK(memcmp(p.target_addr, US, 6) == 0 && p.target_sn == 55, "PREP target is the answerer");
+        CHECK(memcmp(p.orig_addr, PI, 6) == 0 && p.orig_sn == 100, "PREP originator is the asker");
+        CHECK(p.lifetime == 4882 && p.hop_count == 0 && p.ttl == HWMP_DEFAULT_TTL, "PREP fixed fields");
+        CHECK(bp[25] == PI[0] && bp[30] == PI[5], "PREP orig_addr at +25..+30");
+        CHECK(rd32(&bp[31]) == 100, "PREP orig_sn at +31");
+        bp[4] |= HWMP_FLAG_AE;
+        CHECK(!umac_mesh_hwmp_parse_prep(bp, n, &p), "PREP with AE refused");
+        bp[4] &= (uint8_t)~HWMP_FLAG_AE;
+        CHECK(!umac_mesh_hwmp_parse_prep(bp, n - 1, &p), "PREP one octet short refused");
+        CHECK(umac_mesh_hwmp_element_id(bp, n) == HWMP_EID_PREP, "element id reads PREP");
+        CHECK(umac_mesh_hwmp_element_id(bq, HWMP_PREQ_BODY_LEN) == HWMP_EID_PREQ, "element id reads PREQ");
+        CHECK(umac_mesh_hwmp_element_id(bq, 3) == 0, "element id refuses a 3-octet body");
+    }
+
+    /* ---- forwarding: PREQ relay transform -------------------------------- */
+    {
+        struct hwmp_preq q, q2; uint8_t b1[64], b2[64];
+        umac_mesh_hwmp_build_preq(b1, sizeof(b1), PI, 100, 7, US, 4882);
+        umac_mesh_hwmp_parse_preq(b1, HWMP_PREQ_BODY_LEN, &q);
+        q.hop_count = 2; q.ttl = 10; q.metric = 1000;
+        uint16_t n = umac_mesh_hwmp_build_preq_fwd(b2, sizeof(b2), &q, 250);
+        CHECK(n == HWMP_PREQ_BODY_LEN, "PREQ fwd builds a full body");
+        CHECK(umac_mesh_hwmp_parse_preq(b2, n, &q2), "PREQ fwd parses");
+        CHECK(q2.hop_count == 3, "PREQ fwd hop_count + 1 (got %u)", q2.hop_count);
+        CHECK(q2.ttl == 9, "PREQ fwd ttl - 1 (got %u)", q2.ttl);
+        CHECK(q2.metric == 1250, "PREQ fwd metric + link (got %u)", (unsigned)q2.metric);
+        CHECK(q2.preq_id == 7 && q2.orig_sn == 100, "PREQ fwd keeps preq_id and orig_sn");
+        CHECK(memcmp(q2.orig_addr, PI, 6) == 0 && memcmp(q2.target_addr, US, 6) == 0,
+              "PREQ fwd keeps both endpoints");
+        CHECK(q2.target_flags == q.target_flags && q2.target_sn == q.target_sn,
+              "PREQ fwd keeps target flags and sn");
+        q.ttl = 1;
+        CHECK(umac_mesh_hwmp_build_preq_fwd(b2, sizeof(b2), &q, 1) == 0, "PREQ at ttl 1 is not forwarded");
+        q.ttl = 0;
+        CHECK(umac_mesh_hwmp_build_preq_fwd(b2, sizeof(b2), &q, 1) == 0, "PREQ at ttl 0 is not forwarded");
+        q.ttl = 2;
+        CHECK(umac_mesh_hwmp_build_preq_fwd(b2, sizeof(b2), &q, 1) == HWMP_PREQ_BODY_LEN,
+              "PREQ at ttl 2 forwards once more");
+        CHECK(b2[6] == 1, "and goes out with ttl 1 so the next hop stops it");
+    }
+
+    /* ---- forwarding: PREP relay transform -------------------------------- */
+    {
+        struct hwmp_preq q; struct hwmp_prep p, p2; uint8_t b1[64], b2[64];
+        umac_mesh_hwmp_build_preq(b1, sizeof(b1), PI, 100, 7, US, 4882);
+        umac_mesh_hwmp_parse_preq(b1, HWMP_PREQ_BODY_LEN, &q);
+        umac_mesh_hwmp_build_prep(b1, sizeof(b1), &q, US, 55);
+        umac_mesh_hwmp_parse_prep(b1, HWMP_PREP_BODY_LEN, &p);
+        p.ttl = 5; p.hop_count = 1; p.metric = 300;
+        uint16_t n = umac_mesh_hwmp_build_prep_fwd(b2, sizeof(b2), &p, 100);
+        CHECK(n == HWMP_PREP_BODY_LEN && umac_mesh_hwmp_parse_prep(b2, n, &p2), "PREP fwd builds and parses");
+        CHECK(p2.ttl == 4 && p2.hop_count == 2 && p2.metric == 400, "PREP fwd ttl-1 hop+1 metric+link");
+        CHECK(memcmp(p2.target_addr, US, 6) == 0 && p2.target_sn == 55 &&
+              memcmp(p2.orig_addr, PI, 6) == 0 && p2.orig_sn == 100, "PREP fwd keeps endpoints and sns");
+        p.ttl = 1;
+        CHECK(umac_mesh_hwmp_build_prep_fwd(b2, sizeof(b2), &p, 1) == 0, "PREP at ttl 1 is not forwarded");
+    }
+
+    /* ---- PERR ------------------------------------------------------------ */
+    {
+        uint8_t b[64]; struct hwmp_perr e;
+        uint16_t n = umac_mesh_hwmp_build_perr(b, sizeof(b), 31, PI, 0x01020304u,
+                                               HWMP_REASON_MESH_PATH_ERROR_DEST_UNREACHABLE);
+        CHECK(n == HWMP_PERR_BODY_LEN, "PERR body is 19 octets (got %u)", n);
+        CHECK(b[0] == 13 && b[1] == 1, "PERR category 13 action 1");
+        CHECK(b[2] == 132 && b[3] == 15, "PERR element id 132 length 15 -- mac80211 requires exactly 15");
+        CHECK(b[4] == 31, "PERR ttl at +4");
+        CHECK(b[5] == 1, "PERR one destination at +5");
+        CHECK(b[6] == 0, "PERR flags at +6, no AE");
+        CHECK(memcmp(&b[7], PI, 6) == 0, "PERR dest addr at +7..+12");
+        CHECK(b[13] == 0x04 && b[14] == 0x03 && b[15] == 0x02 && b[16] == 0x01, "PERR dest sn LE at +13");
+        CHECK(b[17] == 63 && b[18] == 0, "PERR reason 63 LE at +17");
+        CHECK(umac_mesh_hwmp_parse_perr(b, n, &e), "PERR parses");
+        CHECK(e.ttl == 31 && e.dest_sn == 0x01020304u && e.reason == 63 && memcmp(e.dest_addr, PI, 6) == 0,
+              "PERR fields recovered");
+        CHECK(umac_mesh_hwmp_element_id(b, n) == HWMP_EID_PERR, "element id reads PERR");
+        b[5] = 2;
+        CHECK(!umac_mesh_hwmp_parse_perr(b, n, &e), "PERR with two destinations refused");
+        b[5] = 1; b[6] = HWMP_PERR_FLAG_AE;
+        CHECK(!umac_mesh_hwmp_parse_perr(b, n, &e), "PERR with AE refused");
+        b[6] = 0;
+        CHECK(!umac_mesh_hwmp_parse_perr(b, n - 1, &e), "PERR one octet short refused");
+        b[3] = 14;
+        CHECK(!umac_mesh_hwmp_parse_perr(b, n, &e), "PERR element length 14 refused");
+    }
+
     printf(failures ? "\nFAILED (%d)\n" : "\nALL TESTS PASSED\n", failures);
     return failures ? 1 : 0;
 }
