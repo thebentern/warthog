@@ -212,7 +212,11 @@ int main(void)
         umac_mesh_hwmp_parse_perr(acts[1].body, acts[1].body_len, &e1);
         CHECK((memcmp(e0.dest_addr, B, 6) == 0 && memcmp(e1.dest_addr, Z, 6) == 0) ||
               (memcmp(e0.dest_addr, Z, 6) == 0 && memcmp(e1.dest_addr, B, 6) == 0), "PERRs name B and Z");
-        CHECK(e0.dest_sn != 0 && e1.dest_sn != 0, "PERRs carry the sn we held");
+        /* B was at sn 2, Z at 3: the PERRs must say 3 and 4, or a neighbour
+         * holding the same numbers rejects them as stale. */
+        uint32_t snB = memcmp(e0.dest_addr, B, 6) == 0 ? e0.dest_sn : e1.dest_sn;
+        uint32_t snZ = memcmp(e0.dest_addr, Z, 6) == 0 ? e0.dest_sn : e1.dest_sn;
+        CHECK(snB == 3 && snZ == 4, "PERRs carry sn + 1 (B %u, Z %u)", (unsigned)snB, (unsigned)snZ);
         CHECK(umac_mesh_path_lookup(&T, A, now) != NULL, "path via A untouched");
         CHECK(umac_mesh_path_count(&T, now) == 1, "one path left");
         struct umac_mesh_hwmp_ctx leaf = ctx(false, now);

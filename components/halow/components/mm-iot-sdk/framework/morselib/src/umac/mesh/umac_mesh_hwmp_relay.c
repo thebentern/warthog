@@ -224,6 +224,11 @@ uint32_t umac_mesh_hwmp_lose_neighbour(const struct umac_mesh_hwmp_ctx *c,
             continue;
         }
         e->flags &= (uint8_t)~UMAC_MESH_PATH_ACTIVE;
+        /* 802.11s 14.10.11.4.4: announce the destination at its sn + 1, or
+         * every node holding the same sn -- all of them -- rejects the PERR
+         * as not newer. Record it so our own table agrees with what we said. */
+        e->sn += 1u;
+        e->flags |= UMAC_MESH_PATH_SN_VALID;
         if (c->forwarding && out != NULL && n < max)
         {
             struct umac_mesh_hwmp_action *a = &out[n];
