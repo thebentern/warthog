@@ -469,7 +469,7 @@ volatile uint32_t g_warthog_mesh_key_fail = 0;
  * at runtime and re-peers, so the two can be told apart on hardware. */
 volatile uint32_t g_warthog_mesh_secure = 1;
 /* Forwarding and bridge gates, seeded from NVS in mesh.c before the mesh starts. */
-volatile uint32_t g_warthog_mesh_fwd = 0, g_warthog_mesh_bridge = 0;
+volatile uint32_t g_warthog_mesh_fwd = 0, g_warthog_mesh_bridge = 0, g_warthog_mesh_grp = 0;
 volatile uint32_t g_warthog_fwd_uni = 0, g_warthog_fwd_grp = 0, g_warthog_fwd_nomem = 0;
 volatile uint32_t g_warthog_fwd_drop_own = 0, g_warthog_fwd_drop_dup = 0, g_warthog_fwd_drop_ttl = 0;
 volatile uint32_t g_warthog_fwd_drop_nopath = 0, g_warthog_fwd_drop_nofwd = 0, g_warthog_fwd_drop_bad = 0;
@@ -939,10 +939,11 @@ static void cmd_meshcfg(void)
              WARTHOG_REGION_NAME, WARTHOG_COUNTRY_CODE);
     cdc_write(line);
     snprintf(line, sizeof(line),
-             "+MESHCFG: enable=%u secure=%u dhcp=%u fwd=%u bridge=%u id='%s' pass=%u chars\r\n",
+             "+MESHCFG: enable=%u secure=%u dhcp=%u fwd=%u bridge=%u grp=%s id='%s' pass=%u chars\r\n",
              (unsigned)warthog_cfg_get_mesh_enable(), (unsigned)warthog_cfg_get_mesh_secure(),
              (unsigned)warthog_cfg_get_mesh_dhcp(), (unsigned)warthog_cfg_get_mesh_fwd(),
-             (unsigned)warthog_cfg_get_mesh_bridge(), id, (unsigned)strlen(pw));
+             (unsigned)warthog_cfg_get_mesh_bridge(),
+             warthog_cfg_get_mesh_grp() ? "std" : "replicate", id, (unsigned)strlen(pw));
     cdc_write(line);
     if (g_warthog_applied_chan == 0) {
         snprintf(line, sizeof(line),
@@ -1889,6 +1890,17 @@ static void dispatch(char *line)
     } else if (strcasecmp(verb, "MESHFWD") == 0 && terminator == '?') {
         char line[64];
         snprintf(line, sizeof(line), "+MESHFWD: %u\r\n", (unsigned)warthog_cfg_get_mesh_fwd());
+        cdc_write(line);
+        reply_ok();
+    } else if (strcasecmp(verb, "MESHGRP") == 0 && terminator == '=') {
+        unsigned long v = strtoul(args, NULL, 10);
+        if (warthog_cfg_set_mesh_grp((uint8_t)v) == ESP_OK) {
+            cdc_write("+MESHGRP: stored; takes effect on next boot (AT+RESET)\r\n");
+            reply_ok();
+        } else { reply_error("usage: AT+MESHGRP=<0|1>"); }
+    } else if (strcasecmp(verb, "MESHGRP") == 0 && terminator == '?') {
+        char line[64];
+        snprintf(line, sizeof(line), "+MESHGRP: %u\r\n", (unsigned)warthog_cfg_get_mesh_grp());
         cdc_write(line);
         reply_ok();
     } else if (strcasecmp(verb, "MESHBRIDGE") == 0 && terminator == '=') {

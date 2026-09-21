@@ -181,6 +181,25 @@ int main(void)
     umac_mesh_fwd_tx(&c, MC, HW, 107, &t);
     CHECK(t.ok && t.shape == UMAC_MESH_TX_GROUP_3ADDR && memcmp(t.ra, MC, 6) == 0 && umac_mesh_ctrl_ae(&t.mc) == UMAC_MESH_CTRL_AE_A4 && memcmp(t.mc.eaddr1, HW, 6) == 0, "HW->multicast: 3-addr group with AE 1 carrying HW");
 
+    /* ---- replica normalisation: the per-peer unicast form of a group frame --- */
+    {
+        /* Arrives 4-addr, RA=us, TA=A, addr3=us (the chip's addr3 filter), addr4=A,
+         * AE 2 with eaddr1 = the group, eaddr2 = the host behind A. */
+        struct umac_mesh_rx_frame rep = uni(W, A, W, A, 40, 31, UMAC_MESH_CTRL_AE_A5A6, BC, HA);
+        CHECK(umac_mesh_fwd_normalise_replica(&rep), "AE 2 with a group extension DA is a replica");
+        CHECK(rep.group && memcmp(rep.addr1, BC, 6) == 0, "rewritten as a group frame to bcast");
+        CHECK(memcmp(rep.addr3, A, 6) == 0, "mesh SA is A (from addr4)");
+        CHECK(umac_mesh_ctrl_ae(&rep.mc) == UMAC_MESH_CTRL_AE_A4 && memcmp(rep.mc.eaddr1, HA, 6) == 0, "AE 1 now carries the host behind A");
+        umac_mesh_fwd_rx(&c, &rep, &r);
+        CHECK(r.verdict == UMAC_MESH_FWD_DELIVER_AND_FORWARD && memcmp(r.deliver_da, BC, 6) == 0 && memcmp(r.deliver_sa, HA, 6) == 0,
+              "and the engine delivers it as a broadcast from HA and forwards it");
+        CHECK(memcmp(r.mesh_sa, A, 6) == 0, "with mesh SA = A, so the next hop's cache sees the same identity");
+        struct umac_mesh_rx_frame notrep = uni(W, A, W, A, 41, 31, UMAC_MESH_CTRL_AE_A5A6, HW, HA);
+        CHECK(!umac_mesh_fwd_normalise_replica(&notrep) && !notrep.group, "AE 2 with a unicast extension DA is left alone");
+        struct umac_mesh_rx_frame plain = uni(W, A, W, A, 42, 31, 0, NULL, NULL);
+        CHECK(!umac_mesh_fwd_normalise_replica(&plain), "no AE is left alone");
+    }
+
     /* ---- round trip: what we shape, we would deliver correctly -------------- */
     {
         umac_mesh_fwd_tx(&c, HA, HW, 108, &t);

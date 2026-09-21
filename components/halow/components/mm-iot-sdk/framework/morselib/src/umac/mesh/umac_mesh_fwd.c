@@ -206,3 +206,21 @@ void umac_mesh_fwd_tx(const struct umac_mesh_fwd_ctx *c, const uint8_t *da, cons
     r->need_path = true;
     memcpy(r->path_target, mesh_da, 6);
 }
+
+bool umac_mesh_fwd_normalise_replica(struct umac_mesh_rx_frame *f)
+{
+    if (f == NULL || f->group || umac_mesh_ctrl_ae(&f->mc) != UMAC_MESH_CTRL_AE_A5A6 ||
+        !is_group_(f->mc.eaddr1))
+    {
+        return false;
+    }
+    uint8_t src[6];
+    memcpy(src, f->mc.eaddr2, 6);
+    f->group = true;
+    memcpy(f->addr1, f->mc.eaddr1, 6);
+    memcpy(f->addr3, f->addr4, 6);
+    f->mc.flags = (uint8_t)((f->mc.flags & ~UMAC_MESH_CTRL_AE_MASK) | UMAC_MESH_CTRL_AE_A4);
+    memcpy(f->mc.eaddr1, src, 6);
+    memset(f->mc.eaddr2, 0, 6);
+    return true;
+}

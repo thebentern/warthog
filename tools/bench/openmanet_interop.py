@@ -271,8 +271,8 @@ def main():
         # Relay state: reported, never asserted -- nothing here has a measured
         # baseline yet, and the first run IS the baseline.
         if a.fwd or a.bridge:
-            for line in at(w, ["AT+MESHFWDSTAT?", "AT+MESHPATH?"]).splitlines():
-                if line.strip().startswith(("+MESHFWDSTAT:", "+MESHPATH:")):
+            for line in at(w, ["AT+MESHGRP?", "AT+MESHFWDSTAT?", "AT+MESHPATH?"]).splitlines():
+                if line.strip().startswith(("+MESHGRP:", "+MESHFWDSTAT:", "+MESHPATH:")):
                     print("        %s" % line.strip())
 
     print("\n== 4. data plane ==")

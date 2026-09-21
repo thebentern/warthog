@@ -105,6 +105,21 @@ changes, all of it 802.11s as mac80211 does it:
 
 Read the state with `AT+MESHPATH?` and the counters with `AT+MESHFWDSTAT?`.
 
+**Group frames and OpenMANET, honestly.** This chip cannot key group frames
+across more than one SAE peer, so by default a broadcast leaves as one
+unicast per peer with the group address in Address Extension 2. A warthog
+receiver recognises that as the broadcast it is and re-floods it. A mac80211
+receiver rebuilds it as an Ethernet frame to the group and delivers it
+locally — on kernels before 6.3 it then floods on the bridge; on 6.3 and
+later the receive path plausibly treats a unicast-addressed frame whose
+extension DA is a group as one to route onward, fails the next-hop lookup and
+answers with a PERR. OpenMANET 24.10 is kernel 6.6. That is not verified
+either way and it is the single biggest interop question this design leaves
+open. `AT+MESHGRP=1` switches to standard 3-address broadcasts, which every
+mac80211 receiver floods correctly, at the cost that under SAE they decrypt
+only with one peer or with host CCMP on the receivers. On an open mesh, use
+it.
+
 **How much of this is verified.** Every decision above is a freestanding
 function the host suite tests directly, and `sim_mesh` drives a 3–4 node
 mesh through the shipping code: unicast through a relay exactly once, a

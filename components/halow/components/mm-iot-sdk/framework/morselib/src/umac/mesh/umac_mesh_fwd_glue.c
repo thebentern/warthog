@@ -108,17 +108,9 @@ void umac_mesh_fwd_glue_rx(struct umac_data *umacd, struct umac_sta_data *stad,
         memcpy(f.addr4, dot11_get_sa_data(dhdr), 6);
     }
     f.mc = *mc;
-    /* A group frame a warthog replicated as unicast: AE 2 with a group DA in
-     * the extension. Treat it as the group frame it is. */
-    if (!f.group && umac_mesh_ctrl_ae(mc) == UMAC_MESH_CTRL_AE_A5A6 &&
-        mm_mac_addr_is_multicast(mc->eaddr1))
-    {
-        f.group = true;
-        memcpy(f.addr1, mc->eaddr1, 6);
-        memcpy(f.addr3, f.addr4, 6);
-        f.mc.flags = (uint8_t)((mc->flags & ~UMAC_MESH_CTRL_AE_MASK) | UMAC_MESH_CTRL_AE_A4);
-        memcpy(f.mc.eaddr1, mc->eaddr2, 6);
-    }
+    /* A group frame a warthog replicated as unicast is recognised and
+     * rewritten by the tested engine, not here. */
+    (void)umac_mesh_fwd_normalise_replica(&f);
     struct umac_mesh_fwd_ctx c = fctx_();
     lock_();
     umac_mesh_fwd_rx(&c, &f, out);
@@ -282,6 +274,18 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
     if (t.need_path)
     {
         maybe_preq_(t.path_target);
+    }
+    extern volatile uint32_t g_warthog_mesh_grp;
+    if (t.shape == UMAC_MESH_TX_GROUP_3ADDR && g_warthog_mesh_grp)
+    {
+        /* Standard group frame: the engine's own Mesh Control (AE 1 carries a
+         * proxied source, else no extension) goes out as-is. */
+        g_warthog_mesh_seq++;
+        md->mesh.mc_len = (uint8_t)umac_mesh_ctrl_build(md->mesh.mc, sizeof(md->mesh.mc), &t.mc);
+        md->mesh.addr_valid = 1;
+        memcpy(md->mesh.mesh_da, da, 6);
+        memcpy(md->mesh.mesh_sa, c.own_addr, 6);
+        return;
     }
     if (t.shape == UMAC_MESH_TX_GROUP_3ADDR)
     {

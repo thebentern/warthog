@@ -1022,6 +1022,14 @@ static void mesh_enqueue_tx_frame(struct umac_data *umacd,
         }
     }
 
+    extern volatile uint32_t g_warthog_mesh_grp;
+    if (group && g_warthog_mesh_grp)
+    {
+        /* Standard group frame: one transmission, the chip broadcasts it.
+         * The handed-over stad only supplies rate control and a queue. */
+        mesh_queue_one_(umacd, stad, txbuf);
+        return;
+    }
     if (group)
     {
         /* Copy to every peer except the one we were handed, which takes the
@@ -1133,6 +1141,21 @@ static void mesh_construct_80211_data_header(struct umac_sta_data *stad,
      * with the pairwise key, the only crypto path this chip handles across
      * several peers. The IP payload is untouched, so a multicast datagram is
      * still delivered by the receiver's IP layer. */
+    extern volatile uint32_t g_warthog_mesh_grp;
+    if (g_warthog_mesh_grp && mm_mac_addr_is_multicast(hdr_8023->dest_addr))
+    {
+        /* Standard 802.11s group frame: 3-address, addr1 = the group,
+         * addr3 = the mesh source (us). Any proxied source rides in AE 1 from
+         * the sidecar; the 24-byte length follows from the FC bits. */
+        uint8_t h3[UMAC_MESH_DATA_HDR3_LEN];
+        umac_mesh_ies_build_data_hdr3_group(h3, hdr_8023->dest_addr, ta, ta);
+        memcpy(&data_hdr->base.frame_control, &h3[0], 2);
+        mac_addr_copy(data_hdr->base.addr1, &h3[4]);
+        mac_addr_copy(data_hdr->base.addr2, &h3[10]);
+        mac_addr_copy(data_hdr->base.addr3, &h3[16]);
+        memset(data_hdr->addr4, 0, 6);
+        return;
+    }
     const uint8_t *da = mm_mac_addr_is_multicast(hdr_8023->dest_addr) ? ra : hdr_8023->dest_addr;
     const uint8_t *sa = hdr_8023->src_addr;
     /* A relayed or proxied frame carries its mesh endpoints in the sidecar:
@@ -1160,6 +1183,7 @@ MM_STATIC_ASSERT(DOT11_MASK_FC_TO_DS == 0x0100, "ToDS bit drift");
 MM_STATIC_ASSERT(DOT11_MASK_FC_FROM_DS == 0x0200, "FromDS bit drift");
 MM_STATIC_ASSERT(DOT11_SHIFT_FC_TYPE == 2 && DOT11_SHIFT_FC_SUBTYPE == 4, "FC shift drift");
 MM_STATIC_ASSERT(sizeof(struct dot11_data_hdr) == UMAC_MESH_DATA_HDR4_LEN, "4-addr hdr size drift");
+MM_STATIC_ASSERT(UMAC_MESH_DATA_HDR3_LEN == 24, "3-addr hdr size drift");
 
 /* --- Frames allowed before "association" -------------------------------- */
 

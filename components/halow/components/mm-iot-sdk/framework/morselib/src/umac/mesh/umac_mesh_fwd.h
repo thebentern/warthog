@@ -91,6 +91,14 @@ struct umac_mesh_fwd_rx_result {
 void umac_mesh_fwd_rx(const struct umac_mesh_fwd_ctx *c, const struct umac_mesh_rx_frame *f,
                       struct umac_mesh_fwd_rx_result *r);
 
+/**
+ * A group frame this chip replicated as unicast arrives 4-address with AE 2
+ * and a group address in the extension DA. Rewrite it in place into the
+ * group frame it is: addr1 = the group, addr3 = the mesh source, AE 1 with
+ * the proxied source. @returns true if it was such a replica.
+ */
+bool umac_mesh_fwd_normalise_replica(struct umac_mesh_rx_frame *f);
+
 /* ---- transmit --------------------------------------------------------- */
 
 enum umac_mesh_tx_shape {

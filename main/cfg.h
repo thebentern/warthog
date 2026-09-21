@@ -97,6 +97,11 @@ esp_err_t warthog_cfg_set_mesh_fwd(uint8_t on);
 uint8_t   warthog_cfg_get_mesh_bridge(void);
 esp_err_t warthog_cfg_set_mesh_bridge(uint8_t on);
 
+/* Group frames as standard 3-address 802.11s broadcasts (1) instead of one
+ * unicast per peer (0, the measured path). Default 0. Next boot. */
+uint8_t   warthog_cfg_get_mesh_grp(void);
+esp_err_t warthog_cfg_set_mesh_grp(uint8_t on);
+
 /* S1G channel pin, stored and returned as a set.
  *
  * Channel, frequency, operating class and bandwidth are not independent --
