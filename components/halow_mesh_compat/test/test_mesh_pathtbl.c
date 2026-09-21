@@ -146,12 +146,37 @@ int main(void)
     CHECK(m != NULL && memcmp(m, H2, 6) == 0, "re-learning moves X behind H2 (a host can roam)");
     CHECK(umac_mesh_proxy_count(&T, now + 10) == 1, "still one proxy entry, not two");
     CHECK(umac_mesh_proxy_lookup(&T, X, now + 10 + UMAC_MESH_PROXY_LIFETIME_MS) == NULL, "proxy entry expires");
-    for (uint32_t i = 0; i < UMAC_MESH_PROXY_MAX + 3; i++)
+    /* One node may own at most UMAC_MESH_PROXY_PER_NODE hosts: a flood of AE
+     * frames from one peer cannot fill the table. */
+    umac_mesh_pathtbl_init(&T);
+    for (uint32_t i = 0; i < UMAC_MESH_PROXY_PER_NODE + 4; i++)
     {
-        uint8_t h[6] = { 0x00, 0x11, 0, 0, (uint8_t)(i >> 8), (uint8_t)i };
-        umac_mesh_proxy_learn(&T, h, H1, now + 1000 + i);
+        uint8_t h[6] = { 0x00, 0x11, 0, 0, 0, (uint8_t)(1 + i) };
+        bool ok = umac_mesh_proxy_learn(&T, h, H1, now + 1000);
+        if (i < UMAC_MESH_PROXY_PER_NODE) { CHECK(ok, "host %u behind H1 learned", (unsigned)i); }
+        else { CHECK(!ok, "host %u behind H1 refused: H1 owns its %u already", (unsigned)i, (unsigned)UMAC_MESH_PROXY_PER_NODE); }
     }
-    CHECK(umac_mesh_proxy_count(&T, now + 2000) == UMAC_MESH_PROXY_MAX, "proxy table stays at its bound");
+    CHECK(umac_mesh_proxy_count(&T, now + 1000) == UMAC_MESH_PROXY_PER_NODE, "H1 owns exactly its bound");
+    uint8_t hb[6] = { 0x00, 0x22, 0, 0, 0, 1 };
+    CHECK(umac_mesh_proxy_learn(&T, hb, H2, now + 1000), "another node may still learn a host");
+    /* A live entry is never evicted for a newcomer: fill with four nodes. */
+    umac_mesh_pathtbl_init(&T);
+    for (uint32_t n = 0; n < 4; n++) for (uint32_t i = 0; i < UMAC_MESH_PROXY_PER_NODE; i++)
+    {
+        uint8_t node[6] = { 0x02, 0, 0, 0, 0, (uint8_t)(0x10 + n) }, h[6] = { 0x00, 0x33, 0, 0, (uint8_t)n, (uint8_t)i };
+        umac_mesh_proxy_learn(&T, h, node, now + 1000);
+    }
+    CHECK(umac_mesh_proxy_count(&T, now + 1000) == UMAC_MESH_PROXY_MAX, "table full of live entries");
+    uint8_t newcomer[6] = { 0x00, 0x44, 0, 0, 0, 1 }, node5[6] = { 0x02, 0, 0, 0, 0, 0x50 };
+    CHECK(!umac_mesh_proxy_learn(&T, newcomer, node5, now + 1000), "a newcomer is refused rather than evicting a live host");
+    uint8_t first_host[6] = { 0x00, 0x33, 0, 0, 0, 0 };
+    CHECK(umac_mesh_proxy_lookup(&T, first_host, now + 1000) != NULL, "the first host is still known");
+    /* Touch on transmit use extends life; an untouched entry lapses. */
+    umac_mesh_pathtbl_init(&T);
+    umac_mesh_proxy_learn(&T, X, H1, now);
+    umac_mesh_proxy_touch(&T, X, now + UMAC_MESH_PROXY_LIFETIME_MS - 1000);
+    CHECK(umac_mesh_proxy_lookup(&T, X, now + UMAC_MESH_PROXY_LIFETIME_MS + 1000) != NULL, "touched on TX use: still known past the original lifetime");
+    CHECK(UMAC_MESH_PROXY_LIFETIME_MS == 600000u, "proxy lifetime is mac80211's 600 s");
 
     /* ---- NULL safety ------------------------------------------------------- */
     CHECK(umac_mesh_path_lookup(NULL, D, now) == NULL, "NULL table lookup");

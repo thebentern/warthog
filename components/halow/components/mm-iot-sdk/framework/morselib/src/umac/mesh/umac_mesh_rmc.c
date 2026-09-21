@@ -68,6 +68,7 @@ bool umac_mesh_rmc_check(struct umac_mesh_rmc *rmc, const uint8_t *sa, uint32_t 
     if (slot == NULL)
     {
         slot = oldest; /* bucket full: the oldest live entry makes room */
+        rmc->evictions++;
     }
     slot->seq = seq;
     slot->exp_ms = now_ms + UMAC_MESH_RMC_TIMEOUT_MS;

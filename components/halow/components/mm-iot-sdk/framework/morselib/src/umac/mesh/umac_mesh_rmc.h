@@ -44,6 +44,11 @@ struct umac_mesh_rmc_entry {
 
 struct umac_mesh_rmc {
     struct umac_mesh_rmc_entry e[UMAC_MESH_RMC_BUCKETS][UMAC_MESH_RMC_QUEUE];
+    /* Live entries pushed out by a full bucket. mac80211 has the same 4-deep
+     * bucket (RMC_QUEUE_MAX_LEN) and the same exposure to a source whose
+     * sequence numbers collide with a victim's; this counter is how the
+     * bench would see it. */
+    uint32_t evictions;
 };
 
 void umac_mesh_rmc_init(struct umac_mesh_rmc *rmc);

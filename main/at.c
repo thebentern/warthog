@@ -475,6 +475,9 @@ volatile uint32_t g_warthog_fwd_drop_own = 0, g_warthog_fwd_drop_dup = 0, g_wart
 volatile uint32_t g_warthog_fwd_drop_nopath = 0, g_warthog_fwd_drop_nofwd = 0, g_warthog_fwd_drop_bad = 0;
 volatile uint32_t g_warthog_fwd_perr_tx = 0, g_warthog_fwd_preq_tx = 0;
 volatile uint32_t g_warthog_hwmp_relay_preq = 0, g_warthog_hwmp_relay_prep = 0, g_warthog_hwmp_relay_perr = 0;
+volatile uint32_t g_warthog_fwd_perr_suppressed = 0, g_warthog_fwd_drop_full = 0;
+volatile uint32_t g_warthog_fwd_pend_tx = 0, g_warthog_fwd_pend_drop = 0, g_warthog_hwmp_prot = 0;
+volatile uint32_t g_warthog_hwmp_unprotected = 0, g_warthog_hwmp_mmie = 0, g_warthog_hwmp_nommie = 0;
 
 /* Data-plane counters (AT+DATASTAT?). rxtap_data = data frames the chip
  * delivered; stad_hit/miss = whether the peer table resolved the sender;
@@ -1873,18 +1876,24 @@ static void dispatch(char *line)
         if (w <= 0) { cdc_write("+MESHPATH: (empty)\r\n"); } else { cdc_write(big); }
         reply_ok();
     } else if (strcasecmp(verb, "MESHFWDSTAT") == 0 && terminator == '?') {
-        char line[320];
+        char line[480];
         snprintf(line, sizeof(line),
                  "+MESHFWDSTAT: on=%lu fwd uni=%lu grp=%lu nomem=%lu | drop own=%lu dup=%lu ttl=%lu "
-                 "nopath=%lu nofwd=%lu bad=%lu | perr_tx=%lu preq_tx=%lu | relay preq=%lu prep=%lu perr=%lu\r\n",
+                 "nopath=%lu nofwd=%lu bad=%lu full=%lu | perr_tx=%lu perr_supp=%lu preq_tx=%lu | relay preq=%lu prep=%lu perr=%lu "
+                 "| pend tx=%lu drop=%lu | hwmp prot=%lu unprotected=%lu mmie=%lu nommie=%lu\r\n",
                  (unsigned long)g_warthog_mesh_fwd, (unsigned long)g_warthog_fwd_uni,
                  (unsigned long)g_warthog_fwd_grp, (unsigned long)g_warthog_fwd_nomem,
                  (unsigned long)g_warthog_fwd_drop_own, (unsigned long)g_warthog_fwd_drop_dup,
                  (unsigned long)g_warthog_fwd_drop_ttl, (unsigned long)g_warthog_fwd_drop_nopath,
                  (unsigned long)g_warthog_fwd_drop_nofwd, (unsigned long)g_warthog_fwd_drop_bad,
-                 (unsigned long)g_warthog_fwd_perr_tx, (unsigned long)g_warthog_fwd_preq_tx,
+                 (unsigned long)g_warthog_fwd_drop_full,
+                 (unsigned long)g_warthog_fwd_perr_tx, (unsigned long)g_warthog_fwd_perr_suppressed,
+                 (unsigned long)g_warthog_fwd_preq_tx,
                  (unsigned long)g_warthog_hwmp_relay_preq, (unsigned long)g_warthog_hwmp_relay_prep,
-                 (unsigned long)g_warthog_hwmp_relay_perr);
+                 (unsigned long)g_warthog_hwmp_relay_perr,
+                 (unsigned long)g_warthog_fwd_pend_tx, (unsigned long)g_warthog_fwd_pend_drop,
+                 (unsigned long)g_warthog_hwmp_prot, (unsigned long)g_warthog_hwmp_unprotected,
+                 (unsigned long)g_warthog_hwmp_mmie, (unsigned long)g_warthog_hwmp_nommie);
         cdc_write(line);
         reply_ok();
     } else if (strcasecmp(verb, "MESHFWD") == 0 && terminator == '?') {

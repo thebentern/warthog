@@ -349,7 +349,9 @@ void umac_datapath_process_rx_action_frame(struct umac_data *umacd,
             {
                 umac_mesh_handle_hwmp((const uint8_t *)&frame->field,
                                       (uint16_t)(total - sizeof(struct dot11_hdr)),
-                                      dot11_get_ta(&frame->hdr));
+                                      dot11_get_ta(&frame->hdr),
+                                      dot11_frame_control_get_protected(frame->hdr.frame_control),
+                                      mm_mac_addr_is_multicast(dot11_get_ra(&frame->hdr)));
             }
             break;
         }
@@ -769,7 +771,7 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         /* Relay on: decide now, while the Mesh Control is still in place.
          * A frame the engine cannot parse falls through to the strip below
          * exactly as before, so the tolerant path is unchanged. */
-        if (g_warthog_mesh_fwd)
+        if (g_warthog_mesh_fwd || g_warthog_mesh_bridge)
         {
             struct umac_mesh_ctrl mcs; uint16_t used = 0;
             if (umac_mesh_ctrl_parse(mc, (uint16_t)mmpkt_get_data_length(rxbufview), &mcs, &used))
@@ -2406,6 +2408,24 @@ enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
 
     if (stad == NULL)
     {
+        /* Relay or bridge on and no path yet for a unicast: the PREQ is out
+         * (lookup_stad sent it); hold the frame for the PREP instead of
+         * losing the first frame of every flow, as mac80211 does. */
+        if (ra == NULL && data->ops == &datapath_ops_mesh &&
+            (g_warthog_mesh_fwd || g_warthog_mesh_bridge) && enc != ENCRYPTION_DISABLED &&
+            be16toh(header_8023->ethertype_be) != ETHERTYPE_EAPOL &&
+            !mm_mac_addr_is_multicast(header_8023->dest_addr))
+        {
+            uint8_t dest[6];
+            memcpy(dest, header_8023->dest_addr, 6);
+            mmpkt_close(&txbufview);
+            if (umac_mesh_fwd_glue_tx_pending(umacd, txbuf, dest))
+            {
+                return MMWLAN_SUCCESS;
+            }
+            mmpkt_release(txbuf);
+            return MMWLAN_NOT_FOUND;
+        }
         MMLOG_WRN("No STA record for %s " MM_MAC_ADDR_FMT "\n", addr_type, MM_MAC_ADDR_VAL(addr));
         status = MMWLAN_NOT_FOUND;
         goto exit;

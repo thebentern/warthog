@@ -31,8 +31,11 @@ extern "C" {
 #endif
 /** mac80211 dot11MeshHWMPactivePathTimeout: 5000 TU, ~5.1 s. */
 #define UMAC_MESH_PATH_LIFETIME_MS 5120u
-/** mac80211 MESH_PATH_EXPIRE for proxy entries. */
-#define UMAC_MESH_PROXY_LIFETIME_MS 60000u
+/** mac80211 MESH_PATH_EXPIRE: 600 s, refreshed on every transmit and receive. */
+#define UMAC_MESH_PROXY_LIFETIME_MS 600000u
+/** At most this many hosts learned behind one mesh node: one peer's flood
+ *  cannot unlearn everyone else's hosts. */
+#define UMAC_MESH_PROXY_PER_NODE 8u
 
 #define UMAC_MESH_PATH_ACTIVE   0x01u
 #define UMAC_MESH_PATH_SN_VALID 0x02u
@@ -95,9 +98,15 @@ bool umac_mesh_path_invalidate(struct umac_mesh_pathtbl *t, const uint8_t *dst,
  *  @returns how many were dropped. */
 uint32_t umac_mesh_path_lose_next_hop(struct umac_mesh_pathtbl *t, const uint8_t *next_hop);
 
-/** Learn that @p ext sits behind @p mesh_sta (from Address Extension). */
-void umac_mesh_proxy_learn(struct umac_mesh_pathtbl *t, const uint8_t *ext,
+/** Learn that @p ext sits behind @p mesh_sta (from Address Extension). A live
+ *  entry is never evicted for a newcomer, and a node may own at most
+ *  UMAC_MESH_PROXY_PER_NODE; a host may move to another node. @returns false
+ *  if refused. */
+bool umac_mesh_proxy_learn(struct umac_mesh_pathtbl *t, const uint8_t *ext,
                            const uint8_t *mesh_sta, uint32_t now_ms);
+
+/** Refresh @p ext's entry on transmit use, as mac80211 does. */
+void umac_mesh_proxy_touch(struct umac_mesh_pathtbl *t, const uint8_t *ext, uint32_t now_ms);
 
 /** The mesh node proxying for @p ext, or NULL. */
 const uint8_t *umac_mesh_proxy_lookup(const struct umac_mesh_pathtbl *t, const uint8_t *ext,

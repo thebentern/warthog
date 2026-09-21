@@ -93,6 +93,13 @@ changes, all of it 802.11s as mac80211 does it:
   out as one unicast per peer (excluding the sender) carrying the group
   address in Address Extension, which a mac80211 receiver rebuilds into the
   real Ethernet frame and floods on its bridge.
+- **Paths are refreshed before they lapse.** A path in use with under a
+  second left triggers a fresh PREQ while still carrying traffic, so a
+  multi-hop flow never waits on rediscovery.
+- **The first frame of a flow waits for the PREP.** A unicast to a node with
+  no path yet is held (up to 4 frames, 2 per destination, 2 s) and sent when
+  the path is installed, as mac80211 does, instead of being lost the way an
+  unanswered ARP is.
 - **Discovery is rate-limited.** A frame for a destination with no path
   triggers a PREQ and is dropped for the upper layer to retry, as an
   unanswered ARP already is; PREQs go out at most once per target per 500 ms
@@ -107,6 +114,19 @@ changes, all of it 802.11s as mac80211 does it:
 - **The Mesh Configuration capability** advertises Forwarding only while the
   gate is on, so a peer never routes through a node that will drop its
   frames.
+- **What a relay refuses.** Path selection from anyone not an established
+  peer — which today is a transmitter-address compare, not an authentication
+  boundary, because Warthog's own mesh runs without management-frame
+  protection; the moment a peer does send protected path selection, a
+  plaintext frame claiming to be that peer is refused (`AT+MESHFWDSTAT?`
+  `prot`/`unprotected`; `mmie`/`nommie` count what group-addressed ones
+  carry); a proxied address that
+  is us, a neighbour, or a node we hold a path to, so one Address Extension
+  frame cannot redirect a neighbour's traffic; more than 8 hosts per node,
+  or any newcomer while the host table is full of live entries; a PERR for
+  the same unroutable destination more than twice a second; and a forwarded
+  frame when the next hop already has 8 queued, so a relay cannot starve its
+  own traffic or peering of buffers.
 
 Read the state with `AT+MESHPATH?` and the counters with `AT+MESHFWDSTAT?`.
 
@@ -114,16 +134,21 @@ Read the state with `AT+MESHPATH?` and the counters with `AT+MESHFWDSTAT?`.
 across more than one SAE peer, so by default a broadcast leaves as one
 unicast per peer with the group address in Address Extension 2. A warthog
 receiver recognises that as the broadcast it is and re-floods it. A mac80211
-receiver rebuilds it as an Ethernet frame to the group and delivers it
-locally — on kernels before 6.3 it then floods on the bridge; on 6.3 and
-later the receive path plausibly treats a unicast-addressed frame whose
-extension DA is a group as one to route onward, fails the next-hop lookup and
-answers with a PERR. OpenMANET 24.10 is kernel 6.6. That is not verified
-either way and it is the single biggest interop question this design leaves
-open. `AT+MESHGRP=1` switches to standard 3-address broadcasts, which every
+receiver — traced through the 6.6 source — rebuilds it as an Ethernet frame
+to the group, delivers it to its own bridge, learns the proxy, and **does not
+re-flood it**: no PERR, no onward broadcast. So with the default a warthog's
+broadcast (ARP, DHCP, mDNS, Meshtastic UDP) reaches a Linux node and stops
+there; nothing beyond a Linux relay hears it. The reverse direction works,
+because Linux sends standard frames. Whenever a Linux node is expected to
+relay a warthog's broadcasts, set `AT+MESHGRP=1`. `AT+MESHGRP=1` switches to standard 3-address broadcasts, which every
 mac80211 receiver floods correctly, at the cost that under SAE they decrypt
 only with one peer or with host CCMP on the receivers. On an open mesh, use
 it.
+
+**Bridge mode implies the tables.** `AT+MESHBRIDGE=1` runs the same receive
+engine and path-selection handling in leaf mode even with forwarding off,
+because a bridge must learn which node each remote host sits behind and hold
+paths to non-neighbours; it still relays nothing for others.
 
 **How much of this is verified.** Every decision above is a freestanding
 function the host suite tests directly, and `sim_mesh` drives a 3–4 node
@@ -131,7 +156,7 @@ mesh through the shipping code — carrying the **exact bytes the firmware
 emits**: the MAC header comes from the same `umac_mesh_fwd_tx_header()` the
 SDK builder calls, and the receive side parses it with
 `umac_mesh_fwd_parse_frame()` before the engine sees it. That binding found
-two firmware bugs a struct-based simulator had passed. Fifteen scenarios:
+two firmware bugs a struct-based simulator had passed. Seventeen scenarios:
 unicast through a relay exactly once; a flood reaching every node exactly
 once; a triangle and a ring under a 30-frame burst without a storm; hosts
 behind opposite ends reaching each other with their real addresses; a lost
@@ -141,7 +166,11 @@ from a node in range but not peered changing nothing; a bystander's PERR
 ignored; a deliberately poisoned two-relay loop dying on TTL; and, under a
 modelled single chip group-key slot, standard group frames failing exactly
 where the measured hardware fails and recovering with host CCMP or with
-per-peer replicas. What is **not** verified is the radio: whether the MM6108 hands up
+per-peer replicas; the first frame of a flow held through discovery and
+delivered on the PREP, a burst before the PREP bounded and rate-limited to
+one PREQ, an unreachable target's frame released after two seconds; and a
+ten-second flow over a five-second path lifetime losing nothing because the
+path is refreshed in use. What is **not** verified is the radio: whether the MM6108 hands up
 a 4-address frame whose mesh destination is a third party (`AT+RXCHAN?`
 `fwdcand`), and whether it transmits one whose addr4 is not its own. Both
 need a board. Until then forwarding is compiled, simulated and off by

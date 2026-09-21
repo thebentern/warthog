@@ -108,6 +108,15 @@ int main(void)
     CHECK(!umac_mesh_rmc_check(&rmc, NULL, 1, now), "NULL source is not a duplicate");
     CHECK(umac_mesh_rmc_count(NULL, now) == 0, "NULL cache counts zero");
 
+    /* Evictions are counted: five frames whose sequence numbers share a bucket. */
+    umac_mesh_rmc_init(&rmc);
+    for (uint32_t i = 0; i < UMAC_MESH_RMC_QUEUE + 1; i++)
+    {
+        (void)umac_mesh_rmc_check(&rmc, A, i * UMAC_MESH_RMC_BUCKETS, now);
+    }
+    CHECK(rmc.evictions == 1, "the fifth congruent sequence number evicted one entry, counted");
+    CHECK(!umac_mesh_rmc_check(&rmc, A, 0, now), "and the first is forgotten -- mac80211's 4-deep bucket has the same shape");
+
     printf("sizeof(struct umac_mesh_rmc) = %u bytes\n", (unsigned)sizeof(struct umac_mesh_rmc));
     CHECK(sizeof(struct umac_mesh_rmc) <= 8192, "cache fits in 8 KiB");
 

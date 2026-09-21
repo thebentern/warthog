@@ -186,7 +186,70 @@ struct umac_mesh_fwd_tx_result {
     struct umac_mesh_ctrl mc;   /* flags/AE/eaddrs/ttl/seq filled */
     bool need_path;      /* caller should send a PREQ for path_target */
     uint8_t path_target[6];
+    /* The path is about to expire (mac80211 dot11MeshHWMPpathRefreshInterval):
+     * still usable, but the caller should send a PREQ for path_target now. */
+    bool refresh;
 };
+
+/** mac80211 default path refresh interval. */
+#define UMAC_MESH_PATH_REFRESH_MS 1000u
+
+/* ---- protection latch --------------------------------------------------
+ * Trust on first protected frame. Warthog's own mesh runs without management
+ * frame protection, so today no path-selection frame arrives protected and
+ * the peer check is a transmitter-address compare, not an authentication
+ * boundary. The moment a peer DOES protect its path selection, a plaintext
+ * frame claiming to be from it is refused -- so turning PMF on makes the
+ * check real without another code change, and nothing is dropped before. */
+#define UMAC_MESH_PROT_LATCH_MAX 8u
+struct umac_mesh_prot_latch {
+    struct { uint8_t ta[6]; bool used; } e[UMAC_MESH_PROT_LATCH_MAX];
+    uint32_t next; /* round-robin victim when full */
+};
+void umac_mesh_prot_latch_init(struct umac_mesh_prot_latch *l);
+/** @returns true if a frame from @p ta with this protection may be processed. */
+bool umac_mesh_prot_latch_check(struct umac_mesh_prot_latch *l, const uint8_t *ta, bool is_protected);
+void umac_mesh_prot_latch_forget(struct umac_mesh_prot_latch *l, const uint8_t *ta);
+
+/* ---- frames held for discovery -------------------------------------------
+ * mac80211 queues up to 10 frames per path while a PREQ is out and sends
+ * them when the PREP installs the path; without it the first frame of every
+ * flow to a non-neighbour is lost. Bounded small: the handles are TX-pool
+ * buffers shared with our own traffic and peering. */
+#define UMAC_MESH_PENDING_MAX 4u
+#define UMAC_MESH_PENDING_PER_TARGET 2u
+#define UMAC_MESH_PENDING_MS 2000u
+struct umac_mesh_pending {
+    struct { uint8_t target[6]; void *handle; uint32_t exp_ms; uint32_t order; bool used; } e[UMAC_MESH_PENDING_MAX];
+    uint32_t order;
+};
+struct umac_mesh_pending_out {
+    void *handle;
+    uint8_t target[6];
+    uint8_t ra[6];  /* valid when ok */
+    bool ok;        /* false: expired, the caller drops it */
+};
+void umac_mesh_pending_init(struct umac_mesh_pending *p);
+/** Hold @p handle for @p target. @returns a handle the caller must now drop
+ *  (the oldest for that target past UMAC_MESH_PENDING_PER_TARGET, an expired
+ *  one, or the oldest overall when full), else NULL. */
+void *umac_mesh_pending_push(struct umac_mesh_pending *p, const uint8_t *target, void *handle, uint32_t now_ms);
+/** Hand back every frame that can now be sent (with its next hop) or has
+ *  expired (ok=false). Resolution is umac_mesh_fwd_tx(), so the precedence
+ *  rules are the shipped ones. @returns entries written to @p out. */
+uint32_t umac_mesh_pending_take(struct umac_mesh_pending *p, const struct umac_mesh_fwd_ctx *c,
+                                struct umac_mesh_pending_out *out, uint32_t max);
+uint32_t umac_mesh_pending_count(const struct umac_mesh_pending *p);
+
+/**
+ * Originate a PREQ for @p target: the body, and the address it must be sent
+ * to, which is ALWAYS broadcast -- the target is by construction not a
+ * neighbour, so a unicast to it reaches nobody. The one-hop responder path
+ * that pings a peer directly is a different function and unaffected.
+ */
+uint16_t umac_mesh_fwd_originate_preq(uint8_t *body, uint16_t body_len, const uint8_t *own,
+                                      uint32_t *own_sn, uint32_t *preq_id, const uint8_t *target,
+                                      uint32_t lifetime_tu, uint8_t ra_out[6]);
 
 /**
  * Shape an outgoing frame whose 802.3 endpoints are @p da and @p sa.

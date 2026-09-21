@@ -120,7 +120,12 @@ extern volatile unsigned int g_warthog_hostap_estab;
 static bool s_mesh_netif_up;
 static void mesh_netif_up_(void)
 {
-    /* In bridge mode the bridge is the L3 interface; the mesh netif is a port. */
+    /* In bridge mode the bridge is the L3 interface; the mesh netif is a port.
+     * A peer can reach ESTAB before app_main has built the bridge, so decide by
+     * the persisted gate and wait: the probe task calls this every 2 s. */
+    if (warthog_cfg_get_mesh_bridge() && !warthog_mesh_bridge_active()) {
+        return;
+    }
     esp_netif_t *netif = warthog_mesh_bridge_active() ? warthog_mesh_bridge_netif()
                                                       : mmhalow_get_netif();
     if (netif == NULL || s_mesh_netif_up) {

@@ -1679,6 +1679,11 @@ const uint8_t *umac_mesh_own_addr(void)
     return s_mesh_own_addr;
 }
 
+uint32_t *umac_mesh_hwmp_own_sn_ptr(void)
+{
+    return &s_hwmp_sn;
+}
+
 /* Ask @p da for a path to itself.
  *
  * Emitting this is what makes US reachable: a peer that accepts a PREQ installs
@@ -1706,7 +1711,8 @@ int umac_mesh_hwmp_send_preq(const uint8_t *da)
  *
  * Answer a PREQ that targets us with a PREP; a PREQ for anyone else is counted
  * and ignored, because warthog does not forward. */
-void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta)
+void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta,
+                           bool is_protected, bool is_group_addressed)
 {
     struct hwmp_preq preq;
 
@@ -1729,12 +1735,15 @@ void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta)
      * emitting one. */
     /* Relay on: the forwarding engine owns PREQ, PREP and PERR. Off: the
      * original responder below, untouched. */
-    extern volatile uint32_t g_warthog_mesh_fwd;
-    if (g_warthog_mesh_fwd)
+    extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge;
+    if (g_warthog_mesh_fwd || g_warthog_mesh_bridge)
     {
+        /* The bridge needs the same tables (paths from PREPs, hosts from AE)
+         * even when it relays nothing; the engine's leaf mode does exactly that. */
         extern void umac_mesh_fwd_glue_hwmp_rx(const uint8_t *body, uint16_t len,
-                                               const uint8_t *ta, uint32_t *own_sn);
-        umac_mesh_fwd_glue_hwmp_rx(body, len, ta, &s_hwmp_sn);
+                                               const uint8_t *ta, uint32_t *own_sn,
+                                               bool is_protected, bool is_group_addressed);
+        umac_mesh_fwd_glue_hwmp_rx(body, len, ta, &s_hwmp_sn, is_protected, is_group_addressed);
         return;
     }
     if (len >= 3u && body[2] == HWMP_EID_PREP)

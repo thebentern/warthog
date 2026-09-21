@@ -307,8 +307,107 @@ int main(void)
         CHECK(!umac_mesh_preq_gate_allow(NULL, X, 1) && !umac_mesh_preq_gate_allow(&g, NULL, 1), "NULLs suppressed");
     }
 
+    /* ---- precedence: a mesh node is never treated as a host behind another --- */
+    {
+        umac_mesh_pathtbl_init(&T);
+        /* A peer claims via AE 1 that our direct neighbour B is a host behind it. */
+        struct umac_mesh_rx_frame hij = group_from(A, A, 60, 31, UMAC_MESH_CTRL_AE_A4, B);
+        umac_mesh_fwd_rx(&c, &hij, &r);
+        CHECK(umac_mesh_proxy_lookup(&T, B, now) == NULL, "a claim that peer B is a host behind A is NOT learned");
+        umac_mesh_fwd_tx(&c, B, W, 200, &t);
+        CHECK(t.ok && memcmp(t.ra, B, 6) == 0 && umac_mesh_ctrl_ae(&t.mc) == 0, "and W->B still goes straight to B, no AE");
+        /* Nor ourselves, nor a node we hold a path to, nor a group address. */
+        struct umac_mesh_rx_frame self = group_from(A, A, 61, 31, UMAC_MESH_CTRL_AE_A4, W);
+        umac_mesh_fwd_rx(&c, &self, &r);
+        CHECK(umac_mesh_proxy_lookup(&T, W, now) == NULL, "a claim that WE are a host behind A is not learned");
+        umac_mesh_path_update(&T, C, B, 5, 200, 1, 5120, now);
+        struct umac_mesh_rx_frame viaA = group_from(A, A, 62, 31, UMAC_MESH_CTRL_AE_A4, C);
+        umac_mesh_fwd_rx(&c, &viaA, &r);
+        CHECK(umac_mesh_proxy_lookup(&T, C, now) == NULL, "a node we hold a path to is not learned as a host");
+        umac_mesh_fwd_tx(&c, C, W, 201, &t);
+        CHECK(t.ok && memcmp(t.ra, B, 6) == 0 && memcmp(t.addr3, C, 6) == 0 && umac_mesh_ctrl_ae(&t.mc) == 0, "W->C uses the path, not a proxy");
+        struct umac_mesh_rx_frame grp = group_from(A, A, 63, 31, UMAC_MESH_CTRL_AE_A4, MC);
+        umac_mesh_fwd_rx(&c, &grp, &r);
+        CHECK(umac_mesh_proxy_lookup(&T, MC, now) == NULL, "a group address is not learned as a host");
+        /* A real host is still learned and still wins for a non-mesh address. */
+        struct umac_mesh_rx_frame real = group_from(A, A, 64, 31, UMAC_MESH_CTRL_AE_A4, HA);
+        umac_mesh_fwd_rx(&c, &real, &r);
+        CHECK(umac_mesh_proxy_lookup(&T, HA, now) != NULL, "a genuine host behind A is learned");
+    }
+    /* ---- path refresh ------------------------------------------------------- */
+    {
+        umac_mesh_pathtbl_init(&T);
+        umac_mesh_path_update(&T, C, B, 5, 200, 1, 5120, now);
+        struct umac_mesh_fwd_ctx late = c; late.now_ms = now + 5120 - 500;
+        umac_mesh_fwd_tx(&late, C, W, 300, &t);
+        CHECK(t.ok && memcmp(t.ra, B, 6) == 0, "a path 500 ms from expiry is still used");
+        CHECK(t.refresh && memcmp(t.path_target, C, 6) == 0, "and the caller is told to refresh it");
+        struct umac_mesh_fwd_ctx early = c; early.now_ms = now + 1000;
+        umac_mesh_fwd_tx(&early, C, W, 301, &t);
+        CHECK(t.ok && !t.refresh, "a path with 4 s left is not refreshed");
+    }
+    /* ---- originating a PREQ: always broadcast ------------------------------- */
+    {
+        uint8_t body[HWMP_PREQ_BODY_LEN], ra[6]; uint32_t sn = 10, id = 0; struct hwmp_preq q;
+        uint16_t n = umac_mesh_fwd_originate_preq(body, sizeof(body), W, &sn, &id, C, 4882, ra);
+        CHECK(n == HWMP_PREQ_BODY_LEN, "PREQ originated");
+        CHECK(ra[0] == 0xff && ra[5] == 0xff, "to BROADCAST -- a unicast to a non-neighbour target reaches nobody");
+        CHECK(umac_mesh_hwmp_parse_preq(body, n, &q) && memcmp(q.target_addr, C, 6) == 0 && memcmp(q.orig_addr, W, 6) == 0, "target C, originator us");
+        CHECK(sn == 11 && id == 1 && q.orig_sn == 11 && q.preq_id == 1, "our sn and preq id advanced and are in the frame");
+    }
+
+    /* ---- protection latch: trust on first protected frame ------------------ */
+    {
+        struct umac_mesh_prot_latch L; umac_mesh_prot_latch_init(&L);
+        CHECK(umac_mesh_prot_latch_check(&L, A, false), "plaintext from A accepted while A has never protected (PMF off: today's only case)");
+        CHECK(umac_mesh_prot_latch_check(&L, A, true), "a protected frame from A accepted, and latches A");
+        CHECK(!umac_mesh_prot_latch_check(&L, A, false), "plaintext claiming to be A now refused: A protects its path selection");
+        CHECK(umac_mesh_prot_latch_check(&L, A, true), "protected from A still fine");
+        CHECK(umac_mesh_prot_latch_check(&L, B, false), "B is judged on its own");
+        umac_mesh_prot_latch_forget(&L, A);
+        CHECK(umac_mesh_prot_latch_check(&L, A, false), "forgotten on peer loss: a re-peered A starts over");
+        for (unsigned i = 0; i < UMAC_MESH_PROT_LATCH_MAX + 1; i++)
+        {
+            uint8_t p[6] = { 2, 0, 0, 0, 0, (uint8_t)i };
+            CHECK(umac_mesh_prot_latch_check(&L, p, true), "peer %u latched (the table recycles, never refuses)", i);
+        }
+        uint8_t p8[6] = { 2, 0, 0, 0, 0, 8 };
+        CHECK(!umac_mesh_prot_latch_check(&L, p8, false), "the newest is latched");
+        CHECK(umac_mesh_prot_latch_check(NULL, A, false) && umac_mesh_prot_latch_check(&L, NULL, false), "NULL fails open");
+    }
+    /* ---- pending: frames held for discovery ---------------------------------- */
+    {
+        umac_mesh_pathtbl_init(&T);
+        struct umac_mesh_pending P; umac_mesh_pending_init(&P);
+        int h[8];
+        static const uint8_t D2[6] = { 0x02, 0xd2, 0, 0, 0, 1 }, D3[6] = { 0x02, 0xd3, 0, 0, 0, 1 }, D4[6] = { 0x02, 0xd4, 0, 0, 0, 1 };
+        CHECK(umac_mesh_pending_push(&P, C, &h[0], now) == NULL, "first frame for C held");
+        CHECK(umac_mesh_pending_push(&P, C, &h[1], now) == NULL, "second held");
+        CHECK(umac_mesh_pending_push(&P, C, &h[2], now) == &h[0], "a third for C evicts the OLDEST for C (%u per target)", (unsigned)UMAC_MESH_PENDING_PER_TARGET);
+        CHECK(umac_mesh_pending_push(&P, D2, &h[3], now) == NULL && umac_mesh_pending_push(&P, D3, &h[4], now) == NULL, "other targets fill the table");
+        CHECK(umac_mesh_pending_push(&P, D4, &h[5], now) == &h[1], "table full: the oldest overall goes");
+        CHECK(umac_mesh_pending_count(&P) == UMAC_MESH_PENDING_MAX, "%u held", (unsigned)UMAC_MESH_PENDING_MAX);
+        struct umac_mesh_pending_out out[UMAC_MESH_PENDING_MAX];
+        CHECK(umac_mesh_pending_take(&P, &c, out, UMAC_MESH_PENDING_MAX) == 0, "nothing is released without a path");
+        umac_mesh_path_update(&T, C, B, 5, 200, 1, 5120, now);
+        uint32_t k = umac_mesh_pending_take(&P, &c, out, UMAC_MESH_PENDING_MAX);
+        CHECK(k == 1 && out[0].handle == &h[2] && out[0].ok && memcmp(out[0].ra, B, 6) == 0, "C's frame released to next hop B once the path exists");
+        CHECK(umac_mesh_pending_count(&P) == 3, "the others still wait");
+        struct umac_mesh_fwd_ctx late = c; late.now_ms = now + UMAC_MESH_PENDING_MS;
+        k = umac_mesh_pending_take(&P, &late, out, UMAC_MESH_PENDING_MAX);
+        CHECK(k == 3 && !out[0].ok && !out[1].ok && !out[2].ok, "after %u ms the rest are handed back to drop", (unsigned)UMAC_MESH_PENDING_MS);
+        CHECK(umac_mesh_pending_count(&P) == 0, "store empty");
+        CHECK(umac_mesh_pending_push(&P, B, &h[6], now) == NULL, "held for direct peer B (the caller had no STA yet)");
+        k = umac_mesh_pending_take(&P, &c, out, UMAC_MESH_PENDING_MAX);
+        CHECK(k == 1 && out[0].ok && memcmp(out[0].ra, B, 6) == 0, "a direct peer resolves at once");
+        CHECK(umac_mesh_pending_push(NULL, C, &h[7], now) == &h[7], "NULL store hands the frame straight back");
+    }
+
     /* ---- round trip: what we shape, we would deliver correctly -------------- */
     {
+        /* The blocks above re-initialised the shared table; seed it as at the top. */
+        umac_mesh_pathtbl_init(&T);
+        umac_mesh_proxy_learn(&T, HA, A, now);
         umac_mesh_fwd_tx(&c, HA, HW, 108, &t);
         struct umac_mesh_rx_frame back = uni(A, W, t.addr3, t.addr4, t.mc.seq, t.mc.ttl, t.mc.flags, t.mc.eaddr1, t.mc.eaddr2);
         /* Pretend we are A receiving it. */

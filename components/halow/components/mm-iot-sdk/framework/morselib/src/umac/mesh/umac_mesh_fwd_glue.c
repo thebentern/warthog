@@ -15,6 +15,7 @@
 #include "umac/datapath/umac_datapath_data.h"
 #include "umac/mesh/umac_mesh_fwd.h"
 #include "umac/mesh/umac_mesh_hwmp_relay.h"
+#include "umac/core/umac_core.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -34,8 +35,22 @@ extern volatile uint32_t g_warthog_hwmp_relay_preq, g_warthog_hwmp_relay_prep, g
 static struct umac_mesh_pathtbl s_tbl;
 static struct umac_mesh_rmc s_rmc;
 static struct mmosal_mutex *s_lock;
-/* Discovery rate limit: the tested gate in the engine. */
+/* Discovery and error rate limits: the tested gate in the engine, twice. */
 static struct umac_mesh_preq_gate s_preq_gate;
+static struct umac_mesh_preq_gate s_perr_gate;
+static uint32_t s_hwmp_preq_id;
+static struct umac_mesh_prot_latch s_prot;
+static struct umac_mesh_pending s_pend;
+/* Set by the first held frame; the flush needs the datapath it came from. */
+static struct umac_data *s_pend_umacd;
+extern volatile uint32_t g_warthog_fwd_pend_tx, g_warthog_fwd_pend_drop, g_warthog_hwmp_prot;
+extern volatile uint32_t g_warthog_fwd_perr_suppressed, g_warthog_fwd_drop_full;
+extern volatile uint32_t g_warthog_hwmp_unprotected, g_warthog_hwmp_mmie, g_warthog_hwmp_nommie;
+/* Forwarded frames queued to one peer beyond this are dropped: the pool is
+ * shared with our own traffic and peering, and a relay must not starve them. */
+#ifndef UMAC_MESH_FWD_QUEUE_CAP
+#define UMAC_MESH_FWD_QUEUE_CAP 8u
+#endif
 
 /* Hop cost. mac80211's airtime metric for one S1G hop lands in the low
  * thousands; a constant keeps route choice sane without a rate feed. */
@@ -46,7 +61,7 @@ static struct umac_mesh_preq_gate s_preq_gate;
 extern struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr);
 extern int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len);
 extern const uint8_t *umac_mesh_own_addr(void);
-extern int umac_mesh_hwmp_send_preq(const uint8_t *da);
+extern uint32_t *umac_mesh_hwmp_own_sn_ptr(void);
 extern uint8_t umac_mesh_ies_cap_forwarding;
 
 static bool is_peer_(const uint8_t *addr, void *arg)
@@ -78,6 +93,9 @@ void umac_mesh_fwd_glue_init(void)
     umac_mesh_pathtbl_init(&s_tbl);
     umac_mesh_rmc_init(&s_rmc);
     umac_mesh_preq_gate_init(&s_preq_gate);
+    umac_mesh_preq_gate_init(&s_perr_gate);
+    umac_mesh_prot_latch_init(&s_prot);
+    umac_mesh_pending_init(&s_pend);
     unlock_();
     umac_mesh_ies_cap_forwarding = g_warthog_mesh_fwd ? 1u : 0u;
 }
@@ -126,7 +144,19 @@ void umac_mesh_fwd_glue_rx(struct umac_data *umacd, struct umac_sta_data *stad,
 
 void umac_mesh_fwd_glue_send_perr(const struct umac_mesh_fwd_rx_result *r)
 {
-    if (r != NULL && r->send_perr && umac_mesh_tx_action(r->perr_to, r->perr_body, r->perr_len) >= 0)
+    if (r == NULL || !r->send_perr)
+    {
+        return;
+    }
+    /* One PERR per unroutable destination per interval, and a floor overall:
+     * a stream of frames for random destinations must not become a stream of
+     * management allocations and transmissions (mac80211: perrMinInterval). */
+    if (!umac_mesh_preq_gate_allow(&s_perr_gate, r->mesh_da, mmosal_get_time_ms()))
+    {
+        g_warthog_fwd_perr_suppressed++;
+        return;
+    }
+    if (umac_mesh_tx_action(r->perr_to, r->perr_body, r->perr_len) >= 0)
     {
         g_warthog_fwd_perr_tx++;
     }
@@ -208,6 +238,12 @@ void umac_mesh_fwd_glue_forward(struct umac_data *umacd, struct mmpktview *body,
         g_warthog_fwd_drop_nopath++;
         return;
     }
+    if (umac_sta_data_get_queued_len(stad) >= UMAC_MESH_FWD_QUEUE_CAP)
+    {
+        mmpkt_release(copy);
+        g_warthog_fwd_drop_full++;
+        return;
+    }
     if (group) { g_warthog_fwd_grp++; } else { g_warthog_fwd_uni++; }
     data->ops->enqueue_tx_frame(umacd, stad, copy);
 }
@@ -218,9 +254,62 @@ static void maybe_preq_(const uint8_t *target)
     {
         return;
     }
-    if (umac_mesh_hwmp_send_preq(target) >= 0)
+    /* Broadcast, through the engine: the target is not a neighbour, so a
+     * unicast PREQ to it would reach nobody. */
+    uint8_t body[HWMP_PREQ_BODY_LEN], ra[6];
+    uint16_t n = umac_mesh_fwd_originate_preq(body, sizeof(body), umac_mesh_own_addr(),
+                                              umac_mesh_hwmp_own_sn_ptr(), &s_hwmp_preq_id, target,
+                                              4882u, ra);
+    if (n != 0 && umac_mesh_tx_action(ra, body, n) >= 0)
     {
         g_warthog_fwd_preq_tx++;
+    }
+}
+
+/* Frames held for discovery whose path now exists go out the way a fresh
+ * TX would: classified, then queued to the next hop. Expired ones are
+ * dropped. Called after every path-selection frame is processed. */
+static void flush_pending_(void)
+{
+    struct umac_data *umacd = s_pend_umacd;
+    if (umacd == NULL || umac_mesh_pending_count(&s_pend) == 0)
+    {
+        return;
+    }
+    struct umac_mesh_fwd_ctx c = fctx_();
+    struct umac_mesh_pending_out out[UMAC_MESH_PENDING_MAX];
+    lock_();
+    uint32_t n = umac_mesh_pending_take(&s_pend, &c, out, UMAC_MESH_PENDING_MAX);
+    unlock_();
+    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    bool queued = false;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        struct mmpkt *pkt = (struct mmpkt *)out[i].handle;
+        struct umac_sta_data *stad = out[i].ok ? umac_datapath_mesh_find_peer(out[i].ra) : NULL;
+        if (stad == NULL)
+        {
+            mmpkt_release(pkt);
+            g_warthog_fwd_pend_drop++;
+            continue;
+        }
+        uint8_t da[6], sa[6];
+        struct mmpktview *v = mmpkt_open(pkt);
+        const struct umac_8023_hdr *h = (const struct umac_8023_hdr *)mmpkt_get_data_start(v);
+        memcpy(da, h->dest_addr, 6);
+        memcpy(sa, h->src_addr, 6);
+        mmpkt_close(&v);
+        struct mmdrv_tx_metadata *md = mmdrv_get_tx_metadata(pkt);
+        md->enc = ENCRYPTION_ENABLED;
+        memset(&md->mesh, 0, sizeof(md->mesh));
+        umac_mesh_fwd_glue_tx_classify(pkt, da, sa);
+        data->ops->enqueue_tx_frame(umacd, stad, pkt);
+        g_warthog_fwd_pend_tx++;
+        queued = true;
+    }
+    if (queued)
+    {
+        umac_core_evt_wake(umacd);
     }
 }
 
@@ -234,6 +323,7 @@ bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6])
     if (t.ok && t.shape == UMAC_MESH_TX_UNICAST_4ADDR)
     {
         memcpy(out, t.ra, 6);
+        if (t.refresh) { maybe_preq_(t.path_target); }
         return true;
     }
     if (t.need_path)
@@ -252,7 +342,7 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
     umac_mesh_fwd_tx(&c, da, sa, g_warthog_mesh_seq, &t);
     unlock_();
     struct mmdrv_tx_metadata *md = mmdrv_get_tx_metadata(txbuf);
-    if (t.need_path)
+    if (t.need_path || t.refresh)
     {
         maybe_preq_(t.path_target);
     }
@@ -298,8 +388,31 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
 }
 
 void umac_mesh_fwd_glue_hwmp_rx(const uint8_t *body, uint16_t len, const uint8_t *ta,
-                                uint32_t *own_sn)
+                                uint32_t *own_sn, bool is_protected, bool is_group_addressed)
 {
+    extern volatile uint32_t g_warthog_mesh_secure;
+    if (is_protected) { g_warthog_hwmp_prot++; }
+    /* Unicast path selection: trust on first protected frame (see the latch
+     * in umac_mesh_fwd.h). Group-addressed ones would be BIP-protected with
+     * a trailing MMIE the chip may or may not hand up -- counted, so the
+     * bench can say what arrives before anything is gated on it. */
+    if (!is_group_addressed)
+    {
+        lock_();
+        bool ok = umac_mesh_prot_latch_check(&s_prot, ta, is_protected);
+        unlock_();
+        if (!ok)
+        {
+            g_warthog_hwmp_unprotected++;
+            return;
+        }
+    }
+    else if (g_warthog_mesh_secure)
+    {
+        /* MMIE: element 76, length 16, at the very end of the body. */
+        if (len >= 18u && body[len - 18u] == 76u && body[len - 17u] == 16u) { g_warthog_hwmp_mmie++; }
+        else { g_warthog_hwmp_nommie++; }
+    }
     struct umac_mesh_hwmp_ctx c = {
         .own_addr = umac_mesh_own_addr(), .tbl = &s_tbl, .forwarding = g_warthog_mesh_fwd != 0,
         .link_metric = UMAC_MESH_FWD_HOP_METRIC, .path_lifetime_ms = UMAC_MESH_PATH_LIFETIME_MS,
@@ -324,6 +437,33 @@ void umac_mesh_fwd_glue_hwmp_rx(const uint8_t *body, uint16_t len, const uint8_t
         case UMAC_MESH_HWMP_FORWARD_PERR:     g_warthog_hwmp_relay_perr++; (void)umac_mesh_tx_action(a.to, a.body, a.body_len); break;
         default: break;
     }
+    flush_pending_();
+}
+
+bool umac_mesh_fwd_glue_tx_pending(struct umac_data *umacd, struct mmpkt *txbuf, const uint8_t *dest)
+{
+    struct umac_mesh_fwd_ctx c = fctx_();
+    struct umac_mesh_fwd_tx_result t;
+    void *evicted = NULL;
+    bool held = false;
+    lock_();
+    umac_mesh_fwd_tx(&c, dest, c.own_addr, 0, &t);
+    if (!t.ok && t.need_path)
+    {
+        evicted = umac_mesh_pending_push(&s_pend, t.path_target, txbuf, c.now_ms);
+        held = true;
+    }
+    unlock_();
+    if (evicted != NULL)
+    {
+        mmpkt_release((struct mmpkt *)evicted);
+        g_warthog_fwd_pend_drop++;
+    }
+    if (held)
+    {
+        s_pend_umacd = umacd;
+    }
+    return held;
 }
 
 void umac_mesh_fwd_glue_peer_lost(const uint8_t *peer)
@@ -335,6 +475,7 @@ void umac_mesh_fwd_glue_peer_lost(const uint8_t *peer)
     };
     struct umac_mesh_hwmp_action acts[4];
     lock_();
+    umac_mesh_prot_latch_forget(&s_prot, peer);
     uint32_t n = umac_mesh_hwmp_lose_neighbour(&c, peer, acts, 4);
     unlock_();
     for (uint32_t i = 0; i < n; i++)
@@ -351,10 +492,12 @@ int umac_mesh_fwd_glue_render(char *buf, uint32_t len)
     uint32_t now = mmosal_get_time_ms();
     int w = 0;
     lock_();
-    w += snprintf(buf + w, len - (uint32_t)w, "+MESHPATH: paths=%lu proxies=%lu rmc=%lu\r\n",
+    w += snprintf(buf + w, len - (uint32_t)w, "+MESHPATH: paths=%lu proxies=%lu rmc=%lu rmc_evict=%lu pending=%lu\r\n",
                   (unsigned long)umac_mesh_path_count(&s_tbl, now),
                   (unsigned long)umac_mesh_proxy_count(&s_tbl, now),
-                  (unsigned long)umac_mesh_rmc_count(&s_rmc, now));
+                  (unsigned long)umac_mesh_rmc_count(&s_rmc, now),
+                  (unsigned long)s_rmc.evictions,
+                  (unsigned long)umac_mesh_pending_count(&s_pend));
     for (uint32_t i = 0; i < UMAC_MESH_PATH_MAX && w < (int)len - 96; i++)
     {
         const struct umac_mesh_path *p = &s_tbl.p[i];

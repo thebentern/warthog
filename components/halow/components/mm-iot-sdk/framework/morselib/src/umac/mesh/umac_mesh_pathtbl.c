@@ -186,46 +186,59 @@ uint32_t umac_mesh_path_lose_next_hop(struct umac_mesh_pathtbl *t, const uint8_t
     return n;
 }
 
-void umac_mesh_proxy_learn(struct umac_mesh_pathtbl *t, const uint8_t *ext,
+bool umac_mesh_proxy_learn(struct umac_mesh_pathtbl *t, const uint8_t *ext,
                            const uint8_t *mesh_sta, uint32_t now_ms)
 {
     if (t == NULL || ext == NULL || mesh_sta == NULL)
     {
-        return;
+        return false;
     }
-    struct umac_mesh_proxy *slot = NULL, *victim = NULL;
+    struct umac_mesh_proxy *slot = NULL, *existing = NULL;
+    uint32_t owned = 0;
     for (uint32_t i = 0; i < UMAC_MESH_PROXY_MAX; i++)
     {
         struct umac_mesh_proxy *x = &t->x[i];
-        if (x->used && eq_(x->ext, ext))
+        bool live = x->used && !past_(now_ms, x->exp_ms);
+        if (live && eq_(x->ext, ext))
         {
-            slot = x; /* re-learn: a host may move behind another node */
-            break;
+            existing = x; /* re-learn: a host may move behind another node */
         }
-        if (!x->used || past_(now_ms, x->exp_ms))
+        else if (!live && slot == NULL)
         {
-            if (slot == NULL)
-            {
-                slot = x;
-            }
+            slot = x; /* free or expired; a live entry is never evicted */
         }
-        else if (victim == NULL || (int32_t)(x->exp_ms - victim->exp_ms) < 0)
+        if (live && eq_(x->mesh_sta, mesh_sta))
         {
-            victim = x;
+            owned++;
         }
     }
-    if (slot == NULL)
+    if (existing != NULL)
     {
-        slot = victim;
+        slot = existing;
     }
-    if (slot == NULL)
+    else if (slot == NULL || owned >= UMAC_MESH_PROXY_PER_NODE)
     {
-        return;
+        return false;
     }
     memcpy(slot->ext, ext, 6);
     memcpy(slot->mesh_sta, mesh_sta, 6);
     slot->exp_ms = now_ms + UMAC_MESH_PROXY_LIFETIME_MS;
     slot->used = true;
+    return true;
+}
+
+void umac_mesh_proxy_touch(struct umac_mesh_pathtbl *t, const uint8_t *ext, uint32_t now_ms)
+{
+    if (t == NULL || ext == NULL) { return; }
+    for (uint32_t i = 0; i < UMAC_MESH_PROXY_MAX; i++)
+    {
+        struct umac_mesh_proxy *x = &t->x[i];
+        if (x->used && !past_(now_ms, x->exp_ms) && eq_(x->ext, ext))
+        {
+            x->exp_ms = now_ms + UMAC_MESH_PROXY_LIFETIME_MS;
+            return;
+        }
+    }
 }
 
 const uint8_t *umac_mesh_proxy_lookup(const struct umac_mesh_pathtbl *t, const uint8_t *ext,

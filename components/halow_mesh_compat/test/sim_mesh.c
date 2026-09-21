@@ -44,6 +44,11 @@ struct node {
     struct { uint8_t da[6], sa[6]; uint32_t seq; bool group; } log[LOGMAX];
     int nlog;
     uint32_t tx, fwd_data, fwd_preq, fwd_prep, prep_sent, perr_sent, preq_sent, dup, ttl_drop, nodec;
+    /* Frames held for discovery: the engine's store, handles into precs. */
+    struct umac_mesh_pending pend;
+    struct { uint8_t da[6], sa[6]; uint32_t payload; bool used; } precs[8];
+    uint32_t pend_tx, pend_drop;
+    struct umac_mesh_preq_gate gate; /* the glue's discovery rate limit */
 };
 
 enum fkind { F_DATA, F_ACTION };
@@ -73,6 +78,7 @@ static struct {
     uint32_t steps;
     bool overflow;
     bool grp_std;             /* AT+MESHGRP=1: standard 3-address group frames */
+    bool hold;                /* send() holds a routeless frame for discovery, as the firmware does */
     /* Range is not peering: an attacker can be in range without a link. The
      * firmware takes data and path selection only from ESTAB peers. */
     bool estab[NMAX][NMAX];
@@ -174,6 +180,25 @@ static void queue_action(int from, const uint8_t *ra, const uint8_t *body, uint1
     push(&f);
 }
 
+static bool send(int i, const uint8_t *da, const uint8_t *sa, uint32_t payload);
+
+/* After every path-selection frame: held frames whose path now exists go
+ * out through send() again, expired ones are dropped -- glue flush_pending_(). */
+static void flush_pending(int me)
+{
+    struct node *n = &S.n[me];
+    if (umac_mesh_pending_count(&n->pend) == 0) return;
+    struct umac_mesh_fwd_ctx c = fctx(me);
+    struct umac_mesh_pending_out out[UMAC_MESH_PENDING_MAX];
+    uint32_t k = umac_mesh_pending_take(&n->pend, &c, out, UMAC_MESH_PENDING_MAX);
+    for (uint32_t i = 0; i < k; i++) {
+        typeof(&n->precs[0]) p = out[i].handle;
+        if (out[i].ok) { n->pend_tx++; if (!send(me, p->da, p->sa, p->payload)) { printf("FAIL sim: released frame had no route\n"); failures++; } }
+        else n->pend_drop++;
+        p->used = false;
+    }
+}
+
 /* One node receives one frame and acts on it. */
 static void receive(int me, const struct frame *f)
 {
@@ -192,6 +217,7 @@ static void receive(int me, const struct frame *f)
         case UMAC_MESH_HWMP_FORWARD_PERR:    n->perr_sent++; queue_action(me, a.to, a.body, a.body_len); break;
         default: break;
         }
+        flush_pending(me);
         return;
     }
     /* Bytes -> frame, as the firmware's receive path does it. */
@@ -258,20 +284,41 @@ static bool run(void)
 /* Node i originates a PREQ for target. */
 static void discover(int i, const uint8_t *target)
 {
-    uint8_t body[HWMP_PREQ_BODY_LEN];
-    uint16_t n = umac_mesh_hwmp_build_preq(body, sizeof(body), S.n[i].addr, ++S.n[i].own_sn,
-                                           ++S.n[i].preq_id, target, 4882);
+    /* Through the engine, so the address it is sent to is the shipped rule. */
+    uint8_t body[HWMP_PREQ_BODY_LEN], ra[6];
+    uint16_t n = umac_mesh_fwd_originate_preq(body, sizeof(body), S.n[i].addr, &S.n[i].own_sn,
+                                              &S.n[i].preq_id, target, 4882, ra);
+    if (!eq(ra, BC)) { printf("FAIL originated PREQ is not broadcast\n"); failures++; }
     S.n[i].preq_sent++;
-    queue_action(i, BC, body, n);
+    queue_action(i, ra, body, n);
 }
 
-/* Node i sends an 802.3 frame (da, sa). Returns false if it had no route. */
+/* Discovery the way the glue's maybe_preq_() does it: through the rate limit. */
+static void discover_gated(int i, const uint8_t *target)
+{
+    if (umac_mesh_preq_gate_allow(&S.n[i].gate, target, S.now)) discover(i, target);
+}
+
+/* Node i sends an 802.3 frame (da, sa). Returns false if it had no route
+ * (or, with S.hold, holds it for discovery and returns true). */
 static bool send(int i, const uint8_t *da, const uint8_t *sa, uint32_t payload)
 {
     struct umac_mesh_fwd_ctx c = fctx(i);
     struct umac_mesh_fwd_tx_result t;
     umac_mesh_fwd_tx(&c, da, sa, S.n[i].mesh_seq++, &t);
-    if (!t.ok) return false;
+    if (!t.ok) {
+        if (!S.hold || !t.need_path) return false;
+        struct node *n = &S.n[i];
+        int k; for (k = 0; k < 8 && n->precs[k].used; k++) {}
+        if (k == 8) { printf("FAIL sim: prec pool exhausted\n"); failures++; return false; }
+        memcpy(n->precs[k].da, da, 6); memcpy(n->precs[k].sa, sa, 6); n->precs[k].payload = payload; n->precs[k].used = true;
+        void *ev = umac_mesh_pending_push(&n->pend, t.path_target, &n->precs[k], S.now);
+        if (ev) { ((typeof(&n->precs[0]))ev)->used = false; n->pend_drop++; }
+        discover_gated(i, t.path_target);
+        return true;
+    }
+    /* In use and about to lapse: the glue re-requests it while still sending. */
+    if (t.refresh) discover_gated(i, t.path_target);
     if (t.shape == UMAC_MESH_TX_GROUP_3ADDR) {
         if (S.grp_std) {
             emit_data(i, da, da, sa, true, da, S.n[i].addr, &t.mc, payload);
@@ -595,6 +642,46 @@ int main(void)
     CHECK(S.n[1].fwd_data + S.n[2].fwd_data >= 28 && S.n[1].fwd_data + S.n[2].fwd_data <= 31, "W and B ping-ponged it until TTL ran out (%u + %u)", S.n[1].fwd_data, S.n[2].fwd_data);
     CHECK(delivered(1, 15001, NULL, NULL) == 0 && delivered(2, 15001, NULL, NULL) == 0, "nobody delivered a frame for C");
     CHECK(S.n[1].ttl_drop + S.n[2].ttl_drop == 1, "exactly one relay stopped it on TTL");
+
+    /* ================= 16. Frames held for discovery ===================== */
+    printf("--- scenario 16: the first frame of a flow waits for the PREP instead of being lost ---\n");
+    sim_reset(3, true); link(0, 1); link(1, 2); S.hold = true;
+    CHECK(send(0, S.n[2].addr, S.n[0].addr, 16001), "A sends to B with no path: held, not refused");
+    CHECK(S.n[0].preq_sent == 1 && umac_mesh_pending_count(&S.n[0].pend) == 1, "one PREQ out, one frame waiting");
+    CHECK(run(), "drains, %u steps", S.steps);
+    CHECK(delivered(2, 16001, S.n[2].addr, S.n[0].addr) == 1, "B got the very first frame");
+    CHECK(S.n[0].pend_tx == 1 && S.n[0].pend_drop == 0 && umac_mesh_pending_count(&S.n[0].pend) == 0, "released on the PREP, nothing dropped");
+    CHECK(send(0, S.n[2].addr, S.n[0].addr, 16002) && run() && delivered(2, 16002, NULL, NULL) == 1, "the flow continues on the installed path");
+    CHECK(S.n[0].preq_sent == 1, "no second PREQ was needed");
+    /* Burst before discovery completes: per-target bound 2, oldest go. */
+    sim_reset(3, true); link(0, 1); link(1, 2); S.hold = true;
+    for (uint32_t k = 0; k < 5; k++) CHECK(send(0, S.n[2].addr, S.n[0].addr, 16100 + k), "burst frame %u held", (unsigned)k);
+    CHECK(S.n[0].pend_drop == 3 && umac_mesh_pending_count(&S.n[0].pend) == 2, "five held for one target: the three oldest were dropped (bound %u)", (unsigned)UMAC_MESH_PENDING_PER_TARGET);
+    CHECK(run(), "drains");
+    CHECK(delivered(2, 16103, NULL, NULL) == 1 && delivered(2, 16104, NULL, NULL) == 1 && delivered(2, 16100, NULL, NULL) == 0, "the two newest arrived, the oldest did not");
+    CHECK(S.n[0].preq_sent == 1, "five sends within 500 ms: ONE PREQ (%u) -- the limiter is the shipped gate", S.n[0].preq_sent);
+    /* Unreachable target: the frame lapses after UMAC_MESH_PENDING_MS. */
+    sim_reset(3, true); link(0, 1); S.hold = true;
+    CHECK(send(0, S.n[2].addr, S.n[0].addr, 16201), "A sends to an unreachable B: held");
+    CHECK(run(), "PREQ floods and dies");
+    S.now += UMAC_MESH_PENDING_MS;
+    flush_pending(0);
+    CHECK(S.n[0].pend_drop == 1 && S.n[0].pend_tx == 0 && umac_mesh_pending_count(&S.n[0].pend) == 0, "dropped after %u ms, the buffer is back", (unsigned)UMAC_MESH_PENDING_MS);
+
+    /* ================= 17. Refresh keeps a flow alive across expiry ======= */
+    printf("--- scenario 17: a 10 s flow over a 5 s path lifetime loses nothing ---\n");
+    sim_reset(3, true); link(0, 1); link(1, 2);
+    discover(0, S.n[2].addr); CHECK(run(), "discovered");
+    int lost = 0;
+    for (uint32_t k = 0; k < 10; k++) {
+        S.now += 1000;
+        if (!send(0, S.n[2].addr, S.n[0].addr, 17000 + k)) { lost++; continue; }
+        if (!run()) { printf("FAIL storm\n"); failures++; }
+        if (delivered(2, 17000 + k, S.n[2].addr, S.n[0].addr) != 1) lost++;
+    }
+    CHECK(lost == 0, "10 frames over 10 s, %d lost (path lifetime %u ms)", lost, 5120u);
+    CHECK(S.n[0].preq_sent >= 2 && S.n[0].preq_sent <= 4, "A refreshed the path before it lapsed: %u PREQs", S.n[0].preq_sent);
+    CHECK(S.n[1].fwd_data == 10, "every frame went through W");
 
     printf("\n%s\n", failures ? "SIMULATION FAILED" : "SIMULATION PASSED");
     return failures ? 1 : 0;

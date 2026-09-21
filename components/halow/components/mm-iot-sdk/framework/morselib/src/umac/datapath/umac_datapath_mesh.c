@@ -785,9 +785,9 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
             struct umac_sta_data *stad = s_peers[i];
             /* Paths through this neighbour die with it; the relay announces them. */
             {
-                extern volatile uint32_t g_warthog_mesh_fwd;
+                extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge;
                 extern void umac_mesh_fwd_glue_peer_lost(const uint8_t *peer);
-                if (g_warthog_mesh_fwd)
+                if (g_warthog_mesh_fwd || g_warthog_mesh_bridge)
                 {
                     umac_mesh_fwd_glue_peer_lost(umac_sta_data_peek_peer_addr(stad));
                 }

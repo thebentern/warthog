@@ -49,7 +49,8 @@ int umac_mesh_hwmp_send_preq(const uint8_t *da);
 
 /** Handle a received mesh action frame (category 13). Answers a PREQ that
  *  targets us with a PREP. */
-void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta);
+void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta,
+                           bool is_protected, bool is_group_addressed);
 
 /**
  * Transmit an action frame to a mesh peer, appending S1G Capabilities.

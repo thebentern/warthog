@@ -41,12 +41,17 @@ void umac_mesh_fwd_glue_send_perr(const struct umac_mesh_fwd_rx_result *r);
 /** Locally originated frame: fill the sidecar for proxying, kick discovery. */
 void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, const uint8_t *sa);
 
+/** No STA for a unicast destination: if discovery is what is missing, take
+ *  ownership of @p txbuf until the PREP arrives (or 2 s pass). @returns true
+ *  if held; the caller must then not release it. */
+bool umac_mesh_fwd_glue_tx_pending(struct umac_data *umacd, struct mmpkt *txbuf, const uint8_t *dest);
+
 /** Next hop for a non-neighbour destination into @p out; false = none (a PREQ was sent). */
 bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6]);
 
 /** HWMP action body received; carries out what the relay engine decides. */
 void umac_mesh_fwd_glue_hwmp_rx(const uint8_t *body, uint16_t len, const uint8_t *ta,
-                                uint32_t *own_sn);
+                                uint32_t *own_sn, bool is_protected, bool is_group_addressed);
 
 /** A peer link is gone. */
 void umac_mesh_fwd_glue_peer_lost(const uint8_t *peer);
