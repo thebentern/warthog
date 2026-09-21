@@ -73,5 +73,19 @@ esp_err_t warthog_cfg_set_mesh_pass(const char *pass);
 uint8_t   warthog_cfg_get_mesh_enable(void);
 esp_err_t warthog_cfg_set_mesh_enable(uint8_t enable);
 
+/* Mesh IP addressing: 1 = try DHCP first, 0 = go straight to the static
+ * 10.77.<mac4>.<mac5>/16 fallback.
+ *
+ * An idiomatic OpenMANET node keeps its mesh interface enslaved to a bridge
+ * (and to bat0) with a DHCP server on it. Self-assigning a 10.77 address made
+ * that unreachable, which is why the setup guide used to tell operators to
+ * un-enslave the peer's mesh interface -- dismantling their batman fabric to
+ * talk to us. Taking a lease when one is offered removes that requirement.
+ *
+ * The static fallback still applies on a mesh with no DHCP server, which is
+ * every warthog-to-warthog mesh, so that path is unchanged. */
+uint8_t   warthog_cfg_get_mesh_dhcp(void);
+esp_err_t warthog_cfg_set_mesh_dhcp(uint8_t on);
+
 /* Wipe the entire "warthog" NVS namespace. */
 esp_err_t warthog_cfg_erase(void);

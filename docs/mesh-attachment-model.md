@@ -102,6 +102,35 @@ For the drone-relay goal, forwarding is the answer. For "Warthog appears in
 `batctl originators` and ATAK discovery works end to end", only the subset
 does.
 
+## The bridged-peer blocker is Address Extension, not addressing
+
+It is tempting to think a Warthog could join a bridged OpenMANET node if only
+it stopped self-assigning `10.77.x.y`. It cannot, and the reason is deeper.
+
+A mesh interface enslaved to a bridge forwards **proxied** traffic — frames
+whose original source is some other device on the bridge, not the mesh node
+itself. 802.11s carries that with the Mesh Control **Address Extension**
+field, which adds the original source (and for group frames, the original
+destination) beyond the four 802.11 addresses. Warthog does not implement it:
+`umac_mesh_hwmp.h:53` — "Address Extension. We never set it and we reject it
+on receive." The measured symptom on the peer is its per-station `tx packets`
+freezing at exactly 5.
+
+So keeping the operator's `bat0` intact needs, in order:
+
+1. **Address Extension on receive** — accept and parse AE frames instead of
+   rejecting them, so proxied traffic from a bridged peer is delivered.
+2. **Address Extension on transmit** — set it for anything Warthog forwards
+   on behalf of its tethered client, which is also what makes the client
+   visible to the rest of the mesh.
+3. **Mesh gate behaviour** — announce that Warthog bridges to a non-mesh
+   segment, so peers know to send it traffic for addresses it proxies.
+
+Warthog taking a DHCP lease on the mesh (added alongside this note) removes
+the *addressing* half of the requirement and is worth having on its own, but
+it does not by itself make a bridged peer work. Do not read it as closing
+this gap.
+
 ## Prerequisite: group-addressed frames
 
 The chip holds one VIF-wide MGTK while every 802.11s peer generates its own.

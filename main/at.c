@@ -1644,6 +1644,16 @@ static void dispatch(char *line)
         } else {
             reply_error("usage: AT+MESHEN=<0|1>");
         }
+    } else if (strcasecmp(verb, "MESHDHCP") == 0 && terminator == '=') {
+        unsigned long v = strtoul(args, NULL, 10);
+        if (warthog_cfg_set_mesh_dhcp((uint8_t)v) == ESP_OK) { reply_ok(); }
+        else { reply_error("usage: AT+MESHDHCP=<0|1>"); }
+    } else if (strcasecmp(verb, "MESHDHCP") == 0 && terminator == '?') {
+        char line[64];
+        snprintf(line, sizeof(line), "+MESHDHCP: %u\r\n",
+                 (unsigned)warthog_cfg_get_mesh_dhcp());
+        cdc_write(line);
+        reply_ok();
     } else if (strcasecmp(verb, "MESHEN") == 0 && terminator == '?') {
         char line[64];
         snprintf(line, sizeof(line), "+MESHEN: %u\r\n", (unsigned)warthog_cfg_get_mesh_enable());

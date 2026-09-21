@@ -62,6 +62,9 @@ static const char *TAG = "warthog.mesh";
  * ARP, and UDP multicast -- which is what a Meshtastic UDP transport needs. */
 extern volatile uint32_t g_warthog_mpm_estab;
 extern volatile unsigned int g_warthog_hostap_estab;
+/* Long enough for a bridged peer's dnsmasq to answer, short enough not to
+ * stall a warthog-only mesh noticeably. */
+#define MESH_DHCP_WAIT_MS 6000
 static bool s_mesh_netif_up;
 static void mesh_netif_up_(void)
 {
@@ -71,6 +74,32 @@ static void mesh_netif_up_(void)
     }
     uint8_t mac[6];
     mmwlan_get_mac_addr(mac);
+    /* Claim the slot before the DHCP wait below, so a second peer reaching
+     * ESTAB mid-wait does not start a parallel bring-up. */
+    s_mesh_netif_up = true;
+
+    /* An idiomatic OpenMANET node leaves its mesh interface enslaved to a
+     * bridge that has a DHCP server on it. Taking a lease there is what lets
+     * a Warthog join without the operator un-enslaving that interface (and
+     * with it, their batman fabric). No server answers on a warthog-only
+     * mesh, so the static fallback below still covers that case. */
+    if (warthog_cfg_get_mesh_dhcp()) {
+        esp_netif_action_connected(netif, NULL, 0, NULL);
+        if (esp_netif_dhcpc_start(netif) == ESP_OK) {
+            for (int waited = 0; waited < MESH_DHCP_WAIT_MS; waited += 250) {
+                vTaskDelay(pdMS_TO_TICKS(250));
+                esp_netif_ip_info_t got;
+                if (esp_netif_get_ip_info(netif, &got) == ESP_OK && got.ip.addr != 0) {
+                    ESP_LOGI(TAG, "mesh: DHCP lease " IPSTR " — peer bridge reachable",
+                             IP2STR(&got.ip));
+                    return;
+                }
+            }
+            ESP_LOGI(TAG, "mesh: no DHCP offer in %d ms (expected on a peerless or "
+                          "unbridged mesh) — using the static address",
+                     MESH_DHCP_WAIT_MS);
+        }
+    }
 
     esp_netif_dhcpc_stop(netif);
     esp_netif_ip_info_t ip = { 0 };
@@ -79,7 +108,6 @@ static void mesh_netif_up_(void)
     IP4_ADDR(&ip.gw, 10, 77, mac[4], mac[5]);
     esp_netif_set_ip_info(netif, &ip);
     esp_netif_action_connected(netif, NULL, 0, NULL);
-    s_mesh_netif_up = true;
     ESP_LOGI(TAG, "mesh: netif up at " IPSTR, IP2STR(&ip.ip));
 }
 
