@@ -21,7 +21,8 @@
 extern "C" {
 #endif
 
-/** mac80211 uses 256 buckets; a HaLow mesh has a handful of sources. */
+/** Buckets by sequence number, as mac80211 (256); a burst from one source
+ *  spreads across them. 64 keeps it at 4 KiB. */
 #ifndef UMAC_MESH_RMC_BUCKETS
 #define UMAC_MESH_RMC_BUCKETS 64u
 #endif

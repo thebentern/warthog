@@ -175,6 +175,9 @@ def main():
                     help="turn 802.11s forwarding on (AT+MESHFWD=1) and report the relay state")
     ap.add_argument("--bridge", action="store_true",
                     help="turn L2 bridge mode on (AT+MESHBRIDGE=1); implies --fwd")
+    ap.add_argument("--grp", choices=["replicate", "std"], default=None,
+                    help="group-frame mode: replicate (per-peer unicast, default) or std "
+                         "(3-address broadcasts). The bench A/B; see AT+MESHGRP.")
     ap.add_argument("--settle", type=int, default=90)
     ap.add_argument("--audit-only", action="store_true",
                     help="read the peers and report; change nothing. Safe to "
@@ -219,6 +222,7 @@ def main():
                   (["AT+MESHPASS=%s" % a.passphrase] if a.sae else []) +
                   (["AT+MESHFWD=1"] if (a.fwd or a.bridge) else ["AT+MESHFWD=0"]) +
                   (["AT+MESHBRIDGE=1"] if a.bridge else ["AT+MESHBRIDGE=0"]) +
+                  (["AT+MESHGRP=%d" % (1 if a.grp == "std" else 0)] if a.grp else []) +
                   ["AT+MESHCHAN?"])
         applied = "applied=yes" in t
         check("warthog-chan-applied/%s" % w.split("/")[-1], applied,

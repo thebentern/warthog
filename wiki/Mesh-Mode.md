@@ -122,11 +122,21 @@ it.
 
 **How much of this is verified.** Every decision above is a freestanding
 function the host suite tests directly, and `sim_mesh` drives a 3–4 node
-mesh through the shipping code: unicast through a relay exactly once, a
-flood reaching every node exactly once and never storming, hosts behind
-opposite ends reaching each other with their real addresses, a lost link
-announced and acted on, TTL dying where it should, and a leaf relaying
-nothing. What is **not** verified is the radio: whether the MM6108 hands up
+mesh through the shipping code — carrying the **exact bytes the firmware
+emits**: the MAC header comes from the same `umac_mesh_fwd_tx_header()` the
+SDK builder calls, and the receive side parses it with
+`umac_mesh_fwd_parse_frame()` before the engine sees it. That binding found
+two firmware bugs a struct-based simulator had passed. Fifteen scenarios:
+unicast through a relay exactly once; a flood reaching every node exactly
+once; a triangle and a ring under a 30-frame burst without a storm; hosts
+behind opposite ends reaching each other with their real addresses; a lost
+link announced two hops away and rediscovered at a newer sequence number;
+TTL dying where it should; a leaf relaying nothing; a forged high-SN PREQ
+from a node in range but not peered changing nothing; a bystander's PERR
+ignored; a deliberately poisoned two-relay loop dying on TTL; and, under a
+modelled single chip group-key slot, standard group frames failing exactly
+where the measured hardware fails and recovering with host CCMP or with
+per-peer replicas. What is **not** verified is the radio: whether the MM6108 hands up
 a 4-address frame whose mesh destination is a third party (`AT+RXCHAN?`
 `fwdcand`), and whether it transmits one whose addr4 is not its own. Both
 need a board. Until then forwarding is compiled, simulated and off by

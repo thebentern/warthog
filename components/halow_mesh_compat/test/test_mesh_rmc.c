@@ -22,7 +22,7 @@ static int failures;
 
 static const uint8_t A[6] = { 0x02, 0, 0, 0, 0, 0x01 };
 static const uint8_t B[6] = { 0x02, 0, 0, 0, 0, 0x02 };
-/* Same last octet as A, differs in a high octet: must NOT collide as a key. */
+/* A third source: same seq as A's must be a distinct key in the same bucket. */
 static const uint8_t A2[6] = { 0x02, 0xff, 0, 0, 0, 0x01 };
 
 static struct umac_mesh_rmc rmc;
@@ -37,7 +37,7 @@ int main(void)
     CHECK( umac_mesh_rmc_check(&rmc, A, 1, now + 5), "still a duplicate a moment later");
     CHECK(!umac_mesh_rmc_check(&rmc, A, 2, now), "(A,2) is new");
     CHECK(!umac_mesh_rmc_check(&rmc, B, 1, now), "(B,1) is new: the key is source AND seq");
-    CHECK(!umac_mesh_rmc_check(&rmc, A2, 1, now), "(A2,1) is new even though A2 shares A's last octet");
+    CHECK(!umac_mesh_rmc_check(&rmc, A2, 1, now), "(A2,1) is new: same seq as (A,1), same bucket, different source");
     CHECK( umac_mesh_rmc_check(&rmc, A2, 1, now), "and (A2,1) is then a duplicate on its own");
     CHECK(umac_mesh_rmc_count(&rmc, now) == 4, "four live entries (got %u)", (unsigned)umac_mesh_rmc_count(&rmc, now));
 
@@ -52,22 +52,30 @@ int main(void)
      * oldest, and only the oldest. */
     umac_mesh_rmc_init(&rmc);
     now = 5000;
+    /* Five entries in ONE bucket: seqs congruent modulo the bucket count. */
+    const uint32_t Bk = UMAC_MESH_RMC_BUCKETS;
     for (uint32_t s = 0; s < UMAC_MESH_RMC_QUEUE; s++)
     {
-        umac_mesh_rmc_check(&rmc, A, 100 + s, now + s); /* seq 100.. with rising time */
+        umac_mesh_rmc_check(&rmc, A, 100 + s * Bk, now + s); /* rising time */
     }
     for (uint32_t s = 0; s < UMAC_MESH_RMC_QUEUE; s++)
     {
-        CHECK(umac_mesh_rmc_check(&rmc, A, 100 + s, now + 10), "bucket holds seq %u", (unsigned)(100 + s));
+        CHECK(umac_mesh_rmc_check(&rmc, A, 100 + s * Bk, now + 10), "bucket holds seq %u", (unsigned)(100 + s * Bk));
     }
-    CHECK(!umac_mesh_rmc_check(&rmc, A, 200, now + 10), "one more distinct seq is new");
+    CHECK(!umac_mesh_rmc_check(&rmc, A, 100 + 4 * Bk, now + 10), "a fifth seq in the same bucket is new");
     /* Probe survivors BEFORE probing the victim: a miss inserts, and inserting
      * into a full bucket evicts again. */
-    CHECK( umac_mesh_rmc_check(&rmc, A, 101, now + 10), "seq 101 survived");
-    CHECK( umac_mesh_rmc_check(&rmc, A, 102, now + 10), "seq 102 survived");
-    CHECK( umac_mesh_rmc_check(&rmc, A, 103, now + 10), "seq 103 survived");
-    CHECK( umac_mesh_rmc_check(&rmc, A, 200, now + 10), "seq 200 is remembered");
-    CHECK(!umac_mesh_rmc_check(&rmc, A, 100, now + 10), "the OLDEST (seq 100) was the one evicted");
+    CHECK( umac_mesh_rmc_check(&rmc, A, 100 + 1 * Bk, now + 10), "second survived");
+    CHECK( umac_mesh_rmc_check(&rmc, A, 100 + 2 * Bk, now + 10), "third survived");
+    CHECK( umac_mesh_rmc_check(&rmc, A, 100 + 3 * Bk, now + 10), "fourth survived");
+    CHECK( umac_mesh_rmc_check(&rmc, A, 100 + 4 * Bk, now + 10), "the fifth is remembered");
+    CHECK(!umac_mesh_rmc_check(&rmc, A, 100, now + 10), "the OLDEST was the one evicted");
+    /* And the property scenario 14 needs: one source's burst of 30 consecutive
+     * seqs is remembered in full, because they spread across buckets. */
+    umac_mesh_rmc_init(&rmc);
+    for (uint32_t s = 0; s < 30; s++) umac_mesh_rmc_check(&rmc, A, 1000 + s, now);
+    { int lost = 0; for (uint32_t s = 0; s < 30; s++) if (!umac_mesh_rmc_check(&rmc, A, 1000 + s, now + 5)) lost++;
+      CHECK(lost == 0, "a burst of 30 from one source is all remembered (%d forgotten)", lost); }
 
     /* A duplicate does not refresh the entry's expiry -- otherwise a chatty
      * repeater could keep an entry alive forever and pin the bucket. */
@@ -84,7 +92,8 @@ int main(void)
     CHECK( umac_mesh_rmc_check(&rmc, A, 9, 0x00000010u), "still a duplicate 32 ms later, across the wrap");
     CHECK(!umac_mesh_rmc_check(&rmc, A, 9, 0x00000010u + UMAC_MESH_RMC_TIMEOUT_MS), "and expired after the timeout, across the wrap");
 
-    /* A different source's traffic never evicts A's: buckets are per-source. */
+    /* Another source's traffic with DIFFERENT seqs never evicts A's: they land
+     * in other buckets. (Same-seq collisions share a bucket, as in mac80211.) */
     umac_mesh_rmc_init(&rmc);
     now = 20000;
     umac_mesh_rmc_check(&rmc, A, 1, now);

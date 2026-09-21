@@ -43,7 +43,7 @@ struct node {
     /* what reached this node's host side */
     struct { uint8_t da[6], sa[6]; uint32_t seq; bool group; } log[LOGMAX];
     int nlog;
-    uint32_t tx, fwd_data, fwd_preq, fwd_prep, prep_sent, perr_sent, preq_sent, dup, ttl_drop;
+    uint32_t tx, fwd_data, fwd_preq, fwd_prep, prep_sent, perr_sent, preq_sent, dup, ttl_drop, nodec;
 };
 
 enum fkind { F_DATA, F_ACTION };
@@ -73,6 +73,16 @@ static struct {
     uint32_t steps;
     bool overflow;
     bool grp_std;             /* AT+MESHGRP=1: standard 3-address group frames */
+    /* Range is not peering: an attacker can be in range without a link. The
+     * firmware takes data and path selection only from ESTAB peers. */
+    bool estab[NMAX][NMAX];
+    /* Key domain. Under SAE each node has its own group key and the chip
+     * latches ONE peer's (the measured MM6108 limit); host CCMP lifts it. A
+     * standard group frame is keyed by its TRANSMITTER; a per-peer replica
+     * is pairwise and always decrypts. */
+    bool secure;
+    bool host_ccmp[NMAX];
+    int  slot[NMAX];          /* peer index whose group key the chip holds, -1 none */
 } S;
 
 static const uint8_t BC[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
@@ -88,7 +98,7 @@ static bool is_peer_cb(const uint8_t *addr, void *arg)
 {
     int me = (int)(intptr_t)arg;
     int j = idx_of(addr);
-    return j >= 0 && S.adj[me][j];
+    return j >= 0 && S.estab[me][j];
 }
 
 static void sim_reset(int nn, bool forwarding_all)
@@ -104,11 +114,14 @@ static void sim_reset(int nn, bool forwarding_all)
         umac_mesh_rmc_init(&n->rmc);
         n->own_sn = 10 * (uint32_t)(i + 1);
         n->forwarding = forwarding_all;
+        S.slot[i] = -1;
     }
 }
 
-static void link(int a, int b) { S.adj[a][b] = S.adj[b][a] = true; }
-static void unlink_(int a, int b) { S.adj[a][b] = S.adj[b][a] = false; }
+static void link(int a, int b) { S.adj[a][b] = S.adj[b][a] = true; S.estab[a][b] = S.estab[b][a] = true; }
+static void unlink_(int a, int b) { S.adj[a][b] = S.adj[b][a] = false; S.estab[a][b] = S.estab[b][a] = false; }
+static void range_only(int a, int b) { S.adj[a][b] = S.adj[b][a] = true; S.estab[a][b] = S.estab[b][a] = false; }
+static void latch(int node, int peer) { S.slot[node] = peer; }
 
 static void push(const struct frame *f)
 {
@@ -165,6 +178,9 @@ static void queue_action(int from, const uint8_t *ra, const uint8_t *body, uint1
 static void receive(int me, const struct frame *f)
 {
     struct node *n = &S.n[me];
+    /* The glue takes path selection only from ESTAB peers; the datapath has no
+     * stad for anyone else, so their data never reaches the engine either. */
+    if (!S.estab[f->from][me]) return;
     if (f->kind == F_ACTION) {
         struct umac_mesh_hwmp_ctx c = hctx(me);
         struct umac_mesh_hwmp_action a; enum umac_mesh_hwmp_drop why;
@@ -182,6 +198,8 @@ static void receive(int me, const struct frame *f)
     struct umac_mesh_rx_frame pf;
     if (umac_mesh_fwd_parse_frame(f->bytes, f->len, &pf) == 0) { printf("FAIL parse at node %d\n", me); failures++; return; }
     if (!pf.group && !eq(pf.addr1, n->addr)) return; /* the chip does not deliver unicast for others */
+    /* Key domain: a 3-address group frame is keyed by its transmitter. */
+    if (pf.group && S.secure && !S.host_ccmp[me] && S.slot[me] != f->from) { n->nodec++; return; }
     (void)umac_mesh_fwd_normalise_replica(&pf);
     struct umac_mesh_fwd_ctx c = fctx(me);
     struct umac_mesh_fwd_rx_result r;
@@ -471,6 +489,112 @@ int main(void)
     CHECK(delivered(0, 9001, NULL, NULL) == 0, "A never delivered its own broadcast");
     /* NOTE: keys are not modelled here; under SAE a standard group frame decrypts
      * only where the receiver holds the sender's group key -- see scenario 10. */
+
+    /* ================= 10. Key domain: what SAE does to group frames ====== */
+    printf("--- scenario 10: standard group frames under SAE with one chip group-key slot ---\n");
+    /* Line A - W - B, chip crypto, W latched A and B latched W: A's flood works by luck of latch order. */
+    sim_reset(3, true); link(0, 1); link(1, 2); S.grp_std = true; S.secure = true; latch(1, 0); latch(2, 1);
+    CHECK(send(0, BC, S.n[0].addr, 10001) && run(), "A floods a line");
+    CHECK(delivered(1, 10001, NULL, NULL) == 1 && delivered(2, 10001, NULL, NULL) == 1, "reaches W and B: each chip happened to hold the transmitter's key");
+    /* Star: W peers A and B, W latched A. B's flood cannot be decrypted at W. */
+    sim_reset(3, true); link(0, 1); link(1, 2); S.grp_std = true; S.secure = true; latch(1, 0); latch(0, 1); latch(2, 1);
+    CHECK(send(2, BC, S.n[2].addr, 10002) && run(), "B floods");
+    CHECK(S.n[1].nodec == 1 && delivered(1, 10002, NULL, NULL) == 0, "W cannot decrypt B's group frame: its one slot holds A's key -- the measured failure");
+    CHECK(delivered(0, 10002, NULL, NULL) == 0, "so A never gets it");
+    /* Host CCMP on W lifts the limit. */
+    sim_reset(3, true); link(0, 1); link(1, 2); S.grp_std = true; S.secure = true; latch(1, 0); latch(0, 1); latch(2, 1); S.host_ccmp[1] = true;
+    CHECK(send(2, BC, S.n[2].addr, 10003) && run(), "B floods again");
+    CHECK(S.n[1].nodec == 0 && delivered(1, 10003, NULL, NULL) == 1 && delivered(0, 10003, NULL, NULL) == 1, "with host CCMP on W it decrypts and relays to A");
+    /* Replicate mode never hits it: replicas are pairwise. */
+    sim_reset(3, true); link(0, 1); link(1, 2); S.grp_std = false; S.secure = true; latch(1, 0); latch(0, 1); latch(2, 1);
+    CHECK(send(2, BC, S.n[2].addr, 10004) && run(), "B floods in replicate mode");
+    CHECK(S.n[1].nodec == 0 && delivered(1, 10004, NULL, NULL) == 1 && delivered(0, 10004, NULL, NULL) == 1, "per-peer replicas are pairwise: decrypt everywhere regardless of the slot");
+
+    /* ================= 11. Forged PREQ from a node in range but not peered = */
+    printf("--- scenario 11: forged high-SN PREQ from a non-peer ---\n");
+    sim_reset(4, true); link(0, 1); link(1, 2); range_only(3, 1); /* X (3) hears W, no link */
+    discover(A, S.n[B].addr); run();
+    const struct umac_mesh_path *pa = path(Wn, A);
+    CHECK(pa != NULL && eq(pa->next_hop, S.n[A].addr), "W has a real path to A via A");
+    uint32_t sn_before = pa->sn;
+    {
+        /* X claims to be A with a huge sequence number, asking for B. */
+        uint8_t forged[HWMP_PREQ_BODY_LEN];
+        uint16_t nb = umac_mesh_hwmp_build_preq(forged, sizeof(forged), S.n[A].addr, 0x7fffffffu, 77, S.n[B].addr, 4882);
+        queue_action(3, BC, forged, nb);
+        run();
+    }
+    pa = path(Wn, A);
+    CHECK(pa != NULL && eq(pa->next_hop, S.n[A].addr) && pa->sn == sn_before, "W's path to A is untouched: the forgery came from a non-peer and was never processed");
+    CHECK(S.n[Wn].fwd_preq == 1, "W rebroadcast only the genuine PREQ (got %u)", S.n[Wn].fwd_preq);
+
+    /* ================= 12. Bystander PERR ================================= */
+    printf("--- scenario 12: PERR from a peer that is not our next hop ---\n");
+    sim_reset(3, true); link(0, 1); link(1, 2); link(0, 2); /* triangle */
+    discover(A, S.n[B].addr); run();
+    const struct umac_mesh_path *pb = path(A, B);
+    CHECK(pb != NULL && eq(pb->next_hop, S.n[B].addr), "A reaches B directly (metric wins over the relay)");
+    {
+        uint8_t perr[HWMP_PERR_BODY_LEN];
+        uint16_t nb = umac_mesh_hwmp_build_perr(perr, sizeof(perr), 31, S.n[B].addr, pb->sn + 5, HWMP_REASON_MESH_PATH_ERROR_DEST_UNREACHABLE);
+        queue_action(Wn, BC, perr, nb); /* W is a peer of A, but not A's next hop for B */
+        run();
+    }
+    pb = path(A, B);
+    CHECK(pb != NULL && eq(pb->next_hop, S.n[B].addr), "A's path to B survives a PERR from W, which is not on it");
+    CHECK(S.n[A].perr_sent == 0, "and A did not forward the bystander's PERR");
+
+    /* ================= 13. Two relays: PERR propagates two hops, rediscovery recovers = */
+    printf("--- scenario 13: A - W1 - W2 - B, link loss two hops away ---\n");
+    sim_reset(4, true); link(0, 1); link(1, 2); link(2, 3);
+    discover(0, S.n[3].addr); run();
+    const struct umac_mesh_path *p0 = path(0, 3);
+    CHECK(p0 != NULL && eq(p0->next_hop, S.n[1].addr) && p0->hop_count == 3, "A reaches B via W1 in 3 hops");
+    CHECK(path(1, 3) != NULL && eq(path(1, 3)->next_hop, S.n[2].addr), "W1 reaches B via W2");
+    uint32_t old_sn = p0->sn;
+    unlink_(2, 3);
+    {
+        struct umac_mesh_hwmp_ctx c = hctx(2); struct umac_mesh_hwmp_action acts[4];
+        uint32_t k = umac_mesh_hwmp_lose_neighbour(&c, S.n[3].addr, acts, 4);
+        CHECK(k == 1, "W2 announces B");
+        for (uint32_t i = 0; i < k; i++) { S.n[2].perr_sent++; queue_action(2, acts[i].to, acts[i].body, acts[i].body_len); }
+        run();
+    }
+    CHECK(path(2, 3) == NULL && path(1, 3) == NULL && path(0, 3) == NULL, "the PERR reached two hops: W2, W1 and A all dropped their paths to B");
+    CHECK(S.n[1].perr_sent == 1 && S.n[0].perr_sent == 1, "W1 and A each forwarded it once");
+    CHECK(!send(0, S.n[3].addr, S.n[0].addr, 13001), "A has no route to B");
+    link(2, 3);
+    discover(0, S.n[3].addr); run();
+    p0 = path(0, 3);
+    CHECK(p0 != NULL && eq(p0->next_hop, S.n[1].addr), "rediscovery rebuilt the path");
+    CHECK(hwmp_sn_gt(p0->sn, old_sn), "at a newer sequence number (%u > %u)", (unsigned)p0->sn, (unsigned)old_sn);
+    CHECK(send(0, S.n[3].addr, S.n[0].addr, 13002) && run() && delivered(3, 13002, NULL, NULL) == 1, "and traffic flows again, exactly once");
+
+    /* ================= 14. Ring under a burst ============================== */
+    printf("--- scenario 14: ring A - W - B - C - A, 30 broadcasts ---\n");
+    sim_reset(4, true); link(0, 1); link(1, 2); link(2, 3); link(3, 0);
+    for (uint32_t k = 0; k < 30; k++) CHECK(send(0, BC, S.n[0].addr, 14000 + k) || true, "(send %u)", (unsigned)k);
+    CHECK(run(), "30 floods on a ring drain (%u steps)", S.steps);
+    {
+        int bad = 0;
+        for (int i = 1; i < 4; i++) for (uint32_t k = 0; k < 30; k++) if (delivered(i, 14000 + k, NULL, NULL) != 1) bad++;
+        CHECK(bad == 0, "every node delivered every one of the 30 exactly once (%d misses)", bad);
+        CHECK(delivered(0, 14000, NULL, NULL) == 0 && delivered(0, 14029, NULL, NULL) == 0, "A never delivered its own");
+    }
+
+    /* ================= 15. A poisoned loop is bounded by TTL =============== */
+    printf("--- scenario 15: two relays pointing at each other ---\n");
+    sim_reset(3, true); link(0, 1); link(1, 2);
+    const uint8_t Cx[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0xcc }; /* a destination that does not exist */
+    umac_mesh_path_update(&S.n[0].tbl, Cx, S.n[1].addr, 1, 100, 1, 60000, S.now); /* A: C via W */
+    umac_mesh_path_update(&S.n[1].tbl, Cx, S.n[2].addr, 1, 100, 1, 60000, S.now); /* W: C via B */
+    umac_mesh_path_update(&S.n[2].tbl, Cx, S.n[1].addr, 1, 100, 1, 60000, S.now); /* B: C via W -- the loop */
+    CHECK(send(0, Cx, S.n[0].addr, 15001), "A sends to C");
+    CHECK(run(), "the loop drains (%u steps)", S.steps);
+    CHECK(S.steps <= 40, "bounded by TTL 31: %u steps, not a storm", S.steps);
+    CHECK(S.n[1].fwd_data + S.n[2].fwd_data >= 28 && S.n[1].fwd_data + S.n[2].fwd_data <= 31, "W and B ping-ponged it until TTL ran out (%u + %u)", S.n[1].fwd_data, S.n[2].fwd_data);
+    CHECK(delivered(1, 15001, NULL, NULL) == 0 && delivered(2, 15001, NULL, NULL) == 0, "nobody delivered a frame for C");
+    CHECK(S.n[1].ttl_drop + S.n[2].ttl_drop == 1, "exactly one relay stopped it on TTL");
 
     printf("\n%s\n", failures ? "SIMULATION FAILED" : "SIMULATION PASSED");
     return failures ? 1 : 0;

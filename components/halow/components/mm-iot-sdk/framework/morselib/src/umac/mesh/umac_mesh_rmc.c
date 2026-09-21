@@ -12,12 +12,14 @@ static bool past_(uint32_t now_ms, uint32_t t_ms)
     return (int32_t)(now_ms - t_ms) >= 0;
 }
 
-static uint32_t bucket_(const uint8_t *sa)
+/* mac80211 mesh_rmc_check: the bucket is the SEQUENCE NUMBER's low bits, and
+ * the source is compared inside it. Hashing on the source instead puts one
+ * node's whole burst into a single four-deep bucket, and the fifth frame
+ * evicts the first -- on a ring the late second copy of an early frame is
+ * then delivered again. Found by the simulator, scenario 14. */
+static uint32_t bucket_(uint32_t seq)
 {
-    /* mac80211 hashes on the last octet alone; fold all six so that two
-     * sources differing only in a high octet do not share a bucket. */
-    uint32_t h = (uint32_t)sa[0] ^ sa[1] ^ sa[2] ^ sa[3] ^ sa[4] ^ sa[5];
-    return h % UMAC_MESH_RMC_BUCKETS;
+    return seq % UMAC_MESH_RMC_BUCKETS;
 }
 
 void umac_mesh_rmc_init(struct umac_mesh_rmc *rmc)
@@ -35,7 +37,7 @@ bool umac_mesh_rmc_check(struct umac_mesh_rmc *rmc, const uint8_t *sa, uint32_t 
     {
         return false;
     }
-    struct umac_mesh_rmc_entry *q = rmc->e[bucket_(sa)];
+    struct umac_mesh_rmc_entry *q = rmc->e[bucket_(seq)];
     struct umac_mesh_rmc_entry *slot = NULL;
     struct umac_mesh_rmc_entry *oldest = &q[0];
 
