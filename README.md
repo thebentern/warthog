@@ -496,8 +496,20 @@ air** — `swccmp ok` has not been seen above zero, for unicast or group. That
 802.11w MFP is negotiated and the IGTK installed is readable from the source
 and the linked image; that the chip applies BIP on air is not.
 
-If you are deciding whether to trust this for something that matters, that
-second paragraph is the honest answer.
+**Why the unmeasured work cannot regress the measured work.** Worth knowing if
+you are taking this tree. The receive-side additions — Address Extension, the
+per-peer telemetry hook and the `fwdcand` counter — all sit inside
+`if (mesh_ctrl_present)`, which tests bit 8 of the received QoS Control field.
+Warthog's own transmit path deliberately inserts no Mesh Control field
+(`umac_datapath_mesh.c`, "A Mesh Control field (s9.2.4.7.3) is NOT inserted"),
+so a warthog-to-warthog frame never sets that bit and never enters any of it.
+The new code runs only on frames from a peer that sets Mesh Control — a real
+802.11s node such as OpenMANET — which is precisely the case that was already
+unverified. The 3-node warthog mesh proven on 2026-09-20 is on a path this work
+does not touch.
+
+If you are deciding whether to trust this for something that matters, the
+not-measured paragraph is the honest answer.
 
 ## Security
 
