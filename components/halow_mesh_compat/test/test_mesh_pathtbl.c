@@ -176,7 +176,13 @@ int main(void)
     umac_mesh_proxy_learn(&T, X, H1, now);
     umac_mesh_proxy_touch(&T, X, now + UMAC_MESH_PROXY_LIFETIME_MS - 1000);
     CHECK(umac_mesh_proxy_lookup(&T, X, now + UMAC_MESH_PROXY_LIFETIME_MS + 1000) != NULL, "touched on TX use: still known past the original lifetime");
-    CHECK(UMAC_MESH_PROXY_LIFETIME_MS == 600000u, "proxy lifetime is mac80211's 600 s");
+    /* A touch after the entry has lapsed must NOT bring it back: the host may
+     * have moved, and a resurrected entry steers unicast to the wrong node. */
+    umac_mesh_pathtbl_init(&T);
+    umac_mesh_proxy_learn(&T, X, H1, now);
+    umac_mesh_proxy_touch(&T, X, now + UMAC_MESH_PROXY_LIFETIME_MS + 1);
+    CHECK(umac_mesh_proxy_lookup(&T, X, now + UMAC_MESH_PROXY_LIFETIME_MS + 2) == NULL, "a touch does not resurrect a lapsed host entry");
+    _Static_assert(UMAC_MESH_PROXY_LIFETIME_MS == 600000u, "proxy lifetime is mac80211's 600 s");
 
     /* ---- NULL safety ------------------------------------------------------- */
     CHECK(umac_mesh_path_lookup(NULL, D, now) == NULL, "NULL table lookup");

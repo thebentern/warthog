@@ -115,6 +115,12 @@ int main(void)
         (void)umac_mesh_rmc_check(&rmc, A, i * UMAC_MESH_RMC_BUCKETS, now);
     }
     CHECK(rmc.evictions == 1, "the fifth congruent sequence number evicted one entry, counted");
+    for (uint32_t i = UMAC_MESH_RMC_QUEUE + 1; i < 100; i++)
+    {
+        (void)umac_mesh_rmc_check(&rmc, A, i * UMAC_MESH_RMC_BUCKETS, now);
+    }
+    CHECK(rmc.evictions == 100 - UMAC_MESH_RMC_QUEUE, "the counter keeps counting past one wrap: %lu evictions in 100 congruent frames",
+          (unsigned long)rmc.evictions);
     CHECK(!umac_mesh_rmc_check(&rmc, A, 0, now), "and the first is forgotten -- mac80211's 4-deep bucket has the same shape");
 
     printf("sizeof(struct umac_mesh_rmc) = %u bytes\n", (unsigned)sizeof(struct umac_mesh_rmc));

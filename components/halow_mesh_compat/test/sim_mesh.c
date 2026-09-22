@@ -182,8 +182,13 @@ static void queue_action(int from, const uint8_t *ra, const uint8_t *body, uint1
 
 static bool send(int i, const uint8_t *da, const uint8_t *sa, uint32_t payload);
 
-/* After every path-selection frame: held frames whose path now exists go
- * out through send() again, expired ones are dropped -- glue flush_pending_(). */
+/* After every path-selection frame: held frames whose path now exists go out
+ * through send() again, expired ones are dropped.
+ *
+ * This models the ENGINE's store (umac_mesh_pending_*), not the firmware's
+ * flush: umac_mesh_fwd_glue.c cannot be linked on the host, so its locking and
+ * call ordering are checked by test_glue_guard.sh instead. A green scenario 16
+ * says the store is right, not that the glue calls it correctly. */
 static void flush_pending(int me)
 {
     struct node *n = &S.n[me];
@@ -368,7 +373,10 @@ int main(void)
     p = path(Wn, A); CHECK(p && eq(p->next_hop, S.n[A].addr), "W: path to A via A");
     p = path(Wn, B); CHECK(p && eq(p->next_hop, S.n[B].addr), "W: path to B via B");
     p = path(B, A); CHECK(p && eq(p->next_hop, S.n[Wn].addr) && p->hop_count == 2, "B: path to A via W, 2 hops");
-    CHECK(p && p->metric == 200, "B's metric to A is two hops' worth (got %u)", (unsigned)p->metric);
+    /* The message is evaluated on the failing branch too, so it must survive
+     * the NULL that makes the condition false -- otherwise a real regression
+     * segfaults here and takes the whole report with it. */
+    CHECK(p && p->metric == 200, "B's metric to A is two hops' worth (got %u)", (unsigned)(p ? p->metric : 0));
 
     CHECK(send(A, S.n[B].addr, S.n[A].addr, 1001), "A can send to B");
     CHECK(run(), "unicast drains");

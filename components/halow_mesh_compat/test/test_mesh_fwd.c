@@ -345,6 +345,14 @@ int main(void)
         struct umac_mesh_fwd_ctx early = c; early.now_ms = now + 1000;
         umac_mesh_fwd_tx(&early, C, W, 301, &t);
         CHECK(t.ok && !t.refresh, "a path with 4 s left is not refreshed");
+        /* For a proxied destination the PREQ must name the mesh NODE, never
+         * the host: a PREQ for a host address can never be answered. */
+        umac_mesh_pathtbl_init(&T);
+        umac_mesh_proxy_learn(&T, HA, A, now);
+        umac_mesh_path_update(&T, A, B, 5, 200, 1, 5120, now);
+        struct umac_mesh_fwd_ctx plate = c; plate.now_ms = now + 5120 - 500;
+        umac_mesh_fwd_tx(&plate, HA, W, 302, &t);
+        CHECK(t.ok && t.refresh && memcmp(t.path_target, A, 6) == 0, "refreshing a proxied destination asks for the NODE A, not the host HA");
     }
     /* ---- originating a PREQ: always broadcast ------------------------------- */
     {
@@ -358,21 +366,41 @@ int main(void)
 
     /* ---- protection latch: trust on first protected frame ------------------ */
     {
+        /* A protected frame is never refused, so asserting the return value of
+         * a protected check proves nothing. Every assertion below reads the
+         * latch back through a PLAINTEXT check, which is the only call that
+         * can return false. */
         struct umac_mesh_prot_latch L; umac_mesh_prot_latch_init(&L);
         CHECK(umac_mesh_prot_latch_check(&L, A, false), "plaintext from A accepted while A has never protected (PMF off: today's only case)");
-        CHECK(umac_mesh_prot_latch_check(&L, A, true), "a protected frame from A accepted, and latches A");
-        CHECK(!umac_mesh_prot_latch_check(&L, A, false), "plaintext claiming to be A now refused: A protects its path selection");
-        CHECK(umac_mesh_prot_latch_check(&L, A, true), "protected from A still fine");
+        (void)umac_mesh_prot_latch_check(&L, A, true);
+        CHECK(!umac_mesh_prot_latch_check(&L, A, false), "one protected frame latches A: plaintext claiming to be A is now refused");
         CHECK(umac_mesh_prot_latch_check(&L, B, false), "B is judged on its own");
         umac_mesh_prot_latch_forget(&L, A);
         CHECK(umac_mesh_prot_latch_check(&L, A, false), "forgotten on peer loss: a re-peered A starts over");
-        for (unsigned i = 0; i < UMAC_MESH_PROT_LATCH_MAX + 1; i++)
+        /* Fill the table exactly, then overflow it one peer at a time and name
+         * the victim each time -- that pins the round-robin, which an
+         * always-evict-the-same-slot mutant would otherwise pass. */
+        umac_mesh_prot_latch_init(&L);
+        uint8_t pr[UMAC_MESH_PROT_LATCH_MAX + 2][6];
+        for (unsigned i = 0; i < UMAC_MESH_PROT_LATCH_MAX + 2; i++)
         {
-            uint8_t p[6] = { 2, 0, 0, 0, 0, (uint8_t)i };
-            CHECK(umac_mesh_prot_latch_check(&L, p, true), "peer %u latched (the table recycles, never refuses)", i);
+            pr[i][0] = 2; pr[i][1] = 0; pr[i][2] = 0; pr[i][3] = 0; pr[i][4] = 0; pr[i][5] = (uint8_t)i;
         }
-        uint8_t p8[6] = { 2, 0, 0, 0, 0, 8 };
-        CHECK(!umac_mesh_prot_latch_check(&L, p8, false), "the newest is latched");
+        for (unsigned i = 0; i < UMAC_MESH_PROT_LATCH_MAX; i++)
+        {
+            (void)umac_mesh_prot_latch_check(&L, pr[i], true);
+        }
+        for (unsigned i = 0; i < UMAC_MESH_PROT_LATCH_MAX; i++)
+        {
+            CHECK(!umac_mesh_prot_latch_check(&L, pr[i], false), "peer %u is latched: the table holds all %u", i, (unsigned)UMAC_MESH_PROT_LATCH_MAX);
+        }
+        (void)umac_mesh_prot_latch_check(&L, pr[UMAC_MESH_PROT_LATCH_MAX], true);
+        CHECK(umac_mesh_prot_latch_check(&L, pr[0], false), "overflow evicted peer 0, the first slot");
+        CHECK(!umac_mesh_prot_latch_check(&L, pr[1], false), "and left peer 1 alone");
+        CHECK(!umac_mesh_prot_latch_check(&L, pr[UMAC_MESH_PROT_LATCH_MAX], false), "the newcomer is latched");
+        (void)umac_mesh_prot_latch_check(&L, pr[UMAC_MESH_PROT_LATCH_MAX + 1], true);
+        CHECK(umac_mesh_prot_latch_check(&L, pr[1], false), "the next overflow takes peer 1: the victim ROTATES, it is not a fixed slot");
+        CHECK(!umac_mesh_prot_latch_check(&L, pr[2], false), "peer 2 is still latched");
         CHECK(umac_mesh_prot_latch_check(NULL, A, false) && umac_mesh_prot_latch_check(&L, NULL, false), "NULL fails open");
     }
     /* ---- pending: frames held for discovery ---------------------------------- */
@@ -401,6 +429,16 @@ int main(void)
         k = umac_mesh_pending_take(&P, &c, out, UMAC_MESH_PENDING_MAX);
         CHECK(k == 1 && out[0].ok && memcmp(out[0].ra, B, 6) == 0, "a direct peer resolves at once");
         CHECK(umac_mesh_pending_push(NULL, C, &h[7], now) == &h[7], "NULL store hands the frame straight back");
+        /* A frame held for a HOST address is released through the proxy entry
+         * that arrives later: the next hop is the path to the node, not the host. */
+        umac_mesh_pathtbl_init(&T);
+        umac_mesh_pending_init(&P);
+        CHECK(umac_mesh_pending_push(&P, HA, &h[0], now) == NULL, "frame for host HA held (nothing known about HA yet)");
+        CHECK(umac_mesh_pending_take(&P, &c, out, UMAC_MESH_PENDING_MAX) == 0, "still held: a host with no proxy has no route");
+        umac_mesh_proxy_learn(&T, HA, A, now);
+        umac_mesh_path_update(&T, A, B, 7, 300, 2, 5120, now);
+        k = umac_mesh_pending_take(&P, &c, out, UMAC_MESH_PENDING_MAX);
+        CHECK(k == 1 && out[0].ok && memcmp(out[0].ra, B, 6) == 0, "released via the proxy: HA sits behind A, whose next hop is B");
     }
 
     /* ---- round trip: what we shape, we would deliver correctly -------------- */

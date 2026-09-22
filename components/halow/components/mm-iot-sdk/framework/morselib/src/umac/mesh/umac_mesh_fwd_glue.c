@@ -150,8 +150,13 @@ void umac_mesh_fwd_glue_send_perr(const struct umac_mesh_fwd_rx_result *r)
     }
     /* One PERR per unroutable destination per interval, and a floor overall:
      * a stream of frames for random destinations must not become a stream of
-     * management allocations and transmissions (mac80211: perrMinInterval). */
-    if (!umac_mesh_preq_gate_allow(&s_perr_gate, r->mesh_da, mmosal_get_time_ms()))
+     * management allocations and transmissions (mac80211: perrMinInterval).
+     * Under the lock like every other gate, so it stays correct if a second
+     * task ever reaches this path. */
+    lock_();
+    bool allow = umac_mesh_preq_gate_allow(&s_perr_gate, r->mesh_da, mmosal_get_time_ms());
+    unlock_();
+    if (!allow)
     {
         g_warthog_fwd_perr_suppressed++;
         return;

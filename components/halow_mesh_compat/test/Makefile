@@ -45,8 +45,13 @@ TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
 SDKMESH := ../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh
 MESHIES := $(SDKMESH)/umac_mesh_ies.c
 
-.PHONY: all clean linkcheck freestanding region
-all: $(TESTS) linkcheck freestanding region
+# Header prerequisites. Without these, editing a struct or a constant in a mesh
+# header leaves every test binary stale and the suite reports PASS against code
+# that is no longer built -- which is exactly what a green run must never mean.
+MESHHDRS := $(wildcard $(SDKMESH)/*.h)
+
+.PHONY: all clean linkcheck freestanding region glueguard
+all: $(TESTS) linkcheck freestanding region glueguard
 	@echo "=== running host tests ==="
 	@fail=0; for t in $(TESTS); do echo "--- $$t ---"; ./$$t || fail=1; done; \
 	  if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
@@ -58,6 +63,14 @@ region:
 	@echo "=== regulatory region mapping ==="
 	@sh ./test_region_map.sh
 
+# umac_mesh_fwd_glue.c cannot be linked on the host -- it needs mmosal, mmpkt,
+# mmdrv and the datapath. Its decisions live in the engine, which IS tested;
+# what is left in the glue is locking and call ordering, and those are checked
+# structurally here rather than not at all.
+glueguard:
+	@echo "=== forwarding glue invariants ==="
+	@sh ./test_glue_guard.sh
+
 # Note: -I$(SDKMESH) ONLY, deliberately not $(INCS) -- if these tests could see
 # the compat/dot11ah headers, an SDK dependency could sneak into umac_mesh_ies.c
 # without anything failing.
@@ -68,44 +81,44 @@ test_mesh_diag: test_mesh_diag.c $(MAINDIR)/mesh_diag.c
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $^ -o $@
 
 # The simulator links every forwarding TU the firmware ships.
-sim_mesh: sim_mesh.c $(SDKMESH)/umac_mesh_fwd.c $(SDKMESH)/umac_mesh_hwmp_relay.c $(SDKMESH)/umac_mesh_ctrl.c $(SDKMESH)/umac_mesh_rmc.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHIES)
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+sim_mesh: sim_mesh.c $(SDKMESH)/umac_mesh_fwd.c $(SDKMESH)/umac_mesh_hwmp_relay.c $(SDKMESH)/umac_mesh_ctrl.c $(SDKMESH)/umac_mesh_rmc.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHIES) $(MESHHDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
-test_mesh_fwd: test_mesh_fwd.c $(SDKMESH)/umac_mesh_fwd.c $(SDKMESH)/umac_mesh_ctrl.c $(SDKMESH)/umac_mesh_rmc.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHIES)
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+test_mesh_fwd: test_mesh_fwd.c $(SDKMESH)/umac_mesh_fwd.c $(SDKMESH)/umac_mesh_ctrl.c $(SDKMESH)/umac_mesh_rmc.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHIES) $(MESHHDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
-test_mesh_hwmp_relay: test_mesh_hwmp_relay.c $(SDKMESH)/umac_mesh_hwmp_relay.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+test_mesh_hwmp_relay: test_mesh_hwmp_relay.c $(SDKMESH)/umac_mesh_hwmp_relay.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHHDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
-test_mesh_pathtbl: test_mesh_pathtbl.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+test_mesh_pathtbl: test_mesh_pathtbl.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHHDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
-test_mesh_rmc: test_mesh_rmc.c $(SDKMESH)/umac_mesh_rmc.c
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+test_mesh_rmc: test_mesh_rmc.c $(SDKMESH)/umac_mesh_rmc.c $(MESHHDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
-test_mesh_ctrl: test_mesh_ctrl.c $(SDKMESH)/umac_mesh_ctrl.c
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+test_mesh_ctrl: test_mesh_ctrl.c $(SDKMESH)/umac_mesh_ctrl.c $(MESHHDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
-test_mesh_hwmp: test_mesh_hwmp.c $(SDKMESH)/umac_mesh_hwmp.c
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+test_mesh_hwmp: test_mesh_hwmp.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHHDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
 test_mesh_ies_golden: test_mesh_ies_golden.c $(MESHIES)
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
 test_mesh_mpm_parse: test_mesh_mpm_parse.c $(MESHIES)
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
 test_mesh_beacon_id: test_mesh_beacon_id.c $(MESHIES)
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
 test_mesh_plink_tbl: test_mesh_plink_tbl.c $(SDKMESH)/umac_mesh_plink_tbl.c
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
 test_ccmp_hdr: test_ccmp_hdr.c $(SDKMESH)/umac_mesh_ccmp_hdr.c
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
 test_s1g_beacon: test_s1g_beacon.c $(MESHIES)
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
 # AES-CCM against the RFC 3610 vectors, using hostap's own software AES so the
 # cipher is tested independently of the on-target mbedtls shim.
@@ -121,7 +134,7 @@ test_ccm_crosscheck: test_ccm_crosscheck.c $(SDKMESH)/umac_mesh_ccm.c $(CCMSRC)
 	  -Ihostcompat -I$(SDKMESH) -I$(HOSTAP)/src/utils -I$(HOSTAP)/src/crypto -I$(HOSTAP)/src -I$(HOSTAP) $^ -o $@
 
 test_mesh_data_hdr: test_mesh_data_hdr.c $(MESHIES)
-	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $^ -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
 # Proves the mesh byte-layout TU still compiles with nothing but libc.
 freestanding:
