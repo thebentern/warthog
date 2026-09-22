@@ -79,5 +79,17 @@ else
   bad "umac_mesh_fwd_originate_preq no longer returns a broadcast RA"
 fi
 
+# 7. One allocator for the Mesh Control sequence number, under the lock. Two
+#    frames sharing one are dropped as duplicates by the first relay's cache.
+D=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/datapath/umac_datapath.c
+stray=$(grep -n 'g_warthog_mesh_seq++' "$G" "$D" | grep -v 'umac_mesh_fwd_glue.c:.*uint32_t seq = g_warthog_mesh_seq++;' || true)
+if [ -n "$stray" ]; then
+  bad "the mesh sequence number is incremented outside umac_mesh_fwd_glue_next_seq ($(echo "$stray" | tr '\n' ' '))"
+elif awk '/uint32_t umac_mesh_fwd_glue_next_seq/,/^}/' "$G" | grep -q 'lock_();'; then
+  ok "one locked allocator owns the mesh sequence number"
+else
+  bad "umac_mesh_fwd_glue_next_seq does not take the lock"
+fi
+
 [ $fail -eq 0 ] && echo "GLUE INVARIANTS OK" || echo "GLUE INVARIANTS FAILED"
 exit $fail

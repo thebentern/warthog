@@ -54,6 +54,10 @@ void umac_mesh_fwd_glue_tick(void);
 void umac_mesh_fwd_glue_lock(void);
 void umac_mesh_fwd_glue_unlock(void);
 
+/** Allocate the next Mesh Control sequence number. The only writer: two
+ *  frames sharing one are dropped as duplicates by the first relay. */
+uint32_t umac_mesh_fwd_glue_next_seq(void);
+
 /** Next hop for a non-neighbour destination into @p out; false = none (a PREQ was sent). */
 bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6]);
 

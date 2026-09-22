@@ -279,6 +279,19 @@ static void maybe_preq_(const uint8_t *target)
 void umac_mesh_fwd_glue_lock(void) { lock_(); }
 void umac_mesh_fwd_glue_unlock(void) { unlock_(); }
 
+uint32_t umac_mesh_fwd_glue_next_seq(void)
+{
+    /* The one allocator. Read-and-increment is not atomic, and three tasks
+     * originate mesh frames -- the netif task, the receive path's flush and
+     * the service tick. Two frames sharing a sequence number are dropped as
+     * duplicates by the first relay's cache, so this is silent data loss. */
+    extern volatile uint32_t g_warthog_mesh_seq;
+    lock_();
+    uint32_t seq = g_warthog_mesh_seq++;
+    unlock_();
+    return seq;
+}
+
 /* An 802.3 frame from the TX entry, now that @p ra is its next hop: queued
  * the way a fresh TX would be, classified first. @returns false (frame not
  * taken) when @p ra is not a peer. Same peer-record lifetime as every other
@@ -360,9 +373,12 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
 {
     struct umac_mesh_fwd_ctx c = fctx_();
     struct umac_mesh_fwd_tx_result t;
-    extern volatile uint32_t g_warthog_mesh_seq;
+    /* One sequence number per frame, allocated once. Burning one on a frame
+     * that turns out to need no Mesh Control sidecar is what mac80211 does
+     * too, and is cheaper than reading and incrementing separately. */
+    uint32_t seq = umac_mesh_fwd_glue_next_seq();
     lock_();
-    umac_mesh_fwd_tx(&c, da, sa, g_warthog_mesh_seq, &t);
+    umac_mesh_fwd_tx(&c, da, sa, seq, &t);
     unlock_();
     struct mmdrv_tx_metadata *md = mmdrv_get_tx_metadata(txbuf);
     if (t.need_path || t.refresh)
@@ -374,7 +390,6 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
     {
         /* Standard group frame: the engine's own Mesh Control (AE 1 carries a
          * proxied source, else no extension) goes out as-is. */
-        g_warthog_mesh_seq++;
         md->mesh.mc_len = (uint8_t)umac_mesh_ctrl_build(md->mesh.mc, sizeof(md->mesh.mc), &t.mc);
         md->mesh.addr_valid = 1;
         memcpy(md->mesh.mesh_da, da, 6);
@@ -392,7 +407,6 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
          * nobody accepts. */
         struct umac_mesh_ctrl mc;
         umac_mesh_fwd_replica_ctrl(&t.mc, da, sa, &mc);
-        g_warthog_mesh_seq++;
         md->mesh.mc_len = (uint8_t)umac_mesh_ctrl_build(md->mesh.mc, sizeof(md->mesh.mc), &mc);
         md->mesh.addr_valid = 1;
         memcpy(md->mesh.mesh_da, da, 6);
@@ -402,7 +416,6 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
     /* Unicast: only a proxied frame needs the sidecar. */
     if (umac_mesh_ctrl_ae(&t.mc) != UMAC_MESH_CTRL_AE_NONE)
     {
-        g_warthog_mesh_seq++;
         md->mesh.mc_len = (uint8_t)umac_mesh_ctrl_build(md->mesh.mc, sizeof(md->mesh.mc), &t.mc);
         md->mesh.addr_valid = 1;
         memcpy(md->mesh.mesh_da, t.addr3, 6);

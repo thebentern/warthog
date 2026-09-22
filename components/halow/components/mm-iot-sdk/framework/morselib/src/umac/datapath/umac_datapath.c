@@ -2251,7 +2251,7 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
         {
             /* Same six octets as before, through the codec the host tests pin. */
             struct umac_mesh_ctrl mc = { .flags = 0, .ttl = UMAC_MESH_CTRL_TTL,
-                                         .seq = g_warthog_mesh_seq++ };
+                                         .seq = umac_mesh_fwd_glue_next_seq() };
             uint8_t mesh_ctrl[UMAC_MESH_CTRL_LEN_MAX];
             uint16_t mc_len = umac_mesh_ctrl_build(mesh_ctrl, sizeof(mesh_ctrl), &mc);
             mmpkt_prepend_data(txbufview, mesh_ctrl, mc_len);
