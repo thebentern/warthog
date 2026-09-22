@@ -37,6 +37,46 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
 TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
            test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd sim_mesh
 
+# ---- simnode: the real stack with only the chip and the RTOS replaced ----
+#
+# sim_mesh drives the freestanding forwarding ENGINE. simnode links the real
+# umac_mesh.c, umac_mesh_fwd_glue.c, umac_datapath*.c, mmpkt.c and
+# umac_sta_data.c and cuts at mmdrv_tx_frame(), so what a test asserts on is
+# the frame the firmware would have handed to the radio. It covers the glue,
+# which is the one mesh file no freestanding test can link.
+SIMNODE      := simnode
+SIMNODE_TESTS := test_simnode_smoke
+# Appended after the fact: TESTS above is an immediate assignment, so a
+# reference to this from there would expand to nothing.
+TESTS += $(SIMNODE_TESTS)
+FW           := ../../halow/components/mm-iot-sdk/framework
+HAP          := $(FW)/src/hostap/src
+SIMNODE_INCS = -I$(SIMNODE)/hostshim -Ihostcompat -I../../halow/components/shims/include/esp32s3 \
+                -I$(SDKMESH)/../.. -I$(FW)/morselib/include -I$(FW)/src -I$(FW)/src/mmutils \
+                -I$(FW)/morselib/src/internal -I$(FW)/morselib/mmrc/src/core \
+                -I$(FW)/morselib/src/umac/rc/mmrc_osal -I$(HAP) -I$(HAP)/utils \
+                -I$(SIMNODE) -I$(SDKMESH)
+# The shipping code the simulator puts under test.
+SIMNODE_REAL = $(addprefix $(SDKMESH)/,umac_mesh.c umac_mesh_fwd_glue.c umac_mesh_fwd.c \
+                  umac_mesh_ctrl.c umac_mesh_rmc.c umac_mesh_pathtbl.c umac_mesh_hwmp.c \
+                  umac_mesh_hwmp_relay.c umac_mesh_ies.c umac_mesh_plink_tbl.c \
+                  umac_mesh_ccmp_hdr.c umac_mesh_beacon.c umac_mesh_rx_crypto.c umac_mesh_ccm.c) \
+                $(addprefix $(FW)/morselib/src/umac/datapath/,umac_datapath.c umac_datapath_mesh.c datapath_defrag.c) \
+                $(addprefix $(FW)/morselib/src/common/,mmpkt.c mmpkt_list.c mac_address.c) \
+                $(addprefix $(FW)/morselib/src/umac/data/,umac_sta_data.c umac_data.c) \
+                $(addprefix $(FW)/morselib/src/umac/keys/,umac_keys.c connection_keys.c) \
+                $(addprefix $(FW)/morselib/src/umac/frames/,frame_constructor.c action.c probe_request.c \
+                  probe_response.c utils.c association.c authentication.c deauthentication.c disassociation.c) \
+                $(addprefix $(FW)/morselib/src/umac/ies/,ies_common.c s1g_capabilities.c) \
+                $(FW)/morselib/src/umac/supplicant_shim/ccmp.c $(FW)/morselib/src/umac/stats/umac_stats.c \
+                $(FW)/morselib/src/umac/regdb/umac_regdb.c
+# What it replaces: the chip, the RTOS, the radio stack below the mesh, and
+# the app-side storage that lives in main/at.c on the firmware.
+SIMNODE_FAKE = $(addprefix $(SIMNODE)/,fake_rtos.c fake_chip.c fake_config.c fake_app.c \
+                  fake_radio_stack.c warthog_globals.c simnode.c)
+SIMNODE_SRCS = $(SIMNODE_REAL) $(SIMNODE_FAKE)
+SIMNODE_HDRS = $(wildcard $(SIMNODE)/*.h) $(MESHHDRS)
+
 # The shipping mesh byte-layout code, compiled straight out of the vendored SDK.
 # These tests link the REAL firmware source, not a copy of it -- umac_mesh_ies.c
 # is deliberately freestanding (libc only) so it can be built here. `make
@@ -83,6 +123,22 @@ test_mesh_diag: test_mesh_diag.c $(MAINDIR)/mesh_diag.c
 # The simulator links every forwarding TU the firmware ships.
 sim_mesh: sim_mesh.c $(SDKMESH)/umac_mesh_fwd.c $(SDKMESH)/umac_mesh_hwmp_relay.c $(SDKMESH)/umac_mesh_ctrl.c $(SDKMESH)/umac_mesh_rmc.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHIES) $(MESHHDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
+
+# The generated files are checked in (so a plain `make` needs no python), but
+# regenerate them whenever their source of truth moves.
+$(SIMNODE)/warthog_globals.c: ../../../main/at.c $(SIMNODE)/gen_warthog_globals.py
+	@cd $(SIMNODE) && python3 gen_warthog_globals.py ../../../../main/at.c
+
+# Used by simnode/regen_stubs.sh, so the stub set is always computed against
+# the same source list this file compiles.
+.PHONY: simnode-srcs simnode-incs
+simnode-srcs:
+	@for f in $(SIMNODE_SRCS); do echo $$f; done
+simnode-incs:
+	@echo $(SIMNODE_INCS)
+
+test_simnode_smoke: $(SIMNODE)/test_simnode_smoke.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
 
 test_mesh_fwd: test_mesh_fwd.c $(SDKMESH)/umac_mesh_fwd.c $(SDKMESH)/umac_mesh_ctrl.c $(SDKMESH)/umac_mesh_rmc.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHIES) $(MESHHDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
