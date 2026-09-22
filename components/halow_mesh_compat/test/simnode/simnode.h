@@ -31,7 +31,13 @@ struct simnode_frame {
 
 /* ---- lifecycle -------------------------------------------------------- */
 
-/** Bring one node up with @p mac. Gates default off, as the firmware does. */
+/** Bring one node up with @p mac.
+ *
+ * The gates start where warthog_globals.c (generated from main/at.c) puts
+ * them, which is NOT all-off: mesh_secure defaults ON, as the shipped
+ * firmware does. Suites that call simnode_set_gates(..., secure=false) are
+ * choosing an open mesh, and the keyed path they skip -- per-peer key
+ * install, the Protected bit, the MGTK rules -- is then untested. */
 bool simnode_start(const uint8_t mac[6]);
 void simnode_stop(void);
 
@@ -68,6 +74,21 @@ void simnode_set_time_ms(uint32_t t);
 void simnode_advance_ms(uint32_t d);
 
 /* ---- observation ------------------------------------------------------ */
+
+/** An 802.3 frame the firmware delivered UP to the host netif, captured on the
+ *  real mmwlan_rx_cb_t the datapath calls. This is the only honest answer to
+ *  "did this node's application actually receive it", as opposed to "did a
+ *  frame arrive on the air". */
+struct simnode_hostrx {
+    uint8_t  da[6];
+    uint8_t  sa[6];
+    uint8_t  payload[256];
+    uint16_t len;
+};
+
+unsigned simnode_host_rx_count(void);
+const struct simnode_hostrx *simnode_host_rx_get(unsigned i);
+void simnode_host_rx_clear(void);
 
 unsigned simnode_outbox_count(void);
 unsigned simnode_outbox_dropped(void);

@@ -108,6 +108,33 @@ bool umac_interface_addr_matches_mac_addr(struct umac_sta_data *stad, const uint
  * harness has to have been "connected" enough to answer this. */
 static struct mmwlan_sta_args s_sta_args;
 
+/* ---- the mesh VIF ------------------------------------------------------
+ *
+ * Adding the interface is chip configuration, not radio-stack filler, so it
+ * is written out rather than generated. A generated stub returns success and
+ * leaves *vif_id untouched, which left umac_mesh.c's pre-seeded
+ * UMAC_INTERFACE_VIF_ID_INVALID (0xffff) in place: every mesh frame then went
+ * out tagged with the invalid sentinel while the datapath read 0 from
+ * umac_interface_get_vif_id, so data and management frames disagreed about
+ * the VIF they were on and no chipcfg assertion could catch a wrong one. */
+
+static bool s_vif_add_fails;
+
+/** Make the next interface add fail, for the "chip refused a mesh VIF"
+ *  branch -- the diagnostic umac_mesh.c keeps for a firmware image without
+ *  mesh support. */
+void simnode_fail_vif_add(bool fail) { s_vif_add_fails = fail; }
+
+enum mmwlan_status umac_interface_add(struct umac_data *umacd, enum umac_interface_type type,
+                                      const uint8_t *mac_addr, uint16_t *vif_id)
+{
+    (void)umacd; (void)type;
+    if (s_vif_add_fails) { return MMWLAN_ERROR; }
+    if (mac_addr != NULL) { simnode_set_identity(mac_addr, s_vif_id); }
+    if (vif_id != NULL) { *vif_id = s_vif_id; }
+    return MMWLAN_SUCCESS;
+}
+
 const struct mmwlan_sta_args *umac_connection_get_sta_args(struct umac_data *umacd)
 {
     (void)umacd;

@@ -16,6 +16,7 @@
 #include "umac/datapath/umac_datapath_private.h"
 #include "umac/mesh/umac_mesh.h"
 #include "umac/mesh/umac_mesh_fwd_glue.h"
+#include "umac/mesh/umac_mesh_ies.h"
 
 void simnode_set_identity(const uint8_t mac[6], uint16_t vif_id);
 
@@ -28,6 +29,42 @@ extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge,
 static struct umac_data *s_umacd;
 static uint8_t s_mac[6];
 static bool s_up;
+
+/* ---- the host netif, captured ------------------------------------------
+ *
+ * A real node has a network stack registered; without one the datapath drops
+ * every validated mesh frame one line before delivery ("No RX callback
+ * registered"). Registering the real callback is both more faithful and the
+ * only way to assert that a node's APPLICATION received something, rather
+ * than that bytes arrived on its air interface. */
+#define SIMNODE_HOSTRX_MAX 32u
+static struct simnode_hostrx s_hostrx[SIMNODE_HOSTRX_MAX];
+static unsigned s_hostrx_n;
+
+unsigned simnode_host_rx_count(void) { return s_hostrx_n; }
+void simnode_host_rx_clear(void) { s_hostrx_n = 0; }
+const struct simnode_hostrx *simnode_host_rx_get(unsigned i)
+{
+    return (i < s_hostrx_n) ? &s_hostrx[i] : NULL;
+}
+
+static void simnode_netif_rx_(uint8_t *header, unsigned header_len,
+                              uint8_t *payload, unsigned payload_len, void *arg)
+{
+    (void)arg;
+    if (s_hostrx_n >= SIMNODE_HOSTRX_MAX) { return; }
+    struct simnode_hostrx *e = &s_hostrx[s_hostrx_n++];
+    memset(e, 0, sizeof(*e));
+    if (header != NULL && header_len >= sizeof(struct umac_8023_hdr))
+    {
+        const struct umac_8023_hdr *h = (const struct umac_8023_hdr *)header;
+        memcpy(e->da, h->dest_addr, 6);
+        memcpy(e->sa, h->src_addr, 6);
+    }
+    unsigned n = (payload_len < sizeof(e->payload)) ? payload_len : (unsigned)sizeof(e->payload);
+    if (payload != NULL) { memcpy(e->payload, payload, n); }
+    e->len = (uint16_t)payload_len;
+}
 
 bool simnode_start(const uint8_t mac[6])
 {
@@ -50,6 +87,8 @@ bool simnode_start(const uint8_t mac[6])
      * forwarding glue's own init. */
     if (umac_mesh_enable_mesh(s_umacd, &args) != MMWLAN_SUCCESS) { return false; }
     umac_mesh_fwd_glue_init();
+    (void)umac_datapath_register_rx_cb(s_umacd, simnode_netif_rx_, NULL);
+    s_hostrx_n = 0;
     s_up = true;
     return true;
 }
@@ -68,9 +107,18 @@ void simnode_set_gates(bool fwd, bool bridge, bool grp_std, bool secure)
     g_warthog_mesh_bridge = bridge ? 1u : 0u;
     g_warthog_mesh_grp = grp_std ? 1u : 0u;
     g_warthog_mesh_secure = secure ? 1u : 0u;
-    /* The glue advertises the Forwarding capability from the gate, so it has
-     * to be re-read after a change, exactly as mmwlan_mesh_enable does. */
-    umac_mesh_fwd_glue_init();
+    /* Only the advertised capability is derived from a gate; everything else
+     * reads g_warthog_mesh_fwd live, every frame.
+     *
+     * Deliberately NOT umac_mesh_fwd_glue_init() here. On the device the AT
+     * commands only write NVS ("takes effect on next boot"), the gates load
+     * once at boot, and glue_init runs once after that -- so a device can
+     * never clear the duplicate ring, the two rate gates, the protection
+     * latch, the path table and the held-frame store by changing a gate. A
+     * harness that did would hide any bug where that state wrongly survives
+     * (or wrongly fails to survive), and would drop held packets without
+     * releasing them, corrupting the leak oracle. */
+    umac_mesh_ies_cap_forwarding = fwd ? 1u : 0u;
 }
 
 bool simnode_add_peer(const uint8_t mac[6])

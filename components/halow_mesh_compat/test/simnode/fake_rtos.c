@@ -59,8 +59,22 @@ void simnode_advance_ms(uint32_t d) { s_now_ms += d; }
 
 static unsigned s_live_allocs;
 
-void *mmosal_malloc_(size_t size) { void *p = malloc(size); if (p) { s_live_allocs++; } return p; }
-void *mmosal_calloc(size_t n, size_t size) { void *p = calloc(n, size); if (p) { s_live_allocs++; } return p; }
+/* Allocation failure on demand. The firmware's out-of-memory branches -- the
+ * relay's g_warthog_fwd_nomem, for one -- are otherwise unreachable from a
+ * test, because a host heap does not run out, and an assertion on a branch
+ * that never runs is worse than no assertion. Exactly ONE allocation fails per
+ * arming, so nothing else in the run is disturbed. */
+static bool s_fail_next_alloc;
+void simnode_fail_next_alloc(void) { s_fail_next_alloc = true; }
+static bool take_fail_(void)
+{
+    bool f = s_fail_next_alloc;
+    s_fail_next_alloc = false;
+    return f;
+}
+
+void *mmosal_malloc_(size_t size) { if (take_fail_()) { return NULL; } void *p = malloc(size); if (p) { s_live_allocs++; } return p; }
+void *mmosal_calloc(size_t n, size_t size) { if (take_fail_()) { return NULL; } void *p = calloc(n, size); if (p) { s_live_allocs++; } return p; }
 void mmosal_free(void *p) { if (p) { s_live_allocs--; free(p); } }
 /** Live allocations, so a test can assert the firmware leaks no packets. */
 unsigned simnode_live_allocs(void) { return s_live_allocs; }

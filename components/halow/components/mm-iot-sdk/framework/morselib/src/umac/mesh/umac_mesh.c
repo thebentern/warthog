@@ -687,6 +687,8 @@ enum mmwlan_status umac_mesh_disable_mesh(struct umac_data *umacd)
  *
  * Driven from the probe burst instead, which runs on every build and on
  * warthog's own clock rather than a peer's. */
+static void mpm_expire_stale_(uint32_t now_ms);
+
 void umac_mesh_service_tick(void)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid)
@@ -694,6 +696,13 @@ void umac_mesh_service_tick(void)
         return;
     }
     umac_datapath_mesh_service_rekey(); /* AT+REKEY=<n>, serviced here */
+
+    /* Expire dead peers on OUR clock. The only other caller runs when a
+     * neighbour transmits, which is the peer's clock -- and a peer going
+     * silent is exactly what this watchdog is for, so on a two-node mesh it
+     * never ran and the dead peer's stad, chip registration and key slot were
+     * held forever. */
+    mpm_expire_stale_(mmosal_get_time_ms());
 
     /* Frames held for discovery: released or dropped here too, so a peer that
      * never answers does not park TX buffers until the next HWMP frame. */
@@ -2052,6 +2061,7 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
          * the quiesce gate re-arms cleanly on the next ESTAB. */
         umac_datapath_mesh_del_peer(ta);
         mpm_table_release(&s_mpm, mpm_table_find(&s_mpm, ta));
+            mpm_publish_(NULL); /* every other teardown publishes; AT+MPMPEERS? went stale without this */
         g_warthog_mpm_our_llid = 0;
         g_warthog_mpm_our_plid = 0;
         g_warthog_mpm_estab = mpm_table_estab_count(&s_mpm);

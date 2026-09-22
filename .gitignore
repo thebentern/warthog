@@ -72,6 +72,10 @@ id_vm
 # Host-test build products (clang binaries + macOS debug bundles)
 components/halow_mesh_compat/test/*.dSYM/
 components/halow_mesh_compat/test/test_*
+# The simulator built as a shared object, plus the per-node copies the
+# multinode test loads (one file per node, for private statics).
+components/halow_mesh_compat/test/libsimnode*.dylib
+components/halow_mesh_compat/test/libsimnode*.so
 # ...but that pattern is for the COMPILED binaries. Test SOURCES live beside
 # them and must stay tracked -- without these negations a new test_*.c or
 # test_*.sh is silently untracked, and the existing ones only survive because

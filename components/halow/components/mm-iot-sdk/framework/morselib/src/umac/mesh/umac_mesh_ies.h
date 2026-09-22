@@ -114,7 +114,10 @@ uint16_t umac_mesh_ies_build_mpm_body(uint8_t *out, uint16_t out_len, uint8_t ac
                                       const uint8_t *extra_ies, uint16_t extra_ies_len);
 
 /** 802.11 reason code: no room for another peering. */
-#define UMAC_MESH_REASON_MAX_PEERS 52
+/* Linux: 52 is MESH-PEERING-CANCELLED, 53 is MESH-MAX-PEERS. Sending 52 for
+ * a full table tells the peer its request was cancelled, so it retries at
+ * once instead of backing off. */
+#define UMAC_MESH_REASON_MAX_PEERS 53
 
 /**
  * Read the sender's link id (first Peer Management IE link-id field).

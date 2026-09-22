@@ -768,6 +768,22 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             }
             g_warthog_rx_meshctrl_ae++;
         }
+        /* Forwarding off: the engine never runs, so nothing else compares the
+         * frame's mesh destination with our own address, and the 802.3 header
+         * below would be built from addr3 -- another node. A leaf that hands
+         * a third party's traffic to its IP stack is a leak, so drop it here. */
+        if (!g_warthog_mesh_fwd && !g_warthog_mesh_bridge &&
+            dot11_is_4addr_hdr(header->frame_control))
+        {
+            const uint8_t *mesh_da = dot11_get_da(header);
+            if (!mm_mac_addr_is_multicast(mesh_da) &&
+                !umac_interface_addr_matches_mac_addr(stad, mesh_da))
+            {
+                g_warthog_rxdrop_reason = 93; /* leaf: mesh DA is not us */
+                g_warthog_rxdrop_count++;
+                goto drop;
+            }
+        }
         /* Relay on: decide now, while the Mesh Control is still in place.
          * A frame the engine cannot parse falls through to the strip below
          * exactly as before, so the tolerant path is unchanged. */

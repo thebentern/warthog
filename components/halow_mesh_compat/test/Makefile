@@ -45,7 +45,7 @@ TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
 # the frame the firmware would have handed to the radio. It covers the glue,
 # which is the one mesh file no freestanding test can link.
 SIMNODE      := simnode
-SIMNODE_TESTS := test_simnode_smoke
+SIMNODE_TESTS := test_simnode_smoke test_simnode_peering test_simnode_datapath test_simnode_multinode test_simnode_glue
 # Appended after the fact: TESTS above is an immediate assignment, so a
 # reference to this from there would expand to nothing.
 TESTS += $(SIMNODE_TESTS)
@@ -69,6 +69,7 @@ SIMNODE_REAL = $(addprefix $(SDKMESH)/,umac_mesh.c umac_mesh_fwd_glue.c umac_mes
                   probe_response.c utils.c association.c authentication.c deauthentication.c disassociation.c) \
                 $(addprefix $(FW)/morselib/src/umac/ies/,ies_common.c s1g_capabilities.c) \
                 $(FW)/morselib/src/umac/supplicant_shim/ccmp.c $(FW)/morselib/src/umac/stats/umac_stats.c \
+                $(FW)/morselib/src/dot11/dot11_utils.c \
                 $(FW)/morselib/src/umac/regdb/umac_regdb.c
 # What it replaces: the chip, the RTOS, the radio stack below the mesh, and
 # the app-side storage that lives in main/at.c on the firmware.
@@ -138,6 +139,48 @@ simnode-incs:
 	@echo $(SIMNODE_INCS)
 
 test_simnode_smoke: $(SIMNODE)/test_simnode_smoke.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+
+test_simnode_peering: $(SIMNODE)/test_simnode_peering.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+
+# ---- several nodes in one process ---------------------------------------
+#
+# The SDK keeps its state in file-scope statics, so a second simnode_start()
+# in the same image would share one path table, one HWMP sequence number, one
+# peer list and one clock with the first. The whole simulator is therefore
+# built as ONE shared object and loaded N times from N DISTINCT FILES: the
+# loader gives each file its own copy of .data/.bss, so every node gets
+# private statics while libc stays shared. RTLD_LOCAL plus macOS's two-level
+# namespace (-Bsymbolic on ELF) is what keeps node B's calls bound to node B's
+# own code rather than to whichever copy loaded first.
+SIMNODE_NODES := 3
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+SIMNODE_SO      := .dylib
+SIMNODE_SOFLAGS := -dynamiclib -fPIC
+SIMNODE_DLLIBS  :=
+else
+SIMNODE_SO      := .so
+SIMNODE_SOFLAGS := -shared -fPIC -Wl,-Bsymbolic
+SIMNODE_DLLIBS  := -ldl
+endif
+
+test_simnode_multinode: $(SIMNODE)/test_simnode_multinode.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast \
+	  $(SIMNODE_SOFLAGS) $(SIMNODE_INCS) $(SIMNODE_SRCS) -o libsimnode$(SIMNODE_SO)
+	@i=0; while [ $$i -lt $(SIMNODE_NODES) ]; do \
+	  cp libsimnode$(SIMNODE_SO) libsimnode$$i$(SIMNODE_SO); i=$$((i+1)); done
+	$(CC) $(CFLAGS) $(SANFLAGS) -DSIMNODE_SO_SUFFIX='"$(SIMNODE_SO)"' \
+	  -DSIMNODE_NODES=$(SIMNODE_NODES) $(SIMNODE_INCS) $< -o $@ $(SIMNODE_DLLIBS)
+
+test_simnode_datapath: $(SIMNODE)/test_simnode_datapath.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+
+# The forwarding glue, end to end: held frames, the discovery retry, the
+# bounded pending queue, both rate gates, the queue cap and the peer-loss PERR
+# burst -- driven through the shipping umac_mesh_fwd_glue.c.
+test_simnode_glue: $(SIMNODE)/test_simnode_glue.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
 
 test_mesh_fwd: test_mesh_fwd.c $(SDKMESH)/umac_mesh_fwd.c $(SDKMESH)/umac_mesh_ctrl.c $(SDKMESH)/umac_mesh_rmc.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHIES) $(MESHHDRS)
@@ -233,5 +276,5 @@ linkcheck: linkcheck_main.c $(DOT11AH) $(COMPAT)
 	@echo "link OK: dot11ah layer is self-contained"
 
 clean:
-	rm -f $(TESTS) linkcheck_all
+	rm -f $(TESTS) linkcheck_all libsimnode*.dylib libsimnode*.so
 	rm -rf *.dSYM
