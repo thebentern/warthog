@@ -101,7 +101,13 @@ changes, all of it 802.11s as mac80211 does it:
   the path is installed, as mac80211 does, instead of being lost the way an
   unanswered ARP is. Held frames are released or dropped both when a
   path-selection frame arrives and on the 2 s service tick, so a peer that
-  never answers cannot park transmit buffers.
+  never answers cannot park transmit buffers, and a target still waiting has
+  its PREQ re-asked on that tick — one broadcast PREQ is unacknowledged, so
+  losing it must cost a delay rather than the frame. The store is deliberately
+  shallow (4 frames, 2 per destination, 3 s) against mac80211's 10 per path and
+  its four-step retry ladder: these are transmit-pool buffers shared with our
+  own traffic and with peering, and a burst opened before discovery completes
+  keeps its newest frames, not its oldest.
 - **Discovery is rate-limited.** A frame for a destination with no path
   triggers a PREQ and is dropped for the upper layer to retry, as an
   unanswered ARP already is; PREQs go out at most once per target per 500 ms
@@ -147,6 +153,39 @@ mac80211 receiver floods correctly, at the cost that under SAE they decrypt
 only with one peer or with host CCMP on the receivers. On an open mesh, use
 it.
 
+**Two deliberate deviations from mac80211, both on the wire.**
+
+- *Every PREQ we originate sets Target Only, including the first one.* Only
+  the target may answer, so a relay that already holds a path to it forwards
+  instead of replying and the discovery walks the full path and back.
+  mac80211 sets the bit on a path refresh — where we match it exactly — but
+  leaves it clear on an initial discovery, so an intermediate node may answer
+  in one hop. What we give up is that optimisation, not connectivity: the
+  target itself answers any PREQ naming it whatever the bit says, and relays
+  forward a Target Only PREQ unchanged. The path we install is then always the
+  target's own answer rather than a relay's cached idea of it, which is the
+  conservative reading. Changing it means changing frames that go on the air,
+  so it waits for a bench. (The per-target flags have exactly two bits, Target
+  Only and Unknown Sequence Number; "reply and forward" is a receive-side
+  notion in mac80211, not something an originator can set.)
+- *An `AT+MESHGRP=0` group replica teaches a Linux peer a proxy entry that is
+  not one.* The per-peer replica carries the real source in Address Extension
+  mode 2. For a frame the node originates itself that source is its own mesh
+  address, so the peer learns "this node is proxied behind itself"; for a
+  group frame we relay it is the *originator's* address, so the peer learns a
+  third mesh node as a host sitting behind us. Our own receive side refuses
+  both — a proxied address that is us, a peer, or a node we hold a path to is
+  never learned — but a mac80211 receiver has no such guard. The entry does no
+  harm until that peer's mesh path to the address lapses or is cleared by a
+  PERR: mac80211 then finds both a proxy entry and an inactive path for the
+  same address and deletes the path, losing its sequence number, metric and
+  retry state and cancelling any discovery in flight, so it starts over each
+  time the path ages out. Queued frames are not lost — mac80211 only queues
+  while a path is resolving, and that state suppresses the proxy lookup. This
+  is a second and independent reason to set `AT+MESHGRP=1` on any mesh with a
+  Linux node in it; warthog-to-warthog is unaffected. Traced through the 6.6
+  receive path, not measured.
+
 **Bridge mode implies the tables.** `AT+MESHBRIDGE=1` runs the same receive
 engine and path-selection handling in leaf mode even with forwarding off,
 because a bridge must learn which node each remote host sits behind and hold
@@ -158,7 +197,7 @@ mesh through the shipping code — carrying the **exact bytes the firmware
 emits**: the MAC header comes from the same `umac_mesh_fwd_tx_header()` the
 SDK builder calls, and the receive side parses it with
 `umac_mesh_fwd_parse_frame()` before the engine sees it. That binding found
-two firmware bugs a struct-based simulator had passed. Seventeen scenarios:
+two firmware bugs a struct-based simulator had passed. Eighteen scenarios:
 unicast through a relay exactly once; a flood reaching every node exactly
 once; a triangle and a ring under a 30-frame burst without a storm; hosts
 behind opposite ends reaching each other with their real addresses; a lost
@@ -170,8 +209,9 @@ modelled single chip group-key slot, standard group frames failing exactly
 where the measured hardware fails and recovering with host CCMP or with
 per-peer replicas; the first frame of a flow held through discovery and
 delivered on the PREP, a burst before the PREP bounded and rate-limited to
-one PREQ, an unreachable target's frame released after two seconds; and a
-ten-second flow over a five-second path lifetime losing nothing because the
+one PREQ, an unreachable target's frame released when it lapses, and a lost
+PREQ costing a delay rather than the held frame because the tick re-asks; and
+a ten-second flow over a five-second path lifetime losing nothing because the
 path is refreshed in use. What is **not** verified is the radio: whether the MM6108 hands up
 a 4-address frame whose mesh destination is a third party (`AT+RXCHAN?`
 `fwdcand`), and whether it transmits one whose addr4 is not its own. Both

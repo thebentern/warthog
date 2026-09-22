@@ -218,7 +218,11 @@ void umac_mesh_prot_latch_forget(struct umac_mesh_prot_latch *l, const uint8_t *
  * buffers shared with our own traffic and peering. */
 #define UMAC_MESH_PENDING_MAX 4u
 #define UMAC_MESH_PENDING_PER_TARGET 2u
-#define UMAC_MESH_PENDING_MS 2000u
+/* Longer than the 2 s service tick, so a held frame gets at least one retried
+ * PREQ before it lapses. mac80211 runs a 4-step retry ladder over several
+ * seconds behind a 10-deep queue; ours is shallower because these are TX-pool
+ * buffers shared with our own traffic and with peering. */
+#define UMAC_MESH_PENDING_MS 3000u
 struct umac_mesh_pending {
     struct { uint8_t target[6]; void *handle; uint32_t exp_ms; uint32_t order; bool used; } e[UMAC_MESH_PENDING_MAX];
     uint32_t order;
@@ -240,6 +244,14 @@ void *umac_mesh_pending_push(struct umac_mesh_pending *p, const uint8_t *target,
 uint32_t umac_mesh_pending_take(struct umac_mesh_pending *p, const struct umac_mesh_fwd_ctx *c,
                                 struct umac_mesh_pending_out *out, uint32_t max);
 uint32_t umac_mesh_pending_count(const struct umac_mesh_pending *p);
+
+/**
+ * The distinct targets still waiting on discovery, so the caller can re-ask.
+ * A single PREQ is broadcast and unacknowledged; without a retry a held frame
+ * whose PREQ was lost simply expires. @returns targets written to @p out.
+ */
+uint32_t umac_mesh_pending_targets(const struct umac_mesh_pending *p, uint32_t now_ms,
+                                   uint8_t (*out)[6], uint32_t max);
 
 /**
  * Originate a PREQ for @p target: the body, and the address it must be sent

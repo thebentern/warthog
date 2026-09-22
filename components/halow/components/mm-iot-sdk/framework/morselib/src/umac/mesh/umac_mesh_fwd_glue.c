@@ -342,6 +342,17 @@ static void flush_pending_(void)
         mmpkt_release(pkt);
         g_warthog_fwd_pend_drop++;
     }
+    /* Anything still waiting gets its PREQ re-asked: the first one is a single
+     * unacknowledged broadcast, so losing it must not cost the frame. The gate
+     * decides whether one actually goes out. */
+    uint8_t again[UMAC_MESH_PENDING_MAX][6];
+    lock_();
+    uint32_t m = umac_mesh_pending_targets(&s_pend, c.now_ms, again, UMAC_MESH_PENDING_MAX);
+    unlock_();
+    for (uint32_t i = 0; i < m; i++)
+    {
+        maybe_preq_(again[i]);
+    }
 }
 
 void umac_mesh_fwd_glue_tick(void)

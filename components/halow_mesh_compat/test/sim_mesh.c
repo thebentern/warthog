@@ -79,6 +79,7 @@ static struct {
     bool overflow;
     bool grp_std;             /* AT+MESHGRP=1: standard 3-address group frames */
     bool hold;                /* send() holds a routeless frame for discovery, as the firmware does */
+    int  drop_actions;        /* the air eats this many of the next action frames */
     /* Range is not peering: an attacker can be in range without a link. The
      * firmware takes data and path selection only from ESTAB peers. */
     bool estab[NMAX][NMAX];
@@ -174,6 +175,7 @@ static void emit_data(int from, const uint8_t *ra, const uint8_t *dst8023, const
 
 static void queue_action(int from, const uint8_t *ra, const uint8_t *body, uint16_t len)
 {
+    if (S.drop_actions > 0) { S.drop_actions--; return; } /* lost on the air */
     struct frame f; memset(&f, 0, sizeof(f));
     f.kind = F_ACTION; f.from = from; memcpy(f.ta, S.n[from].addr, 6); memcpy(f.ra, ra, 6);
     memcpy(f.body, body, len); f.body_len = len;
@@ -181,6 +183,7 @@ static void queue_action(int from, const uint8_t *ra, const uint8_t *body, uint1
 }
 
 static bool send(int i, const uint8_t *da, const uint8_t *sa, uint32_t payload);
+static void discover_gated(int i, const uint8_t *target);
 
 /* After every path-selection frame: held frames whose path now exists go out
  * through send() again, expired ones are dropped.
@@ -202,6 +205,10 @@ static void flush_pending(int me)
         else n->pend_drop++;
         p->used = false;
     }
+    /* Still waiting: re-ask, through the same gate the glue uses. */
+    uint8_t again[UMAC_MESH_PENDING_MAX][6];
+    uint32_t m = umac_mesh_pending_targets(&n->pend, S.now, again, UMAC_MESH_PENDING_MAX);
+    for (uint32_t i = 0; i < m; i++) discover_gated(me, again[i]);
 }
 
 /* One node receives one frame and acts on it. */
@@ -690,6 +697,20 @@ int main(void)
     CHECK(lost == 0, "10 frames over 10 s, %d lost (path lifetime %u ms)", lost, 5120u);
     CHECK(S.n[0].preq_sent >= 2 && S.n[0].preq_sent <= 4, "A refreshed the path before it lapsed: %u PREQs", S.n[0].preq_sent);
     CHECK(S.n[1].fwd_data == 10, "every frame went through W");
+
+    /* ================= 18. A lost PREQ costs a delay, not the frame ====== */
+    printf("--- scenario 18: the first PREQ is lost; the retry still delivers the held frame ---\n");
+    sim_reset(3, true); link(0, 1); link(1, 2); S.hold = true;
+    S.drop_actions = 1;   /* the air eats the next action frame */
+    CHECK(send(0, S.n[2].addr, S.n[0].addr, 18001), "A sends to B with no path: held");
+    CHECK(run(), "the PREQ is lost, so nothing comes back");
+    CHECK(delivered(2, 18001, NULL, NULL) == 0 && umac_mesh_pending_count(&S.n[0].pend) == 1, "B heard nothing; the frame is still held");
+    S.now += 2000;        /* the service tick */
+    flush_pending(0);
+    CHECK(S.n[0].preq_sent == 2, "the tick re-asked: a second PREQ went out (%u total)", S.n[0].preq_sent);
+    CHECK(run(), "which is answered");
+    CHECK(delivered(2, 18001, S.n[2].addr, S.n[0].addr) == 1, "and the held frame is delivered -- a lost PREQ cost a delay, not the frame");
+    CHECK(S.n[0].pend_drop == 0, "nothing was dropped");
 
     printf("\n%s\n", failures ? "SIMULATION FAILED" : "SIMULATION PASSED");
     return failures ? 1 : 0;

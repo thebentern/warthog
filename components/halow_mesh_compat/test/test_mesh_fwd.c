@@ -429,6 +429,21 @@ int main(void)
         k = umac_mesh_pending_take(&P, &c, out, UMAC_MESH_PENDING_MAX);
         CHECK(k == 1 && out[0].ok && memcmp(out[0].ra, B, 6) == 0, "a direct peer resolves at once");
         CHECK(umac_mesh_pending_push(NULL, C, &h[7], now) == &h[7], "NULL store hands the frame straight back");
+        /* The targets still waiting, so the caller can re-ask: distinct, and
+         * an expired entry is not worth another PREQ. */
+        umac_mesh_pending_init(&P);
+        uint8_t tg[UMAC_MESH_PENDING_MAX][6];
+        static const uint8_t D9[6] = { 0x02, 0xd9, 0, 0, 0, 1 };
+        (void)umac_mesh_pending_push(&P, C, &h[0], now);
+        (void)umac_mesh_pending_push(&P, C, &h[1], now);
+        (void)umac_mesh_pending_push(&P, D9, &h[2], now);
+        uint32_t m = umac_mesh_pending_targets(&P, now, tg, UMAC_MESH_PENDING_MAX);
+        CHECK(m == 2, "two frames for C and one for D report TWO targets, not three");
+        CHECK((memcmp(tg[0], C, 6) == 0 && memcmp(tg[1], D9, 6) == 0) ||
+              (memcmp(tg[1], C, 6) == 0 && memcmp(tg[0], D9, 6) == 0), "and they are C and D");
+        CHECK(umac_mesh_pending_targets(&P, now + UMAC_MESH_PENDING_MS, tg, UMAC_MESH_PENDING_MAX) == 0,
+              "nothing is re-asked once the frames have lapsed");
+        CHECK(umac_mesh_pending_targets(NULL, now, tg, UMAC_MESH_PENDING_MAX) == 0, "NULL store reports nothing");
         /* A frame held for a HOST address is released through the proxy entry
          * that arrives later: the next hop is the path to the node, not the host. */
         umac_mesh_pathtbl_init(&T);

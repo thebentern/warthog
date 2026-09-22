@@ -546,6 +546,24 @@ uint32_t umac_mesh_pending_take(struct umac_mesh_pending *p, const struct umac_m
     return n;
 }
 
+uint32_t umac_mesh_pending_targets(const struct umac_mesh_pending *p, uint32_t now_ms,
+                                   uint8_t (*out)[6], uint32_t max)
+{
+    uint32_t n = 0;
+    if (p == NULL || out == NULL) { return 0; }
+    for (uint32_t i = 0; i < UMAC_MESH_PENDING_MAX && n < max; i++)
+    {
+        if (!p->e[i].used || pend_past_(now_ms, p->e[i].exp_ms)) { continue; }
+        bool dup = false;
+        for (uint32_t k = 0; k < n; k++)
+        {
+            if (eq_(out[k], p->e[i].target)) { dup = true; break; }
+        }
+        if (!dup) { memcpy(out[n++], p->e[i].target, 6); }
+    }
+    return n;
+}
+
 uint32_t umac_mesh_pending_count(const struct umac_mesh_pending *p)
 {
     uint32_t n = 0;
