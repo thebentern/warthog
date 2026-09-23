@@ -119,6 +119,22 @@ enum mmwlan_status umac_keys_reinstall_keys(struct umac_sta_data *stad, uint16_t
     return MMWLAN_SUCCESS;
 }
 
+enum mmwlan_status umac_keys_reinstall_key(struct umac_sta_data *stad, uint16_t vif_id,
+                                           uint8_t key_id, uint64_t min_tx_seq)
+{
+    struct umac_keys_sta_data *sta_data = umac_sta_data_get_keys(stad);
+    if (key_id >= countof(sta_data->keys.keys) || sta_data->keys.keys[key_id] == NULL)
+    {
+        return MMWLAN_ERROR;
+    }
+    struct umac_key *key = sta_data->keys.keys[key_id];
+    if (key->tx_seq < min_tx_seq)
+    {
+        key->tx_seq = min_tx_seq;
+    }
+    return umac_keys_mmdrv_install_key(vif_id, umac_sta_data_get_aid(stad), key);
+}
+
 enum umac_key_type umac_keys_get_key_type(struct umac_sta_data *stad, uint8_t key_id)
 {
     struct umac_keys_sta_data *sta_data = umac_sta_data_get_keys(stad);

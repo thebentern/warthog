@@ -89,6 +89,22 @@ struct umac_mesh_fwd_rx_result {
     uint16_t perr_len;
 };
 
+/**
+ * Leaf mode (forwarding and bridge off): learn that host @p ext sits behind
+ * direct peer @p mesh_sa, with the same refusals the relay applies -- never us, a
+ * neighbour, a group address, or a node we hold a path to. A host behind a
+ * non-neighbour is not learned: a leaf has no path to address its replies.
+ */
+bool umac_mesh_fwd_learn_proxy(const struct umac_mesh_fwd_ctx *c, const uint8_t *ext,
+                               const uint8_t *mesh_sa);
+
+/**
+ * Leaf mode: the direct peer a learned host @p da sits behind. False for a
+ * group address, a peer, an unknown host, or one whose peer has since gone.
+ */
+bool umac_mesh_fwd_proxy_via_peer(const struct umac_mesh_fwd_ctx *c, const uint8_t *da,
+                                  uint8_t out[6]);
+
 void umac_mesh_fwd_rx(const struct umac_mesh_fwd_ctx *c, const struct umac_mesh_rx_frame *f,
                       struct umac_mesh_fwd_rx_result *r);
 

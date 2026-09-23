@@ -49,7 +49,11 @@ static inline void consbuf_append(struct consbuf *buf, const uint8_t *data, uint
     if (buf->buf != NULL)
     {
         MMOSAL_ASSERT(len <= buf->buf_size - buf->offset);
-        memcpy(buf->buf + buf->offset, data, len);
+        /* memcpy's source must be valid even for len 0; empty elements pass NULL. */
+        if (len != 0)
+        {
+            memcpy(buf->buf + buf->offset, data, len);
+        }
     }
 
     buf->offset += len;

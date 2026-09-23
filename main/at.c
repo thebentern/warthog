@@ -32,6 +32,7 @@
 #include "ping/ping_sock.h"
 #include "mmwlan_mesh.h"
 #include "mudp.h"
+#include "mesh_bridge.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "esp_timer.h"
@@ -424,6 +425,7 @@ volatile uint32_t g_warthog_swccmp_tx_fail = 0;
 volatile uint32_t g_warthog_swccmp_ok = 0;
 volatile uint32_t g_warthog_swccmp_micfail = 0;
 volatile uint32_t g_warthog_swccmp_nokey = 0;
+volatile uint32_t g_warthog_swccmp_grpkey = 0; /* unicast keyed with a group key: refused */
 volatile uint32_t g_warthog_swccmp_badhdr = 0;
 volatile uint32_t g_warthog_swccmp_short = 0;
 volatile uint32_t g_warthog_swccmp_last_keyid = 0;
@@ -986,8 +988,10 @@ static void cmd_meshcfg(void)
     snprintf(line, sizeof(line), "+MESHCFG: forwarding=%s routing=%s l2=%s multicast=%s batman=no\r\n",
              g_warthog_mesh_fwd ? "yes(802.11s)" : "no",
              g_warthog_mesh_fwd ? "hwmp" : "none",
-             g_warthog_mesh_bridge ? "bridge" : "no(NAT)",
-             g_warthog_mesh_fwd ? "relayed" : "no");
+             /* The live bridge, not the stored flag: a failed start falls back to NAT. */
+             warthog_mesh_bridge_active() ? "bridge"
+                 : (g_warthog_mesh_bridge ? "no(NAT;bridge-failed)" : "no(NAT)"),
+             warthog_mesh_bridge_active() ? "all(bridged)" : "meshtastic(239.0.0.69)");
     cdc_write(line);
     reply_ok();
 }
@@ -1337,8 +1341,8 @@ static void cmd_mudplast(void)
 /* AT+KEYFP? -- per-peer pairwise-key fingerprint. For a per-link key the two
  * ends of one link MUST print the same value; a mismatch means the derivation
  * is not symmetric and only the sender can decrypt. */
-/* AT+REKEY=<n> -- re-install peer n's pairwise key only. See
- * umac_datapath_mesh_rekey_peer(): this is the one-slot-vs-per-station probe. */
+/* AT+REKEY=<n> -- re-push peer n's own pairwise key (none on an open mesh). See
+ * umac_datapath_mesh_service_rekey(): the one-slot-vs-per-station probe. */
 /* AT+CRYPTOHOST=<0|1> ask the chip to stop decrypting in firmware (the
  * prerequisite for host software CCMP and therefore for per-link keys);
  * AT+CRYPTOHOST? read back what it holds. Serviced from the probe path within
@@ -2048,13 +2052,14 @@ static void dispatch(char *line)
                  g_warthog_host_ccmp_on ? "ON" : "OFF");
         cdc_write(b); reply_ok();
     } else if (strcasecmp(verb, "SWCCMP") == 0 && terminator == '?') {
-        char b[3*32 + 190]; int off = 0;
+        char b[3*32 + 222]; int off = 0;
         off += snprintf(b + off, sizeof(b) - off,
-                        "+SWCCMP: on=%lu tried=%lu ok=%lu micfail=%lu tx_ok=%lu tx_fail=%lu nokey=%lu badhdr=%lu short=%lu keyid=%lu aadlen=%lu aad=",
+                        "+SWCCMP: on=%lu tried=%lu ok=%lu micfail=%lu tx_ok=%lu tx_fail=%lu nokey=%lu grpkey=%lu badhdr=%lu short=%lu keyid=%lu aadlen=%lu aad=",
                         (unsigned long)g_warthog_host_ccmp_on, (unsigned long)g_warthog_swccmp_tried,
                         (unsigned long)g_warthog_swccmp_ok, (unsigned long)g_warthog_swccmp_micfail,
                         (unsigned long)g_warthog_swccmp_tx_ok, (unsigned long)g_warthog_swccmp_tx_fail,
-                        (unsigned long)g_warthog_swccmp_nokey, (unsigned long)g_warthog_swccmp_badhdr,
+                        (unsigned long)g_warthog_swccmp_nokey, (unsigned long)g_warthog_swccmp_grpkey,
+                        (unsigned long)g_warthog_swccmp_badhdr,
                         (unsigned long)g_warthog_swccmp_short, (unsigned long)g_warthog_swccmp_last_keyid,
                         (unsigned long)g_warthog_swccmp_last_aadlen);
         for (uint32_t i = 0; i < 32 && i < g_warthog_swccmp_last_aadlen && off < (int)sizeof(b) - 4; i++)

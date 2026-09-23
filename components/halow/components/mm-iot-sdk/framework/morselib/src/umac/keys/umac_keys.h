@@ -70,6 +70,11 @@ enum mmwlan_status umac_keys_uninstall_key(struct umac_sta_data *stad,
 
 enum mmwlan_status umac_keys_reinstall_keys(struct umac_sta_data *stad, uint16_t vif_id);
 
+/** Push one key already on the keychain to the chip again, its TX PN raised to at
+ *  least @p min_tx_seq; RX replay state is left untouched. */
+enum mmwlan_status umac_keys_reinstall_key(struct umac_sta_data *stad, uint16_t vif_id,
+                                           uint8_t key_id, uint64_t min_tx_seq);
+
 
 enum umac_key_type umac_keys_get_key_type(struct umac_sta_data *stad, uint8_t key_id);
 

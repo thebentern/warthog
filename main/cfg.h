@@ -76,14 +76,13 @@ esp_err_t warthog_cfg_set_mesh_enable(uint8_t enable);
 /* Mesh IP addressing: 1 = try DHCP first, 0 = go straight to the static
  * 10.77.<mac4>.<mac5>/16 fallback.
  *
- * An idiomatic OpenMANET node keeps its mesh interface enslaved to a bridge
- * (and to bat0) with a DHCP server on it. Self-assigning a 10.77 address made
- * that unreachable, which is why the setup guide used to tell operators to
- * un-enslave the peer's mesh interface -- dismantling their batman fabric to
- * talk to us. Taking a lease when one is offered removes that requirement.
+ * A bridged OpenMANET node (mesh interface in br-lan) serves DHCP on that
+ * bridge, so a lease puts us on its LAN with no change on the node. A
+ * wizard-configured node enslaves the interface to bat0 instead: no lease and
+ * no IP path, since batman-adv is not implemented here.
  *
- * The static fallback still applies on a mesh with no DHCP server, which is
- * every warthog-to-warthog mesh, so that path is unchanged. */
+ * The static fallback applies whenever no lease arrives, which includes every
+ * warthog-to-warthog mesh. */
 uint8_t   warthog_cfg_get_mesh_dhcp(void);
 esp_err_t warthog_cfg_set_mesh_dhcp(uint8_t on);
 
@@ -110,7 +109,9 @@ esp_err_t warthog_cfg_set_mesh_grp(uint8_t on);
  * An OpenMANET peer emits ieee80211w=2 and reports MFP: yes, and that is NOT a
  * reason to turn this on: such a peer reached ESTAB with a warthog that had it
  * off, because the framing follows our own RSN element. This is for a peer that
- * actually refuses unprotected peering. Not run on air. Next boot. */
+ * actually refuses unprotected peering. It only negotiates MFP: the mesh
+ * set_key drops non-CCMP keys, so no IGTK is installed and nothing enforces it.
+ * Not run on air. Next boot. */
 uint8_t   warthog_cfg_get_mesh_pmf(void);
 esp_err_t warthog_cfg_set_mesh_pmf(uint8_t on);
 

@@ -131,10 +131,30 @@ int mmdrv_start_beaconing_period(uint16_t vif_id, uint32_t host_timer_period_ms)
     return 0;
 }
 
+#define SIMNODE_KEYINST_MAX 32u
+static struct simnode_keyinst s_keyinst[SIMNODE_KEYINST_MAX];
+static unsigned s_keyinst_n;
+
+unsigned simnode_keyinst_count(void) { return s_keyinst_n; }
+const struct simnode_keyinst *simnode_keyinst_get(unsigned i)
+{
+    return (i < s_keyinst_n) ? &s_keyinst[i] : NULL;
+}
+void simnode_keyinst_clear(void) { s_keyinst_n = 0; }
+
 int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_conf)
 {
-    (void)vif_id; (void)aid; (void)key_conf;
     s_cfg.keys_installed++;
+    if (key_conf != NULL && s_keyinst_n < SIMNODE_KEYINST_MAX)
+    {
+        struct simnode_keyinst *k = &s_keyinst[s_keyinst_n++];
+        k->vif_id = vif_id;
+        k->aid = aid;
+        k->pairwise = key_conf->is_pairwise;
+        k->key_idx = key_conf->key_idx;
+        k->tx_pn = key_conf->tx_pn;
+        memcpy(k->key, key_conf->key, sizeof(k->key));
+    }
     return 0;
 }
 

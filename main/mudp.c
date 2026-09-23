@@ -4,16 +4,14 @@
  * Meshtastic's UDP transport is a multicast to 239.0.0.69:4403. lwIP does
  * not forward multicast between netifs (NAPT is unicast-only), so a
  * Meshtastic node on the Wi-Fi AP or USB side would never reach the HaLow
- * mesh, and vice versa. This is the bridge: one socket, joined to the group
- * on every netif that exists, and every datagram received on one netif is
- * re-sent to the group on each of the others.
- *
- * Which netif a datagram arrived on is classified by source subnet -- the
- * three netifs sit on disjoint /24 // /16 ranges (USB 192.168.4/24, AP
- * 192.168.5/24, HaLow 10.77/16). Datagrams whose source is one of our own
- * addresses are our own repeats and are dropped, which is what prevents a
- * loop; the netif that originated a datagram never receives it back from us
- * because it is excluded from the re-send set.
+ * mesh, and vice versa. This is the bridge: one socket per netif, bound to it
+ * with SO_BINDTODEVICE and joined to the group there, so lwIP hands a
+ * datagram only to the socket of the netif it arrived on and sends only out of
+ * the netif a socket is bound to. Every datagram received on one netif is
+ * re-sent to the group on each of the others. Arrival is never inferred from
+ * the source address, which cannot tell a mesh sender from a local one.
+ * Datagrams whose source is one of our own addresses are our own repeats and
+ * are dropped; the arrival netif is excluded from the re-send set.
  *
  * The HaLow netif only appears on the first mesh peering, so membership on
  * it is joined lazily from the same 2 s poll nat.c uses.
@@ -24,6 +22,7 @@
  */
 
 #include "mudp.h"
+#include "mudp_classify.h"
 #include "mesh_bridge.h"
 
 #include "esp_log.h"
@@ -43,15 +42,14 @@ static const char *TAG = "warthog.mudp";
 #define MUDP_MAX_PKT 1500
 
 /* Netif slots, in a fixed order so counters line up. */
-enum { NIF_USB = 0, NIF_AP, NIF_HALOW, NIF_COUNT };
+enum { NIF_USB = MUDP_NIF_USB, NIF_AP = MUDP_NIF_AP, NIF_HALOW = MUDP_NIF_HALOW,
+       NIF_COUNT = MUDP_NIF_COUNT };
 static const char *const k_ifkey[NIF_COUNT] = { "USB", "WIFI_AP_DEF", "WIFI_STA_DEF" };
 
-static struct {
-    uint32_t ip;      /* host order; 0 = netif not up / not joined */
-    uint32_t netmask; /* host order */
-} s_nif[NIF_COUNT];
+static struct mudp_nif s_nif[NIF_COUNT];
 
-static int s_sock = -1;
+static int s_sock[NIF_COUNT] = { -1, -1, -1 };
+static bool s_started;
 volatile uint32_t g_mudp_rx[NIF_COUNT], g_mudp_tx[NIF_COUNT];
 volatile uint32_t g_mudp_drop_self, g_mudp_drop_unknown, g_mudp_tx_err;
 /* Last datagram relayed FROM the HaLow mesh, for AT+MUDPLAST? -- lets a host
@@ -60,21 +58,68 @@ volatile uint32_t g_mudp_drop_self, g_mudp_drop_unknown, g_mudp_tx_err;
  * ECM links. */
 static uint8_t s_last_halow[256]; static uint16_t s_last_halow_len; static uint32_t s_last_halow_src;
 
-/* Join the group on a netif and record its address. Idempotent. */
+/* A UDP socket on MUDP_PORT that only receives from, and only sends out of, @p nif. */
+static int mudp_open_(esp_netif_t *nif)
+{
+    struct ifreq ifr = { 0 };
+    if (esp_netif_get_netif_impl_name(nif, ifr.ifr_name) != ESP_OK) {
+        return -1;
+    }
+    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s < 0) {
+        return -1;
+    }
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    uint8_t ttl = 64;
+    setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, 1);
+    /* No loopback: we must never receive our own repeats through lwIP. */
+    uint8_t loop = 0;
+    setsockopt(s, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, 1);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(MUDP_PORT),
+                             .sin_addr.s_addr = htonl(INADDR_ANY) };
+    if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0 ||
+        bind(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
+        ESP_LOGW(TAG, "socket on %s failed errno=%d", ifr.ifr_name, errno);
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+/* Open the netif's socket, join the group on it and record its address. Idempotent. */
 static void mudp_join_(int slot)
 {
     esp_netif_t *nif = esp_netif_get_handle_from_ifkey(k_ifkey[slot]);
     esp_netif_ip_info_t ip = { 0 };
-    if (nif == NULL || esp_netif_get_ip_info(nif, &ip) != ESP_OK || ip.ip.addr == 0) {
+    /* A netif lwIP never added (a softAP that failed to start) still reports its
+     * stored address, and its impl name would resolve to loopback. */
+    if (nif == NULL || !esp_netif_is_netif_up(nif) || esp_netif_get_ip_info(nif, &ip) != ESP_OK ||
+        ip.ip.addr == 0) {
         return;
     }
     if (s_nif[slot].ip == ntohl(ip.ip.addr)) {
         return; /* already joined on this address */
     }
-    struct ip_mreq m = { .imr_multiaddr.s_addr = inet_addr(MUDP_GROUP),
-                         .imr_interface.s_addr = ip.ip.addr };
-    if (setsockopt(s_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof(m)) < 0) {
-        ESP_LOGW(TAG, "join on %s (" IPSTR ") failed errno=%d", k_ifkey[slot], IP2STR(&ip.ip), errno);
+    if (s_sock[slot] < 0 && (s_sock[slot] = mudp_open_(nif)) < 0) {
+        return;
+    }
+    /* lwIP registers a membership before it joins and never releases it on a failed
+     * join, from a table shared by every socket: release the old address's on a change,
+     * and a failed join's own entry. */
+    struct ip_mreq m = { .imr_multiaddr.s_addr = inet_addr(MUDP_GROUP) };
+    if (s_nif[slot].ip != 0) {
+        m.imr_interface.s_addr = htonl(s_nif[slot].ip);
+        (void)setsockopt(s_sock[slot], IPPROTO_IP, IP_DROP_MEMBERSHIP, &m, sizeof(m));
+        s_nif[slot].ip = 0;
+    }
+    m.imr_interface.s_addr = ip.ip.addr;
+    if (setsockopt(s_sock[slot], IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof(m)) < 0) {
+        int e = errno;
+        if (e == EADDRNOTAVAIL) {
+            (void)setsockopt(s_sock[slot], IPPROTO_IP, IP_DROP_MEMBERSHIP, &m, sizeof(m));
+        }
+        ESP_LOGW(TAG, "join on %s (" IPSTR ") failed errno=%d", k_ifkey[slot], IP2STR(&ip.ip), e);
         return;
     }
     s_nif[slot].ip = ntohl(ip.ip.addr);
@@ -82,21 +127,24 @@ static void mudp_join_(int slot)
     ESP_LOGI(TAG, "joined %s:%u on %s " IPSTR, MUDP_GROUP, MUDP_PORT, k_ifkey[slot], IP2STR(&ip.ip));
 }
 
-/* Which netif did a datagram from `src` arrive on? -1 if it is one of our own
- * addresses (our own repeat) or matches no netif. */
-static int mudp_classify_(uint32_t src)
+/* Send to the group on every joined netif except @p skip. Returns how many took it. */
+static int mudp_send_others_(int skip, const uint8_t *data, size_t len)
 {
-    for (int i = 0; i < NIF_COUNT; i++) {
-        if (s_nif[i].ip != 0 && src == s_nif[i].ip) {
-            return -2; /* ours */
+    struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(MUDP_PORT),
+                               .sin_addr.s_addr = inet_addr(MUDP_GROUP) };
+    int sent = 0;
+    for (int out = 0; out < NIF_COUNT; out++) {
+        if (out == skip || s_sock[out] < 0 || s_nif[out].ip == 0) {
+            continue;
+        }
+        if (sendto(s_sock[out], data, len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+            g_mudp_tx_err++;
+        } else {
+            g_mudp_tx[out]++;
+            sent++;
         }
     }
-    for (int i = 0; i < NIF_COUNT; i++) {
-        if (s_nif[i].ip != 0 && (src & s_nif[i].netmask) == (s_nif[i].ip & s_nif[i].netmask)) {
-            return i;
-        }
-    }
-    return -1;
+    return sent;
 }
 
 static void mudp_task(void *arg)
@@ -115,44 +163,54 @@ static void mudp_task(void *arg)
             last_join = xTaskGetTickCount();
         }
 
-        struct sockaddr_in from;
-        socklen_t fl = sizeof(from);
-        int n = recvfrom(s_sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl);
-        if (n < 0) {
-            continue; /* SO_RCVTIMEO tick, or transient error */
+        fd_set rd;
+        FD_ZERO(&rd);
+        int maxfd = -1;
+        for (int i = 0; i < NIF_COUNT; i++) {
+            if (s_sock[i] >= 0) {
+                FD_SET(s_sock[i], &rd);
+                maxfd = s_sock[i] > maxfd ? s_sock[i] : maxfd;
+            }
         }
-
-        int in = mudp_classify_(ntohl(from.sin_addr.s_addr));
-        if (in == -2) {
-            g_mudp_drop_self++;
+        if (maxfd < 0) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        if (in < 0) {
-            g_mudp_drop_unknown++;
-            continue;
+        struct timeval tv = { .tv_sec = 1 };
+        int ready = select(maxfd + 1, &rd, NULL, NULL, &tv);
+        if (ready < 0) {
+            vTaskDelay(pdMS_TO_TICKS(100)); /* select allocates; never spin on its failure */
         }
-        g_mudp_rx[in]++;
-        if (in == NIF_HALOW) {
-            uint16_t k = n < (int)sizeof(s_last_halow) ? (uint16_t)n : (uint16_t)sizeof(s_last_halow);
-            memcpy(s_last_halow, buf, k); s_last_halow_len = k; s_last_halow_src = ntohl(from.sin_addr.s_addr);
+        if (ready <= 0) {
+            continue; /* 1 s tick for the lazy joins */
         }
 
-        /* Re-send to the group on every OTHER netif that is up. Flipping
-         * IP_MULTICAST_IF on one socket per send is race-free: this is the
-         * only task that touches the socket. */
-        struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(MUDP_PORT),
-                                   .sin_addr.s_addr = inet_addr(MUDP_GROUP) };
-        for (int out = 0; out < NIF_COUNT; out++) {
-            if (out == in || s_nif[out].ip == 0) {
+        for (int slot = 0; slot < NIF_COUNT; slot++) {
+            if (s_sock[slot] < 0 || !FD_ISSET(s_sock[slot], &rd)) {
                 continue;
             }
-            struct in_addr ifa = { .s_addr = htonl(s_nif[out].ip) };
-            setsockopt(s_sock, IPPROTO_IP, IP_MULTICAST_IF, &ifa, sizeof(ifa));
-            if (sendto(s_sock, buf, (size_t)n, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
-                g_mudp_tx_err++;
-            } else {
-                g_mudp_tx[out]++;
+            struct sockaddr_in from;
+            socklen_t fl = sizeof(from);
+            int n = recvfrom(s_sock[slot], buf, sizeof(buf), MSG_DONTWAIT,
+                             (struct sockaddr *)&from, &fl);
+            if (n < 0) {
+                continue;
             }
+            int in = mudp_classify(ntohl(from.sin_addr.s_addr), slot, s_nif);
+            if (in == MUDP_FROM_SELF) {
+                g_mudp_drop_self++;
+                continue;
+            }
+            if (in < 0) {
+                g_mudp_drop_unknown++;
+                continue;
+            }
+            g_mudp_rx[in]++;
+            if (in == NIF_HALOW) {
+                uint16_t k = n < (int)sizeof(s_last_halow) ? (uint16_t)n : (uint16_t)sizeof(s_last_halow);
+                memcpy(s_last_halow, buf, k); s_last_halow_len = k; s_last_halow_src = ntohl(from.sin_addr.s_addr);
+            }
+            (void)mudp_send_others_(in, buf, (size_t)n);
         }
     }
 }
@@ -163,38 +221,13 @@ esp_err_t warthog_mudp_start(void)
         ESP_LOGI(TAG, "bridge mode: L2 multicast crosses the bridge; repeater not started");
         return ESP_OK;
     }
-    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s < 0) {
-        ESP_LOGE(TAG, "socket failed errno=%d", errno);
-        return ESP_FAIL;
-    }
-    int one = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct timeval tv = { .tv_sec = 1 };
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    uint8_t ttl = 64;
-    setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, 1);
-    /* No loopback: we must never receive our own repeats through lwIP. This
-     * build compiles loopback out anyway; setting it is belt and braces. */
-    uint8_t loop = 0;
-    setsockopt(s, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, 1);
-
-    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(MUDP_PORT),
-                             .sin_addr.s_addr = htonl(INADDR_ANY) };
-    if (bind(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
-        ESP_LOGE(TAG, "bind failed errno=%d", errno);
-        close(s);
-        return ESP_FAIL;
-    }
-    s_sock = s;
-
+    /* Sockets open per netif, from the task's lazy joins. */
     BaseType_t ok = xTaskCreatePinnedToCore(mudp_task, "warthog_mudp", 4096, NULL,
                                             tskIDLE_PRIORITY + 2, NULL, 0);
     if (ok != pdPASS) {
-        close(s);
-        s_sock = -1;
         return ESP_ERR_NO_MEM;
     }
+    s_started = true;
     ESP_LOGI(TAG, "multicast repeater up on :%u", MUDP_PORT);
     return ESP_OK;
 }
@@ -236,24 +269,9 @@ int warthog_mudp_last_halow(char *buf, size_t len)
  * across several identical ECM subnets. */
 int warthog_mudp_inject_from_ap(const uint8_t *data, size_t len)
 {
-    if (s_sock < 0 || data == NULL) {
+    if (!s_started || data == NULL) {
         return -1;
     }
-    struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(MUDP_PORT),
-                               .sin_addr.s_addr = inet_addr(MUDP_GROUP) };
-    int sent = 0;
-    for (int out = 0; out < NIF_COUNT; out++) {
-        if (out == NIF_AP || s_nif[out].ip == 0) {
-            continue;
-        }
-        struct in_addr ifa = { .s_addr = htonl(s_nif[out].ip) };
-        setsockopt(s_sock, IPPROTO_IP, IP_MULTICAST_IF, &ifa, sizeof(ifa));
-        if (sendto(s_sock, data, len, 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0) {
-            g_mudp_tx[out]++; sent++;
-        } else {
-            g_mudp_tx_err++;
-        }
-    }
     g_mudp_rx[NIF_AP]++;
-    return sent;
+    return mudp_send_others_(NIF_AP, data, len);
 }

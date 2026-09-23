@@ -48,6 +48,14 @@ struct simnode_frame {
 bool simnode_start(const uint8_t mac[6]);
 void simnode_stop(void);
 
+/**
+ * Start as an SAE mesh node, as warthog-mesh-sae does (security_type
+ * MMWLAN_SAE). hostap is not linked, so no handshake runs: add peers with
+ * simnode_add_peer and key them with simnode_set_key, in the order hostap
+ * does -- our own MGTK first, at mesh start, before any peer exists.
+ */
+bool simnode_start_sae(const uint8_t mac[6]);
+
 /** The gates AT+MESHFWD / MESHBRIDGE / MESHGRP / MESHSEC set. */
 void simnode_set_gates(bool fwd, bool bridge, bool grp_std, bool secure);
 
@@ -57,6 +65,28 @@ void simnode_set_gates(bool fwd, bool bridge, bool grp_std, bool secure);
 bool simnode_add_peer(const uint8_t mac[6]);
 /** Drop a peer, as the peering watchdog does. */
 void simnode_del_peer(const uint8_t mac[6]);
+
+/**
+ * What hostap's set_key driver op delivers once AMPE completes: a peer's MTK
+ * (pairwise) or MGTK, or -- addressed to the broadcast address -- our own TX
+ * MGTK. Returns the mmwlan_status the datapath returned.
+ */
+int simnode_set_key(const uint8_t addr[6], const uint8_t key[16], uint8_t key_id, bool pairwise);
+
+/* ---- chip key installs ------------------------------------------------ */
+
+/** One INSTALL_KEY the firmware sent the chip. */
+struct simnode_keyinst {
+    uint16_t vif_id;
+    uint16_t aid;      /* 0 for the VIF-wide group slot */
+    bool     pairwise;
+    uint8_t  key_idx;
+    uint8_t  key[16];
+    uint64_t tx_pn;
+};
+unsigned simnode_keyinst_count(void);
+const struct simnode_keyinst *simnode_keyinst_get(unsigned i);
+void simnode_keyinst_clear(void);
 
 /* ---- driving ---------------------------------------------------------- */
 

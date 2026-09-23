@@ -1,10 +1,9 @@
 /*
  * warthog mesh-support fork -- umac datapath ops for 802.11s mesh mode.
  *
- * Mirrors umac_datapath_ap.c structurally, but every TX-side op is a safe
- * "no peer, no frame" stub: the chip polls for TX autonomously, and the AP
- * dequeue derefs an AP-STA struct that does not exist in mesh mode (that is
- * what crashed mesh boards before these ops existed).
+ * Mirrors umac_datapath_ap.c structurally, with a mesh peer table in place of
+ * the AP's STA list: the AP dequeue derefs an AP-STA struct that does not
+ * exist in mesh mode.
  *
  * The RX dispatch is the substantive part, and it owns two things the vendor
  * path cannot do:
@@ -18,9 +17,8 @@
  *     never reached in this build. Peering frames were arriving and being
  *     silently discarded.
  *
- * No peer table yet: the lookup ops return NULL and mmwlan_mesh_get_peer_count
- * stays 0, so exactly one peer per board is supported. 4-address mesh data
- * frames are not implemented.
+ * Peers live in a fixed table of MESH_MAX_PEERS. Data frames go out 4-address,
+ * or as 3-address group frames with AT+MESHGRP=1 (umac_mesh_fwd_tx_header).
  *
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
  */
@@ -90,7 +88,7 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
                                        struct umac_sta_data *stad,
                                        struct mmpktview *rxbufview)
 {
-    (void)stad;  /* No mesh peer table yet; stad is always NULL here */
+    (void)stad;  /* the established peer the frame came from, or NULL */
     const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
     uint16_t frame_control_le = header->frame_control;
 
@@ -269,10 +267,11 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
  * nothing useful while those return NULL. Give it a record and the vendor's
  * data path carries the frames.
  *
- * Small and fixed-size on purpose: MPM today holds a single link-id pair, so a
- * larger table would advertise capacity the peering layer cannot deliver. The
- * table is populated by umac_datapath_mesh_add_peer() when a peering reaches
- * ESTAB and emptied by umac_datapath_mesh_del_peer() on Close.
+ * Fixed-size: every established link takes a slot, so warthog's own MPM table
+ * (MPM_MAX_LINKS) must not exceed it, and past MESH_MAX_PEERS add_peer returns
+ * MMWLAN_UNAVAILABLE. The table is populated by umac_datapath_mesh_add_peer()
+ * when a peering reaches ESTAB and emptied by umac_datapath_mesh_del_peer() on
+ * Close.
  */
 #define MESH_MAX_PEERS 4
 
@@ -296,10 +295,10 @@ static struct umac_sta_data *mesh_find_peer_(const uint8_t *addr)
     return NULL;
 }
 
-/* Phase-1 shared keys. Every warthog node uses these; a per-pair SAE-derived
- * MTK replaces the pairwise one later. 16 bytes = CCMP-128. */
-/* NOT A SECRET. A counting sequence compiled into every warthog image, used as
- * both the pairwise and the group key when AT+MESHSEC=1.
+/* Phase-1 shared keys for a keyed non-SAE mesh (AT+MESHSEC=1). Under SAE the
+ * AMPE per-link MTK and the MGTKs are used instead. 16 bytes = CCMP-128. */
+/* NOT A SECRET. A counting sequence compiled into every warthog image: the
+ * pairwise key (k_mesh_p1_mgtk below is the group key) on a keyed non-SAE mesh.
  *
  * It exists so the data plane can be exercised with CCMP on, not to protect
  * anything: anyone with the firmware has it. It also means "keyed" only
@@ -308,11 +307,10 @@ static struct umac_sta_data *mesh_find_peer_(const uint8_t *addr)
  * 802.11s node) cannot decrypt a frame encrypted with it, and warthog cannot
  * decrypt theirs.
  *
- * Peering itself is unauthenticated regardless: main/mesh.c requests
- * MMWLAN_OPEN, so no SAE handshake runs at all. Real per-link keys need
- * SAE authentication plus AMPE key exchange; hostap's mesh_rsn.c is compiled
- * in but nothing in this port drives it. Until that exists, treat the mesh as
- * an untrusted transport and protect traffic above it. */
+ * Peering on such a mesh is unauthenticated: main/mesh.c requests MMWLAN_OPEN
+ * unless built with WARTHOG_MESH_SAE (warthog-mesh-sae), where SAE and AMPE
+ * (hostap's mesh_rsn.c) derive real per-link keys. Treat a non-SAE mesh as an
+ * untrusted transport and protect traffic above it. */
 static const uint8_t k_mesh_p1_mtk[UMAC_KEY_AES_128_LEN] = {
     0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
     0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
@@ -320,6 +318,38 @@ static const uint8_t k_mesh_p1_mtk[UMAC_KEY_AES_128_LEN] = {
 /* The group key goes into the chip once, VIF-wide. */
 static bool s_group_key_in_chip;
 static uint32_t s_mesh_key_epoch; /* bumps the TX PN forward on every key install */
+
+/* Our own TX MGTK under SAE. hostap delivers it once, at mesh start and before
+ * any peer exists, and this file only learns the mesh VIF from a peer -- so it
+ * waits here and goes into the chip with the first one. */
+static struct
+{
+    bool valid;
+    uint8_t id;
+    uint8_t key[UMAC_KEY_AES_128_LEN];
+} s_own_mgtk;
+
+static enum mmwlan_status mesh_install_own_mgtk_(uint16_t vif_id)
+{
+    struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = s_own_mgtk.id,
+                                 .length = UMAC_KEY_AES_128_LEN, .tx_pn = 0 };
+    memcpy(kc.key, s_own_mgtk.key, sizeof(s_own_mgtk.key));
+    if (mmdrv_install_key(vif_id, 0, &kc) != 0)
+    {
+        MMLOG_WRN("mesh: own MGTK chip install failed\n");
+        return MMWLAN_ERROR;
+    }
+    s_group_key_in_chip = true;
+    g_warthog_ampe_mgtk_installed++;
+    MMLOG_INF("mesh: own TX MGTK installed in chip group slot (key_id %u)\n",
+              (unsigned)s_own_mgtk.id);
+    return MMWLAN_SUCCESS;
+}
+
+int umac_datapath_mesh_own_group_key_id(void)
+{
+    return s_own_mgtk.valid ? (int)s_own_mgtk.id : -1;
+}
 
 static const uint8_t k_mesh_p1_mgtk[UMAC_KEY_AES_128_LEN] = {
     0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78,
@@ -511,6 +541,32 @@ static enum mmwlan_status umac_datapath_mesh_install_peer_keys(struct umac_sta_d
     return st;
 }
 
+/* Put a peer's own pairwise key back in the chip: its AMPE MTK under SAE, the
+ * constant on a keyed non-SAE mesh, nothing on an open one. True if one went in. */
+static bool mesh_restore_peer_key_(struct umac_sta_data *stad, uint16_t vif_id)
+{
+    if (umac_mesh_sae_active())
+    {
+#ifndef WARTHOG_MESH_AMPE_NO_CHIP_KEY
+        /* An unkeyed candidate has no MTK yet. The chip's PN counter is shared by
+         * every link, so the reinstall starts a fresh epoch, never below it. */
+        int kid = umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE);
+        if (kid >= 0)
+        {
+            s_mesh_key_epoch++;
+            return umac_keys_reinstall_key(stad, vif_id, (uint8_t)kid,
+                                           (uint64_t)s_mesh_key_epoch << 20) == MMWLAN_SUCCESS;
+        }
+#endif
+        return false;
+    }
+    if (g_warthog_mesh_secure)
+    {
+        return umac_datapath_mesh_install_peer_keys(stad, vif_id) == MMWLAN_SUCCESS;
+    }
+    return false;
+}
+
 enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t vif_id,
                                                const uint8_t *own_addr,
                                                const uint8_t *peer_addr, bool sae)
@@ -567,16 +623,11 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
     umac_sta_data_set_vif_id(stad, vif_id);
     umac_sta_data_set_bssid(stad, own_addr);
     umac_sta_data_set_peer_addr(stad, peer_addr);
-    /* KEYED, never open. Measured on hardware: with MMWLAN_OPEN every data
-     * frame we send is ACKed by the peer's chip (txst acked=137 noack=0) and
-     * NEVER delivered to its host (rx_data=0) -- the MM6108 firmware will not
-     * deliver unprotected data on a mesh vif, only management. Ruled out by
-     * A/B before landing here: 4-addr vs 3-addr, chip STA registration (accepted),
-     * BSSID filter (wildcard made no difference). The known-working ESP32 mesh
-     * port is a keyed mesh for exactly this reason (its authors call the
-     * behaviour a "delivery gate" and route around it with keys).
+    /* Keyed when AT+MESHSEC=1 (the default) on a non-SAE mesh, open when
+     * AT+MESHSEC=0. Open data is delivered as long as it carries a Mesh Control
+     * field (umac_datapath_process_tx_frame adds one to every mesh frame).
      *
-     * So: mark the stad as secured (this makes the TX path set Protected +
+     * Keyed: mark the stad as secured (this makes the TX path set Protected +
      * HW_ENC and pick a key) and install a pairwise + group key on it. The
      * chip encrypts on TX and decrypts+delivers on RX; the vendor RX path
      * already strips the CCMP header and replay-checks against the stad key.
@@ -612,14 +663,12 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
     umac_sta_data_set_aid(stad, aid);
     mesh_chip_register_sta_(vif_id, aid, peer_addr);
 
-    /* Keys. For now, a fixed shared MTK (pairwise, key 0) and MGTK (group,
-     * key 1), identical on every node -- the same "static/shared" phase the
-     * reference port shipped before SAE. Installed on the PEER's stad, so
-     * they are keyed to the peer's AID: that is how the chip selects the key
-     * for frames to/from that station. Group key also goes on AID 0 (the
-     * chip's "no station" slot) so our own broadcast TX has a key.
-     * Deriving per-pair keys from SAE is the follow-up; the install mechanics
-     * are unchanged by it. */
+    /* Keys on a keyed non-SAE mesh: a fixed shared MTK (pairwise, key 0) and
+     * MGTK (group, key 1), identical on every node -- the same "static/shared"
+     * phase the reference port shipped before SAE. The MTK goes on the PEER's
+     * stad, keyed to the peer's AID: that is how the chip selects the key for
+     * frames to/from that station. The MGTK goes to the chip once, on AID 0
+     * (the chip's "no station" slot), so our own broadcast TX has a key. */
     /* NOT under SAE. The hardcoded MTK/MGTK below is a shared constant with no
      * secrecy value (it is in this source file); installing it on a SAE link
      * would overwrite the AMPE-derived per-link key that .set_key installs a
@@ -629,6 +678,11 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
         umac_datapath_mesh_install_peer_keys(stad, vif_id) != MMWLAN_SUCCESS)
     {
         g_warthog_mesh_key_fail++;
+    }
+    /* Our own TX MGTK arrived at mesh start, before this VIF had a peer. */
+    if (sae && s_own_mgtk.valid && !s_group_key_in_chip)
+    {
+        (void)mesh_install_own_mgtk_(vif_id);
     }
 
     s_peers[slot] = stad;
@@ -644,12 +698,11 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
  *
  *  - the pairwise TX packet number must only ever move FORWARD across
  *    installs, or existing peers reject our frames as replays; and
- *  - the group key is a VIF-wide resource and must go to the chip exactly
- *    once, at aid 0, while every peer keeps a host-keychain copy for the
- *    per-sender replay check.
+ *  - the chip has one VIF-wide group slot (aid 0). It holds our own TX MGTK;
+ *    each peer's MGTK stays in that peer's host keychain.
  *
- * @param peer_addr  peer the key belongs to; for a group key, any established
- *                   peer (the chip slot is VIF-wide).
+ * @param peer_addr  the peer the key belongs to, or the broadcast address for
+ *                   our own TX MGTK.
  * @param pairwise   true for the MTK, false for the MGTK.
  */
 enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, const uint8_t *key,
@@ -663,32 +716,19 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
      * peer lookup below would reject it and leave our broadcasts keyed wrong. */
     if (!pairwise && (peer_addr[0] & 0x01) != 0)
     {
-        struct umac_sta_data *any = NULL;
+        s_own_mgtk.valid = true;
+        s_own_mgtk.id = key_id;
+        memcpy(s_own_mgtk.key, key, key_len);
+        s_group_key_in_chip = false;
         for (int i = 0; i < MESH_MAX_PEERS; i++)
         {
             if (s_peers[i] != NULL)
             {
-                any = s_peers[i];
-                break;
+                return mesh_install_own_mgtk_(umac_sta_data_get_vif_id(s_peers[i]));
             }
         }
-        if (any == NULL)
-        {
-            MMLOG_WRN("mesh: own MGTK arrived before any peer; deferring\n");
-            return MMWLAN_ERROR;
-        }
-        struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = key_id,
-                                     .length = key_len, .tx_pn = 0 };
-        memcpy(kc.key, key, key_len);
-        if (mmdrv_install_key(umac_sta_data_get_vif_id(any), 0, &kc) != 0)
-        {
-            MMLOG_WRN("mesh: own MGTK chip install failed\n");
-            return MMWLAN_ERROR;
-        }
-        s_group_key_in_chip = true;
-        g_warthog_ampe_mgtk_installed++;
-        MMLOG_INF("mesh: own TX MGTK installed in chip group slot (key_id %u)\n",
-                  (unsigned)key_id);
+        /* hostap's normal order: the mesh starts before any peer does. */
+        MMLOG_INF("mesh: own TX MGTK stored; it goes into the chip with the first peer\n");
         return MMWLAN_SUCCESS;
     }
 
@@ -822,7 +862,7 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
              * with no restore, the surviving peers stopped receiving entirely
              * -- sender enq=4/drv_ok=4, receiver rx_data=0 with rxdrop=0, i.e.
              * discarded by the chip before it ever reached the host. Put every
-             * survivor back: station state first, then the key. */
+             * survivor back: station state first, then its key if the link is keyed. */
             for (int j = 0; j < MESH_MAX_PEERS; j++)
             {
                 if (s_peers[j] == NULL)
@@ -832,7 +872,7 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
                 uint8_t survivor[MMWLAN_MAC_ADDR_LEN];
                 umac_sta_data_get_peer_addr(s_peers[j], survivor);
                 mesh_chip_register_sta_(vif_id, umac_sta_data_get_aid(s_peers[j]), survivor);
-                (void)umac_datapath_mesh_install_peer_keys(s_peers[j], vif_id);
+                (void)mesh_restore_peer_key_(s_peers[j], vif_id);
             }
         }
     }
@@ -857,15 +897,11 @@ static struct umac_sta_data *mesh_lookup_stad_by_peer_addr(struct umac_data *uma
 
 /* TX destination -> next hop.
  *
- * Unicast to a known peer: that peer. Anything else -- broadcast, multicast,
- * or a unicast we have no route for -- goes to the FIRST peer as a
- * "default gateway". That is what makes IP over this link work today: ARP,
- * DHCP, mDNS and Meshtastic's UDP multicast are all group-addressed, and with
- * a two-node link the only place they can usefully go is the other node.
- *
- * This is deliberately NOT mesh forwarding / HWMP path selection. With one
- * peer there is nothing to select; a multi-hop mesh needs a real path table
- * here, and that is the next layer up. */
+ * Unicast to a known peer: that peer. With AT+MESHFWD or AT+MESHBRIDGE on, any
+ * other unicast takes its HWMP path's next hop, or is dropped until one exists.
+ * In leaf mode a host learned behind a peer (Address Extension) goes to that
+ * peer. Group frames, and a leaf's other unicast, go to the FIRST peer;
+ * mesh_enqueue_tx_frame decides how a group frame reaches the rest. */
 static struct umac_sta_data *mesh_lookup_stad_by_tx_dest_addr(struct umac_data *umacd,
                                                               const uint8_t *dest_addr)
 {
@@ -881,6 +917,7 @@ static struct umac_sta_data *mesh_lookup_stad_by_tx_dest_addr(struct umac_data *
     {
         extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge;
         extern bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6]);
+        extern bool umac_mesh_fwd_glue_proxy_via_peer(const uint8_t *da, uint8_t out[6]);
         if (g_warthog_mesh_fwd || g_warthog_mesh_bridge)
         {
             uint8_t nh[6];
@@ -891,6 +928,15 @@ static struct umac_sta_data *mesh_lookup_stad_by_tx_dest_addr(struct umac_data *
             if (!mm_mac_addr_is_multicast(dest_addr))
             {
                 return NULL;
+            }
+        }
+        else
+        {
+            /* Leaf mode: a learned host behind a peer goes to that peer. */
+            uint8_t via[6];
+            if (umac_mesh_fwd_glue_proxy_via_peer(dest_addr, via))
+            {
+                return mesh_find_peer_(via);
             }
         }
     }
@@ -947,7 +993,8 @@ static void mesh_queue_one_(struct umac_data *umacd, struct umac_sta_data *stad,
     g_warthog_tx_data_enq++;
 }
 
-/* Group-addressed traffic is REPLICATED as unicast, one copy per peer.
+/* By default (AT+MESHGRP=0) group-addressed traffic is REPLICATED as unicast,
+ * one copy per peer.
  *
  * The obvious implementation -- one real 802.11 group frame, encrypted with a
  * group key -- does not survive this chip once there is more than one peer.
@@ -993,11 +1040,9 @@ static void mesh_queue_one_(struct umac_data *umacd, struct umac_sta_data *stad,
  * real group frame. Emitting standard group frames before step one trades a
  * path measured to work for one that is merely argued to.
  *
- * Emitting them also needs more than a key: a standard 802.11s group frame is
- * 3-address (umac_mesh_ies_build_data_hdr3_group, which has no callers yet)
- * plus a Mesh Control field, where this path emits a fixed-length 4-address
- * header and no Mesh Control. That is a variable-length TX header, not a
- * flag. */
+ * AT+MESHGRP=1 sends the standard shape instead: one 3-address group frame
+ * (umac_mesh_ies_build_data_hdr3_group, via umac_mesh_fwd_tx_header) with a
+ * Mesh Control field, under the group key when keyed (our own MGTK under SAE). */
 static void mesh_enqueue_tx_frame(struct umac_data *umacd,
                                   struct umac_sta_data *stad,
                                   struct mmpkt *txbuf)
@@ -1107,14 +1152,15 @@ static bool mesh_dequeue_tx_frame(struct umac_data *umacd,
  *   addr4 = SA   original source (the 802.3 src)
  * For a single hop RA==DA and TA==SA, but the fields are still all four --
  * that is what lets a receiver's dot11_get_da()/dot11_get_sa_data() recover
- * the 802.3 header, and what a future forwarding node needs to relay without
+ * the 802.3 header, and what a forwarding node needs to relay without
  * losing the endpoints. The vendor RX path is already 4-address aware
  * (dot11_is_4addr_hdr / dot11_get_sa_data read addr4), so nothing changes on
  * receive.
  *
  * The Mesh Control field (s9.2.4.7.3) is NOT built here: the generic TX
- * path in umac_datapath.c prepends a 6-byte one (flags 0, TTL, seq) for
- * every mesh-mode frame, and the RX side strips it. This builder is the MAC
+ * path in umac_datapath.c prepends one to every mesh-mode frame -- 6 bytes
+ * (flags 0, TTL, seq), or a relayed or proxied frame's own, with Address
+ * Extension -- and the RX side strips it. This builder is the MAC
  * header only.
  */
 static const struct mmdrv_tx_metadata *s_cur_tx_md;
@@ -1136,7 +1182,7 @@ static void mesh_construct_80211_data_header(struct umac_sta_data *stad,
     uint8_t ra[6], hdr[UMAC_MESH_DATA_HDR4_LEN];
     umac_sta_data_get_peer_addr(stad, ra); /* next hop = the peer */
 
-    /* A group-addressed frame reaches here once per peer (see
+    /* With AT+MESHGRP=0 a group-addressed frame reaches here once per peer (see
      * mesh_enqueue_tx_frame). Address each replica TO that peer -- RA and DA
      * both the peer -- so it is an ordinary unicast on air and is protected
      * with the pairwise key, the only crypto path this chip handles across
@@ -1234,14 +1280,9 @@ void umac_datapath_configure_mesh_mode(struct umac_data *umacd)
     MMLOG_INF("Datapath configured for mesh mode\n");
 }
 
-/* Re-install peer @p idx's pairwise key, and nothing else.
- *
- * The decisive probe for "does this chip key per station, or per VIF?": with
- * distinct per-link keys, re-install one peer's key and see whether that
- * link starts working while the OTHER link stops. If connectivity follows the
- * most recent install, there is one slot; if both links keep working, keys are
- * per-station and SAE/AMPE is reachable. Returns the peer's AID, or -1.
- */
+/* AT+REKEY=<n>: re-push peer slot n's own pairwise key (mesh_restore_peer_key_)
+ * and publish its AID, or 0xffffffff when no key went in. The one-slot probe:
+ * whichever link the chip decrypts afterwards follows the last install. */
 void umac_datapath_mesh_service_rekey(void)
 {
     /* Serviced from the probe path rather than called from main: morselib is a
@@ -1271,7 +1312,11 @@ void umac_datapath_mesh_service_rekey(void)
         return;
     }
     uint16_t vif_id = umac_sta_data_get_vif_id(s_peers[idx]);
-    (void)umac_datapath_mesh_install_peer_keys(s_peers[idx], vif_id);
+    if (!mesh_restore_peer_key_(s_peers[idx], vif_id))
+    {
+        g_warthog_rekey_aid = 0xffffffffu; /* unkeyed, open, or a no-chip-key build */
+        return;
+    }
     g_warthog_rekey_aid = umac_sta_data_get_aid(s_peers[idx]);
     g_warthog_rekey_done++;
 }

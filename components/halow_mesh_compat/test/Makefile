@@ -35,7 +35,7 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
            ../src/dot11ah/debug.c
 
 TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
-           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd sim_mesh
+           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mudp_classify test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd sim_mesh
 
 # ---- simnode: the real stack with only the chip and the RTOS replaced ----
 #
@@ -45,7 +45,7 @@ TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
 # the frame the firmware would have handed to the radio. It covers the glue,
 # which is the one mesh file no freestanding test can link.
 SIMNODE      := simnode
-SIMNODE_TESTS := test_simnode_smoke test_simnode_peering test_simnode_datapath test_simnode_multinode test_simnode_glue
+SIMNODE_TESTS := test_simnode_smoke test_simnode_peering test_simnode_datapath test_simnode_multinode test_simnode_glue test_simnode_keys test_simnode_keys_nochip
 # Appended after the fact: TESTS above is an immediate assignment, so a
 # reference to this from there would expand to nothing.
 TESTS += $(SIMNODE_TESTS)
@@ -104,10 +104,8 @@ region:
 	@echo "=== regulatory region mapping ==="
 	@sh ./test_region_map.sh
 
-# umac_mesh_fwd_glue.c cannot be linked on the host -- it needs mmosal, mmpkt,
-# mmdrv and the datapath. Its decisions live in the engine, which IS tested;
-# what is left in the glue is locking and call ordering, and those are checked
-# structurally here rather than not at all.
+# Locking and call ordering in umac_mesh_fwd_glue.c, checked structurally: the
+# simnode tests link and drive the glue (SIMNODE_REAL) but cannot observe either.
 glueguard:
 	@echo "=== forwarding glue invariants ==="
 	@sh ./test_glue_guard.sh
@@ -120,6 +118,9 @@ glueguard:
 MAINDIR := ../../../main
 test_mesh_diag: test_mesh_diag.c $(MAINDIR)/mesh_diag.c
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $^ -o $@
+
+test_mudp_classify: test_mudp_classify.c $(MAINDIR)/mudp_classify.c $(MAINDIR)/mudp_classify.h
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $(filter %.c,$^) -o $@
 
 # The simulator links every forwarding TU the firmware ships.
 sim_mesh: sim_mesh.c $(SDKMESH)/umac_mesh_fwd.c $(SDKMESH)/umac_mesh_hwmp_relay.c $(SDKMESH)/umac_mesh_ctrl.c $(SDKMESH)/umac_mesh_rmc.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHIES) $(MESHHDRS)
@@ -183,6 +184,15 @@ test_simnode_datapath: $(SIMNODE)/test_simnode_datapath.c $(SIMNODE_SRCS) $(SIMN
 test_simnode_glue: $(SIMNODE)/test_simnode_glue.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
 
+# The SAE key lifecycle: our own MGTK, which key a broadcast uses, and what a
+# surviving link keeps when a peer goes -- read off the fake chip's INSTALL_KEY log.
+test_simnode_keys: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+
+# The same file on the warthog-mesh-sae-nochipkey/-swccmp key path: AMPE keys stay host-only.
+test_simnode_keys_nochip: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+
 test_mesh_fwd: test_mesh_fwd.c $(SDKMESH)/umac_mesh_fwd.c $(SDKMESH)/umac_mesh_ctrl.c $(SDKMESH)/umac_mesh_rmc.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHIES) $(MESHHDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
@@ -243,6 +253,7 @@ freestanding:
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_ccmp_hdr.c && echo "ok   umac_mesh_ccmp_hdr.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_hwmp.c && echo "ok   umac_mesh_hwmp.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/mesh_diag.c && echo "ok   mesh_diag.c is freestanding"
+	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/mudp_classify.c && echo "ok   mudp_classify.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_ctrl.c && echo "ok   umac_mesh_ctrl.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_rmc.c && echo "ok   umac_mesh_rmc.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_pathtbl.c && echo "ok   umac_mesh_pathtbl.c is freestanding"

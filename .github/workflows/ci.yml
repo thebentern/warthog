@@ -56,11 +56,20 @@ jobs:
         # WARTHOG_REGION_XX define and the BCF/country pick that drives.
         run: pio run -e warthog-us
 
-      # The mesh env is a different set of sources (probe responder, MPM,
-      # datapath ops) behind WARTHOG_MESH_SMOKE, so warthog-us compiles none of
-      # it. Without this, nothing in CI ever type-checks the mesh code.
+      # warthog-us compiles the mesh sources too (mesh is a runtime switch). This
+      # env adds the code behind its own flags: the RX tap, the build-time
+      # channel pin and the USB devloop helpers.
       - name: Smoke build (warthog-mesh-smoke)
         run: pio run -e warthog-mesh-smoke
+
+      # WARTHOG_MESH_SAE, which starts the mesh with SAE/AMPE, is set only in the
+      # mesh-sae envs, and release.yml ships this one.
+      - name: Smoke build (warthog-mesh-sae)
+        run: pio run -e warthog-mesh-sae
+
+      # Host software CCMP (WARTHOG_MESH_HOST_CCMP) is compiled only in the swccmp envs.
+      - name: Smoke build (warthog-mesh-sae-swccmp)
+        run: pio run -e warthog-mesh-sae-swccmp
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

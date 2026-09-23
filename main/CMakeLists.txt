@@ -9,6 +9,7 @@ idf_component_register(
         "wifi_ap.c"
         "nat.c"
         "mudp.c"
+        "mudp_classify.c"
         "led.c"
         "cfg.c"
         "at.c"

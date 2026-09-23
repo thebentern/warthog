@@ -543,18 +543,9 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
     MMLOG_INF("mesh: MESH_CONFIG(START) accepted LAST (after BSSID/BSS_CONFIG/"
               "beacon-engine) — firmware TBTT scan ~2s, then beacon IRQs\n");
 
-    /* install mesh-aware datapath ops. This unblocks the
-     * RX filter (data->ops != NULL gate) so the chip's delivered frames
-     * actually reach umac_datapath_process_rx_mgmt_frame → action-frame
-     * switch → SELF_PROTECTED case → supplicant → mesh_mpm. The TX-side
-     * ops (dequeue/enqueue/lookup) are safe stubs that return "no peer,
-     * no frame" so the chip's autonomous TX poll exits cleanly instead
-     * of crashing on a NULL AP-STA deref (which is what umac_ap_* did).
-     *
-     * See umac_datapath_mesh.c for the per-function rationale. The empty-
-     * peer-table case is correct today (mmwlan_mesh_get_peer_count == 0);
-     * when we wire a real peer table the lookup functions get real impls
-     * but the ops table shape stays the same. */
+    /* Already installed right after ADD_INTERFACE above; re-asserting is
+     * idempotent. The ops (umac_datapath_mesh.c) carry the peer table, the
+     * per-peer TX queues and the mesh management dispatch. */
     umac_datapath_configure_mesh_mode(umacd);
     MMLOG_INF("mesh: datapath ops set to mesh — RX filter will now pass frames\n");
 

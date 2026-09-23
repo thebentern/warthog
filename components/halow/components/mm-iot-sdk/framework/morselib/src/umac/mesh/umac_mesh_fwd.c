@@ -32,6 +32,36 @@ static bool proxy_ok_(const struct umac_mesh_fwd_ctx *c, const uint8_t *ext)
     return umac_mesh_path_lookup(c->tbl, ext, c->now_ms) == NULL;
 }
 
+bool umac_mesh_fwd_learn_proxy(const struct umac_mesh_fwd_ctx *c, const uint8_t *ext,
+                               const uint8_t *mesh_sa)
+{
+    /* Only behind a direct peer: nothing else can be answered, and it would hold a slot. */
+    if (c == NULL || c->tbl == NULL || c->own_addr == NULL || c->is_peer == NULL ||
+        ext == NULL || mesh_sa == NULL || !c->is_peer(mesh_sa, c->is_peer_arg) ||
+        !proxy_ok_(c, ext))
+    {
+        return false;
+    }
+    return umac_mesh_proxy_learn(c->tbl, ext, mesh_sa, c->now_ms);
+}
+
+bool umac_mesh_fwd_proxy_via_peer(const struct umac_mesh_fwd_ctx *c, const uint8_t *da,
+                                  uint8_t out[6])
+{
+    if (c == NULL || c->tbl == NULL || c->is_peer == NULL || da == NULL || out == NULL ||
+        is_group_(da) || c->is_peer(da, c->is_peer_arg))
+    {
+        return false;
+    }
+    const uint8_t *proxy = umac_mesh_proxy_lookup(c->tbl, da, c->now_ms);
+    if (proxy == NULL || !c->is_peer(proxy, c->is_peer_arg))
+    {
+        return false;
+    }
+    memcpy(out, proxy, 6);
+    return true;
+}
+
 void umac_mesh_fwd_rx(const struct umac_mesh_fwd_ctx *c, const struct umac_mesh_rx_frame *f,
                       struct umac_mesh_fwd_rx_result *r)
 {

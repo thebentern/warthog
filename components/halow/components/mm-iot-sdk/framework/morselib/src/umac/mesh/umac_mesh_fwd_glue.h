@@ -61,6 +61,11 @@ uint32_t umac_mesh_fwd_glue_next_seq(void);
 /** Next hop for a non-neighbour destination into @p out; false = none (a PREQ was sent). */
 bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6]);
 
+/** Leaf mode: learn a host behind a peer, and find the peer a learned host is
+ *  behind. Neither path-selects nor relays; see umac_mesh_fwd_learn_proxy. */
+void umac_mesh_fwd_glue_learn_proxy(const uint8_t *ext, const uint8_t *mesh_sa);
+bool umac_mesh_fwd_glue_proxy_via_peer(const uint8_t *da, uint8_t out[6]);
+
 /** HWMP action body received; carries out what the relay engine decides. */
 void umac_mesh_fwd_glue_hwmp_rx(const uint8_t *body, uint16_t len, const uint8_t *ta,
                                 uint32_t *own_sn, bool is_protected, bool is_group_addressed);

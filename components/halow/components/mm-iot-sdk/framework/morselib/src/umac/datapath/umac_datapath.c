@@ -649,7 +649,10 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     }
 
 
-    if ((umac_sta_data_get_security_type(stad) != MMWLAN_OPEN) &&
+    /* Under SAE every data frame is protected, and a candidate AMPE has not keyed
+     * is still OPEN: its cleartext must not be delivered, learned from or relayed. */
+    if ((umac_sta_data_get_security_type(stad) != MMWLAN_OPEN ||
+         (data->ops == &datapath_ops_mesh && umac_mesh_sae_active())) &&
         !dot11_frame_control_get_protected(header->frame_control) &&
         !umac_datapath_is_eapol_frame(rxbufview))
     {
@@ -693,6 +696,15 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
                 else                       { g_warthog_nodec_uni_n++; }
             }
             { g_warthog_rxdrop_reason = 4; g_warthog_rxdrop_count++; goto drop; }
+        }
+
+        /* Under SAE the chip's only group key is our own TX MGTK, which no peer sends
+         * under; a group frame it decrypted is forged in the TA's name. */
+        if ((rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED) &&
+            data->ops == &datapath_ops_mesh && umac_mesh_sae_active() &&
+            mm_mac_addr_is_multicast(dot11_get_ra(header)))
+        {
+            g_warthog_rxdrop_reason = 95; g_warthog_rxdrop_count++; goto drop;
         }
 
         uint8_t *ccmp_header = mmpkt_remove_from_start(rxbufview, DOT11_CCMP_HEADER_LEN);
@@ -785,6 +797,12 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
                 g_warthog_rxdrop_count++;
                 goto drop;
             }
+        }
+        /* Leaf mode learns hosts behind a peer too: without that, a reply to one
+         * goes out with the host as mesh DA, which no mesh node accepts. */
+        if (!g_warthog_mesh_fwd && !g_warthog_mesh_bridge && have_ae_sa)
+        {
+            umac_mesh_fwd_glue_learn_proxy(ae_sa, dot11_get_sa_data(data_hdr));
         }
         /* Relay on: decide now, while the Mesh Control is still in place.
          * A frame the engine cannot parse falls through to the strip below
@@ -2156,6 +2174,7 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
     int key_id = -1;
     int key_len = 0;
     int ccmp_len = 0;
+    bool own_group = false;
     uint32_t rts_threshold = 0;
     bool rts_required = false;
     struct dot11_qos_ctrl qos_ctrl = {};
@@ -2208,14 +2227,27 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 
     MMOSAL_DEV_ASSERT(is_eapol || enc == ENCRYPTION_ENABLED);
 
-    if (umac_sta_data_get_security_type(stad) != MMWLAN_OPEN && enc != ENCRYPTION_DISABLED)
+    const bool mesh_sae = data->ops == &datapath_ops_mesh && umac_mesh_sae_active();
+    /* Under SAE our broadcasts go out under our own MGTK, whatever peer carries them. */
+    own_group = is_multicast && mesh_sae;
+    if (mesh_sae && !own_group && umac_sta_data_get_security_type(stad) == MMWLAN_OPEN &&
+        enc != ENCRYPTION_DISABLED)
+    {
+        /* An SAE candidate AMPE has not keyed yet: nothing goes to it in the clear. */
+        g_warthog_tx_nokey++;
+        status = MMWLAN_ERROR;
+        goto error;
+    }
+    if ((own_group || umac_sta_data_get_security_type(stad) != MMWLAN_OPEN) &&
+        enc != ENCRYPTION_DISABLED)
     {
         enum umac_key_type key_type = is_multicast ? UMAC_KEY_TYPE_GROUP : UMAC_KEY_TYPE_PAIRWISE;
 
-        key_id = umac_keys_get_active_key_id(stad, key_type);
+        key_id = own_group ? umac_datapath_mesh_own_group_key_id()
+                           : umac_keys_get_active_key_id(stad, key_type);
         if (key_id >= 0)
         {
-            key_len = umac_keys_get_key_len(stad, key_id);
+            key_len = own_group ? UMAC_KEY_AES_128_LEN : umac_keys_get_key_len(stad, key_id);
             header->frame_control |= htole16(DOT11_MASK_FC_PROTECTED);
             g_warthog_tx_protected++;
             g_warthog_tx_last_key = (uint32_t)key_id;
@@ -2298,7 +2330,7 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
      * rather than an insert into the middle of the buffer. The chip holds one
      * pairwise key while AMPE gives every link its own, so on a mesh with more
      * than one peer the chip cannot be the one doing this. */
-    if (data->ops == &datapath_ops_mesh && key_id >= 0 && stad != NULL)
+    if (data->ops == &datapath_ops_mesh && key_id >= 0 && stad != NULL && !own_group)
     {
         extern bool umac_mesh_tx_host_ccmp(struct umac_sta_data *stad, uint8_t key_id,
                                            const uint8_t *mac_hdr, const uint8_t *qos,
@@ -2326,7 +2358,11 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
         {
             tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
         }
-        umac_keys_increment_tx_seq(stad, key_id);
+        /* The chip counts our own group key's PN; the peer's keychain has no say. */
+        if (!own_group)
+        {
+            umac_keys_increment_tx_seq(stad, key_id);
+        }
     }
 
     tx_metadata->key_idx = key_id;
@@ -2481,9 +2517,16 @@ enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
     /* Locally originated: no sidecar unless the classifier sets one. Alloc
      * does not promise zeroed metadata, so clear it here every time. */
     memset(&tx_metadata->mesh, 0, sizeof(tx_metadata->mesh));
-    if (data->ops == &datapath_ops_mesh && (g_warthog_mesh_fwd || g_warthog_mesh_bridge))
+    if (data->ops == &datapath_ops_mesh)
     {
-        umac_mesh_fwd_glue_tx_classify(txbuf, header_8023->dest_addr, header_8023->src_addr);
+        uint8_t via[6];
+        /* Leaf mode shapes only a unicast to a learned host behind a peer;
+         * broadcasts and everything else keep the measured leaf shape. */
+        if (g_warthog_mesh_fwd || g_warthog_mesh_bridge ||
+            umac_mesh_fwd_glue_proxy_via_peer(header_8023->dest_addr, via))
+        {
+            umac_mesh_fwd_glue_tx_classify(txbuf, header_8023->dest_addr, header_8023->src_addr);
+        }
     }
 
     if (is_eapol && !data->ops->is_stad_tx_paused(stad))

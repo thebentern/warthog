@@ -360,6 +360,23 @@ void umac_mesh_fwd_glue_tick(void)
     flush_pending_();
 }
 
+void umac_mesh_fwd_glue_learn_proxy(const uint8_t *ext, const uint8_t *mesh_sa)
+{
+    struct umac_mesh_fwd_ctx c = fctx_();
+    lock_();
+    (void)umac_mesh_fwd_learn_proxy(&c, ext, mesh_sa);
+    unlock_();
+}
+
+bool umac_mesh_fwd_glue_proxy_via_peer(const uint8_t *da, uint8_t out[6])
+{
+    struct umac_mesh_fwd_ctx c = fctx_();
+    lock_();
+    bool ok = umac_mesh_fwd_proxy_via_peer(&c, da, out);
+    unlock_();
+    return ok;
+}
+
 bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6])
 {
     struct umac_mesh_fwd_ctx c = fctx_();
@@ -392,7 +409,9 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
     umac_mesh_fwd_tx(&c, da, sa, seq, &t);
     unlock_();
     struct mmdrv_tx_metadata *md = mmdrv_get_tx_metadata(txbuf);
-    if (t.need_path || t.refresh)
+    /* A leaf reaches here only for a learned proxied host; if its peer went since
+     * the gate, it still must not originate a PREQ. */
+    if ((t.need_path || t.refresh) && (g_warthog_mesh_fwd || g_warthog_mesh_bridge))
     {
         maybe_preq_(t.path_target);
     }

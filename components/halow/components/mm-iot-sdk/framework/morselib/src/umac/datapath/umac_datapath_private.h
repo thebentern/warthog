@@ -88,4 +88,6 @@ struct mmdrv_tx_metadata;
 void umac_datapath_mesh_set_cur_tx_md(const struct mmdrv_tx_metadata *md);
 const struct mmdrv_tx_metadata *umac_datapath_mesh_cur_tx_md(void);
 struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr);
+/** Key id of our own TX MGTK once hostap has delivered it, else -1. */
+int umac_datapath_mesh_own_group_key_id(void);
 struct umac_sta_data *umac_datapath_mesh_first_peer_except(const uint8_t *excl);

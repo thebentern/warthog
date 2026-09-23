@@ -66,7 +66,24 @@ static void simnode_netif_rx_(uint8_t *header, unsigned header_len,
     e->len = (uint16_t)payload_len;
 }
 
+static bool simnode_start_(const uint8_t mac[6], bool sae);
+
 bool simnode_start(const uint8_t mac[6])
+{
+    return simnode_start_(mac, false);
+}
+
+bool simnode_start_sae(const uint8_t mac[6])
+{
+    return simnode_start_(mac, true);
+}
+
+int simnode_set_key(const uint8_t addr[6], const uint8_t key[16], uint8_t key_id, bool pairwise)
+{
+    return (int)umac_datapath_mesh_set_peer_key(addr, key, 16, key_id, pairwise);
+}
+
+static bool simnode_start_(const uint8_t mac[6], bool sae)
 {
     if (s_up) { simnode_stop(); }
     memcpy(s_mac, mac, 6);
@@ -79,7 +96,12 @@ bool simnode_start(const uint8_t mac[6])
     memset(&args, 0, sizeof(args));
     memcpy(args.mesh_id, "simnode", 7);
     args.mesh_id_len = 7;
-    args.security_type = MMWLAN_OPEN;
+    args.security_type = sae ? MMWLAN_SAE : MMWLAN_OPEN;
+    if (sae)
+    {
+        memcpy(args.passphrase, "simnode-pass", 12);
+        args.passphrase_len = 12;
+    }
     args.max_peers = 4;
     args.beacon_interval_tu = 100;
 

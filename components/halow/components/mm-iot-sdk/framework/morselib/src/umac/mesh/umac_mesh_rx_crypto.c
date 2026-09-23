@@ -23,6 +23,7 @@
 #include "umac/keys/umac_keys.h"
 #include "umac/keys/connection_keys.h"
 #include "dot11/dot11.h"
+#include "dot11/dot11_frames.h"
 #include "mmpkt.h"
 #include <string.h>
 
@@ -36,6 +37,7 @@ extern volatile uint32_t g_warthog_host_ccmp_on;
 extern volatile uint32_t g_warthog_swccmp_ok;
 extern volatile uint32_t g_warthog_swccmp_micfail;
 extern volatile uint32_t g_warthog_swccmp_nokey;
+extern volatile uint32_t g_warthog_swccmp_grpkey;
 extern volatile uint32_t g_warthog_swccmp_badhdr;
 extern volatile uint32_t g_warthog_swccmp_short;
 extern volatile uint32_t g_warthog_swccmp_tried;
@@ -106,6 +108,16 @@ bool umac_mesh_rx_host_ccmp(struct umac_sta_data *stad, const struct dot11_hdr *
         return false;
     }
 
+    /* Individually addressed means pairwise. Every member of the mesh holds a
+     * peer's MGTK, so a unicast keyed with it could have been forged by any of
+     * them in that peer's name. */
+    if ((header->addr1[0] & 0x01u) == 0u &&
+        umac_keys_get_key_type(stad, key_id) != UMAC_KEY_TYPE_PAIRWISE)
+    {
+        g_warthog_swccmp_grpkey++;
+        return false;
+    }
+
     uint8_t aad[UMAC_CCMP_AAD_MAXLEN];
     uint8_t nonce[13];
     uint32_t aad_len = umac_ccmp_build_aad((const uint8_t *)header, aad);
@@ -154,8 +166,9 @@ extern volatile uint32_t g_warthog_swccmp_tx_fail;
  * 4-address frame, which is exactly a 30-byte MAC header followed by the
  * 2-byte QoS Control.
  *
- * @param stad     the peer this frame is addressed to -- mesh replicates group
- *                 frames per peer, so every frame here is pairwise.
+ * @param stad     the peer this frame is addressed to. The caller hands frames
+ *                 under our own MGTK (standard group frames under SAE) to the
+ *                 chip instead, so the key here is the link's pairwise one.
  * @param key_id   the key to encrypt under.
  * @param mac_hdr  the 30-byte 4-address header about to be prepended.
  * @param qos      the 2-byte QoS Control about to be prepended.

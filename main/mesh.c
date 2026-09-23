@@ -108,10 +108,10 @@ static void mesh_report_unpeered(unsigned int peers)
  *
  * In STA mode this happens through mmhalow_link_state() when the chip reports
  * MMWLAN_LINK_UP; mesh has no such event, so it is done here on the first
- * ESTAB. Static addressing, 10.77.0.0/16 with the host part taken from the
- * low two octets of the HaLow MAC, so two boards never collide and there is
- * no DHCP to run over a link that has no server. That is enough for IP,
- * ARP, and UDP multicast -- which is what a Meshtastic UDP transport needs. */
+ * ESTAB. DHCP first when AT+MESHDHCP=1 (the default); otherwise, or with no
+ * lease, a static 10.77.0.0/16 address with the host part taken from the low
+ * two octets of the HaLow MAC, so two boards never collide. That is enough for
+ * IP, ARP, and UDP multicast -- which is what a Meshtastic UDP transport needs. */
 extern volatile uint32_t g_warthog_mpm_estab;
 extern volatile unsigned int g_warthog_hostap_estab;
 /* Long enough for a bridged peer's dnsmasq to answer, short enough not to
@@ -138,11 +138,9 @@ static void mesh_netif_up_(void)
      * ESTAB mid-wait does not start a parallel bring-up. */
     s_mesh_netif_up = true;
 
-    /* An idiomatic OpenMANET node leaves its mesh interface enslaved to a
-     * bridge that has a DHCP server on it. Taking a lease there is what lets
-     * a Warthog join without the operator un-enslaving that interface (and
-     * with it, their batman fabric). No server answers on a warthog-only
-     * mesh, so the static fallback below still covers that case. */
+    /* A bridged OpenMANET node (mesh iface in br-lan) serves DHCP on the bridge;
+     * a lease joins its LAN. A wizard node's iface is a bat0 port and gives none
+     * (no batman-adv here). Without a lease the static address below is used. */
     if (warthog_cfg_get_mesh_dhcp()) {
         esp_netif_action_connected(netif, NULL, 0, NULL);
         if (esp_netif_dhcpc_start(netif) == ESP_OK) {
@@ -384,9 +382,9 @@ void warthog_mesh_smoke_test(void)
     g_warthog_mesh_pmf = warthog_cfg_get_mesh_pmf();
 #if WARTHOG_MESH_SAE && !defined(WARTHOG_MESH_HOST_CCMP)
     if (g_warthog_mesh_grp) {
-        ESP_LOGE(TAG, "mesh: standard group frames under SAE with chip crypto: a peer's chip "
-                      "holds ONE group key, so with more than one peer these will not decrypt "
-                      "(measured). This is the A/B, not a fix.");
+        ESP_LOGE(TAG, "mesh: standard group frames under SAE with chip crypto: sent under our "
+                      "own MGTK, which a Linux peer decrypts but another warthog's chip cannot; "
+                      "receiving any peer's group frames needs host CCMP (swccmp build).");
     }
 #endif
     /* The gates are read by mmwlan_mesh_enable(), which initialises the

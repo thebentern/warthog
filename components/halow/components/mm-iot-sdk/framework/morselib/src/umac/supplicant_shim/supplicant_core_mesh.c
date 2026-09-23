@@ -218,6 +218,11 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
     }
     ifmsh->mconf = mconf;
 
+    /* hostap's MPM sets the Open/Confirm forwarding bit from this (mesh_mpm.c);
+     * match our beacons (umac_mesh_ies.c) rather than its default of 1. */
+    extern volatile uint32_t g_warthog_mesh_fwd;
+    mconf->mesh_fwding = g_warthog_mesh_fwd ? 1 : 0;
+
     /* Management frame protection, pinned rather than inherited.
      *
      * This decides the size of the AMPE payload, and both ends of a link have

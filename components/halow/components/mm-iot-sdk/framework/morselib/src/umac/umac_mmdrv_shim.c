@@ -119,6 +119,14 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
         MMOSAL_ASSERT(false);
     }
 
+    /* Nothing below re-adds a mesh VIF, its stations or their keys, so a mesh
+     * node would carry on looking up while hearing nothing. Restart instead. */
+    if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH) != UMAC_INTERFACE_VIF_ID_INVALID)
+    {
+        MMLOG_ERR("Unable to recover from hardware restart with mesh interface active\n");
+        MMOSAL_ASSERT(false);
+    }
+
     if (umac_interface_is_active(umacd))
     {
         const char *country_code = umac_regdb_get_country_code(umacd);

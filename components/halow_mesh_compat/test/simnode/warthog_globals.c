@@ -62,6 +62,7 @@ volatile uint32_t g_warthog_swccmp_tx_fail = 0;
 volatile uint32_t g_warthog_swccmp_ok = 0;
 volatile uint32_t g_warthog_swccmp_micfail = 0;
 volatile uint32_t g_warthog_swccmp_nokey = 0;
+volatile uint32_t g_warthog_swccmp_grpkey = 0;
 volatile uint32_t g_warthog_swccmp_badhdr = 0;
 volatile uint32_t g_warthog_swccmp_short = 0;
 volatile uint32_t g_warthog_swccmp_last_keyid = 0;
