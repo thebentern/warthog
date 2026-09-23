@@ -331,18 +331,47 @@ driver release these nodes run is not established):
   10 s. It is not a password or crypto rejection. After four, the peer is
   blocked for `mesh_max_inactivity` (300 s by default).
 
-So both sides know each other and SAE still times out. Why is open. The
-candidates are an interaction between two simultaneous initiators (or
-anti-clogging) and asymmetric frame loss — both radios report millions of PHY
-signal-field failures in `morse_cli -i wlh0 stats`. A `wpa_supplicant -dd`
-trace on both nodes across one cycle is what separates them. Ruled out by
-measurement: a cold reboot, restoring a disabled `mesh11sd`, and matching the
-one mesh parameter that differed (`mesh_rssi_threshold`, `-80` vs `0`).
+So both sides know each other and SAE still times out. Why is open, and the
+stuck state could not be produced on demand. From a healthy start, with debug
+logging on both nodes, every kind of drop recovered by itself:
 
-Separately, an **established** link that goes idle is torn down about 300 s
-after it came up — the same supplicant inactivity limit — while a link carrying
-traffic held for 19 minutes. Keep traffic flowing during any test that needs
-the link to stay up.
+| Drop | Recovered in | How |
+|---|---|---|
+| Clean close, keys cached both sides | ~1 s | SAE skipped: both reuse the cached key (PMKSA caching) |
+| Clean close, one side's cache flushed | <10 s | The cached side cancels caching when the peer starts SAE |
+| Clean close, both caches flushed | <10 s | Full SAE |
+| Graceful reboot of one node | ~20 s | It sends Close frames on the way down |
+| One node's supplicant killed (a crash) | ~50 s | Almost all rediscovery; the survivor, still holding the old link, tears it down itself when the restarted node's SAE Commit arrives |
+| No traffic for 12 min | never dropped | At 300 s idle the peer is polled; answered, the link stays |
+
+Rebooting **both** nodes together cleared a stuck pair within 37 s of boot;
+rebooting one did not. So the stuck state depends on something a fresh pair
+does not have — long uptime, accumulated driver or chip state, or RF
+conditions (both radios count millions of PHY signal-field failures in
+`morse_cli -i wlh0 stats`). Also ruled out: restoring a disabled `mesh11sd`,
+and matching the one mesh parameter that differed (`mesh_rssi_threshold`,
+`-80` vs `0`).
+
+To trace it when it next happens, raise the supplicant's log level at runtime —
+no restart, so nothing about the failure is disturbed — and stream the log
+past the ring buffer:
+
+```
+wpa_cli_s1g -p /var/run/wpa_supplicant_s1g -i wlh0 log_level DEBUG
+logread -f > /tmp/trace.log &        # log_level INFO and killall logread afterwards
+```
+
+`wpa_cli_s1g ... pmksa` lists the cached keys and `mesh_peer_remove <mac>`
+closes one link cleanly, both without disturbing the radio.
+
+An established link is **not** torn down for being idle. At 300 s without
+traffic (`mesh_max_inactivity`) the supplicant polls the peer, and when the poll
+is answered the link carries on. Measured: after 8 minutes of 1 Hz traffic
+across the mesh (483/483 replies, 4–15 ms), the same link sat idle for 12
+minutes and survived two polls — inactivity climbed to 300 s on both nodes and
+reset together each time. Drops seen about 300 s after a link formed coincide
+with that poll, which is consistent with a poll going unanswered rather than
+with idleness itself. Traffic avoids the poll altogether.
 
 Measurement traps on a pair like this:
 
