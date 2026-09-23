@@ -27,6 +27,11 @@ struct simnode_frame {
     bool     is_mgmt;
     uint8_t  vif_id;
     uint8_t  tid;
+    /* What the host asked the chip to do with it. On a keyed link the chip
+     * adds the CCMP header and MIC, so the bytes above carry neither and these
+     * are the only record that the frame was sent encrypted. */
+    uint8_t  tx_flags; /* MMDRV_TX_FLAG_* -- HW_ENC means "encrypt this" */
+    uint8_t  key_idx;  /* 0xff when no key was selected */
 };
 
 /* ---- lifecycle -------------------------------------------------------- */
@@ -36,8 +41,10 @@ struct simnode_frame {
  * The gates start where warthog_globals.c (generated from main/at.c) puts
  * them, which is NOT all-off: mesh_secure defaults ON, as the shipped
  * firmware does. Suites that call simnode_set_gates(..., secure=false) are
- * choosing an open mesh, and the keyed path they skip -- per-peer key
- * install, the Protected bit, the MGTK rules -- is then untested. */
+ * choosing an open mesh, and the keyed path they skip is then untested there.
+ * The keyed UNICAST relay is covered once, in test_simnode_datapath's
+ * t_rx_forward_keyed (via simnode_rx_flags + MMDRV_RX_FLAG_DECRYPTED); keyed
+ * group frames and the MGTK rules still are not. */
 bool simnode_start(const uint8_t mac[6]);
 void simnode_stop(void);
 
@@ -59,6 +66,15 @@ bool simnode_host_tx(const uint8_t da[6], const uint8_t sa[6],
 
 /** Inject a received 802.11 frame, through the real RX path. */
 bool simnode_rx(const uint8_t *frame, uint16_t len, int16_t rssi);
+
+/**
+ * As simnode_rx, with the chip's RX flags (MMDRV_RX_FLAG_*). Pass
+ * MMDRV_RX_FLAG_DECRYPTED to model a frame the chip decrypted in place: the
+ * bytes are then the MAC header, the CCMP header, the PLAINTEXT body and the
+ * MIC octets, exactly as the MM6108 hands them up. Without it, a Protected
+ * frame is one the chip could not decrypt.
+ */
+bool simnode_rx_flags(const uint8_t *frame, uint16_t len, int16_t rssi, uint8_t rx_flags);
 
 /** Run the 2 s service tick (held-frame flush, peering watchdog, rekey). */
 void simnode_tick(void);

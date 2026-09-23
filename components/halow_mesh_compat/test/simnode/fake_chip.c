@@ -18,18 +18,11 @@
 
 #include "mmpkt.h"
 #include "mmdrv.h"
+#include "simnode.h" /* the one definition of struct simnode_frame the tests read */
 
 #ifndef SIMNODE_OUTBOX_MAX
 #define SIMNODE_OUTBOX_MAX 64u
 #endif
-
-struct simnode_frame {
-    uint8_t  bytes[512];
-    uint16_t len;
-    bool     is_mgmt;
-    uint8_t  vif_id;
-    uint8_t  tid;
-};
 
 static struct simnode_frame s_outbox[SIMNODE_OUTBOX_MAX];
 static unsigned s_outbox_n;
@@ -59,6 +52,8 @@ int mmdrv_tx_frame(struct mmpkt *pkt, bool is_mgmt)
         struct mmdrv_tx_metadata *md = mmdrv_get_tx_metadata(pkt);
         f->vif_id = md->vif_id;
         f->tid = md->tid;
+        f->tx_flags = md->flags;
+        f->key_idx = md->key_idx;
     }
     else
     {

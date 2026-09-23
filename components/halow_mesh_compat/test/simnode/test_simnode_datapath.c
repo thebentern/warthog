@@ -34,6 +34,7 @@
 #include <string.h>
 
 #include "simnode.h"
+#include "mmdrv.h"
 #include "umac_mesh_ctrl.h"
 #include "umac_mesh_fwd.h"
 #include "umac_mesh_ies.h"
@@ -63,6 +64,8 @@ static const uint8_t PAY[8] = { 0xc0, 0xff, 0xee, 0x11, 0x22, 0x33, 0x44, 0x55 }
 /* SNAP/802.1h, the eight octets umac_datapath.c puts between Mesh Control and
  * the payload. Spelled out here because the offsets below count through it. */
 static const uint8_t SNAP_IPV4[8] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00 };
+/* 802.1X / EAPOL. umac_datapath.c recognises EAPOL by this ethertype alone. */
+static const uint8_t SNAP_EAPOL[8] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E };
 
 #define MAC_EQ(p, m) (memcmp((p), (m), 6) == 0)
 
@@ -452,6 +455,203 @@ static void t_rx_forward_unicast(void)
           (g != NULL && g->len > 34u) ? g->bytes[33] : 0u);
 }
 
+/* ---- 7b. receive: a relayed EAPOL frame is relayed, not swallowed --------
+ *
+ * The forwarding engine decides a frame's fate while its Mesh Control is still
+ * in place, but the relay itself happens further down the RX path -- and the
+ * EAPOL gate sits between the two. That gate drops every 4-address EAPOL frame
+ * as "not supported", which is right for EAPOL addressed to us and wrong for
+ * EAPOL we were only asked to carry: a relay must not care what it carries.
+ * The observable failure is a silent blackhole with rxdrop reason 9. */
+
+static void t_rx_forward_eapol(void)
+{
+    printf("--- RX: an EAPOL frame for a third node is relayed, not dropped ---\n");
+    fresh(/*fwd=*/true, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+
+    uint8_t frame[256];
+    struct umac_mesh_ctrl mc = { .flags = 0, .ttl = 31, .seq = 400 };
+    uint16_t n = umac_mesh_ies_build_data_hdr4(frame, W, A, C, A);
+    frame[n++] = 0x00;
+    frame[n++] = 0x01;
+    n = (uint16_t)(n + umac_mesh_ctrl_build(&frame[n], 18u, &mc));
+    memcpy(&frame[n], SNAP_EAPOL, sizeof(SNAP_EAPOL));
+    n = (uint16_t)(n + sizeof(SNAP_EAPOL));
+    memcpy(&frame[n], PAY, sizeof(PAY));
+    n = (uint16_t)(n + sizeof(PAY));
+    CHECK(simnode_rx(frame, n, -60), "A sends an EAPOL frame whose mesh DA is C");
+
+    CHECK(g_warthog_rxdrop_reason != 9u,
+          "it is not dropped as 'unsupported 4-address EAPOL' (rxdrop reason %lu)",
+          (unsigned long)g_warthog_rxdrop_reason);
+    CHECK(simnode_host_rx_count() == 0, "it is NOT delivered to our host (got %u)",
+          simnode_host_rx_count());
+    CHECK(simnode_outbox_count() == 1, "exactly one relayed copy (got %u)",
+          simnode_outbox_count());
+    const struct simnode_frame *f = simnode_outbox_get(0);
+    if (f != NULL && f->len >= 46u + sizeof(PAY))
+    {
+        CHECK(MAC_EQ(&f->bytes[4], C), "[4]  addr1 = C: the next hop");
+        CHECK(MAC_EQ(&f->bytes[16], C), "[16] addr3 = C: the mesh destination is carried through");
+        CHECK(f->bytes[44] == 0x88u && f->bytes[45] == 0x8Eu,
+              "[44] the ethertype is still EAPOL (got %02x%02x)", f->bytes[44], f->bytes[45]);
+        CHECK(memcmp(&f->bytes[46], PAY, sizeof(PAY)) == 0, "[46] the payload is untouched");
+    }
+
+    /* The gate itself stays: 4-address EAPOL addressed to US is still refused. */
+    fresh(/*fwd=*/true, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    n = umac_mesh_ies_build_data_hdr4(frame, W, A, W, A);
+    frame[n++] = 0x00;
+    frame[n++] = 0x01;
+    mc.seq = 401;
+    n = (uint16_t)(n + umac_mesh_ctrl_build(&frame[n], 18u, &mc));
+    memcpy(&frame[n], SNAP_EAPOL, sizeof(SNAP_EAPOL));
+    n = (uint16_t)(n + sizeof(SNAP_EAPOL));
+    memcpy(&frame[n], PAY, sizeof(PAY));
+    n = (uint16_t)(n + sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    CHECK(g_warthog_rxdrop_reason == 9u && simnode_outbox_count() == 0,
+          "4-address EAPOL addressed to us is still refused (reason %lu, %u sent)",
+          (unsigned long)g_warthog_rxdrop_reason, simnode_outbox_count());
+
+    /* Group-addressed EAPOL is DELIVER_AND_FORWARD: it must be re-flooded like
+     * any other group frame, and reach our stack as an ordinary 802.3 frame. */
+    fresh(/*fwd=*/true, /*bridge=*/false, /*grp_std=*/true);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    mc.seq = 402;
+    n = umac_mesh_ies_build_data_hdr3_group(frame, BC, A, A);
+    frame[n++] = 0x00;
+    frame[n++] = 0x01;
+    n = (uint16_t)(n + umac_mesh_ctrl_build(&frame[n], 18u, &mc));
+    memcpy(&frame[n], SNAP_EAPOL, sizeof(SNAP_EAPOL));
+    n = (uint16_t)(n + sizeof(SNAP_EAPOL));
+    memcpy(&frame[n], PAY, sizeof(PAY));
+    n = (uint16_t)(n + sizeof(PAY));
+    CHECK(simnode_rx(frame, n, -60), "A broadcasts a group EAPOL frame");
+    CHECK(simnode_outbox_count() == 1, "it is re-flooded once (got %u)", simnode_outbox_count());
+    CHECK(simnode_host_rx_count() == 1, "and delivered to our stack (got %u)",
+          simnode_host_rx_count());
+    CHECK(g_warthog_rxdrop_reason != 9u && g_warthog_rxdrop_reason != 10u,
+          "not swallowed by the EAPOL gate (rxdrop reason %lu)",
+          (unsigned long)g_warthog_rxdrop_reason);
+}
+
+/* ---- 7c. receive: a KEYED relay ------------------------------------------
+ *
+ * The shipping default is a keyed mesh, and until this case every relay test
+ * ran open -- so the plaintext refusal, the not-decrypted drop, the CCMP replay
+ * check and the MIC strip had never executed for a frame we forward, and
+ * nothing showed that the forwarded copy is itself sent encrypted.
+ *
+ * On RX the chip decrypts in place and hands up header + CCMP header +
+ * plaintext + MIC octets with MMDRV_RX_FLAG_DECRYPTED. On TX the host sets the
+ * Protected bit, HW_ENC and the key index, and the chip adds CCMP header and
+ * MIC -- so the relayed copy's bytes carry neither, and tx_flags/key_idx are
+ * the record that it went out keyed. */
+
+static uint16_t mk_keyed_(uint8_t *f, const uint8_t *ra, const uint8_t *ta, const uint8_t *da,
+                          const uint8_t *sa, uint8_t pn, bool is_protected, uint16_t seq)
+{
+    uint16_t n = umac_mesh_ies_build_data_hdr4(f, ra, ta, da, sa);
+    if (is_protected) { f[1] |= 0x40; } /* FC Protected (bit 14) */
+    f[n++] = 0x00;
+    f[n++] = 0x01;
+    if (is_protected)
+    {
+        /* CCMP header: PN0 PN1 rsvd KeyID|ExtIV PN2..PN5, key id 0. */
+        const uint8_t ccmp[8] = { pn, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00 };
+        memcpy(&f[n], ccmp, sizeof(ccmp));
+        n = (uint16_t)(n + sizeof(ccmp));
+    }
+    struct umac_mesh_ctrl mc = { .flags = 0, .ttl = 31, .seq = seq };
+    n = (uint16_t)(n + umac_mesh_ctrl_build(&f[n], 18u, &mc));
+    memcpy(&f[n], SNAP_IPV4, sizeof(SNAP_IPV4));
+    n = (uint16_t)(n + sizeof(SNAP_IPV4));
+    memcpy(&f[n], PAY, sizeof(PAY));
+    n = (uint16_t)(n + sizeof(PAY));
+    if (is_protected)
+    {
+        memset(&f[n], 0xA5, 8); /* MIC octets: present, value already checked by the chip */
+        n = (uint16_t)(n + 8u);
+    }
+    return n;
+}
+
+static void t_rx_forward_keyed(void)
+{
+    printf("--- RX: a KEYED relay -- every crypto gate runs, and the copy goes out keyed ---\n");
+    fresh(/*fwd=*/true, /*bridge=*/false, /*grp_std=*/false);
+    simnode_set_gates(/*fwd=*/true, /*bridge=*/false, /*grp_std=*/false, /*secure=*/true);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+
+    uint8_t frame[256];
+    uint16_t n;
+
+    /* Baseline: keyed and addressed to us, it is delivered. */
+    n = mk_keyed_(frame, W, A, W, A, /*pn=*/1, true, 500);
+    (void)simnode_rx_flags(frame, n, -60, MMDRV_RX_FLAG_DECRYPTED);
+    CHECK(simnode_host_rx_count() == 1,
+          "a decrypted frame addressed to us is delivered (%u delivered, rxdrop reason %lu)",
+          simnode_host_rx_count(), (unsigned long)g_warthog_rxdrop_reason);
+
+    /* The relay. */
+    simnode_host_rx_clear();
+    simnode_outbox_clear();
+    n = mk_keyed_(frame, W, A, C, A, /*pn=*/2, true, 501);
+    CHECK(simnode_rx_flags(frame, n, -60, MMDRV_RX_FLAG_DECRYPTED),
+          "A sends a decrypted frame whose mesh DA is C");
+    CHECK(simnode_host_rx_count() == 0, "it is not delivered to our host (got %u)",
+          simnode_host_rx_count());
+    CHECK(g_warthog_rxdrop_reason == 99u, "it passes every crypto gate and is forwarded (reason %lu)",
+          (unsigned long)g_warthog_rxdrop_reason);
+    CHECK(simnode_outbox_count() == 1, "exactly one relayed copy (got %u)", simnode_outbox_count());
+    const struct simnode_frame *f = simnode_outbox_get(0);
+    if (f != NULL && f->len >= 46u + sizeof(PAY))
+    {
+        if (f->len != 46u + sizeof(PAY)) { hexdump("relayed", f->bytes, f->len); }
+        CHECK(MAC_EQ(&f->bytes[4], C), "[4]  addr1 = C: the next hop");
+        CHECK((f->bytes[1] & 0x40u) != 0u, "the relayed copy has the Protected bit set");
+        CHECK((f->tx_flags & MMDRV_TX_FLAG_HW_ENC) != 0u,
+              "and the chip is told to encrypt it (tx_flags 0x%02x)", f->tx_flags);
+        CHECK(f->key_idx == 0u, "with the pairwise key, id 0 (got 0x%02x)", f->key_idx);
+        CHECK(f->len == 46u + sizeof(PAY),
+              "the host added no CCMP header or MIC of its own -- the chip does (len %u)", f->len);
+        CHECK(f->len >= 46u + sizeof(PAY) && f->bytes[33] == 30u, "[33] TTL 31 -> 30 (got %u)",
+              f->bytes[33]);
+        CHECK(f->len >= 46u + sizeof(PAY) && memcmp(&f->bytes[46], PAY, sizeof(PAY)) == 0,
+              "[46] the payload is untouched");
+    }
+
+    /* The same packet number again is a replay: it must not be relayed. */
+    simnode_outbox_clear();
+    n = mk_keyed_(frame, W, A, C, A, /*pn=*/2, true, 502);
+    (void)simnode_rx_flags(frame, n, -60, MMDRV_RX_FLAG_DECRYPTED);
+    CHECK(simnode_outbox_count() == 0 && g_warthog_rxdrop_reason == 5u,
+          "a replayed packet number is dropped by the CCMP check, not relayed (reason %lu, %u sent)",
+          (unsigned long)g_warthog_rxdrop_reason, simnode_outbox_count());
+
+    /* A frame the chip could not decrypt is not relayed either. */
+    simnode_outbox_clear();
+    n = mk_keyed_(frame, W, A, C, A, /*pn=*/3, true, 503);
+    (void)simnode_rx_flags(frame, n, -60, 0);
+    CHECK(simnode_outbox_count() == 0 && g_warthog_rxdrop_reason == 4u,
+          "a frame the chip did not decrypt is dropped, not relayed (reason %lu, %u sent)",
+          (unsigned long)g_warthog_rxdrop_reason, simnode_outbox_count());
+
+    /* Plaintext on a keyed link is refused before it could be relayed. */
+    simnode_outbox_clear();
+    n = mk_keyed_(frame, W, A, C, A, /*pn=*/0, false, 504);
+    (void)simnode_rx_flags(frame, n, -60, 0);
+    CHECK(simnode_outbox_count() == 0 && g_warthog_rxdrop_reason == 3u,
+          "plaintext on a keyed link is refused, not relayed (reason %lu, %u sent)",
+          (unsigned long)g_warthog_rxdrop_reason, simnode_outbox_count());
+}
+
 /* ---- 8. receive: group frame delivered AND re-flooded ------------------- */
 
 static void t_rx_group_deliver_and_forward(void)
@@ -719,6 +919,53 @@ static void t_rx_drops(void)
     (void)simnode_rx(frame, n, -60);
     CHECK(simnode_host_rx_count() == 1,
           "a leaf still delivers what is addressed to it (%u delivered)", simnode_host_rx_count());
+
+    /* The same leak, without a Mesh Control field. The destination check above
+     * lives inside the Mesh-Control branch, so a 4-address frame with the QoS
+     * Mesh Control Present bit clear skipped it and was delivered with addr3 --
+     * a third party -- as its destination. A conforming peer never sends that
+     * shape, and whether one can reach the host over the air at all is not
+     * measured (the MM6108 may discard it first), so this is defence in depth.
+     * With no Mesh Control there is no TTL, so it cannot be relayed either,
+     * whatever the forwarding gate says. */
+    for (int fwd = 0; fwd <= 1; fwd++)
+    {
+        fresh(fwd != 0, /*bridge=*/false, /*grp_std=*/false);
+        (void)simnode_add_peer(A);
+        (void)simnode_add_peer(C);
+        n = umac_mesh_ies_build_data_hdr4(frame, W, A, C, A);
+        frame[n++] = 0x00; /* QoS Control: TID 0 ... */
+        frame[n++] = 0x00; /* ... Mesh Control Present CLEAR */
+        memcpy(&frame[n], SNAP_IPV4, sizeof(SNAP_IPV4));
+        n = (uint16_t)(n + sizeof(SNAP_IPV4));
+        memcpy(&frame[n], PAY, sizeof(PAY));
+        n = (uint16_t)(n + sizeof(PAY));
+        (void)simnode_rx(frame, n, -60);
+        CHECK(simnode_host_rx_count() == 0,
+              "forwarding %s: a 4-address frame for another node with NO Mesh Control is "
+              "not delivered either (%u delivered)",
+              fwd ? "on" : "off", simnode_host_rx_count());
+        CHECK(simnode_outbox_count() == 0, "  and it is not relayed (%u sent)",
+              simnode_outbox_count());
+        CHECK(g_warthog_rxdrop_reason == 94u, "  dropped with reason 94 (got %lu)",
+              (unsigned long)g_warthog_rxdrop_reason);
+    }
+
+    /* Only the destination is judged: addressed to us, no Mesh Control, it is
+     * still delivered exactly as before. */
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    n = umac_mesh_ies_build_data_hdr4(frame, W, A, W, A);
+    frame[n++] = 0x00;
+    frame[n++] = 0x00;
+    memcpy(&frame[n], SNAP_IPV4, sizeof(SNAP_IPV4));
+    n = (uint16_t)(n + sizeof(SNAP_IPV4));
+    memcpy(&frame[n], PAY, sizeof(PAY));
+    n = (uint16_t)(n + sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    CHECK(simnode_host_rx_count() == 1,
+          "addressed to us with no Mesh Control, it is still delivered (%u delivered)",
+          simnode_host_rx_count());
 }
 
 int main(void)
@@ -733,6 +980,8 @@ int main(void)
     t_tx_proxied_destination();
     t_rx_deliver();
     t_rx_forward_unicast();
+    t_rx_forward_eapol();
+    t_rx_forward_keyed();
     t_rx_group_deliver_and_forward();
     t_rx_replica_normalise();
     t_rx_proxied_endpoints();

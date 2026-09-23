@@ -608,7 +608,9 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         {
             tid_index = dot11_qos_control_get_tid(qos_control->field);
         }
-        mesh_ctrl_present = (le16toh(qos_control->field) & 0x0100) != 0;
+        /* Bit 8 means Mesh Control only in an MBSS; in a BSS it is TXOP/queue size. */
+        mesh_ctrl_present = data->ops == &datapath_ops_mesh &&
+                            (le16toh(qos_control->field) & 0x0100) != 0;
         /* Forwarding feasibility probe.
          *
          * A relay must receive frames whose mesh destination is somebody else.
@@ -810,6 +812,19 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         }
         g_warthog_rx_meshctrl_stripped++;
     }
+    else if (data->ops == &datapath_ops_mesh && dot11_is_4addr_hdr(header->frame_control))
+    {
+        /* No Mesh Control means no TTL to relay with: a frame for another node
+         * is never ours, whatever the forwarding gates say. */
+        const uint8_t *mesh_da = dot11_get_da(header);
+        if (!mm_mac_addr_is_multicast(mesh_da) &&
+            !umac_interface_addr_matches_mac_addr(stad, mesh_da))
+        {
+            g_warthog_rxdrop_reason = 94; /* 4-address, no Mesh Control, not for us */
+            g_warthog_rxdrop_count++;
+            goto drop;
+        }
+    }
 
     if (mm_mac_addr_is_broadcast(dot11_get_da(header)) ||
         mm_mac_addr_is_multicast(dot11_get_da(header)))
@@ -849,7 +864,10 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         }
     }
 
-    if (umac_datapath_is_eapol_frame(rxbufview))
+    /* A frame we relay is not ours to judge by content; mesh security never uses EAPOL. */
+    if (!(fwd_active && (fwd_res.verdict == UMAC_MESH_FWD_FORWARD ||
+                         fwd_res.verdict == UMAC_MESH_FWD_DELIVER_AND_FORWARD)) &&
+        umac_datapath_is_eapol_frame(rxbufview))
     {
         if (dot11_is_4addr_hdr(header->frame_control))
         {

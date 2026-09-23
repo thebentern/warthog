@@ -157,12 +157,18 @@ bool simnode_host_tx(const uint8_t da[6], const uint8_t sa[6],
 
 bool simnode_rx(const uint8_t *frame, uint16_t len, int16_t rssi)
 {
+    return simnode_rx_flags(frame, len, rssi, 0);
+}
+
+bool simnode_rx_flags(const uint8_t *frame, uint16_t len, int16_t rssi, uint8_t rx_flags)
+{
     if (!s_up || frame == NULL || len == 0) { return false; }
     struct mmpkt *pkt = mmpkt_alloc_on_heap(0, len, sizeof(struct mmdrv_rx_metadata));
     if (pkt == NULL) { return false; }
     struct mmdrv_rx_metadata *md = mmpkt_get_metadata(pkt).rx;
     memset(md, 0, sizeof(*md));
     md->rssi = rssi;
+    md->flags = rx_flags;
     struct mmpktview *v = mmpkt_open(pkt);
     mmpkt_append_data(v, frame, len);
     mmpkt_close(&v);
