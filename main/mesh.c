@@ -375,11 +375,13 @@ void warthog_mesh_smoke_test(void)
      * umac_datapath_mesh_add_peer() reads it at ESTAB, so setting it later
      * would only affect peers that happen to arrive afterwards. */
     extern volatile uint32_t g_warthog_mesh_secure, g_warthog_mesh_fwd, g_warthog_mesh_bridge,
-                             g_warthog_mesh_grp;
+                             g_warthog_mesh_grp, g_warthog_mesh_pmf;
     g_warthog_mesh_secure = warthog_cfg_get_mesh_secure();
     g_warthog_mesh_fwd = warthog_cfg_get_mesh_fwd();
     g_warthog_mesh_bridge = warthog_cfg_get_mesh_bridge();
     g_warthog_mesh_grp = warthog_cfg_get_mesh_grp();
+    /* Must precede the supplicant's mesh_config_create(), which reads it once. */
+    g_warthog_mesh_pmf = warthog_cfg_get_mesh_pmf();
 #if WARTHOG_MESH_SAE && !defined(WARTHOG_MESH_HOST_CCMP)
     if (g_warthog_mesh_grp) {
         ESP_LOGE(TAG, "mesh: standard group frames under SAE with chip crypto: a peer's chip "

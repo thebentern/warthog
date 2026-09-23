@@ -235,9 +235,16 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
      * working link already uses, so keep it, but say so, and keep it away from
      * the one value that silently breaks the framing.
      *
-     * If a peer ever refuses to peer without protection, this is the single
-     * line to change -- to MGMT_FRAME_PROTECTION_REQUIRED, never OPTIONAL. */
-    mconf->ieee80211w = NO_MGMT_FRAME_PROTECTION;
+     * If a peer ever refuses to peer without protection, AT+MESHPMF=1 selects
+     * required. An OpenMANET peer is NOT that peer, despite appearances: it
+     * runs ieee80211w=2 and reports MFP: yes, yet reached ESTAB with a warthog
+     * that had this off, because the framing follows our own RSN element. Off
+     * stays the default because it is the measured-working value on both link
+     * types. Note which two values this offers: OPTIONAL is unreachable on
+     * purpose. */
+    extern volatile uint32_t g_warthog_mesh_pmf;
+    mconf->ieee80211w = g_warthog_mesh_pmf ? MGMT_FRAME_PROTECTION_REQUIRED
+                                           : NO_MGMT_FRAME_PROTECTION;
 
     /* Bring up mesh RSN when the config asked for SAE.
      *

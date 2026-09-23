@@ -470,6 +470,9 @@ volatile uint32_t g_warthog_mesh_key_fail = 0;
 volatile uint32_t g_warthog_mesh_secure = 1;
 /* Forwarding and bridge gates, seeded from NVS in mesh.c before the mesh starts. */
 volatile uint32_t g_warthog_mesh_fwd = 0, g_warthog_mesh_bridge = 0, g_warthog_mesh_grp = 0;
+/* Mesh MFP. Read once by the supplicant shim while it builds the mesh config,
+ * so unlike AT+MESHSEC= this one cannot be flipped under a live mesh. */
+volatile uint32_t g_warthog_mesh_pmf = 0;
 volatile uint32_t g_warthog_fwd_uni = 0, g_warthog_fwd_grp = 0, g_warthog_fwd_nomem = 0;
 volatile uint32_t g_warthog_fwd_drop_own = 0, g_warthog_fwd_drop_dup = 0, g_warthog_fwd_drop_ttl = 0;
 volatile uint32_t g_warthog_fwd_drop_nopath = 0, g_warthog_fwd_drop_nofwd = 0, g_warthog_fwd_drop_bad = 0;
@@ -942,8 +945,10 @@ static void cmd_meshcfg(void)
              WARTHOG_REGION_NAME, WARTHOG_COUNTRY_CODE);
     cdc_write(line);
     snprintf(line, sizeof(line),
-             "+MESHCFG: enable=%u secure=%u dhcp=%u fwd=%u bridge=%u grp=%s id='%s' pass=%u chars\r\n",
+             "+MESHCFG: enable=%u secure=%u pmf=%s dhcp=%u fwd=%u bridge=%u grp=%s id='%s' "
+             "pass=%u chars\r\n",
              (unsigned)warthog_cfg_get_mesh_enable(), (unsigned)warthog_cfg_get_mesh_secure(),
+             warthog_cfg_get_mesh_pmf() ? "required" : "off",
              (unsigned)warthog_cfg_get_mesh_dhcp(), (unsigned)warthog_cfg_get_mesh_fwd(),
              (unsigned)warthog_cfg_get_mesh_bridge(),
              warthog_cfg_get_mesh_grp() ? "std" : "replicate", id, (unsigned)strlen(pw));
@@ -1910,6 +1915,17 @@ static void dispatch(char *line)
     } else if (strcasecmp(verb, "MESHGRP") == 0 && terminator == '?') {
         char line[64];
         snprintf(line, sizeof(line), "+MESHGRP: %u\r\n", (unsigned)warthog_cfg_get_mesh_grp());
+        cdc_write(line);
+        reply_ok();
+    } else if (strcasecmp(verb, "MESHPMF") == 0 && terminator == '=') {
+        unsigned long v = strtoul(args, NULL, 10);
+        if (warthog_cfg_set_mesh_pmf((uint8_t)v) == ESP_OK) {
+            cdc_write("+MESHPMF: stored; takes effect on next boot (AT+RESET)\r\n");
+            reply_ok();
+        } else { reply_error("usage: AT+MESHPMF=<0|1>"); }
+    } else if (strcasecmp(verb, "MESHPMF") == 0 && terminator == '?') {
+        char line[64];
+        snprintf(line, sizeof(line), "+MESHPMF: %u\r\n", (unsigned)warthog_cfg_get_mesh_pmf());
         cdc_write(line);
         reply_ok();
     } else if (strcasecmp(verb, "MESHBRIDGE") == 0 && terminator == '=') {

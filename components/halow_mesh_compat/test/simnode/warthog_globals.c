@@ -87,6 +87,7 @@ volatile uint32_t g_warthog_mesh_chip_sta_fail = 0;
 volatile uint32_t g_warthog_mesh_key_fail = 0;
 volatile uint32_t g_warthog_mesh_secure = 1;
 volatile uint32_t g_warthog_mesh_fwd = 0, g_warthog_mesh_bridge = 0, g_warthog_mesh_grp = 0;
+volatile uint32_t g_warthog_mesh_pmf = 0;
 volatile uint32_t g_warthog_fwd_uni = 0, g_warthog_fwd_grp = 0, g_warthog_fwd_nomem = 0;
 volatile uint32_t g_warthog_fwd_drop_own = 0, g_warthog_fwd_drop_dup = 0, g_warthog_fwd_drop_ttl = 0;
 volatile uint32_t g_warthog_fwd_drop_nopath = 0, g_warthog_fwd_drop_nofwd = 0, g_warthog_fwd_drop_bad = 0;

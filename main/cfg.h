@@ -102,6 +102,18 @@ esp_err_t warthog_cfg_set_mesh_bridge(uint8_t on);
 uint8_t   warthog_cfg_get_mesh_grp(void);
 esp_err_t warthog_cfg_set_mesh_grp(uint8_t on);
 
+/* Management frame protection for the mesh: 0 = off (the warthog-to-warthog
+ * default that is measured working), 1 = MFP required.
+ *
+ * Only these two -- "optional" is the one setting that makes the two ends size
+ * the AMPE payload differently, so it is deliberately not reachable from here.
+ * An OpenMANET peer emits ieee80211w=2 and reports MFP: yes, and that is NOT a
+ * reason to turn this on: such a peer reached ESTAB with a warthog that had it
+ * off, because the framing follows our own RSN element. This is for a peer that
+ * actually refuses unprotected peering. Not run on air. Next boot. */
+uint8_t   warthog_cfg_get_mesh_pmf(void);
+esp_err_t warthog_cfg_set_mesh_pmf(uint8_t on);
+
 /* S1G channel pin, stored and returned as a set.
  *
  * Channel, frequency, operating class and bandwidth are not independent --
