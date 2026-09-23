@@ -261,7 +261,7 @@ two causes it is. The same thing is available on demand:
 ```
 AT+MESHCFG?
 +MESHCFG: region=US country=US
-+MESHCFG: enable=1 secure=1 dhcp=1 id='openmanet-mesh' pass=12 chars
++MESHCFG: enable=1 secure=1 pmf=off dhcp=1 fwd=0 bridge=0 grp=replicate id='openmanet-mesh' pass=12 chars
 +MESHCFG: applied chan=42 freq=923000000 bw=2 gclass=69 sclass=2 (set_channel_list=0)
 +MESHCFG: peers=0 beacons_heard=0
 +MESHCFG: 0 beacons heard: nothing is audible. Wrong channel or bandwidth, or out of range. Check the channel first
@@ -282,13 +282,89 @@ reading first:
 | `applied chan=NONE` | The radio has the whole country list; its operating channel is neither chosen nor observable | Region builds ship unpinned. Set `AT+MESHCHAN=<chan>,<freq_hz>,<gclass>,<sclass>,<bw>` to match the peer and reboot. An unpinned radio meeting a mesh is luck, not configuration. |
 | `set_channel_list` non-zero | The channel was refused; the radio is **not** on the channel printed above | The channel must exist in the country's regulatory table. `AT+MESHCHAN=default` restores the build-time pin. |
 | `beacons_heard=0` | Nothing is audible | Channel, bandwidth, or range. Compare `applied chan`/`bw` against `uci get wireless.radio1.channel` on the peer — `radio1` is the HaLow device and `channel` lives on the device, not the iface; `radio0` is the 5 GHz radio and `default_radio0.channel` is unset. Fix this before looking at anything else. |
-| `beacons_heard>0`, `peers=0` | The mesh is audible and Warthog will not join it | Mesh ID (exact match, case included), operating class, or security mode. An open Warthog will not peer with an SAE mesh, and vice versa. |
+| `beacons_heard>0`, `peers=0` | The mesh is audible and Warthog will not join it | Mesh ID (exact match, case included), operating class, or security mode. An open Warthog will not peer with an SAE mesh, and vice versa. Management frame protection is **not** on this list — interop is measured working with it off; see the PMF note below before chasing it. |
 | `peers>0` but no traffic | Peered; this is a data-plane question | `AT+RXCHAN?` and `AT+MPING=<peer>,8`. |
 
-The capability line is not a placeholder. Warthog does not forward for other
-nodes, does not run a routing protocol, does not bridge the tethered client
-onto the mesh at layer 2, and does not carry multicast across. A node that
-peers correctly is still a leaf.
+### Management frame protection: `MFP: yes` on the peer is not a demand on us
+
+An OpenMANET node configures MFP required — `ieee80211w=2` in its generated
+supplicant config — and once peered its station dump reads `MFP: yes`. Neither
+means a Warthog has to match it. Warthog peered with exactly such a node while
+running MFP **off**, and that peer reported `mesh plink: ESTAB`,
+`authenticated: yes` and `MFP: yes` for the link at the same time. The AMPE
+framing follows what our RSN element advertises, and off and required are each
+self-consistent; only "optional" desyncs the two ends, which is why no setting
+here can select it.
+
+So do not read `MFP: yes` on a peer as the reason a link is failing — that
+reasoning has already produced one wrong diagnosis. `AT+MESHPMF=1` (then
+`AT+RESET`) exists for a peer that genuinely refuses to peer unprotected, and
+as a one-command A/B when SAE is failing for reasons not yet pinned down. It
+has not been run on air, and off is the measured-working default.
+`AT+MESHCFG?` prints `pmf=` so the two sides can be compared directly.
+
+**A station entry is not a peering.** `iw dev wlh0 station dump` lists blocked
+candidates too, so counting stations reports success that is not there. Only
+`mesh plink: ESTAB` counts — a blocked candidate shows `llid 0`, `plid 0`,
+`authenticated: no` and an airtime metric of `-1`, while still accumulating
+`tx failed`. Measuring a data path across such a link returns 100% loss that
+says nothing about the data path.
+
+### Two OpenMANET nodes can fail SAE with each other
+
+Worth knowing before blaming a Warthog for a mesh that will not form: two
+OpenMANET Pis with the same `mesh_id`, passphrase, channel and `ieee80211w=2`,
+RF verified at 923000 kHz / 2 MHz, peer with each other only intermittently.
+They have held `ESTAB` for long stretches, and they have also gone 70 minutes
+(210 samples) without it. The failing state is a loop: four
+`MESH-SAE-AUTH-FAILURE`, then `MESH-SAE-AUTH-BLOCKED duration=300`, then again.
+
+What the log lines mean, from the supplicant and the Morse driver source (which
+driver release these nodes run is not established):
+
+- `process_mesh_rx_mgmt_beaconless: Rx of Mesh Auth from unknown peer` is the
+  driver's **first-contact path, not the failure**. It drops the Auth and
+  immediately injects a synthesized probe response, so the receiver learns the
+  sender at once and starts its own SAE. On these nodes it fires once per
+  cycle, about 45 s before each `BLOCKED`.
+- `MESH-SAE-AUTH-FAILURE` is a **timeout**: SAE did not reach ACCEPTED within
+  10 s. It is not a password or crypto rejection. After four, the peer is
+  blocked for `mesh_max_inactivity` (300 s by default).
+
+So both sides know each other and SAE still times out. Why is open. The
+candidates are an interaction between two simultaneous initiators (or
+anti-clogging) and asymmetric frame loss — both radios report millions of PHY
+signal-field failures in `morse_cli -i wlh0 stats`. A `wpa_supplicant -dd`
+trace on both nodes across one cycle is what separates them. Ruled out by
+measurement: a cold reboot, restoring a disabled `mesh11sd`, and matching the
+one mesh parameter that differed (`mesh_rssi_threshold`, `-80` vs `0`).
+
+Separately, an **established** link that goes idle is torn down about 300 s
+after it came up — the same supplicant inactivity limit — while a link carrying
+traffic held for 19 minutes. Keep traffic flowing during any test that needs
+the link to stay up.
+
+Measurement traps on a pair like this:
+
+- Poll `mesh plink:` and count; do not diagnose from `logread`, which can hold
+  `plink ... established` lines old enough that nothing is establishing now.
+- Compare like with like. `dmesg` counts since that node's boot. On a node
+  without `bat0`, `openmanetd` logs an error every few seconds, so `logread`
+  holds only about the last hour.
+- The Pis' clocks are wrong and do not agree with each other (here by about a
+  day and a half). Correlate the two nodes by the host's poll time or by
+  uptime, never by their log timestamps.
+- Once the link is up, two nodes that share a LAN address (OpenMANET's
+  `10.41.254.1`) sit on one bridged segment, so a ping from that address loses
+  most replies to the other node. Ping from a transient unique address instead.
+
+The capability line is not a placeholder; it reports the gates. With the
+defaults a Warthog does not forward for other nodes, does not run a routing
+protocol, does not bridge the tethered client onto the mesh at layer 2, and
+does not carry multicast across — a node that peers correctly is still a leaf.
+`AT+MESHFWD=1` turns on 802.11s forwarding and HWMP (`forwarding=yes(802.11s)
+routing=hwmp`) and `AT+MESHBRIDGE=1` the layer-2 bridge (`l2=bridge`); both are
+compiled and host-tested, and neither has yet been measured on air.
 
 `multicast=no` is not a missing feature flag. Every Warthog NATs its tethered
 host to the same compile-time addresses (`192.168.4.1` on USB), so two hosts on
@@ -305,15 +381,20 @@ Everything in forwarding and bridge mode is host-tested and simulated and
 nothing in it has been on a radio. When a board is back, this is the order,
 and each step is a counter read rather than an argument:
 
-1. **Does the chip hand up third-party frames at all?** Two OpenMANET nodes
-   peered with a warthog between them, forwarding still off. Have the nodes
-   exchange unicast (they will route direct if they can hear each other, so
-   put the warthog where they cannot). `AT+RXCHAN?` — `fwdcand` climbing
-   means the MM6108 delivers 4-address data whose mesh destination is
-   someone else, and everything below is buildable. Zero while the nodes
-   demonstrably talk means the chip filters on addr3, and host-side unicast
-   relaying is impossible; only the group flood (which arrives addressed to
-   us or to the group) would work.
+1. **Does the chip hand up third-party frames at all?** One Linux node peered
+   with the warthog, forwarding still off. On the Linux node, install a static
+   mesh path to a fabricated address via the warthog and ping it, so every
+   frame is addressed to the warthog with a third party in addr3 — the exact
+   frame a relay receives. `fwdcand` in `AT+RXCHAN?` climbing, with
+   `rxdrop reason=93` beside it, means the MM6108 delivers them and everything
+   below is buildable. The full procedure, its positive control and the
+   four-way reading are in `docs/mesh-attachment-model.md`.
+   Two setups look equivalent and are not. A warthog overhearing two peers
+   receives frames addressed to someone else, which every 802.11 receiver
+   discards on addr1 — zero there proves nothing. And a warthog placed
+   *between* two nodes with forwarding off never has a path formed through it
+   (it neither advertises forwarding nor answers path selection for others),
+   so nothing addressed to it carries a third party at all.
 2. **Path selection through the warthog.** `AT+MESHFWD=1`, `AT+RESET`. The
    peer's beacons now see the Forwarding capability. On an OpenMANET node,
    `iw dev wlh0 mpath dump` should show the far node with the warthog as

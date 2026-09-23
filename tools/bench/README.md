@@ -81,7 +81,9 @@ What it covers, and what it deliberately only reports:
 - **Reports** `ae=`, `fwdcand=` and `nodec grp=` without asserting. These are
   the numbers that decide what to build next rather than pass/fail states:
   `ae>0` means a bridged peer is reaching us, `fwdcand>0` means the chip
-  delivers third-party frames and 802.11s forwarding is host-side work, and
+  delivers third-party frames and 802.11s forwarding is host-side work (zero
+  in an ordinary run only means nothing asked us to relay — the experiment
+  that answers it is in `docs/mesh-attachment-model.md`), and
   `nodec grp` climbing means group frames are arriving undecryptable.
 - `--negative` exercises the mismatch cases the scope calls for: an
   out-of-band frequency, an illegal bandwidth, and an empty mesh ID.

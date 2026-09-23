@@ -71,6 +71,8 @@ Everything here persists in NVS and outranks the build-time default.
 | `AT+MESHFWDSTAT?` | [op] | Relay counters: frames forwarded (unicast, group), allocation failures, and every drop by cause — own frame echoed, duplicate, TTL, no path, forwarding off, malformed, next hop's queue full — plus PERRs originated and suppressed by the rate limit, PREQs originated, PREQ/PREP/PERR relayed, frames held for discovery then sent or dropped, and path-selection frames seen protected, refused as plaintext from a peer that protects, and (group-addressed, keyed mesh) with or without an MMIE. `nopath` climbing with `perr_tx` alongside is a node asking us to relay somewhere we have no route. |
 | `AT+MESHGRP=<0\|1>` | [op] | How group frames leave the radio. `0` (default, measured): one unicast per peer, the group address carried in Address Extension — works under SAE, but a mac80211 node that receives one delivers it locally and does not re-flood it, so a warthog's broadcasts stop at the first Linux relay, and it also learns a proxy entry that is not one — the sending warthog as a host behind itself, or a relayed frame's originator as a host behind the relay — which costs that node its path state every time the path ages out. Both are reasons to prefer `1` wherever a Linux node is in the mesh. `1`: standard 3-address 802.11s broadcasts, what mac80211 sends and re-floods — but under SAE a peer's chip holds one group key, so with more than one peer these do not decrypt (measured) unless the receivers run host CCMP. This is the bench A/B, not a fix. Persisted; next boot. |
 | `AT+MESHGRP?` | [op] | Current setting. |
+| `AT+MESHPMF=<0\|1>` | [op] | Management frame protection on the mesh. `0` (default): off — the measured-working value, both warthog-to-warthog and against an OpenMANET peer, which reported `MFP: yes` for a link to a warthog that had it off. `1`: MFP required. A peer advertising `ieee80211w=2` is **not** by itself a reason to set this; the AMPE framing follows our own RSN element, and off and required are each self-consistent. Only these two values exist here: "optional" is the setting where the two ends size the AMPE payload differently and a peer slices the frame short, taking the MIC and Peer Management elements with it, so it is deliberately unreachable. Read once while the mesh config is built, so unlike `AT+MESHSEC=` it cannot be flipped under a live mesh. Persisted; next boot. **Not measured on air** — it exists for a peer that truly refuses unprotected peering, and as a one-command A/B when SAE fails for an unpinned reason. |
+| `AT+MESHPMF?` | [op] | Current setting. |
 | `AT+MESHBRIDGE=<0\|1>` | [op] | L2 bridge mode: USB, the Wi-Fi AP and the mesh become ports of one lwIP bridge, so tethered hosts sit on the mesh segment with their own MACs and take addresses from the mesh's DHCP server — the fix for CoT and mDNS, whose payload addresses alias under NAT. NAT and the multicast repeater are off in this mode. Default 0 — NAT is the proven path. Persisted; next boot. **Compiled, not measured on air**; see [Mesh Mode](Mesh-Mode#bridge-mode). |
 | `AT+MESHBRIDGE?` | [op] | Current setting. |
 | `AT+MESHDHCP=<0\|1>` | [op] | Take a DHCP lease on the mesh if one is offered (default 1), else go straight to the static `10.77.x.y`. A peer that keeps its mesh interface bridged runs a DHCP server on that bridge. |
@@ -132,9 +134,36 @@ AT+FILTSTAT?
 OK
 ```
 
-> `delivered=` in `AT+DATASTAT?` reads 0 on a perfectly healthy link. It is only
-> incremented on a receive path this build does not take. Do not read it as a
-> fault.
+`delivered=` in `AT+DATASTAT?` counts every data frame handed to the network
+stack, on every delivery path. (Older builds counted it on only one path, one
+this build never takes, so it read 0 on a healthy link; that is fixed.) It is
+the positive control for any receive experiment: if it is not climbing, the
+link is not carrying data and no other counter means anything.
+
+`AT+RXCHAN?` reports `rxdrop=<count> reason=<last>`. The count covers every
+frame the receive path finished with other than an ordinary delivery, so it is
+not a loss counter by itself; `reason` is the most recent cause:
+
+| Reason | Meaning |
+|---|---|
+| 3 | Plaintext data on a keyed link (only EAPOL may arrive unprotected) |
+| 4 | Protected, but the chip did not decrypt it (no key, or wrong key) |
+| 5 | CCMP header unreadable, or a replayed packet number (the replay check) |
+| 6 | Too short to hold the CCMP MIC |
+| 7 / 8 | Group frame with the fragment bit set / our own broadcast relayed back |
+| 9 | 4-address EAPOL addressed to us (unsupported) |
+| 10 | EAPOL consumed locally — **not a loss** |
+| 11 / 12 | Controlled port closed / no LLC ethertype |
+| 13 / 15 | No receiving interface / no network-stack callback registered |
+| 14 | Delivered via the legacy callback — **not a loss**; current builds deliver without touching `rxdrop` |
+| 90 / 91 / 92 | Mesh Control truncated / could not be stripped / Address Extension truncated |
+| 93 | Leaf: a mesh frame for another node, dropped because forwarding and bridge are both off |
+| 94 | A 4-address frame for another node **without** Mesh Control — never relayable, dropped in every mode |
+| 99 | Forwarded to the next hop — **not a loss** |
+| 100 + N | Forwarding engine: 101 own frame echoed, 102 duplicate, 103 not for us, 104 would forward but `AT+MESHFWD=0`, 105 TTL, 106 no path (a PERR goes back), 107 bad Address Extension, 108 arrived with TTL 0 |
+
+93 and 104 are configuration, not failure: they mean the node is a leaf, or
+bridge-only, by setting.
 
 ## Crypto
 

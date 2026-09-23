@@ -205,32 +205,94 @@ Both are worth doing deliberately or not at all — switching either on without
 the duplicate suppression that mesh forwarding normally provides invites
 loops.
 
-## Settle the forwarding question before writing forwarding
+## The forwarding question: does the chip hand up a relay frame?
 
-Two independent reviews disagree on whether the MM6108 hands up a mesh data
-frame whose destination is a third party. One reads the chip as a lower MAC
-that receives whatever the host can parse; the other found a recorded
-chip-firmware addr3 filter that would make host-side forwarding impossible
-without a firmware change. That is the difference between a two-week feature
-and a blocked one, and it is not worth writing a thousand lines of relay
-logic to find out — a half-working relay blackholes traffic, which is exactly
-why the Forwarding capability bit is deliberately clear today.
+Everything above the chip is settled by source and host tests. Nothing in
+Warthog's receive path discards a 4-address frame because its mesh destination
+(addr3) is a third party, except the leaf guard (`rxdrop reason=93`), which
+exists only while `AT+MESHFWD=0` and `AT+MESHBRIDGE=0`, and reason 94 for the
+non-conforming case of a 4-address frame without Mesh Control. The host
+simulator relays such a frame end to end (`scenario_relay`,
+`t_rx_forward_unicast`) — on an open mesh only; no host test runs a keyed relay.
 
-**The probe is in the firmware.** `AT+RXCHAN?` reports `fwdcand=N(xxxxxx)`:
-mesh data frames whose destination is neither us nor a group address, counted
-before any of our own drops, with the low three octets of the most recent
-such destination.
+The chip is a closed binary. Its one receive-address filter reachable through
+morselib is `BSSID_SET`, and Warthog programs it with a synthetic value that no
+data frame's addr3 ever equals, yet the data plane works. That rules out a
+BSSID match on addr3 — and nothing more. Every frame measured so far had addr3
+equal to the receiver itself, so a firmware rule "addr3 must be me" would have
+passed all of them. (The command set also defines a monitor interface type,
+`ADD_INTERFACE` type 3; morselib does not use it and it is untested on this
+firmware.) The comments in `mmdrv.h`, `driver.c` and `umac_mesh.c` describing a
+chip "addr3 filter" were hypotheses written before mesh receive worked; nothing
+measured supports or refutes them.
 
-Run it with three nodes: two peers exchanging traffic with each other, and a
-Warthog in range of both but addressed by neither.
+So two questions need a radio, and a relay needs both answered yes:
 
-| Result | Meaning | Next step |
-|---|---|---|
-| `fwdcand` climbing | The chip delivers third-party frames. Forwarding is host-side work. | Build it: RX re-enqueue, TTL decrement, duplicate suppression by mesh sequence number, then set the Forwarding bit last. |
-| `fwdcand` stays 0 | The chip filters on the mesh destination. | Host-side forwarding is impossible; raise it with Morse Micro. Do not write the relay. |
+1. **Receive:** does the MM6108 deliver a 4-address data frame **addressed to
+   us** (addr1) by a peer, whose addr3 names somebody else? That is the frame a
+   relay receives.
+2. **Transmit:** does it send a frame whose addr4 is not its own address? That
+   is the frame a relay emits. Step 3 of the on-air sequence in
+   `wiki/OpenMANET-Interop.md` answers it, once the first answer is yes.
 
-Read `ae=` in the same query: a bridged peer reaching us at all is the other
-precondition for being useful on an idiomatic OpenMANET network.
+**Do not test the first by overhearing.** A Warthog "in range of two peers but
+addressed by neither" receives frames whose addr1 is another station. Every
+802.11 receiver filters on addr1 — acknowledgement depends on it — so that setup
+reads zero whether addr3 is filtered or not.
+
+### The experiment
+
+Two nodes: a Linux 802.11s node (an OpenMANET node, or an MM8108 adapter on a
+Linux host) and one Warthog, peered — `mesh plink: ESTAB` on the Linux side.
+Use `warthog-mesh-sae` against an SAE peer, the pairing that has already peered
+on this hardware; `AT+MESHPASS` is ignored on an open build. The third party is
+fabricated and never has to exist.
+
+On the Warthog, keep `AT+MESHFWD=0` and `AT+MESHBRIDGE=0`, so a relay frame is
+counted by `fwdcand` and then dropped with reason 93. The two are readouts of
+the same check (both require Mesh Control, both compare addr3 with our
+address), not independent evidence; 93 confirms the frame went on to decrypt.
+Set every stored gate first and reboot once before the baseline: only a reboot
+clears the counters this reads.
+
+On the Linux node, with `W` the Warthog's MAC from `iw dev wlh0 station dump`
+and an unused address on the subnet of the bridge that holds the mesh
+interface:
+
+```
+X=02:00:00:de:ad:01
+iw dev wlh0 mpath new $X next_hop $W
+ip neigh replace 10.41.99.99 lladdr $X nud permanent dev br-lan
+ping -c 50 -i 0.2 -W 1 10.41.99.99     # no replies: expected
+iw dev wlh0 mpath del $X; ip neigh del 10.41.99.99 dev br-lan
+```
+
+Every echo leaves as a 4-address frame with addr1 = `W` and addr3 = `X`. Read
+`tx packets` for `W` in `iw dev wlh0 station dump` before and after; it must
+rise by at least 50, or nothing was sent.
+
+In the same minute, as the positive control, run `AT+MPING=<Linux node>,20` on
+the Warthog: `delivered=` in `AT+DATASTAT?` must rise by at least 20. If it
+does not, the link is the finding and the run is void.
+
+Then read `AT+RXCHAN?` and `AT+DATASTAT?`:
+
+| Reading | Answer |
+|---|---|
+| `fwdcand` up by about 50, its last destination the low octets of `X`, `rxdrop` up with `reason=93` | **Yes.** The chip delivers relay frames. |
+| `fwdcand` up by about 50 but `reason=4` instead of 93 | **Yes** for the chip — it delivered them — but they did not decrypt. The keyed path is the next problem, not the chip. |
+| `fwdcand` flat and `data` up by no more than the control accounts for, while the Linux node's `tx packets` rose by 50 | **Probably no**: the chip filters on addr3, and host-side unicast relaying is impossible without Morse Micro. `data` is counted when a page reaches the host's page handler, so a host page-level drop (checksum, sync, allocation) would read the same — rule those out before concluding. |
+| `data` up by about 50 but `fwdcand` flat | The chip delivered and the host dropped it earlier — see `AT+FILTSTAT?` and `stad_miss` in `AT+DATASTAT?`. The chip's answer is still yes. |
+| The Linux node's `tx packets` did not move | Void: the path was never used. |
+
+On a build with the receive tap (`warthog-mesh-smoke`), `AT+RXHEAD?` shows the
+last data frame's addr3 directly, at hex characters 32–43; other builds return
+ERROR for it.
+
+A two-Warthog version is possible in principle — with forwarding off, a unicast
+for an unknown destination goes to the first peer, addressed to it, carrying
+the unknown address as addr3 — but no AT command sends to an arbitrary MAC
+today, so it needs one added.
 
 ## Current on-air posture
 
