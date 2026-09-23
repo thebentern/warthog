@@ -81,16 +81,24 @@ A Warthog joins a mesh and talks to its peers. It does **not** forward frames
 between two other nodes, so it cannot extend a mesh's reach — a Warthog placed
 between two nodes that cannot hear each other does not connect them.
 
-This is absent at every layer, not merely unverified: the RX data path
-delivers to the local host or drops, with no branch that re-enqueues a frame
-whose mesh destination is somebody else; the Mesh Control TTL is written on
-transmit and never read or decremented on receive; and the multicast repeater
-explicitly refuses to re-send a datagram out the interface it arrived on
-(`main/mudp.c`).
+In the default leaf mode this is switched off, not merely unverified: the RX
+data path delivers to the local host or drops, and a unicast whose mesh
+destination is another node is dropped (`AT+RXCHAN?` reason 93, or 94 without
+Mesh Control); the relay decision (`umac_mesh_fwd_rx`), the only code that
+reads and decrements the Mesh Control TTL, runs only under `AT+MESHFWD=1` or
+`AT+MESHBRIDGE=1`; a leaf neither relays a PREQ nor starts path discovery
+(its only PREQs are the per-peer keepalive); and the multicast repeater
+refuses to re-send a datagram out the interface it arrived on (`main/mudp.c`).
+
+A leaf does learn hosts behind a peer (the LAN of a bridged OpenMANET node)
+from Address Extension frames, and sends a reply to such a host via that peer
+with Address Extension mode 2. Broadcasts keep the leaf shape, one plain
+replica per peer (or one standard group frame with `AT+MESHGRP=1`), and a
+unicast to an unknown address goes to the first peer.
 
 If you need a relay — an airborne node extending coverage, for instance —
-that is 802.11s HWMP forwarding, and it is not built yet. See
-[`docs/mesh-attachment-model.md`](docs/mesh-attachment-model.md).
+that is `AT+MESHFWD=1` (802.11s HWMP forwarding), which has not been on a
+radio. See [Mesh Mode](wiki/Mesh-Mode.md#forwarding).
 
 ### Warthog routes, it does not bridge
 
@@ -353,17 +361,21 @@ node that loses power takes only its own links with it.
 
 ```bash
 pio run -e warthog-mesh-sae -t upload      # encrypted: SAE auth + AMPE per-link keys
-pio run -e warthog-mesh-smoke -t upload    # open: for stock (unencrypted) OpenMANET
+pio run -e warthog-mesh-smoke -t upload    # open peering; AT+MESHSEC=0 for stock (unencrypted) OpenMANET
 ```
 
 The encrypted build runs real 802.11s security — SAE authentication
-(Dragonfly, group 19) and AMPE key exchange, with per-link pairwise and group
-keys installed in the radio. All nodes share one passphrase: `AT+MESHPASS=` at
+(Dragonfly, group 19) and AMPE key exchange, which gives every link its own
+pairwise key and every node its own group key (what the radio can hold is under
+[Status](#status)). All nodes share one passphrase: `AT+MESHPASS=` at
 runtime, defaulting to the build's `WARTHOG_MESH_PASSPHRASE` (`warthog-mesh`)
 until one is set. Peering, keying and addressing are automatic.
 
-Nodes address themselves statically from their own MAC — `10.77.<mac[4]>.<mac[5]>/16`
-— so `3c:1a:cc:4c:83:a5` is `10.77.131.165`. There is no DHCP on the mesh.
+A node first asks for a DHCP lease on the mesh; a peer whose mesh interface is
+bridged to a LAN with a DHCP server can answer it. With no offer within
+6 s it addresses itself statically from its own MAC — `10.77.<mac[4]>.<mac[5]>/16`
+— so `3c:1a:cc:4c:83:a5` is `10.77.131.165`. `AT+MESHDHCP=0` skips the DHCP
+attempt.
 
 ```
 AT+MPMPEERS?                     peers, handshake state, AMPE key counters
@@ -388,10 +400,12 @@ joins as a peer and presents a Wi-Fi AP and a USB Ethernet adapter on the other
 side. That story, end to end, is in the wiki:
 [OpenMANET Gateway](../../wiki/OpenMANET-Gateway).
 
-Two OpenWrt defaults will stop it dead, each with no error message: the mesh
-interface is bridged into `br-lan`, and unbridging it drops it out of the `lan`
-firewall zone. Both are covered, with the diagnostic signature of each, in
-[`docs/mesh-openmanet.md`](docs/mesh-openmanet.md).
+Two OpenWrt defaults stopped the measured build dead, each with no error
+message: the mesh interface is bridged into `br-lan`, and unbridging it drops it
+out of the `lan` firewall zone. Both are covered, with the diagnostic signature
+of each, in [`docs/mesh-openmanet.md`](docs/mesh-openmanet.md). Current builds
+try DHCP first and learn the hosts behind a bridged peer from Address
+Extension; neither has been on a radio against a bridged node.
 
 ## Troubleshooting
 
@@ -473,9 +487,11 @@ The CDC console (`/dev/cu.usbmodemXXXX`) carries all ESP-IDF logs after USB-OTG 
 SAE/AMPE is implemented: the `warthog-mesh-sae` build derives a per-link MTK
 per peer, and peering interoperates with stock OpenMANET. One limit applies:
 the **encrypted** data plane is warthog-to-warthog only — against OpenMANET the
-verified result is the unencrypted mesh above, because the chip holds one
-VIF-wide group key while every 802.11s peer generates its own, so
-group-addressed frames from a second peer cannot be decrypted in hardware.
+verified result is the unencrypted mesh above, because the chip has one group
+key slot while every 802.11s peer generates its own group key. That slot holds
+our own TX group key, so a peer's group-addressed frames cannot be decrypted in
+hardware; each peer's group key is kept on the host, where only host software
+CCMP (`warthog-mesh-sae-swccmp`) can use it.
 
 Mesh is no longer confined to the capability builds: `AT+MESHEN=1` enables it
 on any image, region envs included, and the mesh ID, passphrase and channel are
@@ -490,8 +506,9 @@ Implemented but not measured on air, likewise: L2 bridge mode (`AT+MESHBRIDGE=1`
 — USB, Wi-Fi AP and mesh as one segment, NAT off; builds on every env with the
 lwIP bridge compiled in, has not carried a packet).
 
-Not implemented: per-transmitter group keys, multicast across the mesh on a
-leaf, Windows RNDIS, and a web UI.
+Not implemented: per-transmitter group keys in the chip (the host keeps one
+per peer, above), multicast across the mesh on a leaf, batman-adv, Windows
+RNDIS, and a web UI.
 
 ### What is measured, and what is not
 
@@ -505,20 +522,27 @@ The unencrypted data-plane figures in phase 7, against OpenMANET **1.8.0**. On
 mesh configuration, the absence of a batman fabric on an un-wizarded node, and
 proxied endpoints crossing the mesh on air.
 
-**Not measured.** Everything added on 2026-09-21 is compiled, reviewed and
+**Not measured.** Everything added from 2026-09-21 on is compiled, reviewed and
 where possible host-tested, but has not run on a radio: receive-side Address
-Extension against a real bridged peer, DHCP-first netif bring-up, runtime
-channel configuration on a region build, per-peer RSSI/SNR/bandwidth, the
-`fwdcand` forwarding-feasibility counter, the peering watchdog's output
-(its cause-selection is unit-tested on the host; its log lines have never
-fired on hardware), and the whole of 802.11s forwarding — every decision in
-it is host-tested and a multi-node simulator drives the shipping code through
-relay, flood, proxy, link-loss and TTL scenarios, but no forwarded frame has
-been on a radio, and whether the chip delivers third-party frames to the host
-at all is the `fwdcand` question above. Host software CCMP has **never been observed working on
-air** — `swccmp ok` has not been seen above zero, for unicast or group. That
-802.11w MFP is negotiated and the IGTK installed is readable from the source
-and the linked image; that the chip applies BIP on air is not.
+Extension against a real bridged peer, leaf-mode learning of hosts behind a
+peer and the Address Extension mode 2 replies to them, DHCP-first netif
+bring-up, runtime channel configuration on a region build, per-peer
+RSSI/SNR/bandwidth, the `fwdcand` forwarding-feasibility counter, the peering
+watchdog's output (its cause-selection is unit-tested on the host; its log
+lines have never fired on hardware), standard group frames (`AT+MESHGRP=1`),
+our own group key going into the chip with the first SAE peer, the re-install
+of each surviving link's own AMPE key when an SAE peer is removed, the board
+reset on a chip restart while the mesh interface is up, the Meshtastic
+repeater's one-socket-per-interface receive and send (the repeater was measured
+on air before that change),
+`AT+MESHPMF=1`, and the whole of 802.11s forwarding and bridge mode — every
+forwarding decision is host-tested and a multi-node simulator drives the
+shipping code through relay, flood, proxy, link-loss and TTL scenarios, but no
+forwarded frame has been on a radio, and whether the chip delivers third-party
+frames to the host at all is the `fwdcand` question above. Host software CCMP
+has **never been observed working on air** — `swccmp ok` has not been seen
+above zero, for unicast or group — and its refusal of a unicast keyed with a
+group key (`AT+SWCCMP?` `grpkey=`) is host-tested only.
 
 **What the unmeasured receive-side work does to the measured path.** A
 previous revision of this paragraph claimed warthog never emits a Mesh Control
@@ -528,9 +552,12 @@ wrong: every mesh data frame warthog transmits carries a 6-byte Mesh Control
 4-address data without it). So warthog-to-warthog frames DO take the
 `mesh_ctrl_present` branch. What that branch does to them is the pre-existing
 6-byte strip plus three additive counters; the Address Extension capture only
-fires when the sender set AE flags, which warthog does not. The 3-node result
-from 2026-09-20 was measured with that strip already in place. The exposure is
-therefore the counters and the AE parse on foreign frames, not the strip.
+fires when the sender set AE flags, which a warthog does only when forwarding,
+bridging, or replying to a host learned behind a peer — never to another
+warthog in the default NAT and leaf mode. The 3-node result from 2026-09-20 was
+measured with that strip already in place. The exposure is therefore the
+counters and, on foreign frames, the AE parse and the host learning it feeds,
+not the strip.
 
 If you are deciding whether to trust this for something that matters, the
 not-measured paragraph is the honest answer.
@@ -563,15 +590,15 @@ same mesh are in exactly the same position.
 
 | Mode | Peering | Data plane | Use |
 |---|---|---|---|
-| Default mesh build | open, unauthenticated | cleartext | interop testing; this is what talks to stock OpenMANET today |
-| `AT+MESHSEC=1` | open, unauthenticated | CCMP under a **public constant** | exercising the CCMP path only |
+| Non-SAE mesh, default (`AT+MESHSEC=1`) | open, unauthenticated | CCMP under a **public constant** | warthog-to-warthog only; not link security |
+| `AT+MESHSEC=0` | open, unauthenticated | cleartext | interop with stock (unencrypted) OpenMANET |
 | `warthog-mesh-sae` | SAE (Dragonfly) | CCMP under a per-link AMPE MTK | the only mode with real link security |
 
-The `AT+MESHSEC=1` key is `00 11 22 33 … ff` — a counting sequence compiled
-into every Warthog image. It is not a secret, anyone with the firmware has it,
-and it exists only so the CCMP data path can be exercised. It also cannot
-interoperate: a peer deriving real keys can neither read those frames nor be
-read by them.
+The `AT+MESHSEC=1` key, the default on every image built without SAE (the
+region builds and `warthog-mesh-smoke`), is `00 11 22 33 … ff` — a counting
+sequence compiled into every Warthog image. It is not a secret and anyone with
+the firmware has it. It also cannot interoperate: a peer that derives real keys
+or sends cleartext can neither read those frames nor be read by them.
 
 ### The default SAE passphrase is in the binary
 
@@ -593,20 +620,19 @@ pio run -e warthog-mesh-sae --build-flag='-UWARTHOG_MESH_PASSPHRASE' \
 
 ### Management frame protection (802.11w)
 
-MFP is negotiated on the SAE build. The mesh join path sets PMF to *required*
-(`umac/supplicant_shim/config.c:452`), which is what mac80211 and hostap do for
-a secured mesh, so the RSN capabilities Warthog advertises match what an
-OpenMANET peer expects. hostap's `mesh_rsn` generates a TX IGTK and installs it
-through the driver shim as `WPA_ALG_BIP_CMAC_128`, the shim handles that
-algorithm (`umac/supplicant_shim/driver.c:879`), and the BIP primitives are
-linked into the image. Warthog's AMPE parser accounts for the peer's IGTK when
-the peer advertises MFP capable and required (`umac/mesh/umac_mesh.c:1105`).
+MFP is off by default: the SAE build's mesh join advertises no management frame
+protection (`AT+MESHPMF=0`). An OpenMANET peer running `ieee80211w=2` still
+peers with it.
 
-**Not measured.** That the key is generated, installed and negotiated is
-readable from the source and the linked image. Whether the MM6108 actually
-applies BIP to robust management frames on air has never been observed here —
-it is the same open question as the group CCMP key, and it needs a radio and a
-peer to answer.
+`AT+MESHPMF=1` (stored; applies after `AT+RESET`) sets PMF to *required* in the
+mesh join (`umac/supplicant_shim/supplicant_core_mesh.c`), so the RSN
+capabilities ask for MFP and hostap's `mesh_rsn` generates a TX IGTK. That
+negotiates MFP and nothing more: the mesh driver's key op
+(`mmwpas_set_key_mesh`, `umac/supplicant_shim/driver_ap.c`) installs CCMP keys
+only and ignores the BIP IGTK, so no IGTK is installed, no BIP is applied, and
+nothing enforces protection.
+
+**Not measured.** `AT+MESHPMF=1` has never been run on air.
 
 ### For anything that actually needs confidentiality
 

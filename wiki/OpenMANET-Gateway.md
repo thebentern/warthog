@@ -41,7 +41,8 @@ the Pi sent it. `parse_fail=0` means every frame was understood.
 
 ## Setup — warthog
 
-**1. Build and flash the mesh image.** Mesh is a build-time mode:
+**1. Build and flash the mesh image.** It always boots into mesh (any other
+image: `AT+MESHEN=1`, then `AT+RESET`):
 
 ```bash
 pio run -e warthog-mesh-smoke -t upload
@@ -90,6 +91,14 @@ same comparison.
 Two OpenWrt defaults will stop it dead, and neither produces an error message.
 This is the part that costs people hours.
 
+**First, run `ip addr show bat0`.** If `bat0` exists, the node was configured by
+OpenMANET's mesh wizard: `wlh0` is a batman-adv (BATMAN_V) hard interface of
+`bat0`, not a `br-lan` port. Warthog does not implement batman-adv, so against
+such a node it peers but gets no DHCP lease and no IP path, and the unbridging
+below would remove `wlh0` from `bat0`. Not measured; see
+[OpenMANET Interop](OpenMANET-Interop). The steps below are for a node without
+`bat0`.
+
 **Take the mesh interface out of the bridge.** OpenWrt puts `wlh0` in
 `br-lan`. A bridged mesh interface cannot hold its own address, and traffic
 entering the mesh from a bridge is *proxied* — 802.11s handles that through a
@@ -121,15 +130,17 @@ every ~10 s. warthog answers path discovery properly; it is not needed.
 
 ## Addressing
 
-There is no DHCP on the mesh. Every node — warthog and Pi alike — derives a
-static address from its own MAC:
+A warthog first asks for a DHCP lease over the mesh and waits up to 6 s. A Pi
+taken out of its bridge as above serves no lease on `wlh0`, so the warthog
+falls back to a static address derived from its own MAC — the same form the Pi
+is given by hand with the `ip addr add` above:
 
 ```
 10.77.<mac[4]>.<mac[5]> / 255.255.0.0
 ```
 
-warthog does this automatically. Give the Pi the matching address by hand (the
-`ip addr add` above). `AT+STATUS?` reports what a warthog picked.
+`AT+MESHDHCP=0` skips the lease attempt. `AT+STATUS?` reports what a warthog
+picked.
 
 ## Now the clients
 
@@ -153,7 +164,7 @@ macOS, Linux, Windows 10+ and iOS/iPadOS all bind with an in-box driver. The
 host gets `192.168.4.x` by DHCP.
 
 Both surfaces are NAT'd onto the mesh, so clients need no route configured and
-the mesh sees only the warthog's `10.77.x.y` address.
+the mesh sees only the warthog's own mesh address.
 
 ## Verifying end to end
 
@@ -168,12 +179,15 @@ outward: [Troubleshooting](Troubleshooting) has the symptom → cause table.
 
 ## What warthog does not do
 
-- **Forward.** A warthog answers path requests aimed at itself and relays
-  nothing. It is a leaf with clients behind it, not a repeater. Two mesh nodes
-  that cannot hear each other will not be relayed through a warthog between
-  them.
+- **Forward, by default.** A warthog answers path requests aimed at itself and
+  relays nothing. It is a leaf with clients behind it, not a repeater. Two mesh
+  nodes that cannot hear each other will not be relayed through a warthog
+  between them. `AT+MESHFWD=1` makes it a relay; that is host-tested and
+  simulated, not yet run on air.
 - **Encrypt meaningfully.** The keyed mode is one hardcoded key on every node.
   Run open to match OpenMANET, and treat the mesh as an untrusted transport —
   which for ATAK-style traffic you should be doing anyway.
-- **Bridge at L2.** Clients are NAT'd, so a mesh node cannot initiate a
-  connection *to* a phone behind a warthog. Phone-initiated flows are fine.
+- **Bridge at L2, by default.** Clients are NAT'd, so a mesh node cannot
+  initiate a connection *to* a phone behind a warthog. Phone-initiated flows
+  are fine. `AT+MESHBRIDGE=1` puts the clients on the mesh at layer 2 instead;
+  that mode builds but has not carried a packet on a board.

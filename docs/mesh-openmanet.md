@@ -19,7 +19,8 @@ Verified result, stock peer configuration, unencrypted mesh:
 
 ## Build and flash
 
-Mesh mode is a build-time configuration, not a runtime toggle:
+`AT+MESHEN=1` puts any build in mesh mode (stored; applied on the next boot).
+This env starts in it:
 
 ```bash
 pio run -e warthog-mesh-smoke
@@ -27,7 +28,9 @@ pio run -e warthog-mesh-smoke
 
 That env pins the radio to a single S1G channel and sets the mesh identity, so
 every node agrees without any runtime configuration. The values that must match
-across the whole mesh are compile-time flags in `platformio.ini`:
+across the whole mesh are compile-time defaults in `platformio.ini`;
+`AT+MESHID=` and `AT+MESHCHAN=` override the first five at runtime (stored;
+applied on the next boot):
 
 | Flag | Default | Must match peers |
 |---|---|---|
@@ -59,18 +62,20 @@ tools/bench/flash.sh "WTHG-0272A1F8738D 0-1 1" "WTHG-021BF681BA51 0-1 2"
 
 ## Addressing
 
-Mesh nodes are statically addressed. There is no DHCP on the mesh; a node
-derives its own address from its MAC:
+On its first peer establishment a node asks for a DHCP lease (`AT+MESHDHCP`,
+default 1) and waits up to 6 s; a peer whose mesh interface is bridged to a
+DHCP server can serve one. With no offer, the node derives a static address
+from its MAC:
 
 ```
 10.77.<mac[4]>.<mac[5]> / 255.255.0.0
 ```
 
-So `3c:1a:cc:4c:83:a5` is `10.77.131.165`. The whole mesh is one flat
-`10.77.0.0/16`, which is why nodes whose third octet differs are still on-link.
+So `3c:1a:cc:4c:83:a5` is `10.77.131.165`. Statically addressed nodes share one
+flat `10.77.0.0/16`, which is why nodes whose third octet differs are still on-link.
 
-**A Linux peer must use the same derivation**, or nothing will route. For a card
-with MAC `e4:5f:01:28:bf:74`:
+**An unbridged Linux peer must use the same derivation**, or nothing will
+route. For a card with MAC `e4:5f:01:28:bf:74`:
 
 ```sh
 ip addr add 10.77.191.116/16 dev wlh0
@@ -78,10 +83,11 @@ ip addr add 10.77.191.116/16 dev wlh0
 
 `AT+STATUS?` reports the address the node picked.
 
-Two behaviours worth knowing. The gateway is set to the node's **own** address,
-so a mesh node has no upstream route — mesh mode is not a path to the internet.
-And the address is applied lazily, on the first peer establishment rather than
-at boot, so a node with no peers yet has no mesh address to report.
+Two behaviours worth knowing. With the static address the gateway is set to
+the node's **own** address, so the node has no upstream route — the static mesh
+is not a path to the internet. And the address is applied lazily, on the first
+peer establishment rather than at boot, so a node with no peers yet has no mesh
+address to report.
 
 ## Setting up an OpenMANET / OpenWrt peer
 
@@ -112,6 +118,15 @@ ip link set wlh0 nomaster
 ip addr add 10.77.191.116/16 dev wlh0
 ip link set wlh0 up
 ```
+
+This is the measured procedure for a bare node. Keeping `wlh0` in `br-lan`
+(Warthog takes a lease from the bridge and exchanges Address Extension frames
+with it) is implemented and not measured on air.
+
+Run `ip addr show bat0` on the peer first. If `bat0` exists, the OpenMANET
+wizard has made `wlh0` a batman hardif of `bat0`: `ip link set wlh0 nomaster`
+takes that node off its own batman fabric, and a Warthog gets no IP path into
+that fabric either way. Not measured; see `docs/mesh-attachment-model.md`.
 
 ### 2. Put the interface back in a firewall zone
 
@@ -171,8 +186,8 @@ nobody is answering.
 > **Real 802.11s security is the `warthog-mesh-sae` build**: SAE (Dragonfly,
 > group 19) authentication and AMPE per-link key exchange, hardware-validated
 > warthog↔warthog (peering + keying in one exchange, 0% loss over the CCMP
-> link). Every node needs the same passphrase
-> (`-DWARTHOG_MESH_PASSPHRASE`, default `warthog-mesh`). A standard secured
+> link). Every node needs the same passphrase (`AT+MESHPASS=`, build default
+> `-DWARTHOG_MESH_PASSPHRASE`, `warthog-mesh`). A standard secured
 > 802.11s stack such as OpenMANET's speaks the same protocol; configure its
 > `wpa_supplicant` for mesh SAE with the matching passphrase.
 >
@@ -263,17 +278,24 @@ AT+MPING=10.77.191.116,8
 | Peering fine, zero data both ways | `AT+MESHSEC?` | Keyed Warthog against an open peer. `AT+MESHSEC=0`. |
 | Frames arrive, nothing delivered | `AT+FILTSTAT?` | Names which of the RX filter's eight drop paths is firing. |
 
-Two counters that are *not* evidence of a fault:
-
-- `delivered=` in `AT+DATASTAT?` reads 0 on a healthy link — it is only
-  incremented on a receive path this build does not take.
-- `rx_data` counts frames reaching the datapath, not frames delivered to the IP
-  stack; it moving slowly while pings succeed is normal.
+A counter that is *not* evidence of a fault: `rx_data` counts frames reaching
+the datapath, not frames delivered to the IP stack; it moving slowly while pings
+succeed is normal. `delivered=` in `AT+DATASTAT?` counts frames handed to the IP
+stack.
 
 ## Known gaps
 
-- Warthog does not forward. It answers path requests that target it and ignores
-  the rest, so a three-node mesh where two nodes cannot hear each other will not
-  relay through a Warthog in the middle.
-- Keyed mesh uses a single fixed key on every node. SAE/AMPE key derivation is
-  not implemented.
+- By default Warthog does not forward. It answers path requests that target it
+  and ignores the rest, so a three-node mesh where two nodes cannot hear each
+  other will not relay through a Warthog in the middle. `AT+MESHFWD=1` adds
+  forwarding and `AT+MESHBRIDGE=1` bridge mode; both are host-tested only, and
+  whether the chip hands a relay frame to the host is unmeasured
+  (`docs/mesh-attachment-model.md`).
+- SAE/AMPE (`warthog-mesh-sae`) peers cross-vendor, but its data plane has not
+  yet carried traffic with an OpenMANET peer. The chip holds one pairwise and
+  one group key, so more than one keyed peer, and any peer's group frames,
+  need host CCMP (`warthog-mesh-sae-swccmp`), which has not run on air.
+- `AT+MESHPMF=1` negotiates management frame protection only: no IGTK is
+  installed, and path-selection frames go out unprotected.
+- `AT+MESHSEC=1` on the non-SAE build uses one published key on every node.
+- batman-adv is not implemented.

@@ -36,19 +36,23 @@ exactly — read the peer's actual setting rather than assuming a default; see
 
 ## Addressing
 
-There is no DHCP on the mesh. Each node derives a static address from its own
-MAC:
+A node first asks for a DHCP lease over the mesh and waits up to 6 s. A peer
+whose mesh interface sits in a bridge with a DHCP server on it (an OpenMANET
+node with `wlh0` in `br-lan`) can answer; that path is not yet measured on air.
+With no offer — every warthog-only mesh — the node falls back to a static
+address derived from its own MAC. `AT+MESHDHCP=0` skips the lease attempt.
 
 ```
 10.77.<mac[4]>.<mac[5]> / 255.255.0.0
 ```
 
-`3c:1a:cc:4c:83:a5` becomes `10.77.131.165`. The mesh is one flat
+`3c:1a:cc:4c:83:a5` becomes `10.77.131.165`. The static mesh is one flat
 `10.77.0.0/16`, so nodes whose third octet differs are still on-link. Ask a node
 what it picked with `AT+STATUS?`.
 
-The gateway is the node's own address, so **mesh mode has no upstream route** —
-it is a network between peers, not a path to the internet. The address is also
+On the static address the gateway is the node's own address, so **mesh mode
+has no upstream route** — it is a network between peers, not a path to the
+internet. The address is also
 applied on first peer establishment rather than at boot, so a node that has not
 peered yet has no mesh address.
 
@@ -138,20 +142,25 @@ changes, all of it 802.11s as mac80211 does it:
 
 Read the state with `AT+MESHPATH?` and the counters with `AT+MESHFWDSTAT?`.
 
-**Group frames and OpenMANET, honestly.** This chip cannot key group frames
-across more than one SAE peer, so by default a broadcast leaves as one
-unicast per peer with the group address in Address Extension 2. A warthog
-receiver recognises that as the broadcast it is and re-floods it. A mac80211
-receiver — traced through the 6.6 source — rebuilds it as an Ethernet frame
-to the group, delivers it to its own bridge, learns the proxy, and **does not
-re-flood it**: no PERR, no onward broadcast. So with the default a warthog's
-broadcast (ARP, DHCP, mDNS, Meshtastic UDP) reaches a Linux node and stops
-there; nothing beyond a Linux relay hears it. The reverse direction works,
-because Linux sends standard frames. Whenever a Linux node is expected to
+**Group frames and OpenMANET, honestly.** Under SAE a warthog's chip cannot
+decrypt a peer's group frames — its one group slot holds its own TX MGTK — so
+by default a broadcast leaves as one unicast per peer. In leaf mode that copy
+is a plain unicast to the peer with no Address Extension. With `AT+MESHFWD=1`
+or `AT+MESHBRIDGE=1` it carries the group address in Address Extension 2,
+which a warthog relay recognises as the broadcast it is and re-floods. A
+mac80211 receiver — traced through the 6.6 source — rebuilds the AE 2 form as
+an Ethernet frame to the group, delivers it to its own bridge, learns the
+proxy, and **does not re-flood it**: no PERR, no onward broadcast; the plain
+leaf copy is addressed to that node and goes no further either. So with the
+default a warthog's broadcast (ARP, DHCP, mDNS, Meshtastic UDP) reaches a
+Linux node and stops there; nothing beyond a Linux relay hears it. The reverse
+direction works on an open mesh, because Linux sends standard frames; under
+SAE, receiving them needs host CCMP. Whenever a Linux node is expected to
 relay a warthog's broadcasts, set `AT+MESHGRP=1`. `AT+MESHGRP=1` switches to standard 3-address broadcasts, which every
-mac80211 receiver floods correctly, at the cost that under SAE they decrypt
-only with one peer or with host CCMP on the receivers. On an open mesh, use
-it.
+mac80211 receiver floods correctly. Under SAE they go out under the sender's
+own MGTK, which each peer receives in AMPE; a warthog receiver decrypts them
+only with host CCMP, and a Linux receiver doing so is not yet measured. On an
+open mesh, use it.
 
 **Two deliberate deviations from mac80211, both on the wire.**
 
@@ -319,23 +328,26 @@ images must be safe before they are configured. Every node on the mesh needs
 the same one.
 
 On boot the node authenticates each SAE peer it discovers (SAE Commit/Confirm,
-NIST P-256), then AMPE derives a per-link pairwise key (MTK) and a group key
-(MGTK) and installs both in the chip. Peering completes in a single
+NIST P-256), then AMPE derives a per-link pairwise key (MTK) and each side
+sends the other its own group key (MGTK). The MTK and Warthog's own MGTK go
+into the chip; a peer's MGTK stays in the host keychain, because the chip has
+one group slot. Peering completes in a single
 Open/Confirm exchange and data flows CCMP-encrypted end to end. Verify:
 
 ```
 AT+SAERX?
 +SAERX: ... ESTAB=1 ...
 AT+MPMPEERS?
-+MPMPEERS: ... ampe_mtk=1 ampe_mgtk=1 ...
++MPMPEERS: ... ampe_mtk=1 ampe_mgtk=2 ...
 AT+KEYINST?
 +KEYINST: n=2 [aid=1 pw=1 ...] [aid=0 pw=0 ... hw=1]
 ```
 
-`ampe_mtk`/`ampe_mgtk` count AMPE-derived keys installed in the chip;
-`AT+KEYINST?` shows the pairwise key on the peer's AID and the group key on
-AID 0. Bench-measured: peering + keying in one exchange, 8/8 pings at 0% loss,
-~16 ms RTT over the keyed link.
+`ampe_mtk` counts pairwise keys installed in the chip; `ampe_mgtk` counts
+Warthog's own MGTK, installed with the first peer, plus each peer's MGTK in the
+host keychain, so one peer reads 2. `AT+KEYINST?` shows the pairwise key on the
+peer's AID and Warthog's own group key on AID 0. Bench-measured: peering +
+keying in one exchange, 8/8 pings at 0% loss, ~16 ms RTT over the keyed link.
 
 A SAE node ignores open-mesh nodes sharing the Mesh ID (and vice versa) — the
 Mesh Configuration's Authentication Protocol Identifier must match before a
@@ -386,7 +398,12 @@ AT+HWMPSTAT?
 
 ## Limits
 
-- **No forwarding.** Warthog answers path requests that target it and ignores
-  the rest. Two nodes that cannot hear each other will not relay through a
-  Warthog between them.
+- **No forwarding by default.** A leaf (`AT+MESHFWD=0`, `AT+MESHBRIDGE=0`)
+  answers path requests that target it and ignores the rest, so two nodes that
+  cannot hear each other will not relay through it. It does learn a host behind
+  a direct peer from Address Extension and addresses replies to that host via
+  the peer in AE 2 (host-tested, not yet on air); any other unknown unicast
+  goes to the first peer.
+  `AT+MESHFWD=1` makes the node a relay ([Forwarding](#forwarding)), which is
+  host-tested and simulated, not yet run on air.
 - SAE/AMPE requires the `warthog-mesh-sae` build; the default smoke build still peers open or with the fixed key.

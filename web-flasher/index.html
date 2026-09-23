@@ -152,7 +152,8 @@
       a constant compiled into every warthog, so anyone holding the firmware holds
       the key. <b>For real security flash the encrypted mesh variant instead</b>:
       SAE authentication and AMPE per-link keys, no runtime switch needed (the
-      passphrase is set at build time). It has no effect on the encrypted build.</p>
+      passphrase defaults to a build-time value; <code>AT+MESHPASS</code> changes it,
+      next boot). It has no effect on the encrypted build.</p>
       <div class="row"><button id="meshsecSave" class="secondary" disabled>Save mesh setting</button></div>
     </div>
 
@@ -190,7 +191,7 @@ const VARIANTS = [
   { key: "kr",         label: "KR — 917.5–923.5 MHz (station uplink)" },
   { key: "au",         label: "AU (station uplink)" },
   { key: "mesh-sae",   label: "Mesh, encrypted — 802.11s + SAE/AMPE per-link keys (US band)" },
-  { key: "mesh-smoke", label: "Mesh, open — 802.11s peer, stock-OpenMANET-compatible (US band)" },
+  { key: "mesh-smoke", label: "Mesh, no SAE — 802.11s; data plane keyed with a built-in constant until set to Open (US band)" },
 ];
 
 if (!("serial" in navigator)) {

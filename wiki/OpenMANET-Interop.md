@@ -51,9 +51,11 @@ Warthog side:
 pio run -e warthog-mesh-sae -t upload     # passphrase: -DWARTHOG_MESH_PASSPHRASE='"..."', default warthog-mesh
 ```
 
-Nothing to configure at runtime — the node authenticates (SAE, group 19),
-exchanges per-link keys (AMPE) and peers on its own. Verify with `AT+SAERX?`
-(`ESTAB=1`) and `AT+MPMPEERS?` (`ampe_mtk=1 ampe_mgtk=1`).
+The build flag only sets the default: `AT+MESHPASS=<pass>` and `AT+MESHID=<id>`
+set the passphrase and mesh ID at runtime (persisted, applied on the next
+boot). The node then authenticates (SAE, group 19), exchanges per-link keys
+(AMPE) and peers on its own. Verify with `AT+SAERX?` (`ESTAB=1`) and
+`AT+MPMPEERS?` (`ampe_mtk=1 ampe_mgtk=2` with one peer).
 
 OpenMANET side — use `uci`. This is the idiomatic path and the one verified on
 hardware; a hand-run `wpa_supplicant` fights netifd and loses its config on the
@@ -103,18 +105,22 @@ logread | grep MESH-PEER-CONNECTED
 
 **Status (2026-09-20): Warthog↔OpenMANET SAE peering is verified on hardware.**
 A three-node mesh — two OpenMANET Pis and one Warthog — reached `ESTAB` on
-every link, with the Warthog holding two distinct AMPE pairwise keys at once
+every link, with the Warthog installing two distinct AMPE pairwise keys
 (`AT+KEYINST?` showing `aid=1 pw=1` and `aid=2 pw=1`). The peer's own log shows
 `mesh plink with <warthog> established` / `MESH-PEER-CONNECTED`, at −2 dBm and
 135–150 Mbit/s VHT-MCS6/7.
 
-**The encrypted data plane does not yet pass traffic cross-vendor.** ICMP is
-0/30 and every undecryptable frame is group-addressed (`AT+RXCHAN?` shows
-`nodec grp` climbing 1:1 with pings while `uni` stays 0). Two group-key
-defects are responsible: the chip holds one VIF-wide MGTK latched at aid 0
-while every 802.11s peer generates its own, and Warthog's own TX MGTK was
-being dropped as an unknown peer. The second is fixed; neither is yet
-confirmed on air. **For cross-vendor data today, use the unencrypted mesh
+**The encrypted data plane does not yet pass traffic cross-vendor.** In that
+run ICMP was 0/30 and every undecryptable frame was group-addressed
+(`AT+RXCHAN?` showed `nodec grp` climbing 1:1 with pings while `uni` stayed
+0). The chip has one group key slot, while every 802.11s peer generates its
+own MGTK, and one pairwise slot, where the last install wins. The group slot
+now holds Warthog's own TX MGTK, installed with the first peer, so standard
+group frames (`AT+MESHGRP=1`) go out under Warthog's own key; each peer's MGTK
+stays in the host keychain. Under SAE, receiving any peer's group frames,
+and any unicast with more than one peer, therefore needs host CCMP
+(`warthog-mesh-sae-swccmp`, armed with `AT+SWCCMP=1`), which has not been
+measured on air. **For cross-vendor data today, use the unencrypted mesh
 above.**
 
 Earlier bench findings, still relevant:
@@ -197,6 +203,17 @@ Symptom: an address configured on `wlh0` is ignored, `iw dev wlh0 mpath dump`
 stays empty, and the peer's per-station `tx packets` counter sits at exactly 5 —
 its Open and Confirm — no matter how much traffic you offer.
 
+This applies to a node whose `wlh0` is a `br-lan` port. Check first with
+`ip addr show bat0` (`tools/bench/openmanet_interop.py` prints the same). On a
+node configured by OpenMANET's mesh wizard, `bat0` exists, `wlh0` is a
+batman-adv hard interface of it (BATMAN_V), and mesh11sd runs with
+`mesh_fwding='0'` and `nolearn='1'`. Warthog does not implement batman-adv, and
+a batman hard interface hands only batman's own ethertype (0x4305) to `bat0`,
+so a Warthog peers with such a node at 802.11s but gets no DHCP lease and no
+IP path to it. `nomaster` on a wizard node removes `wlh0` from `bat0` and takes
+that node off its own batman fabric. Nothing involving `bat0` has been
+measured.
+
 ```sh
 ip link set wlh0 nomaster
 ip addr add 10.77.191.116/16 dev wlh0
@@ -265,7 +282,7 @@ AT+MESHCFG?
 +MESHCFG: applied chan=42 freq=923000000 bw=2 gclass=69 sclass=2 (set_channel_list=0)
 +MESHCFG: peers=0 beacons_heard=0
 +MESHCFG: 0 beacons heard: nothing is audible. Wrong channel or bandwidth, or out of range. Check the channel first
-+MESHCFG: forwarding=no routing=none l2=no(NAT) multicast=no batman=no
++MESHCFG: forwarding=no routing=none l2=no(NAT) multicast=meshtastic(239.0.0.69) batman=no
 ```
 
 The second-to-last line is the diagnosis, and the firmware logs the same one
@@ -390,18 +407,21 @@ Measurement traps on a pair like this:
 The capability line is not a placeholder; it reports the gates. With the
 defaults a Warthog does not forward for other nodes, does not run a routing
 protocol, does not bridge the tethered client onto the mesh at layer 2, and
-does not carry multicast across — a node that peers correctly is still a leaf.
-`AT+MESHFWD=1` turns on 802.11s forwarding and HWMP (`forwarding=yes(802.11s)
-routing=hwmp`) and `AT+MESHBRIDGE=1` the layer-2 bridge (`l2=bridge`); both are
-compiled and host-tested, and neither has yet been measured on air.
+carries only Meshtastic's multicast group across — a node that peers correctly
+is still a leaf. `AT+MESHFWD=1` turns on 802.11s forwarding and HWMP
+(`forwarding=yes(802.11s) routing=hwmp`) and `AT+MESHBRIDGE=1` the layer-2
+bridge (`l2=bridge multicast=all(bridged)`); both are compiled and host-tested,
+and neither has yet been measured on air.
 
-`multicast=no` is not a missing feature flag. Every Warthog NATs its tethered
-host to the same compile-time addresses (`192.168.4.1` on USB), so two hosts on
-opposite sides of a mesh are both `192.168.4.x`. Protocols that carry the
-sender's address in the payload — CoT, mDNS/SD — would therefore be repeated
-into a contact the receiver cannot reach, or worse, one that aliases itself.
-Widening the repeater in `main/mudp.c` would make discovery look like it works.
-The fix is one L2 segment with unique host addresses; see
+`multicast=meshtastic(239.0.0.69)` is deliberate. In NAT mode the repeater in
+`main/mudp.c` carries Meshtastic's UDP group, `239.0.0.69:4403`, between the
+tethered links and the mesh, and no other group. Every Warthog NATs its
+tethered host to the same compile-time addresses (`192.168.4.1` on USB), so two
+hosts on opposite sides of a mesh are both `192.168.4.x`. Protocols that carry
+the sender's address in the payload — CoT, mDNS/SD — would therefore be
+repeated into a contact the receiver cannot reach, or worse, one that aliases
+itself. Widening the repeater would make discovery look like it works. The fix
+is one L2 segment with unique host addresses, which is bridge mode; see
 `docs/mesh-attachment-model.md`.
 
 ## Turning on the relay: the on-air experiment, in order
