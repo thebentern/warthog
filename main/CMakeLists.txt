@@ -14,8 +14,24 @@ idf_component_register(
         "led.c"
         "cfg.c"
         "at.c"
+        "bat_mode.c"
+        "bat_port.c"
+        "bat/bat_bcast.c"
+        "bat/bat_codec.c"
+        "bat/bat_core.c"
+        "bat/bat_crc32c.c"
+        "bat/bat_elp.c"
+        "bat/bat_frag.c"
+        "bat/bat_icmp.c"
+        "bat/bat_ogm.c"
+        "bat/bat_orig.c"
+        "bat/bat_render.c"
+        "bat/bat_tt.c"
+        "bat/bat_unicast.c"
+        "bat/bat_utvlv.c"
     INCLUDE_DIRS
         "."
+        "bat"
     REQUIRES
         halow
         esp_netif

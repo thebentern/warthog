@@ -83,6 +83,23 @@
  *     dropped, reason 96, and moves no replay floor; on no-chip-key builds, where
  *     the chip holds no MTK, every chip-decrypted unicast is. A keyed non-SAE mesh
  *     still takes one under its shared group key id (pin).
+ * (33) a peer's QoS data on different TIDs was judged against ONE replay counter per
+ *     key, so TID 0 PN 9 after TID 5 PN 10 was dropped as a replay (reason 5); each TID
+ *     now has its own, and a lower PN on the same TID is still refused. Unicast and group,
+ *     chip-decrypted on every build, host CCMP where it is compiled in.
+ * Built with host CCMP (as warthog-mesh-sae-swccmp, the only SAE build batman runs on):
+ * (34) batman mode's frames against a wizard node: a peer's group ELP under its MGTK is
+ *     opened by host CCMP and reaches the batman hook with the TA as its source, a replay
+ *     and a forgery do not, nor anything with host CCMP disarmed (reason 4); our ELP goes
+ *     out as a host-sealed AE-2 replica to each keyed peer (none to a candidate), or with
+ *     AT+MESHGRP=1 as one group frame the chip encrypts under our MGTK.
+ * (35) a keyed peer's unicast to another station (RA not us; measured on air, where the
+ *     MM6108 hands such frames up) is dropped by the receive filter as not_ours, before
+ *     host CCMP: tried, micfail and the fail snapshot do not move, even when the frame is
+ *     one host CCMP could open. Unicast to us still opens, relayed traffic (RA us) still
+ *     goes on, group frames are not judged, and a real MIC failure still snapshots. A
+ *     Protected unicast management frame to another station is only counted (mgmt_nours):
+ *     whether the chip hands those up is not measured, so host CCMP still tries it.
  * Chip-key builds:
  * (30) under SAE a group frame -- replicated, standard, or one we relay -- is queued
  *     to no slot AMPE has not keyed: TX would only drop it there, and a failed SAE
@@ -1718,6 +1735,423 @@ static void t_decrypted_unicast_off_pairwise_key(void)
           simnode_host_rx_count(), (unsigned long)g_warthog_rxdrop_reason);
 }
 
+/* ---- 33. one receive counter per TID -------------------------------------- */
+
+/* A QoS data frame from @p ta on @p tid, PN @p pn under key @p kid: a unicast to us or a
+ * 3-address group frame, laid out as the chip hands up a decrypted one, each with its own
+ * Mesh Control seq. With @p seal it is sealed under that key instead, as the peer would. */
+static uint16_t mk_tid_(uint8_t *f, bool group, const uint8_t *ta, uint8_t kid, uint8_t tid,
+                        uint64_t pn, const uint8_t *seal)
+{
+    static uint32_t mseq = 5000;
+    const uint8_t pn6[6] = { (uint8_t)(pn >> 40), (uint8_t)(pn >> 32), (uint8_t)(pn >> 24),
+                             (uint8_t)(pn >> 16), (uint8_t)(pn >> 8),  (uint8_t)pn };
+    uint16_t n = group ? umac_mesh_ies_build_data_hdr3_group(f, BC, ta, ta)
+                       : umac_mesh_ies_build_data_hdr4(f, W, ta, W, ta);
+    f[1] |= 0x40u;
+    f[n++] = tid;
+    f[n++] = 0x01;
+    umac_ccmp_write_header(&f[n], pn6, kid);
+    n = (uint16_t)(n + UMAC_CCMP_HDR_LEN);
+    const uint16_t body = n;
+    struct umac_mesh_ctrl mc = { .flags = 0, .ttl = 31, .seq = ++mseq };
+    n = (uint16_t)(n + umac_mesh_ctrl_build(&f[n], 18u, &mc));
+    static const uint8_t snap[8] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00 };
+    memcpy(&f[n], snap, sizeof(snap));
+    n = (uint16_t)(n + sizeof(snap));
+    memcpy(&f[n], PAY, sizeof(PAY));
+    n = (uint16_t)(n + sizeof(PAY));
+    memset(&f[n], 0xA5, 8);
+    n = (uint16_t)(n + 8u);
+    if (seal != NULL)
+    {
+        uint8_t aad[UMAC_CCMP_AAD_MAXLEN], nonce[13];
+        const uint32_t al = umac_ccmp_build_aad(f, aad);
+        umac_ccmp_build_nonce(f, pn6, nonce);
+        (void)warthog_ccm_ae(seal, nonce, 8, aad, al, &f[body], (size_t)(n - body - 8u), &f[n - 8u]);
+    }
+    return n;
+}
+
+/* A Linux peer's frames on different access categories leave its chip with their PNs
+ * interleaved; each TID must be judged against its own counter, as mac80211 does. */
+static void tid_steps_(const char *what, bool group, uint8_t kid, uint8_t rx_flags,
+                       const uint8_t *seal)
+{
+    static const struct { uint8_t tid; uint8_t pn; bool take; const char *why; } s[] = {
+        { 5, 10, true,  "TID 5, PN 10" },
+        { 0,  9, true,  "then TID 0, PN 9: TID 0 has its own counter" },
+        { 0,  9, false, "TID 0, PN 9 again" },
+        { 5, 10, false, "TID 5, PN 10 again" },
+        { 0,  8, false, "TID 0, PN 8: below TID 0's counter" },
+        { 6,  1, true,  "TID 6, PN 1: a TID not heard from yet" },
+        { 5, 11, true,  "TID 5, PN 11" },
+    };
+    uint8_t f[200];
+    for (unsigned i = 0; i < sizeof(s) / sizeof(s[0]); i++)
+    {
+        simnode_host_rx_clear();
+        g_warthog_rxdrop_reason = 0;
+        const uint16_t n = mk_tid_(f, group, A, kid, s[i].tid, s[i].pn, seal);
+        (void)simnode_rx_flags(f, n, -60, rx_flags);
+        const bool took = simnode_host_rx_count() == 1u;
+        CHECK(took == s[i].take && (took || g_warthog_rxdrop_reason == 5u),
+              "%s: %s is %s (delivered %u, reason %lu)", what, s[i].why,
+              s[i].take ? "delivered" : "refused as a replay (5)", simnode_host_rx_count(),
+              (unsigned long)g_warthog_rxdrop_reason);
+    }
+}
+
+static void t_replay_counter_per_tid(void)
+{
+    printf("--- 33. a peer's TIDs keep separate replay counters ---\n");
+    /* Every build: the keyed non-SAE mesh, chip-decrypted, pairwise key 0 and group key 1. */
+    fresh(/*sae=*/false, /*grp_std=*/false, /*secure=*/true);
+    (void)simnode_add_peer(A);
+    tid_steps_("keyed mesh, unicast", false, 0, MMDRV_RX_FLAG_DECRYPTED, NULL);
+    tid_steps_("keyed mesh, group", true, 1, MMDRV_RX_FLAG_DECRYPTED, NULL);
+#ifndef WARTHOG_MESH_AMPE_NO_CHIP_KEY
+    fresh(/*sae=*/true, /*grp_std=*/false, /*secure=*/true);
+    (void)simnode_set_key(BC, K_OWN_MGTK, OWN_MGTK_ID, false);
+    (void)simnode_add_peer(A);
+    (void)simnode_set_key(A, K_A_MTK, 0, true);
+    tid_steps_("SAE, unicast the chip opened under A's MTK", false, 0, MMDRV_RX_FLAG_DECRYPTED, NULL);
+#endif
+#ifdef WARTHOG_MESH_HOST_CCMP
+    const uint32_t was = g_warthog_host_ccmp_on;
+    g_warthog_host_ccmp_on = 1;
+    fresh(/*sae=*/true, /*grp_std=*/false, /*secure=*/true);
+    (void)simnode_set_key(BC, K_OWN_MGTK, OWN_MGTK_ID, false);
+    (void)simnode_add_peer(A);
+    (void)simnode_set_key(A, K_A_MTK, 0, true);
+    (void)simnode_set_key(A, K_A_MGTK, HOSTAP_MGTK_ID, false);
+    tid_steps_("SAE, host CCMP, unicast under A's MTK", false, 0, 0, K_A_MTK);
+    tid_steps_("SAE, host CCMP, group under A's MGTK", true, HOSTAP_MGTK_ID, 0, K_A_MGTK);
+    g_warthog_host_ccmp_on = was;
+#endif
+}
+
+#ifdef WARTHOG_MESH_HOST_CCMP
+/* ---- 34. batman mode against a wizard (SAE) node: host CCMP both ways ---------- */
+
+extern volatile uint32_t g_warthog_swccmp_ok, g_warthog_swccmp_micfail;
+
+/* A 20-byte ELP, as main/bat/ emits it. */
+static const uint8_t BAT_ELP[20] = { 0x03, 0x0f, 0x02, 0x00, 0x00, 0x00, 0x00, 0x0a,
+                                     0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x01, 0xf4,
+                                     0x00, 0x00, 0x00, 0x00 };
+
+/* A Linux peer's ELP: a 3-address group frame from A, sealed under A's MGTK at @p pn. */
+static uint16_t mk_bat_group_(uint8_t *f, uint64_t pn, uint32_t mseq)
+{
+    const uint8_t pn6[6] = { (uint8_t)(pn >> 40), (uint8_t)(pn >> 32), (uint8_t)(pn >> 24),
+                             (uint8_t)(pn >> 16), (uint8_t)(pn >> 8),  (uint8_t)pn };
+    uint16_t n = umac_mesh_ies_build_data_hdr3_group(f, BC, A, A);
+    f[1] |= 0x40u;
+    f[n++] = 0x00;
+    f[n++] = 0x01;
+    umac_ccmp_write_header(&f[n], pn6, HOSTAP_MGTK_ID);
+    n = (uint16_t)(n + UMAC_CCMP_HDR_LEN);
+    const uint16_t body = n;
+    struct umac_mesh_ctrl mc = { .flags = 0, .ttl = 31, .seq = mseq };
+    n = (uint16_t)(n + umac_mesh_ctrl_build(&f[n], 18u, &mc));
+    static const uint8_t snap[8] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x43, 0x05 };
+    memcpy(&f[n], snap, sizeof(snap));
+    n = (uint16_t)(n + sizeof(snap));
+    memcpy(&f[n], BAT_ELP, sizeof(BAT_ELP));
+    n = (uint16_t)(n + sizeof(BAT_ELP));
+    n = (uint16_t)(n + 8u);
+    uint8_t aad[UMAC_CCMP_AAD_MAXLEN], nonce[13];
+    const uint32_t al = umac_ccmp_build_aad(f, aad);
+    umac_ccmp_build_nonce(f, pn6, nonce);
+    (void)warthog_ccm_ae(K_A_MGTK, nonce, 8, aad, al, &f[body], (size_t)(n - body - 8u), &f[n - 8u]);
+    return n;
+}
+
+/* What bat_mode_rx_classify keeps for the engine: an ELP/OGM/BCAST whose Ethernet source
+ * is the transmitter (main/ is not linked into this binary). */
+static bool hook_got_elp_from_a_(void)
+{
+    const struct simnode_extrx *e = simnode_ext_rx_get(0);
+    return simnode_ext_rx_count() == 1u && e != NULL && e->have_ta && MAC_EQ(e->ta, A) &&
+           MAC_EQ(&e->frame[0], BC) && MAC_EQ(&e->frame[6], A) && e->frame[12] == 0x43 &&
+           e->frame[13] == 0x05 && e->len == 14u + sizeof(BAT_ELP) &&
+           memcmp(&e->frame[14], BAT_ELP, sizeof(BAT_ELP)) == 0;
+}
+
+static void t_batman_sae_host_ccmp(void)
+{
+    printf("--- 34. batman against an SAE node: a peer's group ELP opened by host CCMP, ours sealed ---\n");
+    const uint32_t was = g_warthog_host_ccmp_on;
+    fresh(/*sae=*/true, /*grp_std=*/false, /*secure=*/true);
+    (void)simnode_set_key(BC, K_OWN_MGTK, OWN_MGTK_ID, false);
+    (void)simnode_add_peer(A);
+    (void)simnode_set_key(A, K_A_MTK, 0, true);
+    (void)simnode_set_key(A, K_A_MGTK, HOSTAP_MGTK_ID, false);
+    (void)simnode_add_peer(C);                     /* SAE not finished */
+    simnode_set_batman(true);
+    simnode_set_rx_ext_cb(true);
+    g_warthog_host_ccmp_on = 1;                    /* bat_port arms it at boot */
+
+    uint8_t f[200];
+    uint16_t n = mk_bat_group_(f, 0x10, 7001);
+    const uint32_t ok0 = g_warthog_swccmp_ok;
+    g_warthog_rxdrop_reason = 0;
+    (void)simnode_rx(f, n, -55);
+    CHECK(hook_got_elp_from_a_() && g_warthog_swccmp_ok == ok0 + 1u,
+          "A's ELP under its MGTK reaches the hook: dst ff:ff, src A = TA, 0x4305, the ELP intact "
+          "(%u, reason %lu)", simnode_ext_rx_count(), (unsigned long)g_warthog_rxdrop_reason);
+
+    simnode_ext_rx_clear();
+    n = mk_bat_group_(f, 0x10, 7002);
+    (void)simnode_rx(f, n, -55);
+    CHECK(simnode_ext_rx_count() == 0u && g_warthog_rxdrop_reason == 5u,
+          "the same PN again is a replay (reason %lu)", (unsigned long)g_warthog_rxdrop_reason);
+
+    const uint32_t mf0 = g_warthog_swccmp_micfail;
+    n = mk_bat_group_(f, 0x11, 7003);
+    f[n - 20u] ^= 0x01u;
+    (void)simnode_rx(f, n, -55);
+    CHECK(simnode_ext_rx_count() == 0u && g_warthog_swccmp_micfail == mf0 + 1u,
+          "a frame altered in flight fails the MIC and reaches nothing");
+
+    g_warthog_host_ccmp_on = 0;
+    n = mk_bat_group_(f, 0x12, 7004);
+    (void)simnode_rx(f, n, -55);
+    CHECK(simnode_ext_rx_count() == 0u && g_warthog_rxdrop_reason == 4u,
+          "host CCMP not armed: the chip cannot open a peer's MGTK, dropped as reason 4 (%lu)",
+          (unsigned long)g_warthog_rxdrop_reason);
+    g_warthog_host_ccmp_on = 1;
+
+    /* Ours, AT+MESHGRP=0: an AE-2 replica per keyed peer, sealed by the host. */
+    simnode_outbox_clear();
+    int st = simnode_host_tx_eth(NULL, BC, W, 0x4305, BAT_ELP, sizeof(BAT_ELP));
+    const struct simnode_frame *fa = frame_to(A);
+    CHECK(st == MMWLAN_SUCCESS && simnode_outbox_count() == 1u && fa != NULL && frame_to(C) == NULL,
+          "our ELP: one replica, to A; none to the candidate C (%d, %u frames)", st,
+          simnode_outbox_count());
+    if (fa != NULL && fa->len == 94u)
+    {
+        CHECK((fa->bytes[1] & 0x40u) != 0u && (fa->tx_flags & MMDRV_TX_FLAG_HW_ENC) == 0u,
+              "  Protected, sealed by the host, not handed to the chip to encrypt");
+        uint8_t g[94], pn[6], kid = 0xff;
+        memcpy(g, fa->bytes, sizeof(g));
+        uint8_t aad[UMAC_CCMP_AAD_MAXLEN], nonce[13];
+        const bool hdr_ok = umac_ccmp_parse_header(&g[32], pn, &kid);
+        const uint32_t al = umac_ccmp_build_aad(g, aad);
+        umac_ccmp_build_nonce(g, pn, nonce);
+        const bool opened = hdr_ok && kid == 0 &&
+                            warthog_ccm_ad(K_A_MTK, nonce, 8, aad, al, &g[40], 46, &g[86]) == 0;
+        CHECK(opened, "  opens under A's MTK, key id 0 (%u)", kid);
+        CHECK(opened && g[40] == UMAC_MESH_CTRL_AE_A5A6 && g[41] == UMAC_MESH_CTRL_TTL_DEFAULT &&
+                  MAC_EQ(&g[46], BC) && MAC_EQ(&g[52], W) && g[64] == 0x43 && g[65] == 0x05 &&
+                  memcmp(&g[66], BAT_ELP, sizeof(BAT_ELP)) == 0,
+              "  inside: Mesh Control AE 2, TTL 31, addr5 ff:ff, addr6 us, LLC 0x4305, the ELP");
+    }
+    else
+    {
+        CHECK(false, "  30 MAC + 2 QoS + 8 CCMP + 18 Mesh Control + 8 LLC + 20 + 8 MIC = 94 bytes (got %u)",
+              fa != NULL ? fa->len : 0u);
+    }
+    static uint8_t big[1500];
+    memset(big, 0x5a, sizeof(big));
+    simnode_outbox_clear();
+    (void)simnode_host_tx_eth(NULL, BC, W, 0x4305, big, sizeof(big));
+    fa = frame_to(A);
+    CHECK(fa != NULL && fa->len == 74u + sizeof(big) && simnode_outbox_dropped() == 0,
+          "a 1500-byte batman packet: the largest MPDU batman mode makes, 1574 bytes (got %u)",
+          fa != NULL ? fa->len : 0u);
+
+    /* AT+MESHGRP=1: one standard group frame, which the chip encrypts under our MGTK. */
+    simnode_set_gates(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/true, /*secure=*/true);
+    simnode_outbox_clear();
+    (void)simnode_host_tx_eth(NULL, BC, W, 0x4305, BAT_ELP, sizeof(BAT_ELP));
+    const struct simnode_frame *fg = simnode_outbox_get(0);
+    CHECK(simnode_outbox_count() == 1u && fg != NULL && (fg->bytes[4] & 0x01u) != 0u &&
+              (fg->tx_flags & MMDRV_TX_FLAG_HW_ENC) != 0u && fg->key_idx == OWN_MGTK_ID &&
+              fg->bytes[26] == 0x00u && fg->bytes[27] == UMAC_MESH_CTRL_TTL_DEFAULT,
+          "MESHGRP=1: one group frame, HW_ENC under our MGTK id %u, AE 0, TTL 31 (%u frames)",
+          OWN_MGTK_ID, simnode_outbox_count());
+
+    g_warthog_host_ccmp_on = was;
+    simnode_set_rx_ext_cb(false);
+    simnode_set_batman(false);
+}
+#endif
+
+#ifdef WARTHOG_MESH_HOST_CCMP
+/* ---- 35. host CCMP never sees a unicast addressed to another station ------- */
+
+extern volatile uint32_t g_warthog_filt_hist[10], g_warthog_filt_reason, g_warthog_rxdrop_count;
+extern volatile uint32_t g_warthog_filt_mgmt_nours, g_warthog_filt_drop;
+extern volatile uint8_t g_warthog_filt_mgmt_nours_hdr[16];
+extern volatile uint32_t g_warthog_swccmp_tried, g_warthog_swccmp_fail_len,
+    g_warthog_swccmp_fail_keyid;
+extern volatile uint8_t g_warthog_swccmp_fail_hdr[32];
+
+/* A's 4-address unicast to next hop @p ra for mesh DA @p da, sealed under @p seal (key id 0)
+ * at @p pn, as A's radio puts it on the air. */
+static uint16_t mk_sealed_uni_(uint8_t *f, const uint8_t *ra, const uint8_t *da, uint64_t pn,
+                               const uint8_t *seal)
+{
+    static uint32_t mseq = 8000;
+    const uint8_t pn6[6] = { (uint8_t)(pn >> 40), (uint8_t)(pn >> 32), (uint8_t)(pn >> 24),
+                             (uint8_t)(pn >> 16), (uint8_t)(pn >> 8),  (uint8_t)pn };
+    uint16_t n = umac_mesh_ies_build_data_hdr4(f, ra, A, da, A);
+    f[1] |= 0x40u;
+    f[n++] = 0x00;
+    f[n++] = 0x01;
+    umac_ccmp_write_header(&f[n], pn6, 0);
+    n = (uint16_t)(n + UMAC_CCMP_HDR_LEN);
+    const uint16_t body = n;
+    struct umac_mesh_ctrl mc = { .flags = 0, .ttl = 31, .seq = ++mseq };
+    n = (uint16_t)(n + umac_mesh_ctrl_build(&f[n], 18u, &mc));
+    static const uint8_t snap[8] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00 };
+    memcpy(&f[n], snap, sizeof(snap));
+    n = (uint16_t)(n + sizeof(snap));
+    memcpy(&f[n], PAY, sizeof(PAY));
+    n = (uint16_t)(n + sizeof(PAY));
+    n = (uint16_t)(n + 8u);
+    uint8_t aad[UMAC_CCMP_AAD_MAXLEN], nonce[13];
+    const uint32_t al = umac_ccmp_build_aad(f, aad);
+    umac_ccmp_build_nonce(f, pn6, nonce);
+    (void)warthog_ccm_ae(seal, nonce, 8, aad, al, &f[body], (size_t)(n - body - 8u), &f[n - 8u]);
+    return n;
+}
+
+static void t_host_ccmp_skips_others_unicast(void)
+{
+    printf("--- 35. host CCMP never sees a keyed peer's unicast to another station ---\n");
+    const uint32_t was = g_warthog_host_ccmp_on;
+    fresh(/*sae=*/true, /*grp_std=*/false, /*secure=*/true);
+    (void)simnode_set_key(BC, K_OWN_MGTK, OWN_MGTK_ID, false);
+    (void)simnode_add_peer(A);
+    (void)simnode_set_key(A, K_A_MTK, 0, true);
+    (void)simnode_set_key(A, K_A_MGTK, HOSTAP_MGTK_ID, false);
+    (void)simnode_add_peer(C);
+    (void)simnode_set_key(C, K_C_MTK, 0, true);
+    g_warthog_host_ccmp_on = 1;
+
+    /* On the bench: a warthog's frame to a Linux node, under the link key only those two hold. */
+    static const uint8_t K_A_TO_C[16] = { 0xac, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                                          0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+    uint8_t f[256];
+    uint8_t hdr0[32];
+    for (unsigned i = 0; i < sizeof(hdr0); i++)
+    {
+        hdr0[i] = g_warthog_swccmp_fail_hdr[i];
+    }
+    uint32_t tr0 = g_warthog_swccmp_tried, mf0 = g_warthog_swccmp_micfail,
+             no0 = g_warthog_filt_hist[9], rd0 = g_warthog_rxdrop_count;
+    const uint32_t fl0 = g_warthog_swccmp_fail_len;
+    simnode_host_rx_clear();
+    simnode_outbox_clear();
+    uint16_t n = mk_sealed_uni_(f, C, C, 1u, K_A_TO_C);
+    (void)simnode_rx(f, n, -60);
+    bool hdr_same = true;
+    for (unsigned i = 0; i < sizeof(hdr0); i++)
+    {
+        hdr_same = hdr_same && hdr0[i] == g_warthog_swccmp_fail_hdr[i];
+    }
+    CHECK(g_warthog_filt_hist[9] == no0 + 1u && g_warthog_filt_reason == 9u,
+          "A's unicast to C is dropped by the receive filter (not_ours +%lu, reason %lu)",
+          (unsigned long)(g_warthog_filt_hist[9] - no0), (unsigned long)g_warthog_filt_reason);
+    CHECK(g_warthog_swccmp_tried == tr0 && g_warthog_swccmp_micfail == mf0 && hdr_same &&
+              g_warthog_swccmp_fail_len == fl0,
+          "  before host CCMP: tried +%lu, micfail +%lu, the fail snapshot %s",
+          (unsigned long)(g_warthog_swccmp_tried - tr0),
+          (unsigned long)(g_warthog_swccmp_micfail - mf0), hdr_same ? "untouched" : "overwritten");
+    CHECK(g_warthog_rxdrop_count == rd0 && simnode_host_rx_count() == 0u &&
+              simnode_outbox_count() == 0u,
+          "  and nothing further (%lu datapath drops, %u delivered, %u sent)",
+          (unsigned long)(g_warthog_rxdrop_count - rd0), simnode_host_rx_count(),
+          simnode_outbox_count());
+
+    /* Relay on, and sealed under A's MTK with us, which host CCMP could open: the RA decides. */
+    simnode_set_gates(/*fwd=*/true, /*bridge=*/false, /*grp_std=*/false, /*secure=*/true);
+    tr0 = g_warthog_swccmp_tried;
+    n = mk_sealed_uni_(f, C, W, 2u, K_A_MTK);
+    (void)simnode_rx(f, n, -60);
+    CHECK(g_warthog_filt_hist[9] == no0 + 2u && g_warthog_swccmp_tried == tr0 &&
+              simnode_host_rx_count() == 0u && simnode_outbox_count() == 0u,
+          "relay on, RA C, mesh DA us, under a key we hold: dropped unopened (not_ours +%lu, "
+          "tried +%lu, %u delivered, %u sent)",
+          (unsigned long)(g_warthog_filt_hist[9] - no0),
+          (unsigned long)(g_warthog_swccmp_tried - tr0), simnode_host_rx_count(),
+          simnode_outbox_count());
+
+    /* Ours: not_ours does not move. */
+    const uint32_t ok0 = g_warthog_swccmp_ok;
+    no0 = g_warthog_filt_hist[9];
+    n = mk_sealed_uni_(f, W, W, 3u, K_A_MTK);
+    (void)simnode_rx(f, n, -60);
+    CHECK(simnode_host_rx_count() == 1u && g_warthog_swccmp_ok == ok0 + 1u &&
+              g_warthog_filt_hist[9] == no0,
+          "A's unicast to us is opened and delivered (%u, ok +%lu)", simnode_host_rx_count(),
+          (unsigned long)(g_warthog_swccmp_ok - ok0));
+
+    simnode_host_rx_clear();
+    simnode_outbox_clear();
+    n = mk_sealed_uni_(f, W, C, 4u, K_A_MTK);
+    (void)simnode_rx(f, n, -60);
+    const struct simnode_frame *fc = frame_to(C);
+    CHECK(fc != NULL && !fc->is_mgmt && (fc->bytes[1] & 0x40u) != 0u &&
+              simnode_host_rx_count() == 0u && g_warthog_swccmp_ok == ok0 + 2u &&
+              g_warthog_filt_hist[9] == no0,
+          "relayed: RA us, mesh DA C, opened and sent on to C protected (%u frames out)",
+          simnode_outbox_count());
+
+    simnode_host_rx_clear();
+    n = mk_tid_(f, /*group=*/true, A, HOSTAP_MGTK_ID, 0, 5u, K_A_MGTK);
+    (void)simnode_rx(f, n, -60);
+    CHECK(simnode_host_rx_count() == 1u && g_warthog_swccmp_ok == ok0 + 3u &&
+              g_warthog_filt_hist[9] == no0,
+          "A's group frame under its MGTK is not judged by RA: opened and delivered (%u)",
+          simnode_host_rx_count());
+
+    /* A's Protected Block Ack action to C: counted as mgmt_nours, not dropped until the chip
+     * is measured handing such frames up, so host CCMP still tries it (MIC fails). */
+    no0 = g_warthog_filt_hist[9];
+    const uint32_t mn0 = g_warthog_filt_mgmt_nours, fd0 = g_warthog_filt_drop;
+    tr0 = g_warthog_swccmp_tried;
+    memset(f, 0, 64);
+    f[0] = 0xd0;
+    f[1] = 0x40;
+    memcpy(&f[4], C, 6);
+    memcpy(&f[10], A, 6);
+    memcpy(&f[16], A, 6);
+    const uint8_t mpn[6] = { 0, 0, 0, 0, 0, 7 };
+    umac_ccmp_write_header(&f[24], mpn, 0);
+    f[32] = 3;                                    /* Block Ack */
+    (void)simnode_rx(f, 32u + 8u + 8u, -60);
+    CHECK(g_warthog_filt_mgmt_nours == mn0 + 1u && g_warthog_filt_drop == fd0 &&
+              g_warthog_filt_hist[9] == no0 &&
+              MAC_EQ((const uint8_t *)&g_warthog_filt_mgmt_nours_hdr[4], C) &&
+              MAC_EQ((const uint8_t *)&g_warthog_filt_mgmt_nours_hdr[10], A),
+          "a Protected unicast action frame to C is counted, mgmt_nours +%lu (addr1 C, addr2 A), "
+          "not dropped by the filter",
+          (unsigned long)(g_warthog_filt_mgmt_nours - mn0));
+    CHECK(g_warthog_swccmp_tried == tr0 + 1u,
+          "  so host CCMP still tries it (tried +%lu); AT+FILTSTAT? mgmt_nours says whether the "
+          "chip hands such frames up",
+          (unsigned long)(g_warthog_swccmp_tried - tr0));
+
+    /* A frame to us that fails the MIC: counted and snapshotted as before. */
+    mf0 = g_warthog_swccmp_micfail;
+    n = mk_sealed_uni_(f, W, W, 6u, K_A_MTK);
+    f[n - 1u] ^= 0x01u;
+    (void)simnode_rx(f, n, -60);
+    CHECK(g_warthog_swccmp_micfail == mf0 + 1u && g_warthog_swccmp_fail_len == (uint32_t)(n - 32u) &&
+              g_warthog_swccmp_fail_keyid == 0u && g_warthog_swccmp_fail_hdr[0] == 0x88u &&
+              MAC_EQ((const uint8_t *)&g_warthog_swccmp_fail_hdr[4], W) &&
+              MAC_EQ((const uint8_t *)&g_warthog_swccmp_fail_hdr[10], A),
+          "a frame to us failing the MIC: micfail +%lu, snapshot len %lu keyid %lu, RA us, TA A",
+          (unsigned long)(g_warthog_swccmp_micfail - mf0),
+          (unsigned long)g_warthog_swccmp_fail_len, (unsigned long)g_warthog_swccmp_fail_keyid);
+    g_warthog_host_ccmp_on = was;
+}
+#endif
+
 int main(void)
 {
     printf("=== simnode keys: the SAE key lifecycle through the real datapath ===\n");
@@ -1765,6 +2199,11 @@ int main(void)
     t_peer_rekey_same_stad_keeps_floor();
     t_repeer_starts_from_advertised_rsc();
     t_decrypted_unicast_off_pairwise_key();
+    t_replay_counter_per_tid();
+#ifdef WARTHOG_MESH_HOST_CCMP
+    t_batman_sae_host_ccmp();
+    t_host_ccmp_skips_others_unicast();
+#endif
 
     simnode_del_peer(NULL);
     CHECK(simnode_live_allocs() == 0, "no packet buffer was orphaned (%u live)",

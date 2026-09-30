@@ -85,9 +85,14 @@ components/halow_mesh_compat/test/libsimnode*.so
 !components/halow_mesh_compat/test/test_*.sh
 !components/halow_mesh_compat/test/test_*.c
 components/halow_mesh_compat/test/linkcheck_all
+# The batman VM harness binaries (batman_vm/Makefile; CI compiles them in the tree).
+components/halow_mesh_compat/test/batman_vm/batvm_node
+components/halow_mesh_compat/test/batman_vm/batvm_node_san
 
 # editor / tooling backups -- never belong in the tree
 *.bak
 *.orig
 *.rej
 components/halow_mesh_compat/test/sim_mesh
+__pycache__/
+*.pyc

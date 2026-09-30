@@ -120,6 +120,24 @@ int mmwlan_mesh_probe_opcode(uint16_t opcode);
 /** Render the forwarding path and proxy tables for AT+MESHPATH?. @returns bytes written. */
 int mmwlan_mesh_fwd_render(char *buf, uint32_t len);
 
+/** One mesh peer link, for a routing layer above 802.11s. */
+struct mmwlan_mesh_peer_link {
+    uint8_t  addr[MMWLAN_MAC_ADDR_LEN];
+    uint8_t  estab;              /* 1 = ESTAB (under SAE: keyed) */
+    uint8_t  rc_valid;           /* 1 = rate control has a best-throughput rate */
+    uint32_t expected_tput_kbps; /* theoretical throughput of that rate, kbit/s; 0 if !rc_valid */
+};
+
+/** Snapshot of up to @p max peers into @p out, taken on the umac event loop; @p count gets
+ *  how many. @returns MMWLAN_SUCCESS, or why no snapshot was taken (@p count 0, @p out
+ *  untouched): a failed query is not an empty peer table. */
+enum mmwlan_status mmwlan_mesh_query_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max,
+                                                uint8_t *count);
+
+/** As mmwlan_mesh_query_peer_links. @returns the count, which is 0 also when the query
+ *  failed; use mmwlan_mesh_query_peer_links to tell the two apart. */
+uint8_t mmwlan_mesh_get_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max);
+
 #ifdef __cplusplus
 }
 #endif

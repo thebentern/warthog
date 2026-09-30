@@ -490,6 +490,67 @@ esp_err_t warthog_cfg_set_mesh_pmf(uint8_t on)
     return err;
 }
 
+uint8_t warthog_cfg_get_mesh_batman(void)
+{
+    nvs_handle_t h;
+    uint8_t on = 0;
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v;
+        if (nvs_get_u8(h, "mesh_bat", &v) == ESP_OK && v <= 1) {
+            on = v;
+        }
+        nvs_close(h);
+    }
+    return on;
+}
+
+esp_err_t warthog_cfg_set_mesh_batman(uint8_t on)
+{
+    if (on > 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, "mesh_bat", on);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+uint32_t warthog_cfg_get_mesh_battp(void)
+{
+    nvs_handle_t h;
+    uint32_t units = 0;
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        uint32_t v;
+        if (nvs_get_u32(h, "mesh_battp", &v) == ESP_OK) {
+            units = v;
+        }
+        nvs_close(h);
+    }
+    return units;
+}
+
+esp_err_t warthog_cfg_set_mesh_battp(uint32_t units)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u32(h, "mesh_battp", units);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
 int16_t warthog_cfg_get_mesh_rssi(void)
 {
     nvs_handle_t h;

@@ -37,6 +37,16 @@ jobs:
           make -C components/halow_mesh_compat/test clean all
           make -C components/halow_mesh_compat/test clean all SAN=1
 
+      # batvm_node, the VM interop harness, drives the batman engine through its public API,
+      # but it is Linux-only and runs only as root against batman-adv, so the host tests never
+      # build it. Compiling it here, plain and ASan/UBSan, with -Werror is what fails an engine
+      # API change the harness missed. Nothing runs. The lint keeps batctl output quoted.
+      - name: Batman VM harness (compile and lint only)
+        run: |
+          make -C components/halow_mesh_compat/test/batman_vm clean all WERROR=1
+          command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+          make -C components/halow_mesh_compat/test/batman_vm lint
+
       - name: Install PlatformIO
         run: pip install --upgrade platformio
 

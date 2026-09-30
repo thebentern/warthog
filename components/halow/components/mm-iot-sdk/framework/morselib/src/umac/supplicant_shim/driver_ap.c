@@ -399,6 +399,12 @@ int mmwpas_set_key_ap(void *priv, struct wpa_driver_set_key_params *params)
                 key.rx_seq[UMAC_KEY_RX_COUNTER_SPACE_DEFAULT] |= ((uint64_t)(params->seq[ii]))
                                                                  << (ii * 8);
             }
+            /* warthog: the RSC floors every TID's counter, not only TID 0's. */
+            for (int t = UMAC_KEY_RX_COUNTER_SPACE_DEFAULT + 1; t <= UMAC_KEY_RX_COUNTER_SPACE_TID7;
+                 t++)
+            {
+                key.rx_seq[t] = key.rx_seq[UMAC_KEY_RX_COUNTER_SPACE_DEFAULT];
+            }
         }
 
         status = umac_keys_install_key(stad, vif_id, &key);
@@ -728,8 +734,8 @@ static int mmwpas_send_action_mesh(void *priv, unsigned int freq, unsigned int w
 }
 
 /* AMPE's keys: each link's MTK, each MGTK, and the IGTKs (ours against the broadcast
- * address, a peer's when it runs MFP), which stay host-side for BIP. Anything else is
- * accepted and ignored rather than failed, so it cannot take the peering down. */
+ * address, a peer's when it runs MFP, which marks it so), which stay host-side. Anything
+ * else is accepted and ignored rather than failed, so it cannot take the peering down. */
 static int mmwpas_set_key_mesh(void *priv, struct wpa_driver_set_key_params *params)
 {
     (void)priv;

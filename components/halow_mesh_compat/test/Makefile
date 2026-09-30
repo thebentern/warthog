@@ -35,7 +35,7 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
            ../src/dot11ah/debug.c
 
 TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
-           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd sim_mesh test_supp_mesh_conf test_mesh_bip
+           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd sim_mesh test_supp_mesh_conf test_mesh_bip test_bat_mode
 
 # ---- simnode: the real stack with only the chip and the RTOS replaced ----
 #
@@ -45,10 +45,12 @@ TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
 # the frame the firmware would have handed to the radio. It covers the glue,
 # which is the one mesh file no freestanding test can link.
 SIMNODE      := simnode
-SIMNODE_TESTS := test_simnode_smoke test_simnode_peering test_simnode_datapath test_simnode_multinode test_simnode_glue test_simnode_keys test_simnode_keys_nochip test_simnode_keys_pnbase_off test_simnode_keys_nochip_pnbase_off test_simnode_capacity test_simnode_discovery test_simnode_mfp test_simnode_mfp_swccmp
+SIMNODE_TESTS := test_simnode_smoke test_simnode_peering test_simnode_datapath test_simnode_multinode test_simnode_glue test_simnode_keys test_simnode_keys_nochip test_simnode_keys_pnbase_off test_simnode_keys_nochip_pnbase_off test_simnode_capacity test_simnode_discovery test_simnode_mfp test_simnode_mfp_swccmp test_simnode_batman
 # Appended after the fact: TESTS above is an immediate assignment, so a
 # reference to this from there would expand to nothing.
 TESTS += $(SIMNODE_TESTS)
+# The clean-room BATMAN_V engine (main/bat/); must precede `all:` so its tests join TESTS.
+include bat.mk
 FW           := ../../halow/components/mm-iot-sdk/framework
 HAP          := $(FW)/src/hostap/src
 SIMNODE_INCS = -I$(SIMNODE)/hostshim -Ihostcompat -I../../halow/components/shims/include/esp32s3 \
@@ -65,7 +67,7 @@ SIMNODE_REAL = $(addprefix $(SDKMESH)/,umac_mesh.c umac_mesh_fwd_glue.c umac_mes
                 $(addprefix $(HAP)/crypto/,aes-internal.c aes-internal-enc.c) \
                 $(addprefix $(FW)/morselib/src/umac/datapath/,umac_datapath.c umac_datapath_mesh.c datapath_defrag.c) \
                 $(addprefix $(FW)/morselib/src/common/,mmpkt.c mmpkt_list.c mac_address.c) \
-                $(addprefix $(FW)/morselib/src/umac/data/,umac_sta_data.c umac_data.c) \
+                $(FW)/morselib/src/umac/data/umac_data.c \
                 $(addprefix $(FW)/morselib/src/umac/keys/,umac_keys.c connection_keys.c) \
                 $(addprefix $(FW)/morselib/src/umac/frames/,frame_constructor.c action.c probe_request.c \
                   probe_response.c utils.c association.c authentication.c deauthentication.c disassociation.c) \
@@ -76,9 +78,14 @@ SIMNODE_REAL = $(addprefix $(SDKMESH)/,umac_mesh.c umac_mesh_fwd_glue.c umac_mes
 # What it replaces: the chip, the RTOS, the radio stack below the mesh, and
 # the app-side storage that lives in main/at.c on the firmware.
 SIMNODE_FAKE = $(addprefix $(SIMNODE)/,fake_rtos.c fake_chip.c fake_config.c fake_app.c \
-                  fake_radio_stack.c warthog_globals.c simnode.c)
+                  fake_radio_stack.c warthog_globals.c simnode.c sta_data_seam.c)
 SIMNODE_SRCS = $(SIMNODE_REAL) $(SIMNODE_FAKE)
-SIMNODE_HDRS = $(wildcard $(SIMNODE)/*.h) $(MESHHDRS)
+# umac_sta_data.c is compiled inside sta_data_seam.c, which adds a hook at its peer-address
+# read, and umac_ba.c with it. Each is a prerequisite, so an edit rebuilds, and SIMNODE_C
+# keeps it off the command line.
+SIMNODE_SEAMED = $(FW)/morselib/src/umac/data/umac_sta_data.c $(FW)/morselib/src/umac/ba/umac_ba.c
+SIMNODE_HDRS = $(wildcard $(SIMNODE)/*.h) $(MESHHDRS) $(SIMNODE_SEAMED)
+SIMNODE_C = $(filter-out $(SIMNODE_SEAMED),$(filter %.c,$^))
 
 # The shipping mesh byte-layout code, compiled straight out of the vendored SDK.
 # These tests link the REAL firmware source, not a copy of it -- umac_mesh_ies.c
@@ -93,8 +100,8 @@ MESHIES := $(SDKMESH)/umac_mesh_ies.c
 # that is no longer built -- which is exactly what a green run must never mean.
 MESHHDRS := $(wildcard $(SDKMESH)/*.h)
 
-.PHONY: all clean linkcheck freestanding region glueguard
-all: $(TESTS) linkcheck freestanding region glueguard
+.PHONY: all clean linkcheck freestanding region glueguard simnode-seamed
+all: $(TESTS) linkcheck freestanding region glueguard bat-freestanding bat-nostatic bat-registered simnode-seamed
 	@echo "=== running host tests ==="
 	@fail=0; for t in $(TESTS); do echo "--- $$t ---"; ./$$t || fail=1; done; \
 	  if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
@@ -106,11 +113,22 @@ region:
 	@echo "=== regulatory region mapping ==="
 	@sh ./test_region_map.sh
 
+# A shipping .c that a simnode source #includes must be in SIMNODE_SEAMED: nothing else
+# makes it a prerequisite, so an edit to it would leave every simnode binary stale.
+simnode-seamed:
+	@echo "=== every .c a simnode source includes is a prerequisite ==="
+	@rc=0; for f in $$(sed -n 's/^#include "\(.*\.c\)".*/\1/p' $(SIMNODE)/*.c); do \
+	  case " $(SIMNODE_SEAMED) " in *"/$$f "*) echo "ok   $$f is in SIMNODE_SEAMED";; \
+	  *) echo "FAIL $(SIMNODE) includes $$f, which is not in SIMNODE_SEAMED: editing it rebuilds nothing"; rc=1;; esac; \
+	done; exit $$rc
+
 # Locking and call ordering in umac_mesh_fwd_glue.c, checked structurally: the
 # simnode tests link and drive the glue (SIMNODE_REAL) but cannot observe either.
+# It also runs firmware glue no test links (main/bat_port.c, mesh.c, at.c, cfg.c, nat.c) on
+# stubs, bat_port.c and at.c's renders also on the real engine, with this build's sanitizers.
 glueguard:
 	@echo "=== forwarding glue invariants ==="
-	@CC="$(CC)" sh ./test_glue_guard.sh
+	@CC="$(CC)" SANFLAGS="$(SANFLAGS)" SIMNODE_INCS="$(SIMNODE_INCS)" sh ./test_glue_guard.sh
 
 # Note: -I$(SDKMESH) ONLY, deliberately not $(INCS) -- if these tests could see
 # the compat/dot11ah headers, an SDK dependency could sneak into umac_mesh_ies.c
@@ -123,6 +141,11 @@ test_mesh_diag: test_mesh_diag.c $(MAINDIR)/mesh_diag.c
 
 test_mudp_classify: test_mudp_classify.c $(MAINDIR)/mudp_classify.c $(MAINDIR)/mudp_classify.h
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $(filter %.c,$^) -o $@
+
+# BATMAN_V member-mode decisions: when batman may run, what the RX hook keeps, the
+# port's engine config and link throughput, and how bat0 gets its address.
+test_bat_mode: test_bat_mode.c $(MAINDIR)/bat_mode.c $(MAINDIR)/bat_mode.h $(MAINDIR)/bat/bat.h
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) -I$(MAINDIR)/bat $(filter %.c,$^) -o $@
 
 # AT output into the 512 B CDC TX FIFO: a long reply and its OK arrive whole.
 test_cdc_out: test_cdc_out.c $(MAINDIR)/cdc_out.c $(MAINDIR)/cdc_out.h
@@ -146,10 +169,10 @@ simnode-incs:
 	@echo $(SIMNODE_INCS)
 
 test_simnode_smoke: $(SIMNODE)/test_simnode_smoke.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 test_simnode_peering: $(SIMNODE)/test_simnode_peering.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 # ---- several nodes in one process ---------------------------------------
 #
@@ -182,43 +205,43 @@ test_simnode_multinode: $(SIMNODE)/test_simnode_multinode.c $(SIMNODE_SRCS) $(SI
 	  -DSIMNODE_NODES=$(SIMNODE_NODES) $(SIMNODE_INCS) $< -o $@ $(SIMNODE_DLLIBS)
 
 test_simnode_datapath: $(SIMNODE)/test_simnode_datapath.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 # The forwarding glue, end to end: held frames, the discovery retry, the
 # bounded pending queue, both rate gates, the queue cap and the peer-loss PERR
 # burst -- driven through the shipping umac_mesh_fwd_glue.c.
 test_simnode_glue: $(SIMNODE)/test_simnode_glue.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 # The SAE key lifecycle: our own MGTK, which key a broadcast uses, and what a
 # surviving link keeps when a peer goes -- read off the fake chip's INSTALL_KEY log.
 # Built with WARTHOG_MESH_MGTK_PN_BASE, which no env pairs with chip-held AMPE keys:
 # it tests our MGTK's PN base and Key RSC, and one PN allocator with chip MTKs (18).
 test_simnode_keys: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 # Peer capacity: the accepting bit, Formation Info, Close(53), the hold-off, the
 # SAE offer gate and failed-SAE hold-off, and the candidate RSSI floor.
 test_simnode_capacity: $(SIMNODE)/test_simnode_capacity.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 # What a mac80211 peer needs before it takes us as a candidate: the RSN element
 # in beacon and probe response under SAE only, and a Mesh ID probe request.
 test_simnode_discovery: $(SIMNODE)/test_simnode_discovery.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 # The same file as warthog-mesh-sae-swccmp builds it: AMPE keys stay host-only, and
 # host CCMP is compiled in but not armed (-swccmp-on arms it at boot).
 test_simnode_keys_nochip: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1 -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1 -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 # And as warthog-mesh-sae ships: no MGTK PN base, so its install PN and Key RSC stay 0.
 test_simnode_keys_pnbase_off: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 # As warthog-mesh-sae-nochipkey: host-only AMPE keys, no MGTK PN base.
 test_simnode_keys_nochip_pnbase_off: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 # ---- the mesh supplicant shim against real hostap headers -----------------
 #
@@ -256,13 +279,20 @@ test_supp_mesh_conf: test_supp_mesh_conf.c $(FW)/morselib/src/umac/supplicant_sh
 	$(if $(SUPP_DEFS),,$(error $(HOSTAP_CMAKE): the SUPP_DEFS scrape found no BUILD_DEFINES))
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-void-pointer-to-int-cast $(SUPP_DEFS) $(SUPP_INCS) $(filter %.c,$^) -o $@
 
-# Path selection against a peer running MFP: CCMP on unicast HWMP, BIP on group, and
-# what an SAE node accepts. Once as the chip-key builds ship, once as -swccmp does.
+# Path selection against a peer running MFP: CCMP on unicast HWMP, our MGTK on group
+# (group-addressed privacy), and what an SAE node accepts. Once as the chip-key builds
+# ship, once as -swccmp does.
 test_simnode_mfp: $(SIMNODE)/test_simnode_mfp.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+# BATMAN_V frames through the real datapath: the AE-2 replica and group shapes, the
+# extended RX hook, the peer-link snapshot, and two engines (main/bat/) across two stacks.
+# main/ and main/bat/ come after the SDK paths, so no main/ header shadows an SDK one.
+test_simnode_batman: $(SIMNODE)/test_simnode_batman.c $(SIMNODE_SRCS) $(SIMNODE_HDRS) $(BAT_SRCS) $(BAT_HDRS) $(MAINDIR)/bat_mode.c $(MAINDIR)/bat_mode.h
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) -I$(BATDIR) -I$(MAINDIR) $(SIMNODE_C) -o $@
 
 test_simnode_mfp_swccmp: $(SIMNODE)/test_simnode_mfp.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
-	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1 -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1 -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 test_mesh_fwd: test_mesh_fwd.c $(SDKMESH)/umac_mesh_fwd.c $(SDKMESH)/umac_mesh_ctrl.c $(SDKMESH)/umac_mesh_rmc.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHIES) $(MESHHDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
@@ -313,8 +343,8 @@ test_ccm_crosscheck: test_ccm_crosscheck.c $(SDKMESH)/umac_mesh_ccm.c $(CCMSRC)
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-parameter -Wno-sign-compare \
 	  -Ihostcompat -I$(SDKMESH) -I$(HOSTAP)/src/utils -I$(HOSTAP)/src/crypto -I$(HOSTAP)/src -I$(HOSTAP) $^ -o $@
 
-# BIP-CMAC-128 (the MMIE on group path selection) against RFC 4493, hostap's
-# omac1_aes_128, and wlantest's bip_protect construction.
+# BIP-CMAC-128 (the MMIE an SAE node refuses on group path selection) against RFC 4493,
+# hostap's omac1_aes_128, and wlantest's bip_protect construction.
 test_mesh_bip: test_mesh_bip.c $(SDKMESH)/umac_mesh_bip.c $(SDKMESH)/umac_mesh_bip.h $(HOSTAP)/src/crypto/aes-omac1.c $(CCMSRC)
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-parameter -Wno-sign-compare \
 	  -Ihostcompat -I$(SDKMESH) -I$(HOSTAP)/src/utils -I$(HOSTAP)/src/crypto -I$(HOSTAP)/src -I$(HOSTAP) $(filter %.c,$^) -o $@
@@ -332,6 +362,7 @@ freestanding:
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/mesh_diag.c && echo "ok   mesh_diag.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/mudp_classify.c && echo "ok   mudp_classify.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/cdc_out.c && echo "ok   cdc_out.c is freestanding"
+	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main -I../../../main/bat ../../../main/bat_mode.c && echo "ok   bat_mode.c is freestanding (libc and the engine's bat.h)"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_ctrl.c && echo "ok   umac_mesh_ctrl.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_rmc.c && echo "ok   umac_mesh_rmc.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_pathtbl.c && echo "ok   umac_mesh_pathtbl.c is freestanding"

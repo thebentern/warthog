@@ -202,7 +202,7 @@ bool umac_mesh_validate_args(struct umac_data *umacd, const struct mmwlan_mesh_a
     return true;
 }
 
-static void mesh_bip_out_reset_(void);
+static void mesh_grp_out_reset_(void);
 
 /* Set before the post and cleared by the handler, so at most one is queued. */
 static volatile bool s_service_queued;
@@ -656,7 +656,7 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
      * umac_mesh_get_args() to populate the wpa_ssid (mesh_id + security). */
     memcpy(&s_mesh_args, args, sizeof(s_mesh_args));
     s_mesh_args_valid = true;
-    mesh_bip_out_reset_();
+    mesh_grp_out_reset_();
     s_service_queued = false; /* a core stop may have dropped a posted service event */
 
     /* stash state for the periodic probe-request burst. */
@@ -1724,11 +1724,11 @@ int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_le
     return mesh_tx_hwmp_(da, body, body_len);
 }
 
-extern volatile uint32_t g_warthog_hwmp_tx_prot, g_warthog_hwmp_tx_mmie, g_warthog_hwmp_tx_nommie;
+extern volatile uint32_t g_warthog_hwmp_tx_prot, g_warthog_hwmp_tx_gp, g_warthog_hwmp_tx_plain;
 bool umac_mesh_tx_host_ccmp_mgmt(const uint8_t key[16], uint8_t key_id, uint64_t pn,
                                  uint8_t *frame, uint32_t len);
 
-/* Apply @p k to a built HWMP frame whose body already reserves the CCMP or MMIE room. */
+/* Apply @p k to a built HWMP frame whose body already reserves the host CCMP room. */
 static bool mesh_hwmp_protect_(struct mmpkt *frm, const struct umac_mesh_hwmp_txkey *k,
                                struct mmdrv_tx_metadata *tx_md)
 {
@@ -1736,7 +1736,7 @@ static bool mesh_hwmp_protect_(struct mmpkt *frm, const struct umac_mesh_hwmp_tx
     uint8_t *f = mmpkt_get_data_start(v);
     const uint32_t len = mmpkt_get_data_length(v);
     bool ok = f != NULL && len > UMAC_MESH_BIP_HDR_LEN;
-    if (ok && k->how == UMAC_MESH_HWMP_PROT_CHIP)
+    if (ok && (k->how == UMAC_MESH_HWMP_PROT_CHIP || k->how == UMAC_MESH_HWMP_PROT_GROUP))
     {
         /* As umac_datapath_tx_mgmt_frame protects a robust frame: the chip adds CCMP. */
         f[1] |= 0x40u;
@@ -1747,45 +1747,44 @@ static bool mesh_hwmp_protect_(struct mmpkt *frm, const struct umac_mesh_hwmp_tx
     {
         ok = umac_mesh_tx_host_ccmp_mgmt(k->key, k->key_id, k->pn, f, len);
     }
-    else if (ok && k->how == UMAC_MESH_HWMP_PROT_BIP)
+    if (ok && k->how == UMAC_MESH_HWMP_PROT_GROUP)
     {
-        const size_t body = len - UMAC_MESH_BIP_HDR_LEN;
-        ok = body >= UMAC_MESH_MMIE_LEN &&
-             umac_mesh_bip_protect(k->key, k->key_id, k->pn, f, f + UMAC_MESH_BIP_HDR_LEN,
-                                   body - UMAC_MESH_MMIE_LEN, body) == body;
+        /* As our group data: in flight under our MGTK, drawing its PN, until its TX status. */
+        umac_datapath_mesh_own_group_tx_note();
+        tx_md->mesh.own_group = 1;
     }
     mmpkt_close(&v);
     return ok;
 }
 
 /* Group path selection is built and sent on the umac event loop only: that keeps
- * mesh_tx_hwmp_now_'s 784 B frame, BIP and the driver off the 3.5 KB tcpip task, and
- * one task draws IPNs in the order frames go out. */
-#define MESH_BIP_OUTBOX 4u
+ * mesh_tx_hwmp_now_'s frame and the driver off the 3.5 KB tcpip task, and counts each
+ * frame under our MGTK on the loop that re-installs it (umac_datapath_mesh_own_group_rsc). */
+#define MESH_GRP_OUTBOX 4u
 static struct
 {
     uint8_t da[6];
     uint8_t len;
     uint8_t body[HWMP_PREQ_BODY_LEN]; /* the largest group path-selection body we send */
-} s_bip_out[MESH_BIP_OUTBOX];
-static unsigned s_bip_out_head, s_bip_out_n;
-static bool s_bip_out_posted; /* an event is queued that will drain s_bip_out */
+} s_grp_out[MESH_GRP_OUTBOX];
+static unsigned s_grp_out_head, s_grp_out_n;
+static bool s_grp_out_posted; /* an event is queued that will drain s_grp_out */
 extern volatile uint32_t g_warthog_hwmp_tx_qdrop, g_warthog_hwmp_tx_qfail;
 
 static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t body_len);
 
-static void mesh_bip_out_reset_(void)
+static void mesh_grp_out_reset_(void)
 {
     MMOSAL_TASK_ENTER_CRITICAL();
-    s_bip_out_head = 0;
-    s_bip_out_n = 0;
-    s_bip_out_posted = false;
+    s_grp_out_head = 0;
+    s_grp_out_n = 0;
+    s_grp_out_posted = false;
     MMOSAL_TASK_EXIT_CRITICAL();
 }
 
 /* A PREQ of ours queued off the loop drew its SN then; the loop may have sent a newer one
  * since, and a peer drops an older SN as stale, so draw it again as it goes out. */
-static void mesh_bip_restamp_(uint8_t *body, uint8_t len)
+static void mesh_grp_restamp_(uint8_t *body, uint8_t len)
 {
     struct hwmp_preq q;
     if (!umac_mesh_hwmp_parse_preq(body, len, &q) || memcmp(q.orig_addr, s_mesh_own_addr, 6) != 0)
@@ -1804,7 +1803,7 @@ static void mesh_bip_restamp_(uint8_t *body, uint8_t len)
     umac_mesh_fwd_glue_unlock();
 }
 
-static void mesh_bip_out_evt_(struct umac_data *umacd, const struct umac_evt *evt)
+static void mesh_grp_out_evt_(struct umac_data *umacd, const struct umac_evt *evt)
 {
     (void)umacd;
     (void)evt;
@@ -1813,24 +1812,24 @@ static void mesh_bip_out_evt_(struct umac_data *umacd, const struct umac_evt *ev
         uint8_t da[6], body[HWMP_PREQ_BODY_LEN];
         uint8_t len = 0;
         MMOSAL_TASK_ENTER_CRITICAL();
-        if (s_bip_out_n != 0u)
+        if (s_grp_out_n != 0u)
         {
-            memcpy(da, s_bip_out[s_bip_out_head].da, sizeof(da));
-            len = s_bip_out[s_bip_out_head].len;
-            memcpy(body, s_bip_out[s_bip_out_head].body, len);
-            s_bip_out_head = (s_bip_out_head + 1u) % MESH_BIP_OUTBOX;
-            s_bip_out_n--;
+            memcpy(da, s_grp_out[s_grp_out_head].da, sizeof(da));
+            len = s_grp_out[s_grp_out_head].len;
+            memcpy(body, s_grp_out[s_grp_out_head].body, len);
+            s_grp_out_head = (s_grp_out_head + 1u) % MESH_GRP_OUTBOX;
+            s_grp_out_n--;
         }
         else
         {
-            s_bip_out_posted = false;
+            s_grp_out_posted = false;
         }
         MMOSAL_TASK_EXIT_CRITICAL();
         if (len == 0u)
         {
             return;
         }
-        mesh_bip_restamp_(body, len);
+        mesh_grp_restamp_(body, len);
         if (mesh_tx_hwmp_now_(da, body, len) < 0)
         {
             g_warthog_hwmp_tx_qfail++;
@@ -1842,22 +1841,22 @@ static void mesh_bip_out_evt_(struct umac_data *umacd, const struct umac_evt *ev
     }
 }
 
-/* Queue a group frame for mesh_bip_out_evt_: 1 once queued, not yet sent (the loop reports
+/* Queue a group frame for mesh_grp_out_evt_: 1 once queued, not yet sent (the loop reports
  * it to the glue when it is), negative (counted) if dropped. */
-static int mesh_bip_defer_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
+static int mesh_grp_defer_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
 {
     bool queued = false, post = false;
     MMOSAL_TASK_ENTER_CRITICAL();
-    if (s_bip_out_n < MESH_BIP_OUTBOX && body_len <= HWMP_PREQ_BODY_LEN)
+    if (s_grp_out_n < MESH_GRP_OUTBOX && body_len <= HWMP_PREQ_BODY_LEN)
     {
-        const unsigned i = (s_bip_out_head + s_bip_out_n) % MESH_BIP_OUTBOX;
-        memcpy(s_bip_out[i].da, da, sizeof(s_bip_out[i].da));
-        memcpy(s_bip_out[i].body, body, body_len);
-        s_bip_out[i].len = (uint8_t)body_len;
-        s_bip_out_n++;
+        const unsigned i = (s_grp_out_head + s_grp_out_n) % MESH_GRP_OUTBOX;
+        memcpy(s_grp_out[i].da, da, sizeof(s_grp_out[i].da));
+        memcpy(s_grp_out[i].body, body, body_len);
+        s_grp_out[i].len = (uint8_t)body_len;
+        s_grp_out_n++;
         queued = true;
-        post = !s_bip_out_posted;
-        s_bip_out_posted = true;
+        post = !s_grp_out_posted;
+        s_grp_out_posted = true;
     }
     MMOSAL_TASK_EXIT_CRITICAL();
     if (!queued)
@@ -1865,14 +1864,14 @@ static int mesh_bip_defer_(const uint8_t *da, const uint8_t *body, uint16_t body
         g_warthog_hwmp_tx_qdrop++;
         return -5;
     }
-    const struct umac_evt evt = UMAC_EVT_INIT(mesh_bip_out_evt_);
+    const struct umac_evt evt = UMAC_EVT_INIT(mesh_grp_out_evt_);
     if (post && !umac_core_evt_queue(s_mesh_umacd, &evt))
     {
         /* Loop down or its queue full: nothing would send what waits, so drop it all. */
         MMOSAL_TASK_ENTER_CRITICAL();
-        g_warthog_hwmp_tx_qdrop += s_bip_out_n;
-        s_bip_out_n = 0;
-        s_bip_out_posted = false;
+        g_warthog_hwmp_tx_qdrop += s_grp_out_n;
+        s_grp_out_n = 0;
+        s_grp_out_posted = false;
         MMOSAL_TASK_EXIT_CRITICAL();
         return -5;
     }
@@ -1888,7 +1887,7 @@ static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_l
     }
     if (body[0] == 13u && (da[0] & 0x01u) != 0u && !umac_core_evtloop_is_active(s_mesh_umacd))
     {
-        return mesh_bip_defer_(da, body, body_len);
+        return mesh_grp_defer_(da, body, body_len);
     }
     return mesh_tx_hwmp_now_(da, body, body_len);
 }
@@ -1913,7 +1912,7 @@ static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t bo
      * fails the bounds check below and returns before reaching the radio --
      * SAE completes on both peers and peering silently never starts. */
     uint8_t frame[UMAC_CCMP_HDR_LEN + UMAC_MESH_ACTION_BODY_MAX + sizeof(s1g_caps) +
-                  UMAC_MESH_MMIE_LEN];
+                  UMAC_CCMP_MIC_LEN];
     if ((uint32_t)body_len + s1g_caps_len > UMAC_MESH_ACTION_BODY_MAX + sizeof(s1g_caps))
     {
         g_warthog_mesh_act_oversize++;
@@ -1925,7 +1924,7 @@ static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t bo
     {
         umac_datapath_mesh_hwmp_tx_key(da, &k);
     }
-    /* Host CCMP fills a CCMP header and MIC in place; BIP appends a zero-MIC MMIE. */
+    /* Host CCMP fills a CCMP header and MIC in place; the chip adds its own. */
     uint16_t n = (k.how == UMAC_MESH_HWMP_PROT_HOST) ? UMAC_CCMP_HDR_LEN : 0u;
     memset(frame, 0, n);
     memcpy(frame + n, body, body_len);
@@ -1935,11 +1934,6 @@ static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t bo
     {
         memset(frame + n, 0, UMAC_CCMP_MIC_LEN);
         n += UMAC_CCMP_MIC_LEN;
-    }
-    else if (k.how == UMAC_MESH_HWMP_PROT_BIP)
-    {
-        memset(frame + n, 0, UMAC_MESH_MMIE_LEN);
-        n += UMAC_MESH_MMIE_LEN;
     }
 
     struct frame_data_action act = {
@@ -1974,13 +1968,13 @@ static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t bo
         {
             g_warthog_hwmp_tx_prot++;
         }
-        else if (k.how == UMAC_MESH_HWMP_PROT_BIP)
+        else if (k.how == UMAC_MESH_HWMP_PROT_GROUP)
         {
-            g_warthog_hwmp_tx_mmie++;
+            g_warthog_hwmp_tx_gp++;
         }
         else if ((da[0] & 0x01u) != 0u)
         {
-            g_warthog_hwmp_tx_nommie++;
+            g_warthog_hwmp_tx_plain++;
         }
     }
     return rc;
@@ -2414,6 +2408,46 @@ uint8_t umac_mesh_get_peer_count(struct umac_data *umacd)
 {
     (void)umacd;
     return umac_datapath_mesh_peer_count();
+}
+
+/* Runs on the umac task: the peer table and rate control are touched only there. */
+static void umac_mesh_peer_links_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    (void)umacd;
+    *evt->args.mesh_peer_links.n =
+        umac_datapath_mesh_peer_links(evt->args.mesh_peer_links.out, evt->args.mesh_peer_links.max);
+    *evt->args.mesh_peer_links.status = MMWLAN_SUCCESS;
+    mmosal_semb_give(evt->args.mesh_peer_links.semb);
+}
+
+enum mmwlan_status umac_mesh_peer_links_snapshot(struct umac_data *umacd,
+                                                 struct mmwlan_mesh_peer_link *out, uint8_t max,
+                                                 uint8_t *count)
+{
+    if (out == NULL || count == NULL)
+    {
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+    *count = 0;
+    if (max == 0)
+    {
+        return MMWLAN_SUCCESS;
+    }
+    if (umac_core_evtloop_is_active(umacd))
+    {
+        *count = umac_datapath_mesh_peer_links(out, max);
+        return MMWLAN_SUCCESS;
+    }
+    /* A failed post (no semaphore, a full event pool, no loop) is not "no peers". */
+    volatile enum mmwlan_status status = MMWLAN_ERROR;
+    uint8_t n = 0;
+    UMAC_QUEUE_EVT_AND_WAIT(umac_mesh_peer_links_evt_handler, mesh_peer_links, &status,
+                            .out = out, .max = max, .n = &n);
+    if (status == MMWLAN_SUCCESS)
+    {
+        *count = n;
+    }
+    return status;
 }
 
 

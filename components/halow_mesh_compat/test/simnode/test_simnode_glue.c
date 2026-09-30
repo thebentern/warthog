@@ -1138,12 +1138,35 @@ int main(void)
         CHECK(g_warthog_fwd_uni - s1.uni == 0, "and was not relayed (%u)",
               g_warthog_fwd_uni - s1.uni);
 
+        /* A unicast whose RA is not us: the receive filter drops it first (not_ours), so
+         * the engine's own RA check is handed the frame directly, as the own-frame case. */
+        extern volatile uint32_t g_warthog_filt_hist[10];
         snap(&s1);
+        const uint32_t no0 = g_warthog_filt_hist[9];
         struct meshdata other = { .ra = B, .ta = A, .a3 = S, .a4 = A, .ttl = 31, .seq = 4002,
                                   .payload_len = 16 };
         CHECK(rx_mesh(&other), "a unicast whose RA is not us is delivered up by the chip");
-        CHECK(g_warthog_fwd_drop_bad - s1.d_bad == 1, "counted as drop bad (%u)",
-              g_warthog_fwd_drop_bad - s1.d_bad);
+        CHECK(g_warthog_filt_hist[9] - no0 == 1 && g_warthog_fwd_drop_bad == s1.d_bad,
+              "and dropped by the receive filter as not_ours (%u), before the engine (%u)",
+              (unsigned)(g_warthog_filt_hist[9] - no0), g_warthog_fwd_drop_bad - s1.d_bad);
+        {
+            uint8_t of[320];
+            uint16_t on = build_mesh_data(of, sizeof(of), &other);
+            const struct dot11_data_hdr *dh = (const struct dot11_data_hdr *)of;
+            struct umac_mesh_ctrl mc;
+            uint16_t used = 0;
+            bool parsed = on > UMAC_MESH_DATA_HDR4_LEN + 2u &&
+                          umac_mesh_ctrl_parse(of + UMAC_MESH_DATA_HDR4_LEN + 2u,
+                                               (uint16_t)(on - UMAC_MESH_DATA_HDR4_LEN - 2u),
+                                               &mc, &used);
+            struct umac_mesh_fwd_rx_result res;
+            memset(&res, 0, sizeof(res));
+            if (parsed) { umac_mesh_fwd_glue_rx(umacd, NULL, &dh->base, dh, &mc, &res); }
+            CHECK(parsed && res.verdict == UMAC_MESH_FWD_DROP &&
+                      g_warthog_fwd_drop_bad - s1.d_bad == 1,
+                  "the engine, handed it directly, drops it too, counted as drop bad (%u)",
+                  g_warthog_fwd_drop_bad - s1.d_bad);
+        }
 
         snap(&s1);
         simnode_outbox_clear();

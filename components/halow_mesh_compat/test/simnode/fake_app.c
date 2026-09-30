@@ -1,7 +1,7 @@
 /*
  * The two app-side entry points morselib calls back into, plus umac_core's
- * timeout registration (recorded, never fired) and event queue (run by
- * simnode_pump).
+ * timeout queue (registered, cancelled, fired by simnode_run_timeouts) and event
+ * queue (run by simnode_pump).
  *
  * On the firmware the entry points live in main/at.c and main/mesh.c, which
  * the harness does not link: at.c is the AT command surface and drags in USB,
@@ -18,6 +18,7 @@
  * the header catches it. */
 #include "umac/core/umac_core.h"
 #include "umac/data/umac_data.h"
+#include "umac/data/umac_data_private.h" /* sizeof(struct umac_sta_data) */
 
 void warthog_mesh_rssi_note(const uint8_t *ta, int16_t rssi, int8_t noise, uint8_t bw_mhz);
 
@@ -112,12 +113,43 @@ int umac_core_deplete_timeout(struct umac_data *umacd, uint32_t delta_ms,
     return -1;
 }
 
+/* umac_timeoutq_cancel_protected: every match goes, and the count is returned. */
+int umac_core_cancel_timeout(struct umac_data *umacd, umac_core_timeout_handler_t handler,
+                             void *arg1, void *arg2)
+{
+    (void)umacd;
+    int n = 0;
+    for (unsigned i = 0; i < SIMNODE_TIMEOUTS_MAX; i++)
+    {
+        if (s_to[i].used && s_to[i].h == handler && s_to[i].a1 == arg1 && s_to[i].a2 == arg2)
+        {
+            s_to[i].used = false;
+            n++;
+        }
+    }
+    return n;
+}
+
 unsigned simnode_timeouts_registered(void) { return s_timeouts; }
 
 unsigned simnode_timeouts_pending(void)
 {
     unsigned n = 0;
     for (unsigned i = 0; i < SIMNODE_TIMEOUTS_MAX; i++) { n += s_to[i].used ? 1u : 0u; }
+    return n;
+}
+
+/* Pending timeouts with an argument inside station record @p rec: compares addresses only,
+ * so @p rec may already be freed. */
+unsigned simnode_timeouts_holding(const void *rec)
+{
+    const uintptr_t lo = (uintptr_t)rec, hi = lo + sizeof(struct umac_sta_data);
+    unsigned n = 0;
+    for (unsigned i = 0; rec != NULL && i < SIMNODE_TIMEOUTS_MAX; i++)
+    {
+        const uintptr_t a1 = (uintptr_t)s_to[i].a1, a2 = (uintptr_t)s_to[i].a2;
+        n += (s_to[i].used && ((a1 >= lo && a1 < hi) || (a2 >= lo && a2 < hi))) ? 1u : 0u;
+    }
     return n;
 }
 

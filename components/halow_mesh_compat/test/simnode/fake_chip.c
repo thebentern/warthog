@@ -7,8 +7,8 @@
  * QoS control, Mesh Control, Address Extension, the lot.
  *
  * Everything above this line is the real firmware. Below it only two things
- * the host sees back are modelled: a TX status per data frame, and the group key
- * slot's TX PN, drawn when a frame is sent. No modulation, no timing, no
+ * the host sees back are modelled: a TX status per data frame (and per management
+ * frame under our group key), and the group key slot's TX PN, drawn when a frame is sent. No modulation, no timing, no
  * interference. What the radio does with these bytes is exactly what the
  * simulator cannot tell you.
  */
@@ -48,6 +48,7 @@ static struct {
     uint64_t next_pn;
     bool     used;
     uint64_t top;
+    unsigned draws;
 } s_grp;
 
 bool simnode_group_pn_top(uint64_t *top)
@@ -55,6 +56,8 @@ bool simnode_group_pn_top(uint64_t *top)
     if (top != NULL) { *top = s_grp.top; }
     return s_grp.used;
 }
+
+unsigned simnode_group_pn_draws(void) { return s_grp.draws; }
 
 /* The chip sends @p pkt, or hands it back untried, then reports its TX status up the
  * real path; the datapath releases it once the event loop takes that status. */
@@ -71,6 +74,7 @@ static void chip_finish_(struct mmpkt *pkt, bool sent)
         uint64_t pn = s_grp.next_pn++;
         if (!s_grp.used || pn > s_grp.top) { s_grp.top = pn; }
         s_grp.used = true;
+        s_grp.draws++;
     }
     md->attempts = sent ? 1u : 0u;
     md->status_flags = !sent ? MMDRV_TX_STATUS_DUTY_CYCLE_CANT_SEND
@@ -134,8 +138,9 @@ int mmdrv_tx_frame(struct mmpkt *pkt, bool is_mgmt)
         s_outbox_dropped++;
     }
     mmpkt_close(&v);
-    /* Management frames' status feeds hostap and rate control, neither linked: freed as sent. */
-    if (is_mgmt)
+    /* Management frames' status feeds hostap and rate control, neither linked: freed as sent.
+     * Not one under our group key (group path selection): it draws that slot's PN, as data does. */
+    if (is_mgmt && mmdrv_get_tx_metadata(pkt)->mesh.own_group == 0u)
     {
         mmpkt_release(pkt);
         return 0;

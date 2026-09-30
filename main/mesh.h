@@ -18,3 +18,7 @@ void warthog_mesh_smoke_test(void);
 struct warthog_mesh_diag_in;
 /* The no-peers diagnosis inputs over the peering watchdog's window (mesh_diag.h). */
 void warthog_mesh_diag_windowed(struct warthog_mesh_diag_in *in);
+
+#include <stddef.h>
+/* The AT+MESHBATMAN? bat0 line (bat_mode_bat0_line) as of the last probe tick. */
+int warthog_mesh_bat0_line(char *buf, size_t len);

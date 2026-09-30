@@ -1,0 +1,197 @@
+===== node A =====
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+a-b@if2          UP             02:00:00:00:0a:01 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+bat0             UNKNOWN        02:00:00:00:0a:ff <BROADCAST,MULTICAST,UP,LOWER_UP> 
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+a-b@if2          UP             
+bat0             UNKNOWN        10.99.0.1/24 fe80::ff:fe00:aff/64 
+--- neighbors
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: a-b/02:00:00:00:0a:01 (bat0/02:00:00:00:0a:ff BATMAN_V)]
+IF             Neighbor              last-seen
+02:00:00:00:0b:01    0.282s (    10000.0) [       a-b]
+--- originators
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: a-b/02:00:00:00:0a:01 (bat0/02:00:00:00:0a:ff BATMAN_V)]
+   Originator        last-seen ( throughput)  Nexthop           [outgoingIF]
+ * 02:00:00:00:0b:01    0.470s (    10000.0)  02:00:00:00:0b:01 [       a-b]
+ * 02:00:00:00:0c:01    0.566s (     8823.5)  02:00:00:00:0b:01 [       a-b]
+--- translocal
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: a-b/02:00:00:00:0a:01 (bat0/02:00:00:00:0a:ff BATMAN_V), TTVN: 2]
+Client             VID Flags    Last seen (CRC       )
+02:00:00:00:0a:ff    0 [.P....]   0.000   (0x6ac8052f)
+01:00:5e:00:00:01   -1 [.P....]   0.000   (0x6c7cbcd6)
+02:00:00:00:0a:ff   -1 [.P....]   0.000   (0x6c7cbcd6)
+33:33:ff:00:0a:ff   -1 [.P....]   0.000   (0x6c7cbcd6)
+33:33:00:00:00:01   -1 [.P....]   0.000   (0x6c7cbcd6)
+--- transglobal
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: a-b/02:00:00:00:0a:01 (bat0/02:00:00:00:0a:ff BATMAN_V)]
+   Client             VID Flags Last ttvn     Via        ttvn  (CRC       )
+ * 33:33:ff:00:0c:ff   -1 [....] (  1) 02:00:00:00:0c:01 (  1) (0x6c7cbcd6)
+ * 33:33:ff:00:0b:ff   -1 [....] (  1) 02:00:00:00:0b:01 (  2) (0x6c7cbcd6)
+   01:00:5e:00:00:01   -1 [....] (  1) 02:00:00:00:0c:01 (  1) (0x6c7cbcd6)
+ * 01:00:5e:00:00:01   -1 [....] (  1) 02:00:00:00:0b:01 (  2) (0x6c7cbcd6)
+ * 02:00:00:00:0c:ff   -1 [....] (  1) 02:00:00:00:0c:01 (  1) (0x6c7cbcd6)
+ * 02:00:00:00:0c:ff    0 [....] (  1) 02:00:00:00:0c:01 (  1) (0x0307541d)
+ * 02:00:00:00:0b:ff   -1 [....] (  1) 02:00:00:00:0b:01 (  2) (0x6c7cbcd6)
+ * 02:00:00:00:0b:ff    0 [....] (  2) 02:00:00:00:0b:01 (  2) (0x796a9d58)
+   33:33:00:00:00:01   -1 [....] (  1) 02:00:00:00:0c:01 (  1) (0x6c7cbcd6)
+ * 33:33:00:00:00:01   -1 [....] (  1) 02:00:00:00:0b:01 (  2) (0x6c7cbcd6)
+--- gateways
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: a-b/02:00:00:00:0a:01 (bat0/02:00:00:00:0a:ff BATMAN_V)]
+  Router            ( throughput) Next Hop          [outgoingIf]  Bandwidth
+* 02:00:00:00:0b:01 (    10000.0) 02:00:00:00:0b:01 [       a-b]: 10.0/2.0 MBit
+--- mcast_flags
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: a-b/02:00:00:00:0a:01 (bat0/02:00:00:00:0a:ff BATMAN_V)]
+Multicast flags (own flags: [.... . .])
+* Bridged [U]				.
+* No IGMP/MLD Querier [4/6]:		?/?
+* Shadowing IGMP/MLD Querier [4/6]:	?/?
+-------------------------------------------
+       Originator Flags
+02:00:00:00:0b:01 [.... . .]
+02:00:00:00:0c:01 [.... . .]
+--- dat_cache
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: a-b/02:00:00:00:0a:01 (bat0/02:00:00:00:0a:ff BATMAN_V)]
+Distributed ARP Table (bat0):
+          IPv4             MAC        VID   last-seen
+--- claimtable
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: a-b/02:00:00:00:0a:01 (bat0/02:00:00:00:0a:ff BATMAN_V), group id: 0x82c6]
+Client               VID      Originator        [o] (CRC   )
+--- backbonetable
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: a-b/02:00:00:00:0a:01 (bat0/02:00:00:00:0a:ff BATMAN_V), group id: 0x82c6]
+Originator           VID   last seen (CRC   )
+--- mesh_json
+{"version":"2024.3","algo_name":"BATMAN_V","mesh_ifindex":3,"mesh_ifname":"bat0","mesh_address":"02:00:00:00:0a:ff","hard_ifindex":2,"hard_ifname":"a-b","hard_address":"02:00:00:00:0a:01","tt_ttvn":2,"bla_crc":33478,"mcast_flags":{"all_unsnoopables": false,"want_all_ipv4": false,"want_all_ipv6": false,"want_no_rtr_ipv4": true,"want_no_rtr_ipv6": true,"have_mc_ptype_capa": true,"raw": 56},"mcast_flags_priv":{"bridged": false,"querier_ipv4_exists": false,"querier_ipv6_exists": false,"querier_ipv4_shadowing": false,"querier_ipv6_shadowing": false,"raw": 0},"aggregated_ogms_enabled":true,"ap_isolation_enabled":false,"isolation_mark":0,"isolation_mask":0,"bonding_enabled":true,"bridge_loop_avoidance_enabled":true,"distributed_arp_table_enabled":true,"fragmentation_enabled":true,"gw_bandwidth_down":100,"gw_bandwidth_up":20,"gw_mode":"client","gw_sel_class":50,"hop_penalty":30,"log_level":{"batman": false,"routes": false,"tt": false,"bla": false,"dat": false,"nc": false,"mcast": false,"tp": false,"raw": 0},"multicast_forceflood_enabled":false,"orig_interval":1000,"multicast_fanout":16}
+--- hardifs_json
+[{"mesh_ifindex":3,"mesh_ifname":"bat0","hard_ifindex":2,"hard_ifname":"a-b","hard_address":"02:00:00:00:0a:01","active":true,"hop_penalty":0,"elp_interval":500,"throughput_override":0}]
+===== node B =====
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+b-a@if2          UP             02:00:00:00:0b:01 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+b-c@if2          UP             02:00:00:00:0b:02 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+bat0             UNKNOWN        02:00:00:00:0b:ff <BROADCAST,MULTICAST,UP,LOWER_UP> 
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+b-a@if2          UP             
+b-c@if2          UP             
+bat0             UNKNOWN        10.99.0.2/24 fe80::ff:fe00:bff/64 
+--- neighbors
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: b-a/02:00:00:00:0b:01 (bat0/02:00:00:00:0b:ff BATMAN_V)]
+IF             Neighbor              last-seen
+02:00:00:00:0a:01    0.466s (    10000.0) [       b-a]
+02:00:00:00:0c:01    0.338s (    10000.0) [       b-c]
+--- originators
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: b-a/02:00:00:00:0b:01 (bat0/02:00:00:00:0b:ff BATMAN_V)]
+   Originator        last-seen ( throughput)  Nexthop           [outgoingIF]
+ * 02:00:00:00:0c:01    0.654s (    10000.0)  02:00:00:00:0c:01 [       b-c]
+ * 02:00:00:00:0a:01    0.501s (    10000.0)  02:00:00:00:0a:01 [       b-a]
+--- translocal
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: b-a/02:00:00:00:0b:01 (bat0/02:00:00:00:0b:ff BATMAN_V), TTVN: 2]
+Client             VID Flags    Last seen (CRC       )
+33:33:ff:00:0b:ff   -1 [.P....]   0.000   (0x6c7cbcd6)
+01:00:5e:00:00:01   -1 [.P....]   0.000   (0x6c7cbcd6)
+02:00:00:00:0b:ff   -1 [.P....]   0.000   (0x6c7cbcd6)
+02:00:00:00:0b:ff    0 [.P....]   0.000   (0x796a9d58)
+33:33:00:00:00:01   -1 [.P....]   0.000   (0x6c7cbcd6)
+--- transglobal
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: b-a/02:00:00:00:0b:01 (bat0/02:00:00:00:0b:ff BATMAN_V)]
+   Client             VID Flags Last ttvn     Via        ttvn  (CRC       )
+ * 02:00:00:00:0a:ff    0 [....] (  2) 02:00:00:00:0a:01 (  2) (0x6ac8052f)
+ * 33:33:ff:00:0c:ff   -1 [....] (  1) 02:00:00:00:0c:01 (  1) (0x6c7cbcd6)
+ * 01:00:5e:00:00:01   -1 [....] (  1) 02:00:00:00:0c:01 (  1) (0x6c7cbcd6)
+   01:00:5e:00:00:01   -1 [....] (  1) 02:00:00:00:0a:01 (  2) (0x6c7cbcd6)
+ * 02:00:00:00:0c:ff   -1 [....] (  1) 02:00:00:00:0c:01 (  1) (0x6c7cbcd6)
+ * 02:00:00:00:0c:ff    0 [....] (  1) 02:00:00:00:0c:01 (  1) (0x0307541d)
+ * 02:00:00:00:0a:ff   -1 [....] (  1) 02:00:00:00:0a:01 (  2) (0x6c7cbcd6)
+ * 33:33:ff:00:0a:ff   -1 [....] (  1) 02:00:00:00:0a:01 (  2) (0x6c7cbcd6)
+ * 33:33:00:00:00:01   -1 [....] (  1) 02:00:00:00:0c:01 (  1) (0x6c7cbcd6)
+   33:33:00:00:00:01   -1 [....] (  1) 02:00:00:00:0a:01 (  2) (0x6c7cbcd6)
+--- gateways
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: b-a/02:00:00:00:0b:01 (bat0/02:00:00:00:0b:ff BATMAN_V)]
+  Router            ( throughput) Next Hop          [outgoingIf]  Bandwidth
+--- mcast_flags
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: b-a/02:00:00:00:0b:01 (bat0/02:00:00:00:0b:ff BATMAN_V)]
+Multicast flags (own flags: [.... . .])
+* Bridged [U]				.
+* No IGMP/MLD Querier [4/6]:		?/?
+* Shadowing IGMP/MLD Querier [4/6]:	?/?
+-------------------------------------------
+       Originator Flags
+02:00:00:00:0c:01 [.... . .]
+02:00:00:00:0a:01 [.... . .]
+--- dat_cache
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: b-a/02:00:00:00:0b:01 (bat0/02:00:00:00:0b:ff BATMAN_V)]
+Distributed ARP Table (bat0):
+          IPv4             MAC        VID   last-seen
+--- claimtable
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: b-a/02:00:00:00:0b:01 (bat0/02:00:00:00:0b:ff BATMAN_V), group id: 0x12c7]
+Client               VID      Originator        [o] (CRC   )
+--- backbonetable
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: b-a/02:00:00:00:0b:01 (bat0/02:00:00:00:0b:ff BATMAN_V), group id: 0x12c7]
+Originator           VID   last seen (CRC   )
+--- mesh_json
+{"version":"2024.3","algo_name":"BATMAN_V","mesh_ifindex":4,"mesh_ifname":"bat0","mesh_address":"02:00:00:00:0b:ff","hard_ifindex":2,"hard_ifname":"b-a","hard_address":"02:00:00:00:0b:01","tt_ttvn":2,"bla_crc":4807,"mcast_flags":{"all_unsnoopables": false,"want_all_ipv4": false,"want_all_ipv6": false,"want_no_rtr_ipv4": true,"want_no_rtr_ipv6": true,"have_mc_ptype_capa": true,"raw": 56},"mcast_flags_priv":{"bridged": false,"querier_ipv4_exists": false,"querier_ipv6_exists": false,"querier_ipv4_shadowing": false,"querier_ipv6_shadowing": false,"raw": 0},"aggregated_ogms_enabled":true,"ap_isolation_enabled":false,"isolation_mark":0,"isolation_mask":0,"bonding_enabled":true,"bridge_loop_avoidance_enabled":true,"distributed_arp_table_enabled":true,"fragmentation_enabled":true,"gw_bandwidth_down":100,"gw_bandwidth_up":20,"gw_mode":"server","gw_sel_class":50,"hop_penalty":30,"log_level":{"batman": false,"routes": false,"tt": false,"bla": false,"dat": false,"nc": false,"mcast": false,"tp": false,"raw": 0},"multicast_forceflood_enabled":false,"orig_interval":1000,"multicast_fanout":16}
+--- hardifs_json
+[{"mesh_ifindex":4,"mesh_ifname":"bat0","hard_ifindex":2,"hard_ifname":"b-a","hard_address":"02:00:00:00:0b:01","active":true,"hop_penalty":0,"elp_interval":500,"throughput_override":0},{"mesh_ifindex":4,"mesh_ifname":"bat0","hard_ifindex":3,"hard_ifname":"b-c","hard_address":"02:00:00:00:0b:02","active":true,"hop_penalty":0,"elp_interval":500,"throughput_override":0}]
+===== node C =====
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+c-b@if3          UP             02:00:00:00:0c:01 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+bat0             UNKNOWN        02:00:00:00:0c:ff <BROADCAST,MULTICAST,UP,LOWER_UP> 
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+c-b@if3          UP             
+bat0             UNKNOWN        10.99.0.3/24 fe80::ff:fe00:cff/64 
+--- neighbors
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: c-b/02:00:00:00:0c:01 (bat0/02:00:00:00:0c:ff BATMAN_V)]
+IF             Neighbor              last-seen
+02:00:00:00:0b:02    0.254s (    10000.0) [       c-b]
+--- originators
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: c-b/02:00:00:00:0c:01 (bat0/02:00:00:00:0c:ff BATMAN_V)]
+   Originator        last-seen ( throughput)  Nexthop           [outgoingIF]
+ * 02:00:00:00:0b:01    0.554s (    10000.0)  02:00:00:00:0b:02 [       c-b]
+ * 02:00:00:00:0a:01    0.441s (     8823.5)  02:00:00:00:0b:02 [       c-b]
+--- translocal
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: c-b/02:00:00:00:0c:01 (bat0/02:00:00:00:0c:ff BATMAN_V), TTVN: 1]
+Client             VID Flags    Last seen (CRC       )
+33:33:ff:00:0c:ff   -1 [.P....]   0.000   (0x6c7cbcd6)
+01:00:5e:00:00:01   -1 [.P....]   0.000   (0x6c7cbcd6)
+02:00:00:00:0c:ff   -1 [.P....]   0.000   (0x6c7cbcd6)
+02:00:00:00:0c:ff    0 [.P....]   0.000   (0x0307541d)
+33:33:00:00:00:01   -1 [.P....]   0.000   (0x6c7cbcd6)
+--- transglobal
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: c-b/02:00:00:00:0c:01 (bat0/02:00:00:00:0c:ff BATMAN_V)]
+   Client             VID Flags Last ttvn     Via        ttvn  (CRC       )
+ * 02:00:00:00:0a:ff    0 [....] (  2) 02:00:00:00:0a:01 (  2) (0x6ac8052f)
+ * 33:33:ff:00:0b:ff   -1 [....] (  2) 02:00:00:00:0b:01 (  2) (0x6c7cbcd6)
+   01:00:5e:00:00:01   -1 [....] (  2) 02:00:00:00:0a:01 (  2) (0x6c7cbcd6)
+ * 01:00:5e:00:00:01   -1 [....] (  2) 02:00:00:00:0b:01 (  2) (0x6c7cbcd6)
+ * 02:00:00:00:0b:ff   -1 [....] (  2) 02:00:00:00:0b:01 (  2) (0x6c7cbcd6)
+ * 02:00:00:00:0b:ff    0 [....] (  2) 02:00:00:00:0b:01 (  2) (0x796a9d58)
+ * 02:00:00:00:0a:ff   -1 [....] (  2) 02:00:00:00:0a:01 (  2) (0x6c7cbcd6)
+ * 33:33:ff:00:0a:ff   -1 [....] (  2) 02:00:00:00:0a:01 (  2) (0x6c7cbcd6)
+   33:33:00:00:00:01   -1 [....] (  2) 02:00:00:00:0a:01 (  2) (0x6c7cbcd6)
+ * 33:33:00:00:00:01   -1 [....] (  2) 02:00:00:00:0b:01 (  2) (0x6c7cbcd6)
+--- gateways
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: c-b/02:00:00:00:0c:01 (bat0/02:00:00:00:0c:ff BATMAN_V)]
+  Router            ( throughput) Next Hop          [outgoingIf]  Bandwidth
+* 02:00:00:00:0b:01 (    10000.0) 02:00:00:00:0b:02 [       c-b]: 10.0/2.0 MBit
+--- mcast_flags
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: c-b/02:00:00:00:0c:01 (bat0/02:00:00:00:0c:ff BATMAN_V)]
+Multicast flags (own flags: [.... . .])
+* Bridged [U]				.
+* No IGMP/MLD Querier [4/6]:		?/?
+* Shadowing IGMP/MLD Querier [4/6]:	?/?
+-------------------------------------------
+       Originator Flags
+02:00:00:00:0b:01 [.... . .]
+02:00:00:00:0a:01 [.... . .]
+--- dat_cache
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: c-b/02:00:00:00:0c:01 (bat0/02:00:00:00:0c:ff BATMAN_V)]
+Distributed ARP Table (bat0):
+          IPv4             MAC        VID   last-seen
+--- claimtable
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: c-b/02:00:00:00:0c:01 (bat0/02:00:00:00:0c:ff BATMAN_V), group id: 0x22c5]
+Client               VID      Originator        [o] (CRC   )
+--- backbonetable
+[B.A.T.M.A.N. adv 2024.3, MainIF/MAC: c-b/02:00:00:00:0c:01 (bat0/02:00:00:00:0c:ff BATMAN_V), group id: 0x22c5]
+Originator           VID   last seen (CRC   )
+--- mesh_json
+{"version":"2024.3","algo_name":"BATMAN_V","mesh_ifindex":3,"mesh_ifname":"bat0","mesh_address":"02:00:00:00:0c:ff","hard_ifindex":2,"hard_ifname":"c-b","hard_address":"02:00:00:00:0c:01","tt_ttvn":1,"bla_crc":8901,"mcast_flags":{"all_unsnoopables": false,"want_all_ipv4": false,"want_all_ipv6": false,"want_no_rtr_ipv4": true,"want_no_rtr_ipv6": true,"have_mc_ptype_capa": true,"raw": 56},"mcast_flags_priv":{"bridged": false,"querier_ipv4_exists": false,"querier_ipv6_exists": false,"querier_ipv4_shadowing": false,"querier_ipv6_shadowing": false,"raw": 0},"aggregated_ogms_enabled":true,"ap_isolation_enabled":false,"isolation_mark":0,"isolation_mask":0,"bonding_enabled":true,"bridge_loop_avoidance_enabled":true,"distributed_arp_table_enabled":true,"fragmentation_enabled":true,"gw_bandwidth_down":100,"gw_bandwidth_up":20,"gw_mode":"client","gw_sel_class":50,"hop_penalty":30,"log_level":{"batman": false,"routes": false,"tt": false,"bla": false,"dat": false,"nc": false,"mcast": false,"tp": false,"raw": 0},"multicast_forceflood_enabled":false,"orig_interval":1000,"multicast_fanout":16}
+--- hardifs_json
+[{"mesh_ifindex":3,"mesh_ifname":"bat0","hard_ifindex":2,"hard_ifname":"c-b","hard_address":"02:00:00:00:0c:01","active":true,"hop_penalty":0,"elp_interval":500,"throughput_override":0}]

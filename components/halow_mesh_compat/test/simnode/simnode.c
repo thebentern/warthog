@@ -12,12 +12,15 @@
 #include "mmwlan_mesh.h"
 #include "mmdrv.h"
 #include "umac/data/umac_data.h"
+#include "umac/data/umac_data_private.h" /* the station record's size, for simnode_recycle_peer_record */
 #include "umac/datapath/umac_datapath.h"
 #include "umac/datapath/umac_datapath_private.h"
 #include "umac/datapath/umac_datapath_data.h"
 #include "umac/mesh/umac_mesh.h"
 #include "umac/mesh/umac_mesh_fwd_glue.h"
 #include "umac/mesh/umac_mesh_ies.h"
+#include "umac/interface/umac_interface.h"
+#include "umac/rc/umac_rc.h"
 
 void simnode_set_identity(const uint8_t mac[6], uint16_t vif_id);
 bool simnode_evt_dispatch_one(struct umac_data *umacd); /* fake_app.c */
@@ -30,7 +33,7 @@ void simnode_loop_leave(void);                          /* fake_app.c */
 void umac_mesh_service_tick(void);
 
 extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge,
-                         g_warthog_mesh_grp, g_warthog_mesh_secure;
+                         g_warthog_mesh_grp, g_warthog_mesh_secure, g_warthog_mesh_batman;
 
 static struct umac_data *s_umacd;
 static uint8_t s_mac[6];
@@ -73,6 +76,154 @@ static void simnode_netif_rx_(uint8_t *header, unsigned header_len,
 }
 
 static bool simnode_start_(const uint8_t mac[6], bool sae, uint16_t vif_id);
+
+/* ---- the extended RX callback --------------------------------------------
+ *
+ * The radio-stack stub generator used to supply these two as no-ops, which made
+ * the ext path unreachable. Here they keep one callback per VIF as umac_interface.c
+ * does, UNSPECIFIED meaning both: the datapath's register calls (raw and pkt clear it,
+ * ext sets it) and its per-frame lookup, for the VIF it names, go through them. */
+static struct { mmwlan_rx_pkt_ext_cb_t cb; void *arg; } s_ext[2]; /* STA, AP */
+static enum mmwlan_vif s_ext_vif;
+static bool s_ext_on;
+
+enum mmwlan_status umac_interface_register_rx_pkt_ext_cb(struct umac_data *umacd,
+                                                         enum mmwlan_vif vif,
+                                                         mmwlan_rx_pkt_ext_cb_t callback,
+                                                         void *arg)
+{
+    if (vif == MMWLAN_VIF_UNSPECIFIED)
+    {
+        (void)umac_interface_register_rx_pkt_ext_cb(umacd, MMWLAN_VIF_STA, callback, arg);
+        return umac_interface_register_rx_pkt_ext_cb(umacd, MMWLAN_VIF_AP, callback, arg);
+    }
+    if (vif != MMWLAN_VIF_STA && vif != MMWLAN_VIF_AP) { return MMWLAN_INVALID_ARGUMENT; }
+    s_ext[vif == MMWLAN_VIF_AP].cb = callback;
+    s_ext[vif == MMWLAN_VIF_AP].arg = arg;
+    return MMWLAN_SUCCESS;
+}
+
+mmwlan_rx_pkt_ext_cb_t umac_interface_get_rx_pkt_ext_cb(struct umac_data *umacd,
+                                                        enum mmwlan_vif vif, void **arg)
+{
+    (void)umacd;
+    const bool known = (vif == MMWLAN_VIF_STA || vif == MMWLAN_VIF_AP);
+    if (arg != NULL) { *arg = known ? s_ext[vif == MMWLAN_VIF_AP].arg : NULL; }
+    return known ? s_ext[vif == MMWLAN_VIF_AP].cb : NULL;
+}
+
+#define SIMNODE_EXTRX_MAX 16u
+static struct simnode_extrx s_extrx[SIMNODE_EXTRX_MAX];
+static unsigned s_extrx_n;
+
+unsigned simnode_ext_rx_count(void) { return s_extrx_n; }
+void simnode_ext_rx_clear(void) { s_extrx_n = 0; }
+const struct simnode_extrx *simnode_ext_rx_get(unsigned i)
+{
+    return (i < s_extrx_n) ? &s_extrx[i] : NULL;
+}
+
+/* Consumes the packet, as the callback contract requires. */
+static void simnode_ext_rx_(struct mmpkt *pkt, const struct mmwlan_rx_metadata *md, void *arg)
+{
+    (void)arg;
+    struct mmpktview *v = mmpkt_open(pkt);
+    if (s_extrx_n < SIMNODE_EXTRX_MAX)
+    {
+        struct simnode_extrx *e = &s_extrx[s_extrx_n++];
+        memset(e, 0, sizeof(*e));
+        uint32_t n = mmpkt_get_data_length(v);
+        memcpy(e->frame, mmpkt_get_data_start(v), n < sizeof(e->frame) ? n : sizeof(e->frame));
+        e->len = (uint16_t)n;
+        if (md != NULL && md->ta != NULL)
+        {
+            memcpy(e->ta, md->ta, 6);
+            e->have_ta = true;
+        }
+    }
+    mmpkt_close(&v);
+    mmpkt_release(pkt);
+}
+
+static void simnode_rx_register_(void)
+{
+    if (s_ext_on)
+    {
+        (void)umac_datapath_register_rx_pkt_ext_cb(s_umacd, s_ext_vif, simnode_ext_rx_, NULL);
+    }
+    else
+    {
+        (void)umac_datapath_register_rx_cb(s_umacd, simnode_netif_rx_, NULL);
+    }
+}
+
+void simnode_set_rx_ext_cb_vif(bool on, unsigned vif)
+{
+    s_ext_on = on;
+    s_ext_vif = (enum mmwlan_vif)vif;
+    s_extrx_n = 0;
+    if (s_umacd != NULL) { simnode_rx_register_(); }
+}
+
+void simnode_set_rx_ext_cb(bool on)
+{
+    simnode_set_rx_ext_cb_vif(on, MMWLAN_VIF_UNSPECIFIED);
+}
+
+/* ---- rate control's expected throughput ---------------------------------
+ *
+ * umac_rc.c is not linked (the radio stack below the mesh is stubbed), so the
+ * helper umac_datapath_mesh_peer_links calls is supplied here, settable per peer. */
+#define SIMNODE_TPUT_MAX 8u
+static struct { uint8_t mac[6]; uint32_t kbps; bool valid, used; } s_tput[SIMNODE_TPUT_MAX];
+
+void simnode_set_peer_tput(const uint8_t mac[6], uint32_t kbps, bool valid)
+{
+    unsigned free_i = SIMNODE_TPUT_MAX;
+    for (unsigned i = 0; i < SIMNODE_TPUT_MAX; i++)
+    {
+        if (s_tput[i].used && memcmp(s_tput[i].mac, mac, 6) == 0) { free_i = i; break; }
+        if (!s_tput[i].used && free_i == SIMNODE_TPUT_MAX) { free_i = i; }
+    }
+    if (free_i == SIMNODE_TPUT_MAX) { return; }
+    memcpy(s_tput[free_i].mac, mac, 6);
+    s_tput[free_i].kbps = kbps;
+    s_tput[free_i].valid = valid;
+    s_tput[free_i].used = true;
+}
+
+uint32_t umac_rc_get_expected_tput_kbps(struct umac_sta_data *stad)
+{
+    if (stad == NULL) { return 0; }
+    for (unsigned i = 0; i < SIMNODE_TPUT_MAX; i++)
+    {
+        if (s_tput[i].used && umac_sta_data_matches_peer_addr(stad, s_tput[i].mac))
+        {
+            return s_tput[i].valid ? s_tput[i].kbps : 0u;
+        }
+    }
+    return 0;
+}
+
+int simnode_peer_links_query(struct mmwlan_mesh_peer_link *out, uint8_t max, uint8_t *count,
+                             bool on_loop)
+{
+    if (on_loop) { simnode_loop_enter(); }
+    int st = (int)umac_mesh_peer_links_snapshot(s_umacd, out, max, count);
+    if (on_loop) { simnode_loop_leave(); }
+    return st;
+}
+
+uint8_t simnode_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max)
+{
+    uint8_t n = 0;
+    return simnode_peer_links_query(out, max, &n, true) == (int)MMWLAN_SUCCESS ? n : 0u;
+}
+
+void simnode_set_batman(bool on)
+{
+    g_warthog_mesh_batman = on ? 1u : 0u;
+}
 
 bool simnode_start(const uint8_t mac[6])
 {
@@ -156,15 +307,28 @@ static bool simnode_start_(const uint8_t mac[6], bool sae, uint16_t vif_id)
      * forwarding glue's own init. */
     if (umac_mesh_enable_mesh(s_umacd, &args) != MMWLAN_SUCCESS) { return false; }
     umac_mesh_fwd_glue_init();
-    (void)umac_datapath_register_rx_cb(s_umacd, simnode_netif_rx_, NULL);
+    simnode_rx_register_();
     s_hostrx_n = 0;
+    s_extrx_n = 0;
     s_up = true;
     return true;
 }
 
 void simnode_stop(void)
 {
-    if (s_up && s_umacd != NULL) { (void)umac_mesh_disable_mesh(s_umacd); }
+    if (s_up && s_umacd != NULL)
+    {
+        /* The loop takes the TX statuses already queued for it (a PERR sent by del_peer, under
+         * our MGTK); the next start's umac_data_init would drop them unreleased. */
+        struct umac_datapath_data *dp = umac_data_get_datapath(s_umacd);
+        simnode_loop_enter();
+        for (unsigned i = 0; i < 64u && !mmpkt_list_is_empty(&dp->tx_status_q); i++)
+        {
+            (void)umac_datapath_process(s_umacd);
+        }
+        simnode_loop_leave();
+        (void)umac_mesh_disable_mesh(s_umacd);
+    }
     s_up = false;
     s_umacd = NULL;
     simnode_outbox_clear();
@@ -206,8 +370,45 @@ void simnode_del_peer(const uint8_t mac[6])
     simnode_loop_leave();
 }
 
+void simnode_recycle_arm(const void *block, size_t size); /* fake_rtos.c */
+
+bool simnode_recycle_peer_record(const uint8_t *mac)
+{
+    if (mac == NULL)
+    {
+        simnode_recycle_arm(NULL, 0);
+        return true;
+    }
+    simnode_loop_enter();
+    const struct umac_sta_data *stad = umac_datapath_mesh_find_peer(mac);
+    simnode_loop_leave();
+    if (stad == NULL) { return false; }
+    simnode_recycle_arm(stad, sizeof(*stad));
+    return true;
+}
+
 static bool simnode_host_tx_(const uint8_t da[6], const uint8_t sa[6],
                              const uint8_t *payload, uint16_t payload_len, bool pump);
+
+int simnode_host_tx_eth(const uint8_t *ra, const uint8_t da[6], const uint8_t sa[6],
+                        uint16_t ethertype, const uint8_t *payload, uint16_t payload_len)
+{
+    if (!s_up) { return (int)MMWLAN_NOT_RUNNING; }
+    struct mmpkt *pkt = umac_datapath_alloc_mmpkt_for_qos_data_tx(
+        (uint32_t)payload_len + sizeof(struct umac_8023_hdr), MMDRV_PKT_CLASS_DATA_TID0);
+    if (pkt == NULL) { return (int)MMWLAN_NO_MEM; }
+    struct umac_8023_hdr h;
+    memcpy(h.dest_addr, da, 6);
+    memcpy(h.src_addr, sa, 6);
+    h.ethertype_be = htobe16(ethertype);
+    struct mmpktview *v = mmpkt_open(pkt);
+    mmpkt_append_data(v, (const uint8_t *)&h, sizeof(h));
+    if (payload != NULL && payload_len != 0) { mmpkt_append_data(v, payload, payload_len); }
+    mmpkt_close(&v);
+    int st = (int)umac_datapath_tx_frame(s_umacd, pkt, ENCRYPTION_ENABLED, ra);
+    simnode_pump();
+    return st;
+}
 
 bool simnode_host_tx(const uint8_t da[6], const uint8_t sa[6],
                      const uint8_t *payload, uint16_t payload_len)
@@ -262,6 +463,7 @@ bool simnode_rx_flags(const uint8_t *frame, uint16_t len, int16_t rssi, uint8_t 
     memset(md, 0, sizeof(*md));
     md->rssi = rssi;
     md->flags = rx_flags;
+    md->read_timestamp_ms = mmosal_get_time_ms(); /* as pageset.c stamps it; the reorder timeout reads it */
     struct mmpktview *v = mmpkt_open(pkt);
     mmpkt_append_data(v, frame, len);
     mmpkt_close(&v);

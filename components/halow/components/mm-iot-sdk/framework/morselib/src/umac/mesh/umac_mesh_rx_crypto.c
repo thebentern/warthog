@@ -44,6 +44,10 @@ extern volatile uint32_t g_warthog_swccmp_tried;
 extern volatile uint32_t g_warthog_swccmp_last_keyid;
 extern volatile uint32_t g_warthog_swccmp_last_aadlen;
 extern volatile uint8_t g_warthog_swccmp_last_aad[32];
+extern volatile uint32_t g_warthog_swccmp_fail_len;
+extern volatile uint32_t g_warthog_swccmp_fail_keyid;
+extern volatile uint8_t g_warthog_swccmp_fail_pn[6];
+extern volatile uint8_t g_warthog_swccmp_fail_hdr[32];
 
 #define SWCCMP_MIC_LEN 8u
 
@@ -137,6 +141,11 @@ bool umac_mesh_rx_host_ccmp(struct umac_sta_data *stad, const struct dot11_hdr *
     if (warthog_ccm_ad(key, nonce, SWCCMP_MIC_LEN, aad, aad_len, cipher, cipher_len, mic) != 0)
     {
         g_warthog_swccmp_micfail++;
+        /* The last failure only, so a passing frame cannot overwrite what went wrong. */
+        g_warthog_swccmp_fail_len = len;
+        g_warthog_swccmp_fail_keyid = key_id;
+        memcpy((void *)g_warthog_swccmp_fail_pn, pn, sizeof(pn));
+        memcpy((void *)g_warthog_swccmp_fail_hdr, header, sizeof(g_warthog_swccmp_fail_hdr));
         return false;
     }
 

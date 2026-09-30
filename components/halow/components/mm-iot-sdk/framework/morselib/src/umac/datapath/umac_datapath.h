@@ -80,18 +80,18 @@ enum mmwlan_status umac_datapath_mesh_set_igtk(const uint8_t *addr, const uint8_
                                                uint8_t key_len, uint16_t key_id,
                                                const uint8_t *rsc, size_t rsc_len);
 
-/** True for a keyed SAE peer that runs MFP (it sent an IGTK, or protected path
+/** True for a keyed SAE peer that runs MFP (it sent an IGTK, or protected unicast path
  *  selection, or AT+MESHPMF=1): it drops our unprotected robust frames, and an
  *  unprotected one claiming to be from it is refused. */
 bool umac_datapath_mesh_peer_mfp(const uint8_t *addr);
 
-/** How mesh_tx_hwmp_ protects one path-selection frame under SAE. */
+/** How a path-selection (mesh_tx_hwmp_) or Block Ack frame is protected under SAE. */
 enum umac_mesh_hwmp_prot
 {
-    UMAC_MESH_HWMP_PROT_NONE, /* as before: plaintext, no MMIE */
-    UMAC_MESH_HWMP_PROT_CHIP, /* unicast: Protected + HW_ENC under the link's key */
-    UMAC_MESH_HWMP_PROT_HOST, /* unicast: host CCMP under the link's key, at pn */
-    UMAC_MESH_HWMP_PROT_BIP,  /* group: MMIE under our IGTK, at pn (the IPN) */
+    UMAC_MESH_HWMP_PROT_NONE,  /* as before: plaintext */
+    UMAC_MESH_HWMP_PROT_CHIP,  /* unicast: Protected + HW_ENC under the link's key */
+    UMAC_MESH_HWMP_PROT_HOST,  /* unicast: host CCMP under the link's key, at pn */
+    UMAC_MESH_HWMP_PROT_GROUP, /* group: Protected + HW_ENC under our own MGTK */
 };
 struct umac_mesh_hwmp_txkey
 {
@@ -100,13 +100,14 @@ struct umac_mesh_hwmp_txkey
     uint8_t key[16];
     uint64_t pn;
 };
-/** Choose the protection for an HWMP frame to @p da and reserve its PN or IPN. */
+/** Choose the protection for a robust management frame to @p da (HWMP, Block Ack) and
+ *  reserve its PN; under our own MGTK the chip draws it. */
 void umac_datapath_mesh_hwmp_tx_key(const uint8_t *da, struct umac_mesh_hwmp_txkey *out);
 
 /**
  * The SAE path-selection RX policy, on a whole Mesh Action frame (24-byte header
- * first): an established peer's only. Protected unicast arrives here decrypted and
- * replay-checked. False = drop.
+ * first): an established peer's only. A Protected frame arrives here decrypted and
+ * replay-checked, unicast under the link's MTK, group under the sender's MGTK. False = drop.
  */
 bool umac_datapath_mesh_hwmp_rx_ok(const uint8_t *frame, uint32_t len);
 
@@ -114,6 +115,9 @@ bool umac_datapath_mesh_hwmp_rx_ok(const uint8_t *frame, uint32_t len);
  *  host-CCMP frame from any task never shares a PN with another. */
 uint64_t umac_datapath_mesh_take_tx_pn(struct umac_sta_data *stad, uint8_t key_id);
 uint8_t umac_datapath_mesh_peer_count(void);
+struct mmwlan_mesh_peer_link;
+/** Every slot's peer, keyed or not, with rate control's expected throughput; event loop only. */
+uint8_t umac_datapath_mesh_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max);
 /** True while the mesh peer table has room for one more peer. */
 bool umac_datapath_mesh_has_free_slot(void);
 
@@ -125,6 +129,10 @@ void umac_datapath_stad_init(struct umac_sta_data *stad);
 
 
 void umac_datapath_stad_flush(struct umac_data *umacd, struct umac_sta_data *stad);
+
+/** A mesh peer record about to be freed, on the event loop: cancel the RX reorder and
+ *  defrag timeouts that point into it and release what it holds for reordering or defrag. */
+void umac_datapath_stad_teardown(struct umac_data *umacd, struct umac_sta_data *stad);
 
 
 void umac_datapath_stad_flush_txq(struct umac_data *umacd, struct umac_sta_data *stad);

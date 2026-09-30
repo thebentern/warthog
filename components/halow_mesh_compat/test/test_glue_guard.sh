@@ -4,13 +4,33 @@
 # umac_mesh_fwd.c, which the unit tests and the simulator drive. What is left
 # here is locking and call ordering -- invariants a reviewer found broken once
 # and a unit test cannot see. Checked structurally, so a revert fails the suite
-# instead of waiting for a radio.
+# instead of waiting for a radio. The batman sections (26 on) do the same for the
+# firmware glue in main/, and run it against stubs where it can run on the host.
 set -u
 G=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh_fwd_glue.c
 M=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh.c
 fail=0
 ok()   { echo "ok   $1"; }
 bad()  { echo "FAIL $1"; fail=1; }
+# Prints why not, or nothing: every function in $1 calling lwIP ($3, an awk regex without
+# backslashes, which awk -v strips) is one esp_netif_tcpip_exec runs, and $2 is among them.
+lwip_only_in_tcpip() {
+  if ! lw_fns=$(awk -v re="$3" '
+      /^[a-z].*\(.*\)$/ || /^[a-z].*\(.*[^;]$/ { if (match($0, /[a-z_0-9]+\(/)) fn = substr($0, RSTART, RLENGTH - 1) }
+      /^}/ { fn = "" }
+      $0 ~ re && fn != "" && $0 !~ /^ *\/[*\/]/ { print fn }' "$1"); then
+    printf ' the lwIP-call scan of %s did not run;' "${1##*/}"
+    return
+  fi
+  lw_fns=$(printf '%s\n' "$lw_fns" | sort -u)
+  case " $(echo $lw_fns) " in
+    *" $2 "*) ;;
+    *) printf ' the lwIP-call scan of %s no longer sees %s;' "${1##*/}" "$2" ;;
+  esac
+  for lw_f in $lw_fns; do
+    grep -q "esp_netif_tcpip_exec($lw_f," "$1" || printf ' %s calls lwIP but is not run by esp_netif_tcpip_exec;' "$lw_f"
+  done
+}
 
 [ -f "$G" ] || { echo "FAIL glue not found at $G"; exit 1; }
 
@@ -241,11 +261,12 @@ else
 fi
 
 # 11. AT+MESHFWDSTAT? prints each checked counter in its own slot (tblfull=,
-#     unestab=). main/at.c is only scraped for storage on the host, so nothing
-#     runs it: pair each conversion in the format with its argument by position.
+#     unestab=, qfail=, the mgmt tx, path-selection and mgmt gp groups). main/at.c
+#     is only scraped for storage on the host, so nothing runs it: pair each
+#     conversion in the format with its argument by position.
 A=../../../main/at.c
 fwdstat_slot() {
-  awk -v want="$1=%lu" '/"MESHFWDSTAT"\) == 0 && terminator == .\?./ {on=1}
+  awk -v want="$1=%lu" -v n="${2:-1}" '/"MESHFWDSTAT"\) == 0 && terminator == .\?./ {on=1}
   on {
     l = $0
     while (match(l, /"[^"]*"/)) { fmt = fmt substr(l, RSTART + 1, RLENGTH - 2); l = substr(l, RSTART + RLENGTH) }
@@ -258,7 +279,8 @@ fwdstat_slot() {
     pre = substr(fmt, 1, i); k = gsub(/%[^%]/, "", pre)
     all = fmt; nc = gsub(/%[^%]/, "", all)
     if (nc != na) { print nc " conversions for " na " arguments"; exit }
-    print arg[k + 1]
+    out = arg[k + 1]; for (j = 2; j <= n; j++) out = out " " arg[k + j]
+    print out
   }' "$A"
 }
 for pair in tblfull:g_warthog_fwd_drop_tblfull unestab:g_warthog_hwmp_unestab qfail:g_warthog_hwmp_tx_qfail; do
@@ -268,6 +290,25 @@ for pair in tblfull:g_warthog_fwd_drop_tblfull unestab:g_warthog_hwmp_unestab qf
     ok "AT+MESHFWDSTAT? prints $want as $label="
   else
     bad "AT+MESHFWDSTAT?'s $label= slot prints: ${slot:-nothing}"
+  fi
+done
+# The Block Ack protection group, whose labels repeat others': matched whole, three in order.
+slot=$(fwdstat_slot "mgmt tx chip=%lu host=%lu drop" 3)
+if [ "$slot" = "g_warthog_mgmt_tx_chip g_warthog_mgmt_tx_host g_warthog_mgmt_tx_drop" ]; then
+  ok "AT+MESHFWDSTAT? prints the mgmt tx chip/host/drop counters in their slots"
+else
+  bad "AT+MESHFWDSTAT?'s mgmt tx chip=/host=/drop= slots print: ${slot:-nothing}"
+fi
+# Group path selection (group-addressed privacy), received, sent and at the CCMP layer.
+for grp in "hwmp prot=%lu unprotected=%lu unestab=%lu gp=%lu mmie=%lu nommie|6|g_warthog_hwmp_prot g_warthog_hwmp_unprotected g_warthog_hwmp_unestab g_warthog_hwmp_gp g_warthog_hwmp_mmie g_warthog_hwmp_nommie" \
+           "hwmp tx prot=%lu gp=%lu plain|3|g_warthog_hwmp_tx_prot g_warthog_hwmp_tx_gp g_warthog_hwmp_tx_plain" \
+           "mgmt gp nodec=%lu own=%lu key=%lu replay|4|g_warthog_mgmt_gp_nodec g_warthog_mgmt_gp_own g_warthog_mgmt_gp_key g_warthog_mgmt_gp_replay"; do
+  label=${grp%%|*}; rest=${grp#*|}; n=${rest%%|*}; want=${rest#*|}
+  slot=$(fwdstat_slot "$label" "$n")
+  if [ "$slot" = "$want" ]; then
+    ok "AT+MESHFWDSTAT? prints ${label%%=*} ... in their slots"
+  else
+    bad "AT+MESHFWDSTAT?'s ${label%%=*} slots print: ${slot:-nothing} (want $want)"
   fi
 done
 
@@ -287,6 +328,56 @@ case "$fit" in
   ok*) ok "AT+MESHFWDSTAT? fits its buffer at its longest (${fit#ok } bytes)" ;;
   *)   bad "AT+MESHFWDSTAT? can outgrow its buffer: ${fit:-nothing parsed}" ;;
 esac
+
+# 11c. AT+FILTSTAT? prints the receive filter's reason 9 (a mesh unicast whose RA is another
+#      station) as not_ours=, fits its buffer at its longest, and the histogram behind it has
+#      a slot for every reason umac_datapath.c counts, in at.c's storage and in its extern.
+D=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/datapath/umac_datapath.c
+filt=$(awk '/^static void cmd_filtstat\(void\)/ {on=1}
+  on && /char buf\[[0-9]+\]/ { match($0, /\[[0-9]+\]/); size = substr($0, RSTART + 1, RLENGTH - 2) + 0 }
+  on && /snprintf\(buf, sizeof\(buf\),/ { args = 1 }
+  args {
+    l = $0
+    while (match(l, /"[^"]*"/)) { fmt = fmt substr(l, RSTART + 1, RLENGTH - 2); l = substr(l, RSTART + RLENGTH) }
+    while (match(l, /g_warthog_[A-Za-z0-9_]+(\[[0-9]+\])?/)) { arg[++na] = substr(l, RSTART, RLENGTH); l = substr(l, RSTART + RLENGTH) }
+  }
+  on && /cdc_write\(buf\);/ { exit }
+  END {
+    i = index(fmt, " not_ours=%lu")
+    pre = substr(fmt, 1, i); k = gsub(/%lu/, "", pre)
+    f = fmt; gsub(/\\[rn]/, "x", f); lu = gsub(/%lu/, "", f)
+    if (i == 0 || size == 0 || lu != na || index(f, "%")) { print "unparsed"; exit }
+    print arg[k + 1] " " length(f) + 10 * lu + 1 " " size
+  }' "$A")
+read -r f_slot f_need f_size f_more <<FILT
+$filt
+FILT
+if [ "$f_slot" = "g_warthog_filt_hist[9]" ] && [ -z "$f_more" ] && [ "${f_need:-x}" -le "${f_size:-0}" ] 2>/dev/null; then
+  ok "AT+FILTSTAT? prints $f_slot as not_ours= and fits its buffer at its longest ($f_need/$f_size bytes)"
+else
+  bad "AT+FILTSTAT?'s not_ours= slot or its fit: ${filt:-nothing parsed} (want g_warthog_filt_hist[9], need <= size)"
+fi
+h_at=$(sed -n 's/^volatile uint32_t g_warthog_filt_hist\[\([0-9][0-9]*\)\].*/\1/p' "$A")
+h_dp=$(sed -n 's/^extern volatile uint32_t g_warthog_filt_hist\[\([0-9][0-9]*\)\];.*/\1/p' "$D")
+h_top=$(grep -o 'g_warthog_filt_hist\[[0-9][0-9]*\]++' "$D" | tr -dc '0-9\n' | sort -n | tail -1)
+if [ -n "$h_at" ] && [ "$h_at" = "$h_dp" ] && [ "${h_top:-99}" -lt "$h_at" ] && [ "$h_top" -eq 9 ]; then
+  ok "g_warthog_filt_hist[$h_at] in at.c and umac_datapath.c holds every filter reason (highest $h_top)"
+else
+  bad "g_warthog_filt_hist: at.c [${h_at:-?}], umac_datapath.c extern [${h_dp:-?}], highest reason counted ${h_top:-none} (want 9, below both)"
+fi
+# 11d. Its second line is the census of mesh unicast management addressed to another station
+#      (counted, not dropped): mgmt_nours= and the last one's 16 octets, as at.c stores them.
+mn_body=$(awk '/^static void cmd_filtstat\(void\)/ {on=1} on {print} on && /^}/ {exit}' "$A")
+mn_len=$(sed -n 's/^volatile uint8_t g_warthog_filt_mgmt_nours_hdr\[\([0-9][0-9]*\)\].*/\1/p' "$A")
+if printf '%s\n' "$mn_body" | grep -q '"+FILTSTAT: mgmt_nours=%lu last="' &&
+   printf '%s\n' "$mn_body" | grep -q '(unsigned long)g_warthog_filt_mgmt_nours)' &&
+   printf '%s\n' "$mn_body" | grep -q "i < ${mn_len:-x}; i++" &&
+   printf '%s\n' "$mn_body" | grep -q 'g_warthog_filt_mgmt_nours_hdr\[i\]' &&
+   [ "$(printf '%s\n' "$mn_body" | grep -c 'cdc_write(buf);')" -eq 2 ]; then
+  ok "AT+FILTSTAT? prints mgmt_nours= and all $mn_len octets of its snapshot on a second line"
+else
+  bad "AT+FILTSTAT? does not print g_warthog_filt_mgmt_nours and its ${mn_len:-?}-octet snapshot on a second line"
+fi
 
 # 12. The path sweep shares the table with the event loop and the netif task.
 awk '
@@ -749,6 +840,2134 @@ if [ "$lvl" = "MMLOG_DBG" ]; then
   ok "mmdrv_tx_frame's periodic diagnostic is DBG-only"
 else
   bad "mmdrv_tx_frame's periodic diagnostic logs at ${lvl:-an unknown level}: printf on every sender's stack"
+fi
+
+# 26. BATMAN_V member mode (main/bat_port.c). Every AT+BAT* verb renders its own table
+#     through cmd_bat_render (AT+BATO= and AT+BATTG= through cmd_bat_render_mac, with their
+#     own usage), which prints only through the waiting writer and always hands the render
+#     buffer back (render_done) before it replies.
+BP=../../../main/bat_port.c
+bad26=$(awk '/^static void dispatch\(/,/^}/' "$A" | awk '
+  BEGIN { k["BATN"] = "NEIGH"; k["BATO"] = "ORIG"; k["BATTG"] = "TT_GLOBAL"; k["BATTL"] = "TT_LOCAL"; k["BATSTAT"] = "STAT" }
+  /strcasecmp\(verb, "BAT[A-Z]*"\)/ { v=$0; sub(/.*"BAT/, "BAT", v); sub(/".*/, "", v); q=($0 ~ /terminator == .\?./); want=1; next }
+  want && q { if ($0 !~ ("^ *cmd_bat_render\\(BAT_RENDER_" k[v] ", NULL\\);$")) print v "?"; want=0 }
+  want { if ($0 !~ ("^ *cmd_bat_render_mac\\(BAT_RENDER_" k[v] ", args, \"usage: AT\\+" v "=<mac>\"\\);$")) print v "="; want=0 }')
+nbat=$(awk '/^static void dispatch\(/,/^}/' "$A" | grep -c 'strcasecmp(verb, "BAT')
+neq=$(awk '/^static void dispatch\(/,/^}/' "$A" | grep -c 'strcasecmp(verb, "BAT[OT]G*") == 0 && terminator == .=.')
+if [ -z "$bad26" ] && [ "$nbat" = 7 ] && [ "$neq" = 2 ] && \
+   awk '/^static void cmd_bat_render\(/,/^}/' "$A" | \
+     awk '/cdc_write_nowait|cdc_out_|tud_cdc|tinyusb_cdcacm/ {b=1} /cdc_write\(out\);/ {w=NR}
+          /warthog_bat_port_render_done\(\);/ {if (w && NR > w) d=NR} /reply_ok\(\);/ {if (d && NR > d) o=1}
+          END {exit (!b && o) ? 0 : 1}'; then
+  ok "AT+BATN/BATO/BATTG/BATTL/BATSTAT? and AT+BATO/BATTG=<mac> render through cmd_bat_render, which uses cdc_write and releases the buffer"
+else
+  bad "a batman render verb bypasses cmd_bat_render (${bad26:-$nbat verbs, $neq with =}) or cmd_bat_render writes around cdc_write / skips render_done"
+fi
+
+# 27. The AT+MESHBATMAN=, AT+MESHFWD= and AT+MESHBRIDGE= setters ask bat_mode_check
+#     before they store, so the console refuses exactly what boot would refuse; the first
+#     store is what counts. MESHFWD=/MESHBRIDGE= reject v > 1 before both: (uint8_t)257 is 1.
+setter_checks() {
+  awk -v v="$1" '/^static void dispatch\(/ {d=1} d && $0 ~ ("strcasecmp\\(verb, \"" v "\"\\) == 0 && terminator == .=.") {on=1}
+    on && /v > 1/ && !r {r=NR} on && /bat_mode_check\(/ && !c {c=NR}
+    on && /warthog_cfg_set_mesh_/ {if (r && c && r < c) print "ok"; else print "late"; exit}
+    on && /^    } else if/ && !/strcasecmp\(verb, "/ {exit}' "$A"
+}
+r27=""
+for v in MESHFWD MESHBRIDGE; do [ "$(setter_checks $v)" = ok ] || r27="$r27 $v"; done
+if ! awk '/^static void cmd_meshbatman_set\(/,/^}/' "$A" | \
+       awk '/bat_mode_check\(/ && !c {c=NR} /warthog_cfg_set_mesh_batman\(/ && !s {s=NR} END {exit (c && s && c < s) ? 0 : 1}' || \
+   ! awk '/^static void dispatch\(/,/^}/' "$A" | grep -q 'cmd_meshbatman_set(args);'; then
+  r27="$r27 MESHBATMAN"
+fi
+if [ -z "$r27" ]; then
+  ok "AT+MESHBATMAN=, AT+MESHFWD= and AT+MESHBRIDGE= call bat_mode_check (and bound the value) before storing"
+else
+  bad "setter(s) store without asking bat_mode_check first:$r27"
+fi
+
+# 28. The AT+MESHCFG? mode line and batman line fit line[320] at their longest: both
+#     builders are compiled out of main/at.c and run for every flag with every %u at
+#     its maximum and the longest refusal reason. They also say the right thing: yes
+#     with the counts while running, refused(<why>) only for a stored flag this boot's
+#     start refused, no otherwise; and the self= line only prints while running.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^struct meshcfg_mode \{/,/^};/' "$A" > "$T/fn.c"
+awk '/^static int meshcfg_mode_line_\(/,/^}/' "$A" >> "$T/fn.c"
+awk '/^static int meshcfg_bat_line_\(/,/^}/' "$A" >> "$T/fn.c"
+size28=$(awk '/^static void cmd_meshcfg\(void\)/ {on=1} on && /char line\[[0-9]+\];/ {match($0, /\[[0-9]+\]/); print substr($0, RSTART + 1, RLENGTH - 2); exit}' "$A")
+cat > "$T/t.c" <<'EOF'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "bat.h"
+#include "fn.c"
+int main(int argc, char **argv)
+{
+    unsigned size = (unsigned)atoi(argv[1]);
+    const char *reasons[] = { "ok", "off", "mesh-off", "fwd", "bridge", "sae-no-host-ccmp", "nomem", "init-failed",
+                              "mesh-failed" };
+    char buf[2048];
+    struct meshcfg_mode y;
+    memset(&y, 0, sizeof(y));
+    y.bat_running = y.bat_stored = 1; y.bat_reason = "ok"; y.neigh = 3; y.routes = 7;
+    memcpy(y.soft, "\x06\x11\x22\x33\x44\x55", 6); memcpy(y.self, "\x02\xaa\xbb\xcc\xdd\xee", 6);
+    meshcfg_mode_line_(buf, sizeof(buf), &y);
+    if (!strstr(buf, "routing=batman_v ") || !strstr(buf, "batman=yes(neigh=3 routes=7 soft=06:11:22:33:44:55)\r\n")) {
+        printf("content (running) %s", buf); return 0;
+    }
+    meshcfg_bat_line_(buf, sizeof(buf), &y);
+    if (!strstr(buf, "batman self=02:aa:bb:cc:dd:ee soft=06:11:22:33:44:55 ")) { printf("content (self) %s", buf); return 0; }
+    memset(&y, 0, sizeof(y));
+    y.bat_stored = 1;
+    for (unsigned r = 2; r < sizeof(reasons) / sizeof(reasons[0]); r++) {
+        char want[64];
+        snprintf(want, sizeof(want), "batman=refused(%s)\r\n", reasons[r]);
+        y.bat_reason = reasons[r];
+        meshcfg_mode_line_(buf, sizeof(buf), &y);
+        if (!strstr(buf, want)) { printf("content (stored, %s) %s", reasons[r], buf); return 0; }
+    }
+    y.bat_reason = "off";
+    meshcfg_mode_line_(buf, sizeof(buf), &y);
+    if (!strstr(buf, "batman=no\r\n")) { printf("content (stored, off) %s", buf); return 0; }
+    y.bat_stored = 0; y.bat_reason = "fwd";
+    meshcfg_mode_line_(buf, sizeof(buf), &y);
+    if (!strstr(buf, "batman=no\r\n")) { printf("content (not stored) %s", buf); return 0; }
+    int worst = 0, lines = 0;
+    for (int m = 0; m < 64; m++) {
+        for (unsigned r = 0; r < sizeof(reasons) / sizeof(reasons[0]); r++) {
+            struct meshcfg_mode x;
+            memset(&x, 0xff, sizeof(x));
+            x.fwd = m & 1; x.bridge_active = (m >> 1) & 1; x.bridge_stored = (m >> 2) & 1;
+            x.bat_running = (m >> 3) & 1; x.bat_stored = (m >> 4) & 1; x.grp_std = (m >> 5) & 1;
+            x.bat_reason = reasons[r];
+            int n = meshcfg_mode_line_(buf, sizeof(buf), &x);
+            if (n > worst) worst = n;
+            n = meshcfg_bat_line_(buf, sizeof(buf), &x);
+            if (n > worst) worst = n;
+            lines += 2;
+        }
+    }
+    (void)argc;
+    printf("%s %d/%u (%d lines)\n", worst + 1 <= (int)size ? "ok" : "short", worst + 1, size, lines);
+    return 0;
+}
+EOF
+fit28=""
+if [ -n "$size28" ] && ${CC:-cc} -std=gnu11 -w -I"$T" -I../../../main/bat -o "$T/t" "$T/t.c" 2>/dev/null; then
+  fit28=$("$T/t" "$size28")
+fi
+rm -rf "$T"
+if ! awk '/^static void cmd_meshcfg\(void\)/,/^}/' "$A" | \
+     awk '/if \(m\.bat_running\) \{/ {g=1; next} g && /meshcfg_bat_line_\(/ {ok=1} !g && /meshcfg_bat_line_\(/ {b=1}
+          /^    }/ {g=0} END {exit (ok && !b) ? 0 : 1}'; then
+  fit28="content: cmd_meshcfg prints the batman self= line outside if (m.bat_running)"
+fi
+case "$fit28" in
+  ok*) ok "AT+MESHCFG?'s mode and batman lines say the right thing and fit line[$size28] at their longest (${fit28#ok })" ;;
+  *)   bad "AT+MESHCFG?'s mode or batman line is wrong or can outgrow line[${size28:-?}]: ${fit28:-did not build or run}" ;;
+esac
+
+# 29. Registering any RX callback silently unregisters the extended one, so outside
+#     morselib only mmhalow.c (halow_rx, at mmhalow_init) and bat_port.c (the batman
+#     hook, after it) may call mmwlan_register_rx_*, and bat_port.c only the ext one.
+regs=$(grep -rl 'mmwlan_register_rx_' ../../../main ../../halow/*.c 2>/dev/null | sed 's|.*/||' | LC_ALL=C sort | tr '\n' ' ')
+if [ "$regs" = "bat_port.c mmhalow.c " ] && \
+   [ "$(grep -c 'mmwlan_register_rx_' "$BP")" = 1 ] && grep -q 'mmwlan_register_rx_pkt_ext_cb(MMWLAN_VIF_UNSPECIFIED, bat_port_rx_ext' "$BP"; then
+  ok "only mmhalow.c and bat_port.c register RX callbacks; bat_port.c registers only the extended one"
+else
+  bad "RX callbacks are registered from: ${regs:-nowhere} (want bat_port.c mmhalow.c, the ext hook only in bat_port.c)"
+fi
+
+# 30. AT+SWCCMP=0 would end all group RX from peers (their ELP/OGM/BCAST) with no
+#     error: the setter asks warthog_bat_port_running() before it writes the flag.
+if awk '/strcasecmp\(verb, "SWCCMP"\) == 0 && terminator == .=./ {on=1}
+        on && /warthog_bat_port_running\(\)/ {r=NR} on && /g_warthog_host_ccmp_on = / {if (r) ok=1; exit}
+        END {exit ok ? 0 : 1}' "$A"; then
+  ok "AT+SWCCMP= consults warthog_bat_port_running() before switching host CCMP"
+else
+  bad "AT+SWCCMP= can switch host CCMP off under a running batman engine"
+fi
+
+# 31. Every engine source the host tests link is in the firmware build too.
+CM=../../../main/CMakeLists.txt
+miss31=""
+for f in ../../../main/bat/*.c; do
+  b=$(basename "$f")
+  grep -q "\"bat/$b\"" "$CM" || miss31="$miss31 bat/$b"
+done
+for f in bat_mode.c bat_port.c; do grep -q "\"$f\"" "$CM" || miss31="$miss31 $f"; done
+if [ -z "$miss31" ] && awk '/INCLUDE_DIRS/ {i=1} i && /"bat"/ {f=1} END {exit f ? 0 : 1}' "$CM"; then
+  ok "main/CMakeLists.txt builds every main/bat/*.c, bat_mode.c and bat_port.c, with bat/ on the include path"
+else
+  bad "main/CMakeLists.txt is missing:${miss31:- the bat include dir}"
+fi
+
+# 32. With batman off nothing is allocated: warthog_bat_port_start returns on any
+#     refusal before its first allocation, and mesh.c starts it before mmwlan_mesh_enable.
+if awk '/^esp_err_t warthog_bat_port_start\(/,/^}/' "$BP" | \
+     awk '/if \(s_reason != BAT_MODE_OK\)/ {g=NR} /return ESP_OK;/ && g && !r {r=NR}
+          /(calloc|malloc|xQueueCreate|xSemaphoreCreate|xTaskCreate)\(/ && !a {a=NR}
+          END {exit (g && r && a && r < a) ? 0 : 1}' && \
+   awk '/^void warthog_mesh_smoke_test\(/,/^}/' ../../../main/mesh.c | \
+     awk '/warthog_bat_port_start\(\);/ {s=NR} /= mmwlan_mesh_enable\(/ {if (s) e=1} END {exit e ? 0 : 1}'; then
+  ok "batman allocates nothing unless bat_mode_check says ok, and starts before mmwlan_mesh_enable"
+else
+  bad "warthog_bat_port_start allocates before its refusal return, or runs after mmwlan_mesh_enable"
+fi
+
+# 33. The batman AT setters, parsers and their NVS storage, compiled out of main/at.c and
+#     main/cfg.c and run against a fake NVS: every refusal of the design's table with its
+#     exact reply, the value stored only on success, out-of-range values refused before
+#     the (uint8_t) cast, each getter reading the key its setter writes, and AT+MESHBATMAN?
+#     adding the bat0 line, whole at its longest, while batman runs.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+C=../../../main/cfg.c
+{
+  for f in reply_ok reply_error trim bat_refusal_ cmd_meshbatman_set cmd_meshbatman_query cmd_meshbattp_set; do
+    awk -v f="$f" '$0 ~ ("^static [a-z ]+[*]?" f "\\(") && !/;$/ {p=1} p {print} p && /^}/ {exit}' "$A"
+  done
+  for v in MESHFWD MESHBRIDGE SWCCMP; do
+    echo "static void branch_$v(char *args) {"
+    awk -v v="$v" '/^static void dispatch\(/ {d=1}
+      d && $0 ~ ("strcasecmp\\(verb, \"" v "\"\\) == 0 && terminator == .=.") {on=1; next}
+      on && /^    } else if/ {exit} on {print}' "$A"
+    echo "}"
+  done
+} > "$T/at_fn.c"
+for f in batman battp fwd bridge; do
+  for g in get set; do
+    awk -v f="warthog_cfg_${g}_mesh_$f" '$0 ~ ("^[a-z_0-9]+ " f "\\(") {p=1} p {print} p && /^}/ {exit}' "$C"
+  done
+done > "$T/cfg_fn.c"
+cat > "$T/t.c" <<'EOF'
+#include <ctype.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "bat_mode.h"
+typedef int esp_err_t;
+typedef int nvs_handle_t;
+#define ESP_OK 0
+#define ESP_FAIL (-1)
+#define ESP_ERR_INVALID_ARG 0x102
+#define ESP_ERR_NVS_NOT_FOUND 0x1102
+enum { NVS_READONLY, NVS_READWRITE };
+static const char *NS = "warthog";
+static struct { char k[16]; uint32_t v; int used; } nvs[8];
+static int kv(const char *k, int create)
+{
+    for (int i = 0; i < 8; i++) if (nvs[i].used && !strcmp(nvs[i].k, k)) return i;
+    for (int i = 0; create && i < 8; i++) if (!nvs[i].used) { nvs[i].used = 1; snprintf(nvs[i].k, 16, "%s", k); return i; }
+    return -1;
+}
+static esp_err_t nvs_open(const char *ns, int m, nvs_handle_t *h) { (void)ns; (void)m; *h = 1; return ESP_OK; }
+static void nvs_close(nvs_handle_t h) { (void)h; }
+static esp_err_t nvs_commit(nvs_handle_t h) { (void)h; return ESP_OK; }
+static esp_err_t nvs_get_u8(nvs_handle_t h, const char *k, uint8_t *v)
+{ (void)h; int i = kv(k, 0); if (i < 0) return ESP_ERR_NVS_NOT_FOUND; *v = (uint8_t)nvs[i].v; return ESP_OK; }
+static esp_err_t nvs_set_u8(nvs_handle_t h, const char *k, uint8_t v)
+{ (void)h; if (strlen(k) > 15) return ESP_FAIL; nvs[kv(k, 1)].v = v; return ESP_OK; }
+static esp_err_t nvs_get_u32(nvs_handle_t h, const char *k, uint32_t *v)
+{ (void)h; int i = kv(k, 0); if (i < 0) return ESP_ERR_NVS_NOT_FOUND; *v = nvs[i].v; return ESP_OK; }
+static esp_err_t nvs_set_u32(nvs_handle_t h, const char *k, uint32_t v)
+{ (void)h; if (strlen(k) > 15) return ESP_FAIL; nvs[kv(k, 1)].v = v; return ESP_OK; }
+#include "cfg_fn.c"
+static char out_[1024];
+static void cdc_write(const char *s) { strncat(out_, s, sizeof(out_) - strlen(out_) - 1); }
+static bool b_sae, b_ccmp, running;
+volatile uint32_t g_warthog_host_ccmp_on;
+static bool warthog_bat_port_sae_build(void) { return b_sae; }
+static bool warthog_bat_port_host_ccmp_build(void) { return b_ccmp; }
+static bool warthog_bat_port_running(void) { return running; }
+static int f_reason = BAT_MODE_MESH_FAILED;
+static int warthog_bat_port_reason(void) { return f_reason; }
+static int warthog_mesh_bat0_line(char *buf, size_t len)
+{ return snprintf(buf, len, "+MESHBATMAN: bat0 addr=leased%0*d\r\n", BAT_MODE_BAT0_LINE - 32, 7); }
+#include "at_fn.c"
+static int fails;
+#define CHECK(c, ...) do { if (!(c)) { fails++; printf(__VA_ARGS__); printf(" [%s] | ", out_); } } while (0)
+static void run(void (*f)(char *), const char *arg) { char a[48]; snprintf(a, sizeof(a), "%s", arg); out_[0] = 0; f(a); }
+static void set(const char *k, uint32_t v) { nvs[kv(k, 1)].v = v; }
+static const char *E_FWD = "+ERR: AT+MESHFWD=1 is set; batman needs 802.11s forwarding off\r\nERROR\r\n";
+static const char *E_BR = "+ERR: AT+MESHBRIDGE=1 is set; batman mode NATs the tethered side\r\nERROR\r\n";
+static const char *E_SAE = "+ERR: this build cannot hear peers' group frames under SAE; "
+                           "use warthog-mesh-sae-swccmp or an open mesh\r\nERROR\r\n";
+static const char *E_BAT = "+ERR: AT+MESHBATMAN=1 is set; batman needs it off\r\nERROR\r\n";
+int main(void)
+{
+    for (int m = 0; m < 16; m++) {
+        set("mesh_fwd", m & 1); set("mesh_br", (m >> 1) & 1); b_sae = (m >> 2) & 1; b_ccmp = (m >> 3) & 1; set("mesh_bat", 0);
+        const char *want = (b_sae && !b_ccmp) ? E_SAE : (m & 1) ? E_FWD : ((m >> 1) & 1) ? E_BR : NULL;
+        run(cmd_meshbatman_set, "1");
+        if (want) CHECK(!strcmp(out_, want) && warthog_cfg_get_mesh_batman() == 0, "MESHBATMAN=1 row %d not refused as the table says", m);
+        else CHECK(!strcmp(out_, "+MESHBATMAN: stored; takes effect on next boot (AT+RESET)\r\nOK\r\n") &&
+                   warthog_cfg_get_mesh_batman() == 1, "MESHBATMAN=1 row %d not stored", m);
+        run(cmd_meshbatman_set, "0");
+        CHECK(strstr(out_, "OK\r\n") && warthog_cfg_get_mesh_batman() == 0, "MESHBATMAN=0 row %d not stored", m);
+    }
+    set("mesh_fwd", 0); set("mesh_br", 0); b_sae = b_ccmp = false;
+    static const char *bad01[] = { "1x", "", "2", "10", "-1", "01" };
+    for (unsigned i = 0; i < sizeof(bad01) / sizeof(bad01[0]); i++) {
+        run(cmd_meshbatman_set, bad01[i]);
+        CHECK(!strcmp(out_, "+ERR: usage: AT+MESHBATMAN=<0|1>\r\nERROR\r\n") && warthog_cfg_get_mesh_batman() == 0,
+              "AT+MESHBATMAN=%s accepted", bad01[i]);
+    }
+    run(cmd_meshbatman_set, " 1 ");
+    CHECK(warthog_cfg_get_mesh_batman() == 1, "AT+MESHBATMAN= 1  (spaces) not stored");
+    out_[0] = 0;
+    cmd_meshbatman_query();
+    CHECK(!strcmp(out_, "+MESHBATMAN: stored=1 running=0 reason=mesh-failed\r\nOK\r\n"), "AT+MESHBATMAN? wrong");
+    running = true; f_reason = BAT_MODE_OK;
+    out_[0] = 0;
+    cmd_meshbatman_query();
+    {
+        char want[512], bat0[BAT_MODE_BAT0_LINE + 8];
+        (void)warthog_mesh_bat0_line(bat0, sizeof(bat0));
+        snprintf(want, sizeof(want), "+MESHBATMAN: stored=1 running=1 reason=ok\r\n%sOK\r\n", bat0);
+        CHECK(strlen(bat0) == BAT_MODE_BAT0_LINE - 1 && !strcmp(out_, want),
+              "AT+MESHBATMAN? while running: the bat0 line at its longest, whole, before OK");
+    }
+    running = false; f_reason = BAT_MODE_MESH_FAILED;
+    set("mesh_bat", 7);
+    CHECK(warthog_cfg_get_mesh_batman() == 0, "a stored 7 reads as on");
+
+    static const struct { const char *in; int ok; uint32_t v; } tp[] = {
+        { "0", 1, 0 }, { "4294967295", 1, 4294967295u }, { "25", 1, 25 }, { " 5", 1, 5 }, { "4294967296", 0, 0 },
+        { "-1", 0, 0 }, { "", 0, 0 }, { "1x", 0, 0 }, { "+5", 0, 0 }, { "0x10", 0, 0 }, { "99999999999999999999", 0, 0 } };
+    for (unsigned i = 0; i < sizeof(tp) / sizeof(tp[0]); i++) {
+        uint32_t before = warthog_cfg_get_mesh_battp();
+        run(cmd_meshbattp_set, tp[i].in);
+        CHECK(tp[i].ok ? (strstr(out_, "OK\r\n") && warthog_cfg_get_mesh_battp() == tp[i].v)
+                       : (strstr(out_, "+ERR: usage") && warthog_cfg_get_mesh_battp() == before),
+              "AT+MESHBATTP=%s", tp[i].in);
+    }
+
+    void (*br[2])(char *) = { branch_MESHFWD, branch_MESHBRIDGE };
+    static const char *key[2] = { "mesh_fwd", "mesh_br" }, *name[2] = { "MESHFWD", "MESHBRIDGE" };
+    uint8_t (*get[2])(void) = { warthog_cfg_get_mesh_fwd, warthog_cfg_get_mesh_bridge };
+    static const char *wrap[] = { "257", "513", "65281", "4294967041", "-255", "2" };
+    for (int k = 0; k < 2; k++) {
+        set("mesh_fwd", 0); set("mesh_br", 0); set("mesh_bat", 1);
+        run(br[k], "1");
+        CHECK(!strcmp(out_, E_BAT) && get[k]() == 0, "AT+%s=1 not refused with AT+MESHBATMAN=1", name[k]);
+        for (unsigned i = 0; i < sizeof(wrap) / sizeof(wrap[0]); i++) {
+            char want[64];
+            snprintf(want, sizeof(want), "+ERR: usage: AT+%s=<0|1>\r\nERROR\r\n", name[k]);
+            run(br[k], wrap[i]);
+            CHECK(!strcmp(out_, want) && get[k]() == 0, "AT+%s=%s not refused as usage", name[k], wrap[i]);
+        }
+        run(br[k], "0");
+        CHECK(strstr(out_, "stored") && get[k]() == 0, "AT+%s=0 refused", name[k]);
+        set("mesh_bat", 0);
+        run(br[k], "1");
+        CHECK(strstr(out_, "stored") && get[k]() == 1, "AT+%s=1 refused without batman", name[k]);
+        set(key[k], 9);
+        CHECK(get[k]() == 0, "a stored 9 in %s reads as on", key[k]);
+    }
+    /* A stored AT+MESHBATMAN=1 is inert on warthog-mesh-sae / -nochipkey, so it blocks neither
+     * there; on a host-CCMP SAE build it does. */
+    for (int ccmp = 0; ccmp < 2; ccmp++) {
+        b_sae = true; b_ccmp = ccmp;
+        for (int k = 0; k < 2; k++) {
+            set("mesh_fwd", 0); set("mesh_br", 0); set("mesh_bat", 1);
+            run(br[k], "1");
+            if (ccmp) CHECK(!strcmp(out_, E_BAT) && get[k]() == 0, "AT+%s=1 not refused on a host-CCMP SAE build", name[k]);
+            else CHECK(strstr(out_, "stored") && get[k]() == 1, "AT+%s=1 refused on an SAE build without host CCMP", name[k]);
+        }
+    }
+    set("mesh_fwd", 0); set("mesh_br", 0); set("mesh_bat", 0);
+
+    b_sae = b_ccmp = true; running = true; g_warthog_host_ccmp_on = 1;
+    run(branch_SWCCMP, "0");
+    CHECK(!strcmp(out_, "+ERR: batman is running; host CCMP must stay on\r\nERROR\r\n") && g_warthog_host_ccmp_on == 1,
+          "AT+SWCCMP=0 under a running engine");
+    run(branch_SWCCMP, "1");
+    CHECK(strstr(out_, "host ccmp ON") && g_warthog_host_ccmp_on == 1, "AT+SWCCMP=1 refused while running");
+    running = false;
+    run(branch_SWCCMP, "0");
+    CHECK(strstr(out_, "host ccmp OFF") && g_warthog_host_ccmp_on == 0, "AT+SWCCMP=0 refused with batman stopped");
+    return fails != 0;
+}
+EOF
+why=""
+if ${CC:-cc} -std=gnu11 -w -I"$T" -I../../../main -I../../../main/bat -o "$T/t" "$T/t.c" ../../../main/bat_mode.c \
+     2>"$T/cc.log" && why=$("$T/t"); then
+  ok "the batman AT setters refuse exactly the design's table, bound their values and store under the keys the getters read"
+else
+  bad "batman AT setters/storage: ${why:-did not build or run: $(head -3 "$T/cc.log" | tr '\n' ' ')}"
+fi
+rm -rf "$T"
+
+# 34. main/bat_port.c itself, compiled against pthread-backed FreeRTOS queues, semaphores
+#     and tasks, recording ESP-IDF/morselib fakes and a counting engine stub: the start
+#     sequence (hook, driver, MTU, soft MAC, engine config, datapath gate, host CCMP), the
+#     tx gate and RA, both slot pools under a stuck engine, at most 16 delivered copies held
+#     by a stalled lwIP (the rest dropped and counted), the render handshake's abandon
+#     and late-finish paths, at.c's cmd_bat_render paging a listing longer than one buffer
+#     (a node's rows alone for AT+BATO=/AT+BATTG=<mac>, a stalled cursor refused), the stat line
+#     after the last chunk or alone in one more, the engine task's answers about the watched
+#     router MAC and the gateways (fresh on a new watch, else every 500 ms), and each refused
+#     start allocating nothing. Run with the build's sanitizers under SAN=1.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+mkdir -p "$T/inc/freertos" "$T/inc/lwip"
+for h in esp_err.h esp_heap_caps.h esp_log.h esp_mac.h esp_netif.h esp_netif_net_stack.h esp_random.h esp_timer.h \
+         freertos/FreeRTOS.h freertos/queue.h freertos/semphr.h freertos/task.h lwip/netif.h mmhalow.h mmpkt.h \
+         mmwlan.h mmwlan_mesh.h; do
+  echo '#include "fake.h"' > "$T/inc/$h"
+done
+cat > "$T/fake.h" <<'EOF'
+/* Every ESP-IDF, FreeRTOS and morselib name main/bat_port.c uses; the queues, semaphores
+ * and tasks are real (pthreads). 1 tick = 1 ms of the port's clock = 50 us of real time. */
+#pragma once
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_FAIL (-1)
+#define ESP_ERR_NO_MEM 0x101
+#define ESP_ERR_INVALID_ARG 0x102
+typedef int BaseType_t;
+typedef unsigned UBaseType_t;
+typedef uint32_t TickType_t;
+#define pdTRUE 1
+#define pdFALSE 0
+#define pdPASS 1
+#define portMAX_DELAY 0xffffffffu
+#define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
+typedef struct fq *QueueHandle_t, *SemaphoreHandle_t;
+typedef struct ft *TaskHandle_t;
+typedef int portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED 0
+void f_crit(int enter);
+#define portENTER_CRITICAL(m) ((void)(m), f_crit(1))
+#define portEXIT_CRITICAL(m) ((void)(m), f_crit(0))
+QueueHandle_t xQueueCreate(UBaseType_t len, UBaseType_t item);
+BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t t);
+BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t t);
+UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q);
+void vQueueDelete(QueueHandle_t q);
+SemaphoreHandle_t xSemaphoreCreateBinary(void);
+BaseType_t xSemaphoreGive(SemaphoreHandle_t s);
+BaseType_t xSemaphoreTake(SemaphoreHandle_t s, TickType_t t);
+#define vSemaphoreDelete vQueueDelete
+BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack, void *arg, UBaseType_t prio,
+                       TaskHandle_t *out);
+void vTaskDelete(TaskHandle_t t);
+BaseType_t xTaskNotifyGive(TaskHandle_t t);
+uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t t);
+UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t t);
+void f_log(const char *fmt, ...);
+#define ESP_LOGE(tag, ...) f_log(__VA_ARGS__)
+#define ESP_LOGW(tag, ...) f_log(__VA_ARGS__)
+#define ESP_LOGI(tag, ...) f_log(__VA_ARGS__)
+#define MACSTR "%02x:%02x:%02x:%02x:%02x:%02x"
+#define MAC2STR(a) (a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5]
+typedef enum { ESP_MAC_EFUSE_FACTORY } esp_mac_type_t;
+esp_err_t esp_read_mac(uint8_t *mac, esp_mac_type_t t);
+uint32_t esp_random(void);
+int64_t esp_timer_get_time(void);
+#define MALLOC_CAP_8BIT 4
+size_t heap_caps_get_free_size(uint32_t caps);
+size_t heap_caps_get_minimum_free_size(uint32_t caps);
+size_t heap_caps_get_largest_free_block(uint32_t caps);
+typedef struct esp_netif_obj esp_netif_t;
+typedef struct {
+    void *handle;
+    esp_err_t (*transmit)(void *h, void *buffer, size_t len);
+    esp_err_t (*transmit_wrap)(void *h, void *buffer, size_t len, void *netstack_buffer);
+    void (*driver_free_rx_buffer)(void *h, void *buffer);
+} esp_netif_driver_ifconfig_t;
+void *esp_netif_get_io_driver(esp_netif_t *n);
+esp_err_t esp_netif_set_driver_config(esp_netif_t *n, const esp_netif_driver_ifconfig_t *c);
+void *esp_netif_get_netif_impl(esp_netif_t *n);
+esp_err_t esp_netif_set_mac(esp_netif_t *n, uint8_t mac[]);
+esp_err_t esp_netif_tcpip_exec(esp_err_t (*fn)(void *ctx), void *ctx);
+esp_err_t esp_netif_receive(esp_netif_t *n, void *buffer, size_t len, void *eb);
+struct netif { uint16_t mtu, mtu6; };
+struct mmpkt;
+struct mmpktview;
+struct mmpktview *mmpkt_open(struct mmpkt *p);
+void mmpkt_close(struct mmpktview **v);
+void mmpkt_append_data(struct mmpktview *v, const uint8_t *d, uint32_t len);
+uint8_t *mmpkt_get_data_start(struct mmpktview *v);
+uint32_t mmpkt_get_data_length(struct mmpktview *v);
+void mmpkt_release(struct mmpkt *p);
+enum mmwlan_status { MMWLAN_SUCCESS, MMWLAN_ERROR, MMWLAN_UNAVAILABLE, MMWLAN_NOT_FOUND };
+enum mmwlan_vif { MMWLAN_VIF_UNSPECIFIED };
+struct mmwlan_rx_metadata { enum mmwlan_vif vif; const uint8_t *ta; };
+typedef void (*mmwlan_rx_pkt_ext_cb_t)(struct mmpkt *, const struct mmwlan_rx_metadata *, void *);
+enum mmwlan_status mmwlan_register_rx_pkt_ext_cb(enum mmwlan_vif vif, mmwlan_rx_pkt_ext_cb_t cb, void *arg);
+struct mmwlan_tx_metadata { uint8_t tid; const uint8_t *ra; };
+#define MMWLAN_TX_METADATA_INIT { 7, (const uint8_t *)1 }
+enum mmwlan_status mmwlan_tx_wait_until_ready(uint32_t ms);
+struct mmpkt *mmwlan_alloc_mmpkt_for_tx(uint32_t len, uint8_t tid);
+enum mmwlan_status mmwlan_tx_pkt(struct mmpkt *p, const struct mmwlan_tx_metadata *md);
+enum mmwlan_status mmwlan_get_mac_addr(uint8_t *mac);
+struct mmwlan_mesh_peer_link { uint8_t addr[6]; uint8_t estab; uint8_t rc_valid; uint32_t expected_tput_kbps; };
+enum mmwlan_status mmwlan_mesh_query_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max, uint8_t *count);
+esp_netif_t *mmhalow_get_netif(void);
+void *f_malloc(size_t n); /* fails while f_malloc_fail counts down */
+#define malloc(n) f_malloc(n)
+EOF
+cat > "$T/fakes.c" <<'EOF'
+/* The host world main/bat_port.c runs in: FreeRTOS on pthreads and recording ESP-IDF,
+ * morselib and cfg fakes. */
+#include <errno.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "bat_mode.h"
+#include "bat_port.h"
+#include "fake.h"
+
+static int fails;
+#define CHECK(c, ...) do { int c_ = (c); printf(c_ ? "ok   " : "FAIL "); printf(__VA_ARGS__); printf("\n"); fails += !c_; } while (0)
+
+/* ---- FreeRTOS on pthreads ---- */
+struct fq { pthread_mutex_t m; pthread_cond_t c; size_t item, len, head, n; unsigned char *buf; };
+struct ft { pthread_t th; void (*fn)(void *); void *arg; struct fq *notify; };
+static __thread struct ft *f_self;
+static pthread_mutex_t f_cm = PTHREAD_MUTEX_INITIALIZER;
+static int f_queues;
+static struct fq *f_q[8]; /* in creation order: the port's free RX slots first */
+static void (*f_timeout_hook)(struct fq *q);
+static uint64_t mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+static void sleep_ms(unsigned port_ms) /* in the port's clock */
+{
+    struct timespec ts = { 0, (long)port_ms * 50000L };
+    nanosleep(&ts, NULL);
+}
+void f_crit(int enter) { if (enter) pthread_mutex_lock(&f_cm); else pthread_mutex_unlock(&f_cm); }
+QueueHandle_t xQueueCreate(UBaseType_t len, UBaseType_t item)
+{
+    struct fq *q = calloc(1, sizeof(*q));
+    q->item = item ? item : 1;
+    q->len = len;
+    q->buf = calloc(len, q->item);
+    pthread_mutex_init(&q->m, NULL);
+    pthread_cond_init(&q->c, NULL);
+    if (f_queues < 8) { f_q[f_queues] = q; }
+    f_queues++;
+    return q;
+}
+BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t t)
+{
+    (void)t;
+    pthread_mutex_lock(&q->m);
+    if (q->n == q->len) { pthread_mutex_unlock(&q->m); return pdFALSE; }
+    memcpy(q->buf + ((q->head + q->n) % q->len) * q->item, item, q->item);
+    q->n++;
+    pthread_cond_broadcast(&q->c);
+    pthread_mutex_unlock(&q->m);
+    return pdTRUE;
+}
+BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t t)
+{
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    long ns = dl.tv_nsec + (long)(t == portMAX_DELAY ? 0 : t) * 50000L;
+    dl.tv_sec += ns / 1000000000L;
+    dl.tv_nsec = ns % 1000000000L;
+    pthread_mutex_lock(&q->m);
+    while (q->n == 0) {
+        int e = t == portMAX_DELAY ? pthread_cond_wait(&q->c, &q->m) : t ? pthread_cond_timedwait(&q->c, &q->m, &dl) : ETIMEDOUT;
+        if (e == ETIMEDOUT && q->n == 0) {
+            pthread_mutex_unlock(&q->m);
+            if (t && f_self == NULL && f_timeout_hook) { f_timeout_hook(q); }
+            return pdFALSE;
+        }
+    }
+    memcpy(item, q->buf + q->head * q->item, q->item);
+    q->head = (q->head + 1) % q->len;
+    q->n--;
+    pthread_mutex_unlock(&q->m);
+    return pdTRUE;
+}
+UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q)
+{
+    pthread_mutex_lock(&q->m);
+    UBaseType_t n = (UBaseType_t)q->n;
+    pthread_mutex_unlock(&q->m);
+    return n;
+}
+void vQueueDelete(QueueHandle_t q) { (void)q; /* a failed start may still have a task blocked on it */ }
+SemaphoreHandle_t xSemaphoreCreateBinary(void) { return xQueueCreate(1, 1); }
+BaseType_t xSemaphoreGive(SemaphoreHandle_t s) { uint8_t b = 1; return xQueueSend(s, &b, 0); }
+BaseType_t xSemaphoreTake(SemaphoreHandle_t s, TickType_t t) { uint8_t b; return xQueueReceive(s, &b, t); }
+static void *f_task_main(void *a) { f_self = a; f_self->fn(f_self->arg); return NULL; }
+BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack, void *arg, UBaseType_t prio,
+                       TaskHandle_t *out)
+{
+    (void)name; (void)stack; (void)prio;
+    struct ft *t = calloc(1, sizeof(*t));
+    t->fn = fn; t->arg = arg; t->notify = xSemaphoreCreateBinary();
+    *out = t;
+    pthread_create(&t->th, NULL, f_task_main, t);
+    pthread_detach(t->th);
+    return pdPASS;
+}
+void vTaskDelete(TaskHandle_t t) { (void)t; }
+BaseType_t xTaskNotifyGive(TaskHandle_t t) { (void)xSemaphoreGive(t->notify); return pdPASS; }
+uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t t) { (void)clear; return xSemaphoreTake(f_self->notify, t) == pdTRUE; }
+UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t t) { (void)t; return 4321; }
+
+/* ---- ESP-IDF, morselib and cfg ---- */
+static int f_verbose;
+void f_log(const char *fmt, ...) { if (f_verbose) { va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); puts(""); } }
+static const uint8_t MESH[6] = { 0x0c, 0xbf, 0x74, 0x28, 0xbf, 0xcd }, FAC[6] = { 0x48, 0xca, 0x43, 0x3c, 0x24, 0x28 };
+esp_err_t esp_read_mac(uint8_t *mac, esp_mac_type_t t) { (void)t; memcpy(mac, FAC, 6); return ESP_OK; }
+uint32_t esp_random(void) { return 4; }
+int64_t esp_timer_get_time(void) { return (int64_t)(mono_us() / 50u) * 1000; }
+size_t heap_caps_get_free_size(uint32_t c) { (void)c; return 111111; }
+size_t heap_caps_get_minimum_free_size(uint32_t c) { (void)c; return 22222; }
+size_t heap_caps_get_largest_free_block(uint32_t c) { (void)c; return 33333; }
+struct esp_netif_obj { int x; } f_netif;
+static struct netif f_lw = { 1500, 1500 };
+static esp_netif_driver_ifconfig_t f_drv;
+static uint8_t f_netif_mac[6], f_rx_copy[2048];
+static volatile int f_delivered, f_freed, f_regs;
+static size_t f_rx_copy_len;
+static void *f_held[64]; /* frames lwIP holds (tcpip mailbox, socket mailboxes) while f_hold */
+static int f_hold, f_nheld, f_malloc_fail;
+void *f_malloc(size_t n) { if (f_malloc_fail > 0) { f_malloc_fail--; return NULL; } return (malloc)(n); }
+void *esp_netif_get_io_driver(esp_netif_t *n) { (void)n; return (void *)&f_lw; }
+esp_err_t esp_netif_set_driver_config(esp_netif_t *n, const esp_netif_driver_ifconfig_t *c) { (void)n; f_drv = *c; return ESP_OK; }
+void *esp_netif_get_netif_impl(esp_netif_t *n) { (void)n; return &f_lw; }
+esp_err_t esp_netif_set_mac(esp_netif_t *n, uint8_t mac[]) { (void)n; memcpy(f_netif_mac, mac, 6); return ESP_OK; }
+esp_err_t esp_netif_tcpip_exec(esp_err_t (*fn)(void *ctx), void *ctx) { return fn(ctx); }
+esp_err_t esp_netif_receive(esp_netif_t *n, void *buffer, size_t len, void *eb)
+{
+    (void)n;
+    memcpy(f_rx_copy, buffer, len);
+    f_rx_copy_len = len;
+    f_delivered++;
+    if (f_hold && f_nheld < 64) { f_held[f_nheld++] = eb; return ESP_OK; }
+    f_drv.driver_free_rx_buffer(f_drv.handle, eb); /* as wlanif does, once lwIP is done with it */
+    f_freed++;
+    return ESP_OK;
+}
+struct mmpkt { uint32_t len; uint8_t d[2048]; };
+struct mmpktview *mmpkt_open(struct mmpkt *p) { return (struct mmpktview *)p; }
+void mmpkt_close(struct mmpktview **v) { *v = NULL; }
+void mmpkt_append_data(struct mmpktview *v, const uint8_t *d, uint32_t len)
+{ struct mmpkt *p = (struct mmpkt *)v; memcpy(p->d + p->len, d, len); p->len += len; }
+uint8_t *mmpkt_get_data_start(struct mmpktview *v) { return ((struct mmpkt *)v)->d; }
+uint32_t mmpkt_get_data_length(struct mmpktview *v) { return ((struct mmpkt *)v)->len; }
+void mmpkt_release(struct mmpkt *p) { free(p); }
+static mmwlan_rx_pkt_ext_cb_t f_rx_cb;
+static void *f_rx_arg;
+static volatile int f_tx_pkts;
+static uint8_t f_tx_ra[6], f_tx_tid = 99;
+static int f_tx_ra_null, f_mac_fail;
+static enum mmwlan_status f_tx_status = MMWLAN_SUCCESS;
+static struct mmwlan_mesh_peer_link f_links[2];
+static uint8_t f_links_n;
+static int f_links_fail;
+enum mmwlan_status mmwlan_register_rx_pkt_ext_cb(enum mmwlan_vif vif, mmwlan_rx_pkt_ext_cb_t cb, void *arg)
+{ (void)vif; f_rx_cb = cb; f_rx_arg = arg; f_regs++; return MMWLAN_SUCCESS; }
+enum mmwlan_status mmwlan_tx_wait_until_ready(uint32_t ms) { (void)ms; return MMWLAN_SUCCESS; }
+struct mmpkt *mmwlan_alloc_mmpkt_for_tx(uint32_t len, uint8_t tid) { (void)len; (void)tid; return calloc(1, sizeof(struct mmpkt)); }
+enum mmwlan_status mmwlan_tx_pkt(struct mmpkt *p, const struct mmwlan_tx_metadata *md)
+{
+    f_tx_ra_null = md->ra == NULL;
+    if (md->ra) { memcpy(f_tx_ra, md->ra, 6); }
+    f_tx_tid = md->tid;
+    mmpkt_release(p);
+    if (f_tx_status != MMWLAN_SUCCESS) { return f_tx_status; }
+    f_tx_pkts++;
+    return MMWLAN_SUCCESS;
+}
+enum mmwlan_status mmwlan_get_mac_addr(uint8_t *mac) { if (f_mac_fail) return MMWLAN_UNAVAILABLE; memcpy(mac, MESH, 6); return MMWLAN_SUCCESS; }
+enum mmwlan_status mmwlan_mesh_query_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max, uint8_t *count)
+{
+    if (f_links_fail) { return MMWLAN_ERROR; }
+    uint8_t n = f_links_n < max ? f_links_n : max;
+    memcpy(out, f_links, n * sizeof(*out));
+    *count = n;
+    return MMWLAN_SUCCESS;
+}
+esp_netif_t *mmhalow_get_netif(void) { return &f_netif; }
+volatile uint32_t g_warthog_mesh_batman, g_warthog_mesh_grp, g_warthog_host_ccmp_on;
+static uint8_t f_stored = 1, f_fwd;
+uint8_t warthog_cfg_get_mesh_batman(void) { return f_stored; }
+uint8_t warthog_cfg_get_mesh_enable(void) { return 1; }
+uint8_t warthog_cfg_get_mesh_fwd(void) { return f_fwd; }
+uint8_t warthog_cfg_get_mesh_bridge(void) { return 0; }
+uint32_t warthog_cfg_get_mesh_battp(void) { return 25; }
+
+EOF
+awk '/^static void cmd_bat_render\(/,/^}/' "$A" > "$T/at_render.c"
+awk '/^static void cmd_bat_render_mac\(/,/^}/' "$A" >> "$T/at_render.c"
+cat > "$T/t.c" <<'EOF'
+/* main/bat_port.c on fakes.c and a counting engine stub, with main/at.c's cmd_bat_render on top:
+ * the start sequence, both slot pools, the tx gate and RA, the delivery cap, the render handshake
+ * (abandon and late finish), paging and the stat line. argv[1]: run, off, fwd or nomac. */
+#include "fakes.c"
+
+/* ---- the engine: counts, and can be held inside bat_rx_hard ---- */
+struct bat { int unused; };
+static struct bat_config f_cfg;
+static struct bat_ops f_ops;
+static void *f_user;
+static volatile int f_inits, f_rx_hard, f_tx_soft, f_ticks, f_in_rx, f_gate;
+static pthread_mutex_t f_gm = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t f_gc = PTHREAD_COND_INITIALIZER;
+static uint8_t f_last[2048];
+static size_t f_last_len;
+void bat_config_defaults(struct bat_config *c) { memset(c, 0x5a, sizeof(*c)); c->bcast_copies = 1; }
+size_t bat_ctx_size(void) { return sizeof(struct bat); }
+int bat_init(struct bat *b, const struct bat_config *cfg, const struct bat_ops *ops, void *user)
+{ (void)b; f_cfg = *cfg; f_ops = *ops; f_user = user; f_inits++; return 0; }
+static void gate(int closed) { pthread_mutex_lock(&f_gm); f_gate = closed; pthread_cond_broadcast(&f_gc); pthread_mutex_unlock(&f_gm); }
+void bat_rx_hard(struct bat *b, uint8_t *frame, size_t len)
+{
+    (void)b;
+    memcpy(f_last, frame, len);
+    f_last_len = len;
+    pthread_mutex_lock(&f_gm);
+    __atomic_store_n(&f_in_rx, 1, __ATOMIC_SEQ_CST);
+    while (f_gate) { pthread_cond_wait(&f_gc, &f_gm); }
+    __atomic_store_n(&f_in_rx, 0, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&f_gm);
+    __atomic_add_fetch(&f_rx_hard, 1, __ATOMIC_SEQ_CST);
+}
+int bat_tx_soft(struct bat *b, const uint8_t *frame, size_t len)
+{ (void)b; memcpy(f_last, frame, len); f_last_len = len; __atomic_add_fetch(&f_tx_soft, 1, __ATOMIC_SEQ_CST); return 0; }
+uint32_t bat_tick(struct bat *b) { (void)b; __atomic_add_fetch(&f_ticks, 1, __ATOMIC_SEQ_CST); return 20; }
+unsigned bat_route_count(const struct bat *b) { (void)b; return 3; }
+unsigned bat_neigh_count(const struct bat *b) { (void)b; return 2; }
+/* One chunk of f_render_len bytes; or with f_entries a summary line (cursor 0) and entries 1..f_entries
+ * of f_entry_len bytes, paged like the engine's (whole entries below len - 32). f_stall hands the
+ * cursor it was given back after the first chunk. */
+static size_t f_render_len;
+static unsigned f_entries, f_entry_len, f_stall, f_render_calls, f_render_mac_calls, f_render_has_mac;
+static uint8_t f_render_mac[6];
+static enum bat_render_kind f_render_kind;
+static size_t entry(char *o, unsigned i)
+{
+    int n = snprintf(o, f_entry_len + 1, "+BATO: e%04u ", i);
+    memset(o + n, '.', f_entry_len - 2 - (size_t)n);
+    memcpy(o + f_entry_len - 2, "\r\n", 3);
+    return f_entry_len;
+}
+size_t bat_render_from(struct bat *b, enum bat_render_kind k, const uint8_t *mac, uint32_t *cursor, char *buf,
+                       size_t len)
+{
+    (void)b;
+    f_render_calls++;
+    f_render_kind = k;
+    f_render_has_mac = mac != NULL;
+    if (mac) { memcpy(f_render_mac, mac, 6); f_render_mac_calls++; }
+    const uint32_t from = *cursor;
+    *cursor = BAT_RENDER_DONE;
+    if (!f_entries) { size_t n = f_render_len < len ? f_render_len : len - 1; memset(buf, 'x', n); buf[n] = 0; return n; }
+    size_t pos = 0;
+    for (uint32_t i = from; i <= f_entries; i++) {
+        if (pos + f_entry_len >= len - 32) { *cursor = f_stall && from ? from : i; break; }
+        pos += entry(buf + pos, i);
+    }
+    buf[pos] = 0;
+    return pos;
+}
+static size_t listing(char *o) /* every entry, as one string */
+{
+    size_t n = 0;
+    for (unsigned i = 0; i <= f_entries; i++) { n += entry(o + n, i); }
+    return n;
+}
+static volatile int f_route_calls, f_routed = 1, f_gw_n;
+static uint8_t f_asked[6];
+static const struct bat_client_route F_ROUTE = { { 2, 0xd4, 0x0b, 0, 0, 1 }, 72, 900 };
+static const struct bat_gw F_GW = { { 2, 0xd4, 0x0a, 0, 0, 1 }, 100, 20, 55, 400 };
+bool bat_client_route(struct bat *b, const uint8_t mac[BAT_ALEN], struct bat_client_route *out)
+{
+    (void)b;
+    memcpy(f_asked, mac, 6);
+    __atomic_add_fetch(&f_route_calls, 1, __ATOMIC_SEQ_CST);
+    const int r = __atomic_load_n(&f_routed, __ATOMIC_SEQ_CST);
+    if (out) { if (r) { *out = F_ROUTE; } else { memset(out, 0, sizeof(*out)); } }
+    return r != 0;
+}
+typedef __typeof__(bat_gw_best(NULL, NULL)) gw_ret_t; /* what the port must hand on unchanged */
+gw_ret_t bat_gw_best(struct bat *b, struct bat_gw *out)
+{
+    (void)b;
+    const int g = __atomic_load_n(&f_gw_n, __ATOMIC_SEQ_CST);
+    if (out) { if (g) { *out = F_GW; } else { memset(out, 0, sizeof(*out)); } }
+    return (gw_ret_t)g;
+}
+
+/* ---- the test ---- */
+static int ld(volatile int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
+static int wait_ge(volatile int *p, int want) /* up to 20 s of port time, 1 s real */
+{
+    for (int i = 0; i < 20000 && ld(p) < want; i++) { sleep_ms(1); }
+    return ld(p) >= want;
+}
+static const uint8_t TA[6] = { 0x0c, 0xbf, 0x74, 0x28, 0xbf, 0x74 }, BC[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+static void rx(const uint8_t *src, uint16_t type, uint8_t first, size_t len)
+{
+    struct mmpkt *p = calloc(1, sizeof(*p));
+    memcpy(p->d, BC, 6);
+    memcpy(p->d + 6, src, 6);
+    p->d[12] = (uint8_t)(type >> 8); p->d[13] = (uint8_t)type; p->d[14] = first;
+    for (size_t i = 15; i < len; i++) { p->d[i] = (uint8_t)i; }
+    p->len = (uint32_t)len;
+    struct mmwlan_rx_metadata md = { MMWLAN_VIF_UNSPECIFIED, TA };
+    f_rx_cb(p, &md, f_rx_arg);
+}
+static esp_err_t soft(size_t len)
+{
+    static uint8_t f[1600];
+    memcpy(f, BC, 6);
+    memcpy(f + 6, f_netif_mac, 6);
+    f[12] = 0x08; f[13] = 0x00;
+    return f_drv.transmit(f_drv.handle, f, len);
+}
+static uint32_t f_cursor;
+static const char *render_next(int *r) /* the AT+BATSTAT? chunk at f_cursor */
+{
+    const char *out = NULL;
+    *r = warthog_bat_port_render(BAT_RENDER_STAT, NULL, &f_cursor, &out);
+    return *r == WARTHOG_BAT_RENDER_OK ? out : NULL;
+}
+static const char *render(int *r) /* its first chunk */
+{
+    f_cursor = 0;
+    return render_next(r);
+}
+static char at_out[65536];
+static size_t at_len;
+static int at_ok, at_err;
+static void cdc_write(const char *s) { size_t n = strlen(s); if (at_len + n < sizeof(at_out)) { memcpy(at_out + at_len, s, n + 1); at_len += n; } }
+static void reply_ok(void) { at_ok++; cdc_write("OK\r\n"); }
+static void reply_error(const char *why) { at_err++; cdc_write("+ERR: "); cdc_write(why); cdc_write("\r\n"); }
+#include "at_render.c"
+static const char *at(enum bat_render_kind k, const char *mac) /* NULL: the '?' form, else AT+BATx=<mac> */
+{
+    at_len = 0; at_out[0] = 0; at_ok = at_err = 0;
+    if (mac) { cmd_bat_render_mac(k, mac, "usage"); } else { cmd_bat_render(k, NULL); }
+    return at_out;
+}
+static struct fq *f_hooked;
+static void late_finish(struct fq *q) /* the engine finishes right after the caller's timeout */
+{
+    f_timeout_hook = NULL;
+    f_hooked = q;
+    gate(0);
+    for (int i = 0; i < 20000 && uxQueueMessagesWaiting(q) == 0; i++) { sleep_ms(1); }
+}
+
+static int refused(const char *mode, int want_reason)
+{
+    esp_err_t e = warthog_bat_port_start();
+    CHECK(!warthog_bat_port_running() && warthog_bat_port_reason() == want_reason && f_queues == 0 &&
+          f_regs == 0 && f_inits == 0 && g_warthog_mesh_batman == 0,
+          "%s: not running (reason %s, start %d), nothing allocated, no hook, gate closed", mode,
+          bat_mode_reason_text((enum bat_mode_reason)warthog_bat_port_reason()), e);
+    return fails ? 1 : 0;
+}
+
+int main(int argc, char **argv)
+{
+    const char *mode = argc > 1 ? argv[1] : "run";
+    f_verbose = getenv("BP_VERBOSE") != NULL;
+    if (!strcmp(mode, "off")) { f_stored = 0; return refused("batman off", BAT_MODE_OFF); }
+    if (!strcmp(mode, "fwd")) { f_fwd = 1; return refused("AT+MESHFWD=1 stored too", BAT_MODE_FWD); }
+    if (!strcmp(mode, "nomac")) { f_mac_fail = 1; return refused("no mesh MAC", BAT_MODE_INIT_FAIL); }
+
+    uint8_t soft_mac[6];
+    bat_mode_soft_mac(FAC, MESH, soft_mac);
+    CHECK(warthog_bat_port_start() == ESP_OK && warthog_bat_port_running() &&
+          warthog_bat_port_reason() == BAT_MODE_OK, "start: running, reason ok");
+    CHECK(f_regs == 1 && f_rx_cb != NULL, "one RX ext hook registered (%d)", f_regs);
+    CHECK(f_drv.transmit && f_drv.transmit_wrap && f_drv.driver_free_rx_buffer && f_drv.handle == (void *)&f_lw,
+          "the netif driver is ours; its handle stays the Morse driver's");
+    CHECK(f_lw.mtu == BAT_SOFT_MTU_DEFAULT, "bat0 IP MTU %u (want %u)", f_lw.mtu, BAT_SOFT_MTU_DEFAULT);
+    CHECK(memcmp(f_netif_mac, soft_mac, 6) == 0, "the netif takes the soft MAC " MACSTR, MAC2STR(f_netif_mac));
+    CHECK(f_inits == 1 && memcmp(f_cfg.hard_addr, MESH, 6) == 0, "engine originator = the mesh MAC (M2) (%d " MACSTR ")", f_inits, MAC2STR(f_cfg.hard_addr));
+    CHECK(memcmp(f_cfg.soft_addr, soft_mac, 6) == 0 && f_cfg.tput_override == 25 && f_cfg.bcast_copies == 1 &&
+          f_cfg.hard_mtu == 0x5a5a, "engine soft MAC, AT+MESHBATTP 25, 1 copy; the rest from bat_config_defaults");
+    CHECK(f_ops.tx && f_ops.deliver && f_ops.now_ms && f_ops.rand32 && f_ops.link_tput, "every engine op is set");
+    CHECK(g_warthog_mesh_batman == 1, "the datapath's batman gate is set (AE-2 replica / group shape)");
+    CHECK(g_warthog_host_ccmp_on == 1, "host CCMP armed: peers' ELP/OGM/BCAST are group frames under their MGTK");
+    CHECK(wait_ge(&f_ticks, 3), "the engine task runs (%d ticks)", ld(&f_ticks));
+
+    /* The stat line, before anything varies its digits: after the engine's last chunk if it fits whole. */
+    int r;
+    f_render_len = 0;
+    const char *o = render(&r);
+    size_t L = o ? strlen(o) : 0;
+    CHECK(o && L > 2 && !strcmp(o + L - 2, "\r\n") && strstr(o, "rx_slots=6/6 tx_slots=4/4 ") &&
+          strstr(o, "tput_cache_age=-1 tput_snap_fail=0 ") && f_cursor == BAT_RENDER_DONE,
+          "AT+BATSTAT? port line, %zu bytes", L);
+    if (o) { warthog_bat_port_render_done(); }
+    f_render_len = BAT_RENDER_BUF - L;
+    unsigned rc0 = f_render_calls;
+    o = render(&r);
+    CHECK(o && strlen(o) == BAT_RENDER_BUF - L && !strstr(o, "+BATSTAT: port") && f_cursor != BAT_RENDER_DONE,
+          "room for the line's length only: the engine's chunk alone, the line not cut");
+    if (o) { warthog_bat_port_render_done(); }
+    o = render_next(&r);
+    CHECK(o && strlen(o) == L && !strncmp(o, "+BATSTAT: port ", 15) && f_cursor == BAT_RENDER_DONE &&
+          f_render_calls == rc0 + 1, "then the line whole in a chunk of its own, the engine not asked again, and done");
+    if (o) { warthog_bat_port_render_done(); }
+    f_render_len = BAT_RENDER_BUF - L - 1;
+    o = render(&r);
+    CHECK(o && strlen(o) == BAT_RENDER_BUF - 1 && o[BAT_RENDER_BUF - 1 - L] == '+' && f_cursor == BAT_RENDER_DONE,
+          "room for it and its NUL: whole, in the same chunk");
+    if (o) { warthog_bat_port_render_done(); }
+    f_render_len = 0;
+
+    /* Paging: at.c's cmd_bat_render asks for chunks until the cursor is done and writes each. */
+    static char want[32768];
+    f_entries = 150;
+    f_entry_len = 100;
+    size_t wl = listing(want);
+    rc0 = f_render_calls;
+    const char *a = at(BAT_RENDER_ORIG, NULL);
+    CHECK(wl > 3 * BAT_RENDER_BUF && !strncmp(a, want, wl) && !strcmp(a + wl, "OK\r\n") && at_ok == 1 &&
+          at_err == 0 && f_render_calls == rc0 + 4 && f_render_kind == BAT_RENDER_ORIG && !f_render_has_mac,
+          "AT+BATO? of %zu bytes: 4 chunks, whole and in order, then one OK (%u chunks)", wl, f_render_calls - rc0);
+    a = at(BAT_RENDER_STAT, NULL);
+    CHECK(!strncmp(a, want, wl) && !strncmp(a + wl, "+BATSTAT: port ", 15) && strlen(a + wl) == L + 4 && at_ok == 1,
+          "AT+BATSTAT? the same way, the port line once, after the last chunk");
+    f_entries = 79; /* the second chunk ends the listing with 40 entries: no room for the port line */
+    wl = listing(want);
+    rc0 = f_render_calls;
+    a = at(BAT_RENDER_STAT, NULL);
+    CHECK(!strncmp(a, want, wl) && !strncmp(a + wl, "+BATSTAT: port ", 15) && strlen(a + wl) == L + 4 && at_ok == 1 &&
+          f_render_calls == rc0 + 2, "a last chunk too full for the port line: the line whole in a third (%u engine "
+          "calls)", f_render_calls - rc0);
+    static const uint8_t NODE[6] = { 0x0c, 0xbf, 0x74, 0x28, 0xbf, 0xcd };
+    const unsigned m0 = f_render_mac_calls;
+    rc0 = f_render_calls;
+    a = at(BAT_RENDER_TT_GLOBAL, "0C:bf:74:28:bF:cd");
+    CHECK(at_ok == 1 && !strncmp(a, want, wl) && f_render_kind == BAT_RENDER_TT_GLOBAL && !memcmp(f_render_mac, NODE, 6) &&
+          f_render_calls - rc0 == 2 && f_render_mac_calls - m0 == 2, "AT+BATTG=<mac>: the MAC reaches the engine's "
+          "filter with every chunk (%u of %u)", f_render_mac_calls - m0, f_render_calls - rc0);
+    rc0 = f_render_calls;
+    a = at(BAT_RENDER_ORIG, "0c:bf:74:28:bf");
+    CHECK(!strcmp(a, "+ERR: usage\r\n") && f_render_calls == rc0, "a bad <mac>: the usage error, the engine not asked");
+    f_stall = 1;
+    f_entries = 150;
+    a = at(BAT_RENDER_ORIG, NULL);
+    CHECK(at_ok == 0 && at_err == 1 && f_render_calls == rc0 + 2 && strstr(a, "+ERR: batman render stalled\r\n"),
+          "an engine handing a cursor back unmoved: an error after that chunk, not a loop (%u chunks)",
+          f_render_calls - rc0);
+    f_stall = 0;
+    f_entries = 0;
+
+    uint8_t uni[64] = { 0 };
+    memcpy(uni, TA, 6);
+    memcpy(uni + 6, MESH, 6);
+    uni[12] = 0x43; uni[13] = 0x05; uni[14] = 0x40;
+    CHECK(f_ops.tx(f_user, uni, sizeof(uni)) == BAT_TX_NOPEER && f_tx_pkts == 0, "before mesh_up: nothing sent");
+    warthog_bat_port_mesh_up();
+    CHECK(f_ops.tx(f_user, uni, sizeof(uni)) == BAT_TX_OK && f_tx_pkts == 1 && !f_tx_ra_null &&
+          memcmp(f_tx_ra, TA, 6) == 0 && f_tx_tid == 0, "unicast: sent to RA = its destination, TID 0");
+    uint8_t bc[64] = { 0 };
+    memcpy(bc, BC, 6);
+    memcpy(bc + 6, MESH, 6);
+    bc[12] = 0x43; bc[13] = 0x05; bc[14] = 0x03;
+    CHECK(f_ops.tx(f_user, bc, sizeof(bc)) == BAT_TX_OK && f_tx_pkts == 2 && f_tx_ra_null,
+          "broadcast: RA NULL, the datapath's group shape");
+    f_tx_status = MMWLAN_NOT_FOUND;
+    CHECK(f_ops.tx(f_user, uni, sizeof(uni)) == BAT_TX_NOPEER, "no ESTAB peer for the RA: BAT_TX_NOPEER");
+    f_tx_status = MMWLAN_SUCCESS;
+
+    int base = ld(&f_rx_hard), got = 0;
+    for (int i = 1; i <= 7; i++) {
+        rx(TA, 0x4305, 0x04, 100 + (size_t)i);
+        got += wait_ge(&f_rx_hard, base + i);
+    }
+    CHECK(got == 7 && f_last_len == 107 && f_last[106] == 106 && memcmp(f_last + 6, TA, 6) == 0,
+          "7 batman frames, one at a time, each reach bat_rx_hard whole (every RX slot comes back)");
+    rx(MESH, 0x4305, 0x04, 60);
+    rx(TA, 0x0800, 0x45, 60);
+    rx(TA, 0x4305, 0x04, 1601);
+    sleep_ms(50);
+    CHECK(ld(&f_rx_hard) == base + 7, "relayed, non-batman and oversize frames are dropped at the hook");
+    base = ld(&f_tx_soft);
+    int okc = 0;
+    for (int i = 1; i <= 5; i++) {
+        okc += soft(100) == ESP_OK;
+        (void)wait_ge(&f_tx_soft, base + i);
+    }
+    CHECK(okc == 5 && ld(&f_tx_soft) == base + 5, "5 soft frames, one at a time, all reach bat_tx_soft");
+    int big = 0;
+    for (int i = 0; i < 4; i++) { big += soft(1537) == ESP_ERR_INVALID_ARG; }
+    CHECK(big == 4 && soft(1536) == ESP_OK && wait_ge(&f_tx_soft, base + 6) && f_last_len == 1536,
+          "1537-byte soft frames refused (4 of 4), 1536 carried whole");
+
+    int rx0 = ld(&f_rx_hard), tx0 = ld(&f_tx_soft);
+    gate(1);
+    rx(TA, 0x4305, 0x04, 60);
+    int busy = wait_ge(&f_in_rx, 1);
+    for (int i = 0; i < 5; i++) { rx(TA, 0x4305, 0x04, 60); }
+    rx(TA, 0x4305, 0x04, 60); /* the 7th: every slot is taken */
+    okc = 0;
+    for (int i = 0; i < 4; i++) { okc += soft(100) == ESP_OK; }
+    esp_err_t full = soft(100);
+    gate(0);
+    int drained = wait_ge(&f_rx_hard, rx0 + 6) && wait_ge(&f_tx_soft, tx0 + 4);
+    sleep_ms(20);
+    CHECK(busy && okc == 4 && full == ESP_ERR_NO_MEM && drained && ld(&f_rx_hard) == rx0 + 6,
+          "engine busy: 6 RX + 4 TX queue, the 7th RX and 5th TX are refused, then all 10 get through");
+
+    static const uint8_t in[20] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x08, 0x00, 0x45 };
+    f_ops.deliver(f_user, in, sizeof(in));
+    CHECK(f_delivered == 1 && f_freed == 1 && f_rx_copy_len == sizeof(in) && !memcmp(f_rx_copy, in, sizeof(in)),
+          "deliver: a copy to esp_netif_receive, freed through the driver");
+    static uint8_t full_frame[1514];
+    memcpy(full_frame, in, sizeof(in));
+    f_hold = 1; /* the tcpip thread stalls (a suspended USB host) and lwIP keeps every frame it is given */
+    for (int i = 0; i < 40; i++) { f_ops.deliver(f_user, full_frame, sizeof(full_frame)); }
+    int held = f_nheld;
+    o = render(&r);
+    CHECK(held == 16 && f_delivered == 17 && o && strstr(o, " deliver_nomem=0 deliver_cap=24 "),
+          "lwIP stalled: at most 16 delivered copies (~25 KB) outstanding, the other 24 dropped and counted (held %d)",
+          held);
+    if (o) { warthog_bat_port_render_done(); }
+    f_hold = 0;
+    for (int i = 0; i < f_nheld; i++) { f_drv.driver_free_rx_buffer(f_drv.handle, f_held[i]); }
+    f_nheld = 0;
+    f_ops.deliver(f_user, in, sizeof(in));
+    CHECK(f_delivered == 18 && f_freed == 2, "once lwIP frees them, frames are delivered again (%d)", f_delivered);
+    f_malloc_fail = 20;
+    for (int i = 0; i < 20; i++) { f_ops.deliver(f_user, in, sizeof(in)); }
+    f_malloc_fail = 0;
+    f_ops.deliver(f_user, in, sizeof(in));
+    o = render(&r);
+    CHECK(f_delivered == 19 && f_freed == 3 && o && strstr(o, " deliver_nomem=20 deliver_cap=24 "),
+          "no heap for 20 copies: dropped, counted, and not held against the cap (%d)", f_delivered);
+    if (o) { warthog_bat_port_render_done(); }
+
+    uint8_t peer[6];
+    memcpy(peer, TA, 6);
+    f_links_fail = 1;
+    CHECK(f_ops.link_tput(f_user, peer) == BAT_TPUT_UNKNOWN, "link_tput: a failed first query is unknown, not 0");
+    f_links_fail = 0;
+    memcpy(f_links[0].addr, TA, 6);
+    f_links[0].estab = 1; f_links[0].rc_valid = 1; f_links[0].expected_tput_kbps = 7200;
+    f_links_n = 1;
+    CHECK(f_ops.link_tput(f_user, peer) == 72, "then the snapshot's 7200 kbit/s: 72");
+    sleep_ms(BAT_MODE_LINKS_MS + 10);
+    f_links_fail = 1;
+    CHECK(f_ops.link_tput(f_user, peer) == 72, "a failed refresh keeps the last snapshot");
+    f_links_fail = 0;
+
+    o = render(&r);
+    CHECK(o && strstr(o, "rx_slots=6/6 tx_slots=4/4 ") && strstr(o, "q_rx_full=1 q_tx_full=1 ") &&
+          strstr(o, "rx_nonbat=1 ") && strstr(o, "rx_relayed=1 ") && strstr(o, "rx_toobig=1 ") &&
+          strstr(o, "tput_snap_fail=2 ") && strstr(o, "soft_toobig=4 ") && strstr(o, "tx_notfound=1 "),
+          "AT+BATSTAT? afterwards: every slot back, each refusal counted once");
+    if (!o || fails) { printf("     %s", o ? o : "(no render)\n"); }
+    if (o) { warthog_bat_port_render_done(); }
+
+    gate(1);
+    rx(TA, 0x4305, 0x04, 60);
+    (void)wait_ge(&f_in_rx, 1);
+    uint64_t t0 = mono_us();
+    o = render(&r);
+    CHECK(r == WARTHOG_BAT_RENDER_BUSY && mono_us() - t0 >= 90000, "engine stuck: the render gives up after 2 s, busy");
+    o = render(&r);
+    CHECK(r == WARTHOG_BAT_RENDER_BUSY, "and the next one too while the abandoned request is queued");
+    gate(0);
+    for (int i = 0; i < 20 && r != WARTHOG_BAT_RENDER_OK; i++) { o = render(&r); }
+    CHECK(r == WARTHOG_BAT_RENDER_OK, "once the engine gets to it, the lock comes back: renders work again");
+    if (r == WARTHOG_BAT_RENDER_OK) { warthog_bat_port_render_done(); }
+
+    gate(1);
+    rx(TA, 0x4305, 0x04, 60);
+    (void)wait_ge(&f_in_rx, 1);
+    f_timeout_hook = late_finish;
+    o = render(&r);
+    CHECK(f_hooked != NULL && r == WARTHOG_BAT_RENDER_OK && o != NULL && f_cursor == BAT_RENDER_DONE,
+          "the engine finishes just after the caller's timeout: the render and its cursor are still taken");
+    if (r == WARTHOG_BAT_RENDER_OK) { warthog_bat_port_render_done(); }
+    o = render(&r);
+    CHECK(r == WARTHOG_BAT_RENDER_OK, "and the next render works");
+    if (r == WARTHOG_BAT_RENDER_OK) { warthog_bat_port_render_done(); }
+
+    /* bat0 addressing's questions: the lease router's MAC, and the best gateway. */
+    static const uint8_t RTR[6] = { 0x02, 0xd4, 0x0b, 0x00, 0x00, 0xff }, RTR2[6] = { 0x02, 0xd4, 0x0c, 0x00, 0x00, 0xff };
+    struct bat_client_route cr;
+    struct bat_gw gw;
+    sleep_ms(600);
+    CHECK(ld(&f_route_calls) == 0 && warthog_bat_port_watch_answer(RTR, &cr) == -1,
+          "nothing watched: the engine is not asked, no answer");
+    warthog_bat_port_watch(RTR);
+    int ans = -1;
+    for (int i = 0; i < 200 && ans < 0; i++) { sleep_ms(1); ans = warthog_bat_port_watch_answer(RTR, &cr); }
+    CHECK(ans == 1 && !memcmp(f_asked, RTR, 6) && !memcmp(&cr, &F_ROUTE, sizeof(cr)),
+          "a new watch is answered on the engine's next pass (%d): routed, its originator and OGM age", ans);
+    CHECK(warthog_bat_port_watch_answer(RTR2, &cr) == -1, "an answer is only for the MAC watched");
+    int c0 = ld(&f_route_calls), k0 = ld(&f_ticks);
+    int64_t p0 = esp_timer_get_time();
+    sleep_ms(2000);
+    int calls = ld(&f_route_calls) - c0, passes = ld(&f_ticks) - k0;
+    int64_t span = (esp_timer_get_time() - p0) / 1000;
+    CHECK(calls >= 2 && calls <= span / 500 + 2 && passes > 4 * calls,
+          "refreshed every 500 ms, not on every engine pass (%d in %lld ms, %d passes)", calls, (long long)span, passes);
+    __atomic_store_n(&f_routed, 0, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < 1500 && ans != 0; i++) { sleep_ms(1); ans = warthog_bat_port_watch_answer(RTR, &cr); }
+    CHECK(ans == 0, "the router stops resolving: the answer follows within 500 ms (%d)", ans);
+    warthog_bat_port_watch(RTR2);
+    CHECK(warthog_bat_port_watch_answer(RTR, &cr) == -1 && warthog_bat_port_watch_answer(RTR2, &cr) == -1,
+          "watching another MAC drops the old answer at once");
+    ans = -1;
+    for (int i = 0; i < 200 && ans < 0; i++) { sleep_ms(1); ans = warthog_bat_port_watch_answer(RTR2, &cr); }
+    CHECK(ans == 0 && !memcmp(f_asked, RTR2, 6), "and the new one is asked on the next pass");
+    warthog_bat_port_watch(NULL);
+    CHECK(warthog_bat_port_watch_answer(RTR2, &cr) == -1, "watch(NULL): no answer");
+    c0 = ld(&f_route_calls);
+    CHECK(warthog_bat_port_gw(&gw) == 0, "no gateway yet");
+    __atomic_store_n(&f_gw_n, 2, __ATOMIC_SEQ_CST);
+    unsigned gn = 0;
+    for (int i = 0; i < 1500 && !gn; i++) { sleep_ms(1); gn = warthog_bat_port_gw(&gw); }
+    CHECK(gn == (uint8_t)(gw_ret_t)2 && !memcmp(&gw, &F_GW, sizeof(gw)) && ld(&f_route_calls) == c0,
+          "gateways are published within 500 ms as bat_gw_best returned them (%u), with the best; with nothing "
+          "watched nobody's route is looked up", gn);
+
+    warthog_bat_port_watch(RTR);
+    __atomic_store_n(&f_routed, 1, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < 1500 && ans != 1; i++) { sleep_ms(1); ans = warthog_bat_port_watch_answer(RTR, &cr); }
+    warthog_bat_port_mesh_failed();
+    CHECK(!warthog_bat_port_running() && warthog_bat_port_reason() == BAT_MODE_MESH_FAILED &&
+          warthog_bat_port_routes() == 0 && render(&r) == NULL && r == WARTHOG_BAT_RENDER_NOT_RUNNING &&
+          warthog_bat_port_watch_answer(RTR, &cr) == -1 && warthog_bat_port_gw(&gw) == 0 &&
+          !strcmp(at(BAT_RENDER_ORIG, NULL), "+ERR: batman not running (mesh-failed)\r\n"),
+          "mmwlan_mesh_enable failed: not running, reason mesh-failed, no renders, no answers, no gateway");
+    printf(fails ? "bat_port: %d FAILED\n" : "bat_port: all passed\n", fails);
+    return fails != 0;
+}
+EOF
+why=""
+if ${CC:-cc} -std=gnu11 -w -pthread ${SANFLAGS:-} -DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_HOST_CCMP=1 -I"$T" -I"$T/inc" \
+     -I../../../main -I../../../main/bat -o "$T/t" "$T/t.c" "$BP" ../../../main/bat_mode.c 2>"$T/cc.log"; then
+  for m in run off fwd nomac; do
+    "$T/t" "$m" > "$T/$m.log" 2>&1 || why="$why $m: $(grep -m2 -E '^FAIL|ERROR|Sanitizer' "$T/$m.log" | tr '\n' ' ')"
+  done
+else
+  why="did not build: $(head -3 "$T/cc.log" | tr '\n' ' ')"
+fi
+if [ -z "$why" ]; then
+  ok "bat_port.c runs: start wiring, tx gate and RA, slot pools, delivery cap, render abandon/late finish, paging through cmd_bat_render, stat line, router/gateway answers, refused starts"
+else
+  bad "bat_port.c on the host harness:$why"
+fi
+
+# 34b. The same bat_port.c and cmd_bat_render with the real engine (main/bat/) behind them, at the
+#      engine's table sizes: 32 originators heard through 4 neighbours, each announcing 3 clients,
+#      two of them gateways, all through the 0x4305 hook. AT+BATO? and AT+BATTG? list every one
+#      of them across chunks with one OK, AT+BATO=/AT+BATTG=<mac> exactly one node's rows, and
+#      the port hands on the engine's gateway answer.
+cat > "$T/scale.c" <<'EOF'
+/* main/bat_port.c on fakes.c, the real engine behind it and main/at.c's cmd_bat_render in front. */
+#include "fakes.c"
+#include "bat_crc32c.h"
+#include "bat_internal.h"
+static char at_out[65536];
+static size_t at_len;
+static int at_ok, at_err;
+static void cdc_write(const char *s) { size_t n = strlen(s); if (at_len + n < sizeof(at_out)) { memcpy(at_out + at_len, s, n + 1); at_len += n; } }
+static void reply_ok(void) { at_ok++; cdc_write("OK\r\n"); }
+static void reply_error(const char *why) { at_err++; cdc_write("+ERR: "); cdc_write(why); cdc_write("\r\n"); }
+#include "at_render.c"
+static const char *at(enum bat_render_kind k, const char *mac)
+{
+    at_len = 0; at_out[0] = 0; at_ok = at_err = 0;
+    if (mac) { cmd_bat_render_mac(k, mac, "usage"); } else { cmd_bat_render(k, NULL); }
+    return at_out;
+}
+#define NODES 32
+#define NB 4
+static void addr(uint8_t *o, uint8_t kind, unsigned k) { o[0] = 0x02; o[1] = kind; o[2] = o[3] = o[4] = 0; o[5] = (uint8_t)k; }
+/* A broadcast from neighbour f+6, its TA too, through the hook; returns once bat_rx_hard is done with it. */
+static void hook(uint8_t *f, size_t len)
+{
+    memset(f, 0xff, 6);
+    f[BAT_LINK_TYPE] = 0x43; f[BAT_LINK_TYPE + 1] = 0x05;
+    struct mmpkt *p = calloc(1, sizeof(*p));
+    memcpy(p->d, f, len);
+    p->len = (uint32_t)len;
+    struct mmwlan_rx_metadata md = { MMWLAN_VIF_UNSPECIFIED, f + BAT_LINK_SRC };
+    f_rx_cb(p, &md, f_rx_arg);
+    for (int i = 0; i < 20000 && uxQueueMessagesWaiting(f_q[0]) < 6; i++) { sleep_ms(1); } /* its RX slot back */
+}
+static void elp(unsigned j, uint32_t seq)
+{
+    uint8_t f[64] = { 0 }, *p = f + BAT_ETH_HLEN;
+    addr(f + BAT_LINK_SRC, 0xA0, j);
+    p[0] = BAT_PT_ELP; p[1] = BAT_COMPAT;
+    addr(p + BAT_ELP_ORIG, 0xA0, j);
+    bat_put32(p + BAT_ELP_SEQ, seq);
+    bat_put32(p + BAT_ELP_INTERVAL, 500);
+    hook(f, BAT_ETH_HLEN + BAT_ELP_LEN);
+}
+/* Node k's OGM through neighbour j: TT (its bat0 MAC untagged and on VID 1, a bridged host) and for
+ * nodes 0 and 1 a gateway announcement. */
+static void ogm(unsigned j, unsigned k)
+{
+    uint8_t f[512] = { 0 }, *p = f + BAT_ETH_HLEN, bat0[6], br[6];
+    addr(f + BAT_LINK_SRC, 0xA0, j);
+    addr(bat0, 0xB0, k); addr(br, 0xC0, k);
+    p[0] = BAT_PT_OGM2; p[1] = BAT_COMPAT; p[BAT_OGM_TTL] = j == k ? BAT_OGM_TTL_INIT : BAT_OGM_TTL_INIT - 1;
+    bat_put32(p + BAT_OGM_SEQ, 7);
+    addr(p + BAT_OGM_ORIG, 0xA0, k);
+    bat_put32(p + BAT_OGM_TPUT, 100);
+    uint8_t *t = p + BAT_OGM_HLEN;
+    if (k < 2) {
+        t[0] = BAT_TVLV_GW; t[1] = 1; bat_put16(t + 2, BAT_TVLV_GW_LEN);
+        bat_put32(t + 4, 10 + k); bat_put32(t + 8, 5); /* below every route's throughput: node 1 is the best */
+        t += BAT_TVLV_HLEN + BAT_TVLV_GW_LEN;
+    }
+    const uint16_t V0 = 0, V1 = BAT_VID_TAGGED | 1, vlen = 4 + 2 * BAT_TT_VLAN_LEN + 3 * BAT_TT_CHANGE_LEN;
+    t[0] = BAT_TVLV_TT; t[1] = 1; bat_put16(t + 2, vlen);
+    uint8_t *v = t + BAT_TVLV_HLEN, *c = v + 4 + 2 * BAT_TT_VLAN_LEN;
+    v[0] = BAT_TT_OGM_DIFF; v[1] = 1; bat_put16(v + 2, 2);
+    bat_put32(v + 4, bat_crc32c_tt(V0, 0, bat0) ^ bat_crc32c_tt(V0, 0, br)); bat_put16(v + 8, V0);
+    bat_put32(v + 12, bat_crc32c_tt(V1, 0, bat0)); bat_put16(v + 16, V1);
+    memcpy(c + 4, bat0, 6); bat_put16(c + 10, V0); c += BAT_TT_CHANGE_LEN;
+    memcpy(c + 4, bat0, 6); bat_put16(c + 10, V1); c += BAT_TT_CHANGE_LEN;
+    memcpy(c + 4, br, 6); bat_put16(c + 10, V0); c += BAT_TT_CHANGE_LEN;
+    bat_put16(p + BAT_OGM_TVLV_LEN, (uint16_t)(c - (p + BAT_OGM_HLEN)));
+    hook(f, (size_t)(c - f));
+}
+static unsigned lines(const char *buf, const char *pfx, const char *also)
+{
+    unsigned n = 0;
+    for (const char *l = buf; *l;) {
+        const char *e = strstr(l, "\r\n");
+        const size_t ll = e ? (size_t)(e - l) : strlen(l);
+        char tmp[512];
+        const size_t c = ll < 511 ? ll : 511;
+        memcpy(tmp, l, c);
+        tmp[c] = 0;
+        n += !strncmp(tmp, pfx, strlen(pfx)) && (!also || strstr(tmp, also));
+        l += ll + (e ? 2 : 0);
+    }
+    return n;
+}
+typedef __typeof__(bat_gw_best(NULL, NULL)) gw_ret_t;
+int main(void)
+{
+    f_verbose = getenv("BP_VERBOSE") != NULL;
+    CHECK(warthog_bat_port_start() == ESP_OK && warthog_bat_port_running(), "started with the real engine");
+    warthog_bat_port_mesh_up();
+    for (uint32_t s = 1; s <= 3; s++) { for (unsigned j = 0; j < NB; j++) { elp(j, s); } }
+    for (int i = 0; i < 400 && lines(at(BAT_RENDER_NEIGH, NULL), "+BATN: 02:a0:", " tput=2.5 ") < NB; i++) {
+        sleep_ms(50); /* until our next ELP samples each link: AT+MESHBATTP's 2.5 Mbit/s */
+    }
+    for (unsigned k = 0; k < NODES; k++) { for (unsigned j = 0; j < NB; j++) { ogm(j, k); } }
+    for (int i = 0; i < 2000 && warthog_bat_port_routes() < NODES; i++) { sleep_ms(1); }
+    const char *st = at(BAT_RENDER_STAT, NULL);
+    CHECK(warthog_bat_port_routes() == NODES && warthog_bat_port_neighs() == NB && strstr(st, " q_rx_full=0 ") &&
+          strstr(st, " tt=96/") && lines(st, "+BATSTAT: port ", NULL) == 1 && at_ok == 1,
+          "setup: %u routes, %u neighbours, 96 client rows, no frame dropped at the hook", warthog_bat_port_routes(),
+          warthog_bat_port_neighs());
+    if (fails) { printf("%s", st); }
+    const char *o = at(BAT_RENDER_ORIG, NULL);
+    CHECK(strlen(o) > BAT_RENDER_BUF && lines(o, "+BATO: 02:a0:", " seen=") == NODES &&
+          lines(o, "+BATO:  via ", NULL) == NODES * NB && strstr(o, "+BATO: 02:a0:00:00:00:1f seen=") &&
+          !strstr(o, "(truncated)") && at_ok == 1 && at_err == 0,
+          "AT+BATO?: all %u originators (%u) and %u candidates (%u) over %zu bytes, node 31 with its ttvn, one OK",
+          NODES, lines(o, "+BATO: 02:a0:", " seen="), NODES * NB, lines(o, "+BATO:  via ", NULL), strlen(o));
+    const char *g = at(BAT_RENDER_TT_GLOBAL, NULL);
+    CHECK(strlen(g) > BAT_RENDER_BUF && lines(g, "+BATTG: 02:", NULL) == NODES * 3 &&
+          strstr(g, "+BATTG: 02:c0:00:00:00:1f") && !strstr(g, "(truncated)") && at_ok == 1 && at_err == 0,
+          "AT+BATTG?: all %u client rows (%u) over %zu bytes, one OK", NODES * 3, lines(g, "+BATTG: 02:", NULL),
+          strlen(g));
+    o = at(BAT_RENDER_ORIG, "02:a0:00:00:00:1f");
+    CHECK(lines(o, "+BATO: 02:a0:", " seen=") == 1 && strstr(o, "+BATO: 02:a0:00:00:00:1f seen=") &&
+          lines(o, "+BATO:  via ", NULL) == NB && at_ok == 1, "AT+BATO=<node 31>: its row and its %u candidates alone",
+          NB);
+    g = at(BAT_RENDER_TT_GLOBAL, "02:a0:00:00:00:1f");
+    CHECK(lines(g, "+BATTG: 02:", NULL) == 3 && lines(g, "+BATTG: 02:", "via=02:a0:00:00:00:1f ") == 3 && at_ok == 1,
+          "AT+BATTG=<node 31>: exactly its 3 client rows (%u)", lines(g, "+BATTG: 02:", NULL));
+    g = at(BAT_RENDER_TT_GLOBAL, "02:c0:00:00:00:1f");
+    CHECK(lines(g, "+BATTG: 02:", NULL) == 1 && strstr(g, "+BATTG: 02:c0:00:00:00:1f") && at_ok == 1,
+          "AT+BATTG=<a client>: that row alone");
+    struct bat_gw gw;
+    unsigned gn = 0;
+    for (int i = 0; i < 1500 && !gn; i++) { sleep_ms(1); gn = warthog_bat_port_gw(&gw); }
+    CHECK(gn == (uint8_t)(gw_ret_t)2 && gw.orig[1] == 0xA0 && gw.orig[5] == 1 && gw.down == 11,
+          "gateways: bat_gw_best's answer for two (%u), node 1 the best", gn);
+    printf(fails ? "bat_port_scale: %d FAILED\n" : "bat_port_scale: all passed\n", fails);
+    return fails != 0;
+}
+EOF
+why=""
+if ${CC:-cc} -std=gnu11 -w -pthread ${SANFLAGS:-} -DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_HOST_CCMP=1 -I"$T" -I"$T/inc" \
+     -I../../../main -I../../../main/bat -o "$T/scale" "$T/scale.c" "$BP" ../../../main/bat_mode.c ../../../main/bat/*.c \
+     2>"$T/cc.log"; then
+  "$T/scale" > "$T/scale.log" 2>&1 || why=" $(grep -m3 -E '^FAIL|ERROR|Sanitizer' "$T/scale.log" | tr '\n' ' ')"
+else
+  why=" did not build: $(head -3 "$T/cc.log" | tr '\n' ' ')"
+fi
+if [ -z "$why" ]; then
+  ok "bat_port.c with the real engine: 32 originators x 4 neighbours, AT+BATO?/AT+BATTG? whole over several chunks, =<mac> one node, gateways handed on"
+else
+  bad "bat_port.c with the real engine:$why"
+fi
+rm -rf "$T"
+
+# 35. mesh.c brings bat0 up from the batman engine: the probe task polls it only while
+#     batman runs (else the plain first-ESTAB bring-up), mmwlan_mesh_enable's result reaches
+#     the port either way, and mesh_bat_netif_poll_ is compiled out of mesh.c and run per
+#     2 s tick against a model of esp_netif's DHCP-client rules, lwIP's DHCP client and ARP
+#     table, DHCP servers and the engine's answers: a lease 36 s after the first route, or
+#     one still being requested or ARP-checked at the 45 s deadline, is kept; a lease renewing
+#     or rebinding stays leased; no lease ends on a probed static candidate via 10.41.0.1; a
+#     held address asks DHCP again beside itself (never dropped, re-applied after a NAK, but
+#     never over a lease lwIP bound or is ARP-checking since the tick read it) 30 s later, then
+#     after 60 s, sooner when a gateway appears (the port's count, so a second one too); a
+#     lease whose router stops resolving for 60 s
+#     asks again keeping its address, the wait doubling while the same router comes back and
+#     still fails, and a live router whose MAC left TT is ARPed back first; AT+MESHDHCP=0 never
+#     asks; and every lwIP call it makes runs inside esp_netif_tcpip_exec.
+MC=../../../main/mesh.c
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^\/\* Batman mode: bat0 comes up/ {p=1} /^static void mesh_probe_burst_task/ {exit} p' "$MC" > "$T/fn.c"
+cat > "$T/t.c" <<'EOF'
+/* mesh_bat_netif_poll_, compiled out of main/mesh.c, one call per 2 s probe tick against a model
+ * of esp_netif (IDF's DHCP-client rules), lwIP's DHCP client and ARP table, DHCP servers and the
+ * engine's answers. lwIP state is only touched inside esp_netif_tcpip_exec, or counted. */
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "bat.h"
+#include "bat_mode.h"
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_FAIL (-1)
+#define ESP_ERR_INVALID_STATE 0x103
+#define ESP_ERR_NOT_STOPPED 0x5001
+#define ESP_ERR_ALREADY 0x5002
+typedef int err_t;
+#define ERR_OK 0
+#define ERR_ARG (-16)
+typedef struct { uint32_t addr; } esp_ip4_addr_t, ip4_addr_t;
+#define ip4_addr_isany_val(a) ((a).addr == 0)
+typedef struct { esp_ip4_addr_t ip, netmask, gw; } esp_netif_ip_info_t;
+typedef enum { ESP_NETIF_DHCP_INIT, ESP_NETIF_DHCP_STARTED, ESP_NETIF_DHCP_STOPPED } esp_netif_dhcp_status_t;
+typedef struct esp_netif_obj esp_netif_t;
+typedef int portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED 0
+#define portENTER_CRITICAL(m) ((void)(m))
+#define portEXIT_CRITICAL(m) ((void)(m))
+struct dhcp { uint8_t state; };
+#define DHCP_STATE_OFF 0
+#define DHCP_STATE_REQUESTING 1
+#define DHCP_STATE_REBINDING 4
+#define DHCP_STATE_RENEWING 5
+#define DHCP_STATE_SELECTING 6
+#define DHCP_STATE_CHECKING 8
+#define DHCP_STATE_BOUND 10
+struct netif { ip4_addr_t ip, mask, gw; struct dhcp *dhcp; int up; };
+struct eth_addr { uint8_t addr[6]; };
+#define IP4_ADDR(p, a, b, c, d) ((p)->addr = (uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
+#define IPSTR "%u.%u.%u.%u"
+#define IP2STR(p) (unsigned)((p)->addr & 0xff), (unsigned)((p)->addr >> 8 & 0xff), (unsigned)((p)->addr >> 16 & 0xff), (unsigned)((p)->addr >> 24)
+static int verbose, in_tcpip, outside, in_esp;
+#define LWIP_CTX() (outside += !in_tcpip)
+static void lg(const char *fmt, ...) { if (verbose) { va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); puts(""); } }
+#define ESP_LOGI(tag, ...) lg(__VA_ARGS__)
+#define ESP_LOGW(tag, ...) lg(__VA_ARGS__)
+static const char *TAG = "t";
+#define MESH_PROBE_BURST_PERIOD_MS 2000
+
+/* ---- the world ---- */
+static struct esp_netif_obj { esp_netif_dhcp_status_t st; esp_netif_ip_info_t cache; } N;
+static struct netif LW;
+static struct dhcp D;
+static int64_t clock_us;
+static uint8_t cfg_dhcp;
+static unsigned routes;
+static int bad_set, dhcp_starts, raw_starts, raw_tries, releases, probes, probe_with_ip, dhcp_broken, tick;
+static uint32_t held[4];
+static int nheld, stable[256];
+/* DHCP server: offers to a client that has run srv_delay_ms, which then requests for srv_req_ms
+ * and ARP-checks the offer for check_ms before the lease binds; a NAK at nak_ms clears the
+ * address. Any address set during the check suspends it for good (lwIP's netif.c). */
+static int srv_on, srv_delay_ms, srv_req_ms, check_ms, client_ms, nak_ms, acd_off, set_in_check;
+static uint32_t lease_ip, lease_router;
+/* The router: answers ARP while rtr_up, heard rtr_age_ms ago. Its node's TT row for its MAC
+ * (rtr_tt) goes 600 s after it last sent into batman and an ARP reply puts it back, unless
+ * tt_full (the engine's table cannot take it); lwIP's ARP entry for it (rtr_arp_ms old) goes at 300 s. */
+static uint32_t rtr_ip;
+static int rtr_up, rtr_tt, rtr_learned, rtr_queries, tt_full;
+static uint32_t rtr_age_ms, rtr_arp_ms;
+/* lwIP binds the lease on the tcpip thread just before the next HOLD op (its ARP check ended). */
+static int bind_before_hold;
+static struct eth_addr RTR_MAC = { { 0x02, 0xd4, 0x0b, 0x00, 0x00, 0xff } };
+static uint8_t watched[6];
+static int watching, gw_on;
+
+static uint32_t A4(unsigned a, unsigned b, unsigned c, unsigned d) { ip4_addr_t x; IP4_ADDR(&x, a, b, c, d); return x.addr; }
+static esp_netif_t *mmhalow_get_netif(void) { return &N; }
+static uint8_t warthog_cfg_get_mesh_dhcp(void) { return cfg_dhcp; }
+static unsigned warthog_bat_port_routes(void) { return routes; }
+static void warthog_bat_port_soft_mac(uint8_t m[6]) { static const uint8_t s[6] = { 6, 0xca, 0x43, 0x3c, 0x24, 0x28 }; memcpy(m, s, 6); }
+static void warthog_bat_port_watch(const uint8_t mac[6]) { watching = mac != NULL; if (mac) memcpy(watched, mac, 6); }
+static int warthog_bat_port_watch_answer(const uint8_t mac[6], struct bat_client_route *r)
+{
+    if (!watching || memcmp(mac, watched, 6)) return -1;
+    memset(r, 0, sizeof(*r));
+    r->ogm_age_ms = rtr_age_ms;
+    return rtr_up && rtr_tt;
+}
+static uint8_t warthog_bat_port_gw(struct bat_gw *g) /* gw_on: how many gateways have a route */
+{
+    memset(g, 0, sizeof(*g));
+    if (gw_on) { g->orig[0] = 2; g->down = 100; g->up = 20; }
+    return (uint8_t)gw_on;
+}
+static int64_t esp_timer_get_time(void) { return clock_us; }
+
+/* lwIP (tcpip context only) */
+static void lw_set(uint32_t ip, uint32_t mask, uint32_t gw) { LW.ip.addr = ip; LW.mask.addr = mask; LW.gw.addr = gw; }
+static err_t dhcp_start(struct netif *l)
+{
+    LWIP_CTX();
+    if (!l->up) return ERR_ARG;
+    raw_tries += !in_esp;
+    if (dhcp_broken) return -1;
+    l->dhcp = &D;
+    D.state = DHCP_STATE_SELECTING; /* the address stays until a lease binds */
+    client_ms = 0;
+    raw_starts += !in_esp; /* mesh.c's own starts, beside an address */
+    return ERR_OK;
+}
+/* lwIP's dhcp_supplied_address: a lease is held while bound, renewing (T1) or rebinding (T2). */
+static int lw_lease(void) { return D.state == DHCP_STATE_BOUND || D.state == DHCP_STATE_RENEWING || D.state == DHCP_STATE_REBINDING; }
+static void dhcp_release_and_stop(struct netif *l)
+{
+    LWIP_CTX();
+    if (!l->dhcp || D.state == DHCP_STATE_OFF) return;
+    if (lw_lease()) { releases++; lw_set(0, 0, 0); }
+    D.state = DHCP_STATE_OFF;
+}
+static uint8_t dhcp_supplied_address(const struct netif *l) { LWIP_CTX(); return l->dhcp && lw_lease(); }
+static struct dhcp *netif_dhcp_data_(struct netif *l) { LWIP_CTX(); return l->dhcp; }
+#define netif_dhcp_data(l) netif_dhcp_data_(l)
+static const ip4_addr_t *lw_addr(const ip4_addr_t *a) { LWIP_CTX(); return a; }
+#define netif_ip4_addr(l) lw_addr(&(l)->ip)
+#define netif_ip4_netmask(l) lw_addr(&(l)->mask)
+#define netif_ip4_gw(l) lw_addr(&(l)->gw)
+#define ip4_addr_get_u32(p) ((p)->addr)
+static void netif_set_addr(struct netif *l, const ip4_addr_t *ip, const ip4_addr_t *m, const ip4_addr_t *g)
+{
+    LWIP_CTX();
+    set_in_check += D.state == DHCP_STATE_CHECKING;
+    acd_off |= D.state == DHCP_STATE_CHECKING;
+    l->ip = *ip; l->mask = *m; l->gw = *g;
+}
+static int etharp_find_addr(struct netif *l, const ip4_addr_t *ip, struct eth_addr **e, const ip4_addr_t **r)
+{
+    (void)l; (void)r;
+    LWIP_CTX();
+    if (ip->addr == rtr_ip && rtr_ip) { if (!rtr_learned || rtr_arp_ms > 300000) return -1; *e = &RTR_MAC; return 0; }
+    return stable[ip->addr >> 24] ? 0 : -1;
+}
+static int etharp_query(struct netif *l, const ip4_addr_t *ip, void *q)
+{
+    (void)l; (void)q;
+    LWIP_CTX();
+    if (ip->addr == rtr_ip && rtr_ip) { /* a broadcast request; the router's reply re-enters its TT */
+        rtr_queries++;
+        rtr_learned |= rtr_up;
+        if (rtr_up) { rtr_tt = !tt_full; rtr_arp_ms = 0; }
+        return 0;
+    }
+    probes++;
+    probe_with_ip += LW.ip.addr != 0;
+    for (int i = 0; i < nheld; i++) if (held[i] == ip->addr) stable[ip->addr >> 24] = 1; /* its holder replies */
+    return 0;
+}
+
+/* esp_netif (thread-safe: IPC into tcpip), IDF's DHCP-client rules */
+static void *esp_netif_get_netif_impl(esp_netif_t *n) { (void)n; return &LW; }
+static void (*tcpip_first)(esp_err_t (*fn)(void *), void *ctx); /* lwIP's own work, due before the call */
+static esp_err_t esp_netif_tcpip_exec(esp_err_t (*fn)(void *), void *ctx)
+{
+    int was = in_tcpip;
+    in_tcpip = 1;
+    if (tcpip_first) tcpip_first(fn, ctx);
+    esp_err_t e = fn(ctx);
+    in_tcpip = was;
+    return e;
+}
+static esp_err_t esp_netif_dhcpc_start(esp_netif_t *n)
+{
+    if (n->st == ESP_NETIF_DHCP_STARTED) return ESP_ERR_ALREADY;
+    memset(&n->cache, 0, sizeof(n->cache));
+    if (!LW.up) { n->st = ESP_NETIF_DHCP_INIT; return ESP_OK; }
+    lw_set(0, 0, 0);
+    in_tcpip++;
+    in_esp++;
+    err_t e = dhcp_start(&LW);
+    in_esp--;
+    in_tcpip--;
+    if (e != ERR_OK) return ESP_FAIL; /* the status stays */
+    n->st = ESP_NETIF_DHCP_STARTED;
+    dhcp_starts++;
+    return ESP_OK;
+}
+static esp_err_t esp_netif_dhcpc_stop(esp_netif_t *n)
+{
+    if (n->st == ESP_NETIF_DHCP_STOPPED) return ESP_ERR_ALREADY;
+    if (n->st == ESP_NETIF_DHCP_STARTED) {
+        in_tcpip++;
+        dhcp_release_and_stop(&LW);
+        in_tcpip--;
+        memset(&n->cache, 0, sizeof(n->cache));
+    }
+    n->st = ESP_NETIF_DHCP_STOPPED;
+    return ESP_OK;
+}
+static void esp_netif_action_connected(void *n_, const char *b, int id, void *d)
+{
+    (void)b; (void)id; (void)d;
+    esp_netif_t *n = n_;
+    LW.up = 1;
+    lw_set(n->cache.ip.addr, n->cache.netmask.addr, n->cache.gw.addr); /* esp_netif_up: the cached address */
+    if (n->st == ESP_NETIF_DHCP_INIT) (void)esp_netif_dhcpc_start(n);
+}
+static esp_err_t esp_netif_get_ip_info(esp_netif_t *n, esp_netif_ip_info_t *i)
+{
+    if (!LW.up) { *i = n->cache; return ESP_OK; }
+    i->ip = LW.ip; i->netmask = LW.mask; i->gw = LW.gw;
+    return ESP_OK;
+}
+static esp_err_t esp_netif_set_ip_info(esp_netif_t *n, const esp_netif_ip_info_t *i)
+{
+    if (n->st != ESP_NETIF_DHCP_STOPPED) { bad_set++; return ESP_ERR_NOT_STOPPED; }
+    n->cache = *i;
+    if (LW.up) lw_set(i->ip.addr, i->netmask.addr, i->gw.addr);
+    return ESP_OK;
+}
+#include "fn.c"
+
+static void bind_first(esp_err_t (*fn)(void *), void *ctx)
+{
+    if (bind_before_hold && fn == mesh_bat_io_ && ((struct mesh_bat_io *)ctx)->op == MESH_BAT_IO_HOLD) {
+        bind_before_hold = 0;
+        D.state = DHCP_STATE_BOUND;
+        lw_set(lease_ip, A4(255, 255, 0, 0), lease_router);
+    }
+}
+
+static int fails;
+#define CHECK(c, ...) do { int c_ = !!(c); if (!c_) { fails++; printf(__VA_ARGS__); printf(" | "); } } while (0)
+static void reset(int dhcp)
+{
+    memset(&N, 0, sizeof(N));
+    memset(&LW, 0, sizeof(LW));
+    memset(&D, 0, sizeof(D));
+    memset(&s_bat0, 0, sizeof(s_bat0));
+    memset(&s_bat_rtr, 0, sizeof(s_bat_rtr));
+    memset(stable, 0, sizeof(stable));
+    s_bat_poll_us = 0;
+    clock_us = 1000000;
+    bad_set = dhcp_starts = raw_starts = raw_tries = releases = probes = probe_with_ip = tick = nheld = dhcp_broken = 0;
+    srv_on = client_ms = 0;
+    srv_delay_ms = 4000;
+    srv_req_ms = check_ms = acd_off = set_in_check = bind_before_hold = 0;
+    nak_ms = -1;
+    lease_ip = A4(10, 41, 0, 102);
+    lease_router = rtr_ip = A4(10, 41, 0, 2);
+    rtr_up = rtr_tt = 1;
+    rtr_learned = rtr_queries = tt_full = 0;
+    rtr_age_ms = 400;
+    rtr_arp_ms = 0;
+    watching = gw_on = 0;
+    cfg_dhcp = (uint8_t)dhcp;
+    routes = 1;
+    tcpip_first = bind_first;
+}
+static void step(void)
+{
+    mesh_bat_netif_poll_();
+    clock_us += 2000000;
+    tick++;
+    rtr_arp_ms += 2000;
+    if (LW.dhcp && D.state != DHCP_STATE_OFF && !lw_lease()) { /* the server */
+        client_ms += 2000;
+        if (client_ms == nak_ms) lw_set(0, 0, 0);
+        if (srv_on && client_ms >= srv_delay_ms && D.state == DHCP_STATE_SELECTING) {
+            D.state = DHCP_STATE_REQUESTING;
+        }
+        if (srv_on && client_ms >= srv_delay_ms + srv_req_ms && D.state == DHCP_STATE_REQUESTING) {
+            D.state = check_ms ? DHCP_STATE_CHECKING : DHCP_STATE_BOUND;
+        }
+        if (D.state == DHCP_STATE_CHECKING && !acd_off && client_ms >= srv_delay_ms + srv_req_ms + check_ms) {
+            D.state = DHCP_STATE_BOUND;
+        }
+        if (D.state == DHCP_STATE_BOUND) {
+            lw_set(lease_ip, A4(255, 255, 0, 0), lease_router);
+        }
+    }
+}
+static unsigned cand(unsigned attempt)
+{
+    uint8_t s[6], a[4];
+    warthog_bat_port_soft_mac(s);
+    bat_mode_static_ip(s, attempt, a);
+    return A4(a[0], a[1], a[2], a[3]);
+}
+/* Steps until the static candidate is on bat0 (at most 60); returns the ticks taken. */
+static int to_static(void)
+{
+    int t = 0;
+    while (t < 60 && !(LW.ip.addr && N.st == ESP_NETIF_DHCP_STOPPED && LW.ip.addr == N.cache.ip.addr)) { step(); t++; }
+    return t;
+}
+int main(int argc, char **argv)
+{
+    verbose = argc > 1;
+    const uint32_t GW = A4(10, 41, 0, 1), MASK = A4(255, 255, 0, 0);
+    char line[BAT_MODE_BAT0_LINE];
+
+    reset(1); /* a node that booted with us: its broadcast hold ends ~31 s in; lease at 36 s */
+    srv_on = 1;
+    srv_delay_ms = 36000;
+    for (int i = 0; i < 40; i++) step();
+    CHECK(LW.ip.addr == lease_ip && N.st == ESP_NETIF_DHCP_STARTED && probes == 0 && dhcp_starts == 1,
+          "lease at 36 s after the first route not kept (ip %08x st %d probes %d)", LW.ip.addr, N.st, probes);
+    (void)warthog_mesh_bat0_line(line, sizeof(line));
+    CHECK(strstr(line, " addr=leased ip=10.41.0.102 router=10.41.0.2(ok) "), "AT line while leased: %s", line);
+
+    reset(1); /* the offer comes at 44 s and its REQUEST/ACK takes 4 s: past the 45 s deadline */
+    srv_on = 1;
+    srv_delay_ms = 44000;
+    srv_req_ms = 4000;
+    for (int i = 0; i < 30; i++) step();
+    CHECK(LW.ip.addr == lease_ip && probes == 0 && dhcp_starts == 1,
+          "an offer taken across the 45 s deadline was cut off (ip %08x probes %d)", LW.ip.addr, probes);
+
+    reset(1);
+    routes = 0;
+    for (int i = 0; i < 5; i++) step();
+    CHECK(LW.up == 0 && dhcp_starts == 0, "bat0 came up with no route");
+    routes = 1;
+    nheld = 1;
+    held[0] = cand(0);
+    int t_probe = -1;
+    for (int i = 0; i < 40; i++) { step(); if (probes && t_probe < 0) t_probe = tick; }
+    CHECK(dhcp_starts == 1 && t_probe >= 5 + 23, "DHCP gave up before 45 s (first probe at tick %d)", t_probe);
+    CHECK(LW.ip.addr == cand(1) && LW.gw.addr == GW && LW.mask.addr == MASK && N.st == ESP_NETIF_DHCP_STOPPED &&
+          D.state == DHCP_STATE_OFF && bad_set == 0, "no lease, candidate 0 answered: want candidate 1/16 via 10.41.0.1, "
+          "DHCP stopped (ip %08x gw %08x mask %08x st %d dhcp %d bad_set %d)", LW.ip.addr, LW.gw.addr, LW.mask.addr,
+          N.st, D.state, bad_set);
+    CHECK(probe_with_ip == 0 && probes >= 3, "ARP probes sent while bat0 had an address, or too few (%d)", probes);
+    (void)warthog_mesh_bat0_line(line, sizeof(line));
+    CHECK(strstr(line, " addr=static ") && strstr(line, " router=10.41.0.1 retry_in="), "AT line while static: %s", line);
+    routes = 0;
+    int flap = 0;
+    for (int i = 0; i < 20; i++) { step(); flap += LW.ip.addr != cand(1); }
+    CHECK(flap == 0 && raw_starts == 0, "no route: the static address kept, DHCP not asked (%d ticks off it)", flap);
+    routes = 1;
+    srv_on = 1;
+    int t = 0;
+    while (t < 5 && raw_starts == 0) { step(); t++; flap += LW.ip.addr == 0; }
+    CHECK(raw_starts == 1 && t == 1, "a route again after 40 s: DHCP asked beside the address at once (tick %d)", t);
+    for (int i = 0; i < 3; i++) { step(); flap += LW.ip.addr == 0; }
+    CHECK(flap == 0 && LW.ip.addr == lease_ip && LW.gw.addr == lease_router && dhcp_starts == 1 && bad_set == 0,
+          "and a lease replaced the static address without a tick at 0.0.0.0 (flap %d ip %08x)", flap, LW.ip.addr);
+
+    reset(1);
+    int ts = to_static();
+    uint32_t st_ip = LW.ip.addr;
+    t = 0;
+    while (t < 40 && raw_starts == 0) { step(); t++; }
+    CHECK(st_ip == cand(0) && raw_starts == 1 && t == 15, "static, no server: the first attempt 30 s later (tick %d)", t);
+    flap = 0;
+    t = 0;
+    while (t < 40 && D.state != DHCP_STATE_OFF) { step(); t++; flap += LW.ip.addr != st_ip; }
+    CHECK(flap == 0 && t == 23 && LW.ip.addr == st_ip && LW.gw.addr == GW && N.st == ESP_NETIF_DHCP_STOPPED &&
+          N.cache.ip.addr == st_ip && bad_set == 0, "the attempt keeps the address for its 46 s, then stops the client and "
+          "leaves it (t %d flap %d ip %08x st %d)", t, flap, LW.ip.addr, N.st);
+    t = 0;
+    while (t < 60 && raw_starts == 1) { step(); t++; }
+    CHECK(raw_starts == 2 && t == 30, "the next attempt 60 s later (tick %d)", t);
+    for (int i = 0; i < 40 && D.state != DHCP_STATE_OFF; i++) step();
+    for (int i = 0; i < 5; i++) step();
+    gw_on = 1;
+    t = 0;
+    while (t < 60 && raw_starts == 2) { step(); t++; }
+    CHECK(raw_starts == 3 && t == 10, "a gateway appears 10 s after the last attempt: the next 30 s after it, "
+          "not 120 s (tick %d)", t);
+    (void)ts;
+
+    reset(1); /* gate A known all along; gate B joins while A still routes, then A's route goes */
+    gw_on = 1;
+    (void)to_static();
+    for (int i = 0; i < 40 && raw_starts == 0; i++) step();
+    for (int i = 0; i < 40 && D.state != DHCP_STATE_OFF; i++) step();
+    t = 0;
+    while (t < 60 && raw_starts == 1) { step(); t++; }
+    CHECK(raw_starts == 2 && t == 30, "one gateway all along: the next attempt 60 s later (tick %d)", t);
+    for (int i = 0; i < 40 && D.state != DHCP_STATE_OFF; i++) step();
+    for (int i = 0; i < 5; i++) step();
+    gw_on = 2;
+    t = 0;
+    while (t < 60 && raw_starts == 2) { step(); t++; }
+    CHECK(raw_starts == 3 && t == 10, "a second gateway 10 s after the last attempt: the next 30 s after it, not "
+          "120 s (tick %d)", t);
+    for (int i = 0; i < 40 && D.state != DHCP_STATE_OFF; i++) step();
+    gw_on = 1;
+    t = 0;
+    while (t < 60 && raw_starts == 3) { step(); t++; }
+    CHECK(raw_starts == 4 && t == 30, "then A's route goes (one fewer is no new gateway): the wait doubles on, "
+          "60 s (tick %d)", t);
+
+    reset(1);
+    (void)to_static();
+    st_ip = LW.ip.addr;
+    nak_ms = 4000;
+    for (int i = 0; i < 40 && raw_starts == 0; i++) step();
+    int zero = 0;
+    for (int i = 0; i < 23; i++) { step(); zero += LW.ip.addr == 0; }
+    CHECK(zero == 1 && LW.ip.addr == st_ip && N.st == ESP_NETIF_DHCP_STOPPED,
+          "a NAK took the address mid-attempt: back on the next tick (%d ticks without), held after", zero);
+
+    reset(1); /* lwIP binds between the tick's READ and its HOLD */
+    (void)to_static();
+    nak_ms = 4000;
+    for (int i = 0; i < 40 && raw_starts == 0; i++) step();
+    bind_before_hold = 1;
+    for (int i = 0; i < 3; i++) step();
+    (void)warthog_mesh_bat0_line(line, sizeof(line));
+    CHECK(bind_before_hold == 0 && LW.ip.addr == lease_ip && LW.gw.addr == lease_router &&
+          strstr(line, " addr=leased ip=10.41.0.102 router=10.41.0.2"), "a lease bound after the tick read no "
+          "address: the held address went over it (ip %08x gw %08x) %s", LW.ip.addr, LW.gw.addr, line);
+
+    reset(1); /* a NAK, then another server's ACK, before the next tick: it reads the ARP check running */
+    (void)to_static();
+    srv_on = 1;
+    nak_ms = srv_delay_ms = check_ms = 2000;
+    for (int i = 0; i < 40 && raw_starts == 0; i++) step();
+    for (int i = 0; i < 3; i++) step();
+    CHECK(set_in_check == 0 && D.state == DHCP_STATE_BOUND && LW.ip.addr == lease_ip, "the held address was set "
+          "during lwIP's ARP check of an offer (%d), which that suspends (dhcp %d ip %08x)", set_in_check, D.state,
+          LW.ip.addr);
+
+    reset(1);
+    srv_on = 1;
+    for (int i = 0; i < 5; i++) step();
+    CHECK(LW.ip.addr == lease_ip && rtr_learned && rtr_queries == 1, "leased; the router's MAC learned with one ARP "
+          "request (%d)", rtr_queries);
+    for (int i = 0; i < 60; i++) step();
+    CHECK(raw_starts == 0 && dhcp_starts == 1 && rtr_queries == 1, "router heard for 2 min: the lease is left alone, "
+          "and not ARPed again (%d)", rtr_queries);
+    rtr_up = 0;
+    lease_ip = A4(10, 41, 7, 9);
+    lease_router = A4(10, 41, 7, 1);
+    t = 0;
+    zero = 0;
+    while (t < 60 && raw_starts == 0) { step(); t++; zero += LW.ip.addr == 0; }
+    CHECK(raw_starts == 1 && t == BAT_MODE_ROUTER_LOSS_MS / 2000, "the router stops resolving: DHCP again after 60 s "
+          "(tick %d)", t);
+    for (int i = 0; i < 3; i++) { step(); zero += LW.ip.addr == 0; }
+    CHECK(zero == 0 && LW.ip.addr == lease_ip && LW.gw.addr == lease_router && bad_set == 0,
+          "another node's lease, the old address kept until it bound (%d ticks at 0.0.0.0, ip %08x)", zero, LW.ip.addr);
+    CHECK(rtr_ip != LW.gw.addr, "setup: the new router is another address");
+
+    reset(1);
+    srv_on = 1;
+    for (int i = 0; i < 5; i++) step();
+    const uint32_t old_ip = LW.ip.addr;
+    rtr_up = srv_on = 0;
+    zero = 0;
+    t = 0;
+    while (t < 100 && !(raw_starts == 1 && D.state == DHCP_STATE_OFF)) { step(); t++; zero += LW.ip.addr != old_ip; }
+    CHECK(zero == 0 && LW.ip.addr == old_ip && LW.gw.addr == GW && LW.mask.addr == MASK && N.st == ESP_NETIF_DHCP_STOPPED &&
+          N.cache.ip.addr == old_ip && N.cache.gw.addr == GW && releases == 0 && bad_set == 0,
+          "router gone, no server: the lease address held via 10.41.0.1, esp_netif agreeing, nothing released "
+          "(ip %08x gw %08x st %d cache %08x)", LW.ip.addr, LW.gw.addr, N.st, N.cache.ip.addr);
+    (void)warthog_mesh_bat0_line(line, sizeof(line));
+    CHECK(strstr(line, " addr=held ip=10.41.0.102 router=10.41.0.1 retry_in=30s ") && strstr(line, " restarts=1 "),
+          "AT line while holding a former lease: %s", line);
+
+    reset(1);
+    srv_on = 1;
+    rtr_up = 1;
+    rtr_age_ms = BAT_MODE_ROUTER_OGM_MS + 1;
+    t = 0;
+    while (t < 80 && raw_starts == 0) { step(); t++; }
+    CHECK(raw_starts == 1 && t >= 31 && t <= 33, "a router TT still resolves but whose OGMs stopped: DHCP again "
+          "after 60 s (tick %d)", t);
+
+    reset(1);
+    srv_on = 1;
+    rtr_up = 0;
+    t = 0;
+    while (t < 80 && raw_starts == 0) { step(); t++; }
+    CHECK(raw_starts == 1 && t >= 31 && t <= 33 && rtr_queries >= 5 && rtr_queries <= 7,
+          "a router MAC that never resolves: DHCP again after 60 s (tick %d), ARPed every 10 s, not every tick (%d)",
+          t, rtr_queries);
+
+    reset(1); /* an idle live router: 10 min without a frame from it, its OGMs going on */
+    srv_on = 1;
+    for (int i = 0; i < 305; i++) step();
+    int q0 = rtr_queries, lost = 0;
+    rtr_tt = 0;
+    for (int i = 0; i < 100; i++) { step(); lost += s_bat_view.router == BAT_MODE_ROUTER_LOST; }
+    CHECK(raw_starts == 0 && rtr_tt && rtr_queries == q0 + 1 && lost <= 2, "a live router whose MAC left TT: ARPed "
+          "back, the lease left alone (DHCP restarts %d, ARPs %d, ticks lost %d)", raw_starts, rtr_queries - q0, lost);
+    for (int i = 0; i < 20; i++) step();
+    q0 = rtr_queries;
+    lost = 0;
+    rtr_tt = 0; /* its node restarted batman: the row goes while lwIP still holds the router's MAC */
+    for (int i = 0; i < 40; i++) { step(); lost += s_bat_view.router == BAT_MODE_ROUTER_LOST; }
+    CHECK(raw_starts == 0 && rtr_tt && rtr_queries == q0 + 1 && lost <= 2, "the same with lwIP's ARP entry still "
+          "fresh (DHCP restarts %d, ARPs %d, ticks lost %d)", raw_starts, rtr_queries - q0, lost);
+    rtr_tt = rtr_up = 0;
+    const int s0 = raw_starts;
+    q0 = rtr_queries;
+    t = 0;
+    while (t < 60 && raw_starts == s0) { step(); t++; }
+    CHECK(raw_starts == s0 + 1 && t == BAT_MODE_ROUTER_LOSS_MS / 2000 && rtr_queries - q0 >= 5 && rtr_queries - q0 <= 7,
+          "a dead router whose MAC left TT: DHCP again after 60 s (tick %d), ARPed every 10 s (%d)", t, rtr_queries - q0);
+
+    reset(1); /* the router answers ARP but its row never fits the engine's TT; the server hands the same lease back */
+    srv_on = tt_full = 1;
+    rtr_tt = 0;
+    int leased_at = -1, nw = 0, waits[4] = { 0 };
+    for (int i = 0; i < 600 && nw < 4; i++) {
+        const int before = raw_starts;
+        step();
+        if (leased_at < 0 && bat_mode_bat0_leased(&s_bat0)) leased_at = tick;
+        if (raw_starts > before && leased_at >= 0) { waits[nw++] = (tick - leased_at) * 2; leased_at = -1; }
+    }
+    (void)warthog_mesh_bat0_line(line, sizeof(line));
+    CHECK(nw == 4 && waits[0] == 60 && waits[1] == 120 && waits[2] == 240 && waits[3] == 480 &&
+          LW.ip.addr == lease_ip && strstr(line, " restarts=4 "), "a router the check never passes, the same lease "
+          "back each time: DHCP again after 60, 120, 240, 480 s, not every 60 s (%d restarts: %d %d %d %d s) %s", nw,
+          waits[0], waits[1], waits[2], waits[3], line);
+
+    reset(1);
+    (void)to_static();
+    dhcp_broken = 1;
+    int t1 = -1, t2 = -1;
+    for (int i = 0; i < 80 && t2 < 0; i++) {
+        int before = raw_tries;
+        step();
+        if (raw_tries > before) { if (t1 < 0) t1 = i; else t2 = i; }
+    }
+    CHECK(t1 == 14 && t2 - t1 == 31 && raw_starts == 0 && LW.ip.addr == cand(0),
+          "a background start that fails ends that attempt on the next tick: the next one 60 s later "
+          "(tries at ticks %d, %d)", t1, t2);
+
+    reset(1);
+    dhcp_broken = 1;
+    for (int i = 0; i < 4; i++) step();
+    CHECK(dhcp_starts == 0 && LW.ip.addr == cand(0) && probe_with_ip == 0 && bad_set == 0,
+          "the DHCP client would not start: want candidate 0 after two quiet ticks, not a 45 s wait (ip %08x)", LW.ip.addr);
+
+    reset(0);
+    for (int i = 0; i < 4; i++) step();
+    CHECK(dhcp_starts == 0 && LW.ip.addr == cand(0) && LW.gw.addr == GW && LW.up && bad_set == 0,
+          "AT+MESHDHCP=0: want candidate 0 after two quiet ticks, no DHCP (starts %d ip %08x)", dhcp_starts, LW.ip.addr);
+    srv_on = gw_on = 1;
+    for (int i = 0; i < 400; i++) { routes = (unsigned)(i / 7) & 1; step(); }
+    CHECK(dhcp_starts == 0 && raw_starts == 0 && LW.ip.addr == cand(0), "AT+MESHDHCP=0 never asks DHCP");
+
+    reset(1); /* the ACK at 42 s; lwIP's ARP check of it (PROBE_WAIT, 3 probes, ANNOUNCE_WAIT: 4-7 s) spans 45 s */
+    srv_on = 1;
+    srv_delay_ms = 40000;
+    srv_req_ms = 2000;
+    check_ms = 6000;
+    int seen_check = 0;
+    for (int i = 0; i < 35; i++) {
+        const int was = D.state;
+        step();
+        seen_check += was == DHCP_STATE_CHECKING && s_bat0.ms >= BAT_MODE_DHCP_WAIT_MS;
+    }
+    CHECK(seen_check >= 1 && LW.ip.addr == lease_ip && D.state == DHCP_STATE_BOUND && probes == 0 && dhcp_starts == 1,
+          "an offer lwIP was ARP-checking at the 45 s deadline was cut off (checked past it %d, ip %08x dhcp %d "
+          "probes %d)", seen_check, LW.ip.addr, D.state, probes);
+
+    reset(1); /* T1: the unicast renewal goes unanswered for 80 s, T2: the broadcast one for 60 s, then an ACK */
+    srv_on = 1;
+    for (int i = 0; i < 5; i++) step();
+    int off_lease = 0;
+    for (int i = 0; i < 70; i++) {
+        if (i == 0 || (i == 40 && D.state == DHCP_STATE_RENEWING)) D.state = i ? DHCP_STATE_REBINDING : DHCP_STATE_RENEWING;
+        step();
+        (void)warthog_mesh_bat0_line(line, sizeof(line));
+        off_lease += !strstr(line, " addr=leased ") || LW.ip.addr != lease_ip;
+    }
+    if (D.state == DHCP_STATE_REBINDING) D.state = DHCP_STATE_BOUND; /* the ACK */
+    for (int i = 0; i < 3; i++) step();
+    CHECK(off_lease == 0 && raw_starts == 0 && dhcp_starts == 1 && probes == 0 && releases == 0 &&
+          LW.ip.addr == lease_ip, "a lease renewing or rebinding was taken for a lost one (%d ticks off it, restarts %d "
+          "probes %d releases %d)", off_lease, raw_starts, probes, releases);
+
+    CHECK(outside == 0, "%d lwIP calls outside tcpip context", outside);
+    return fails != 0;
+}
+EOF
+why=""
+if ! ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -I"$T" -I../../../main -I../../../main/bat -o "$T/t" "$T/t.c" \
+       ../../../main/bat_mode.c 2>"$T/cc.log"; then
+  why="did not build: $(head -3 "$T/cc.log" | tr '\n' ' ')"
+elif ! why=$("$T/t" 2>&1); then
+  why="${why:-crashed}"
+else
+  why=""
+fi
+rm -rf "$T"
+if ! awk '/^static void mesh_probe_burst_task\(/,/^}/' "$MC" | \
+       awk '/if \(warthog_bat_port_running\(\)\) \{/ {r=NR} r && NR == r + 1 && /^ *mesh_bat_netif_poll_\(\);/ {p=NR}
+            p && NR == p + 1 && /} else if \(g_warthog_mpm_estab \|\| g_warthog_hostap_estab\) \{/ {e=NR}
+            e && NR == e + 1 && /^ *mesh_netif_up_\(\);/ {u=1} /mesh_netif_up_\(\);/ {n++}
+            END {exit (u && n == 1) ? 0 : 1}'; then
+  why="$why the probe task does not poll bat0 exactly while batman runs;"
+fi
+if ! awk '/^void warthog_mesh_smoke_test\(/,/^}/' "$MC" | \
+       awk '/st = mmwlan_mesh_enable\(/ {e=NR} e && !s && /if \(st == MMWLAN_SUCCESS\) \{/ {s=NR}
+            s && NR == s + 1 && /^ *warthog_bat_port_mesh_up\(\);/ {u=NR} u && NR == u + 1 && /} else \{/ {x=NR}
+            x && NR == x + 1 && /^ *warthog_bat_port_mesh_failed\(\);/ {f=1} END {exit f ? 0 : 1}'; then
+  why="$why mmwlan_mesh_enable's result does not reach warthog_bat_port_mesh_up / _mesh_failed;"
+fi
+# Statically too: the lwIP calls sit only in functions esp_netif_tcpip_exec runs.
+why="$why$(lwip_only_in_tcpip "$MC" mesh_bat_io_ \
+  '(dhcp_start|dhcp_release_and_stop|dhcp_supplied_address|netif_dhcp_data|netif_set_addr|etharp_[a-z_]+|netif_ip4_[a-z]+)[(]')"
+if [ -z "$why" ]; then
+  ok "bat0: polled while batman runs, DHCP for 45 s from the first route (an offer ARP-checked at the deadline kept), ARP-probed static via 10.41.0.1, retried beside it, router loss restarts DHCP backing off, renewals stay leased, lwIP only in tcpip context"
+else
+  bad "mesh.c batman bring-up: $why"
+fi
+
+# 36. The link throughput batman is given: umac_rc_get_expected_tput_kbps (umac_rc.c) and
+#     mmrc's rate table (mmrc.c) compiled out of the SDK and run, so kbit/s stays kbit/s
+#     (300 at 1 MHz MCS0, 3 to the engine) and a rate outside the table reads 0, never
+#     past it. Nothing else links umac_rc.c on the host.
+FW=../../halow/components/mm-iot-sdk/framework
+[ -n "${SIMNODE_INCS:-}" ] || SIMNODE_INCS=$(env -u MAKEFLAGS -u MAKELEVEL make -s --no-print-directory simnode-incs)
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^u32 mmrc_calculate_theoretical_throughput\(/,/^}/' "$FW/morselib/mmrc/src/core/mmrc.c" > "$T/fn.c"
+awk '/^uint32_t umac_rc_get_expected_tput_kbps\(/,/^}/' "$FW/morselib/src/umac/rc/umac_rc.c" >> "$T/fn.c"
+cat > "$T/t.c" <<'EOF'
+#include <stdio.h>
+#include <string.h>
+#include "umac_rc_data.h"
+#include "bat_mode.h"
+struct umac_sta_data { struct umac_rc_sta_data rc; };
+static struct mmrc_rate best;
+struct umac_rc_sta_data *umac_sta_data_get_rc(struct umac_sta_data *stad) { return &stad->rc; }
+struct mmrc_rate mmrc_sta_get_best_rate(struct mmrc_table *tb) { (void)tb; return best; }
+#include "fn.c"
+static int fails;
+#define CHECK(c, ...) do { if (!(c)) { fails++; printf(__VA_ARGS__); printf(" | "); } } while (0)
+static uint32_t at(unsigned bw, unsigned mcs, unsigned sgi, struct umac_sta_data *s)
+{
+    memset(&best, 0, sizeof(best));
+    best.bw = bw & 7; best.rate = mcs & 15; best.guard = sgi & 1;
+    return umac_rc_get_expected_tput_kbps(s);
+}
+int main(void)
+{
+    static struct mmrc_table tb;
+    struct umac_sta_data s = { { &tb } };
+    uint32_t v;
+    CHECK((v = at(MMRC_BW_1MHZ, MMRC_MCS0, 0, &s)) == 300, "1 MHz MCS0 LGI: %u kbit/s, want 300", (unsigned)v);
+    CHECK((v = at(MMRC_BW_8MHZ, MMRC_MCS9, 1, &s)) == 43333, "8 MHz MCS9 SGI: %u, want 43333", (unsigned)v);
+    CHECK((v = at(MMRC_BW_1MHZ, MMRC_MCS10, 0, &s)) == 150, "1 MHz MCS10 LGI: %u, want 150", (unsigned)v);
+    CHECK((v = at(MMRC_BW_2MHZ, MMRC_MCS_UNUSED, 0, &s)) == 0, "no MCS yet: %u, want 0", (unsigned)v);
+    CHECK((v = at(MMRC_BW_8MHZ, MMRC_MCS_UNUSED, 1, &s)) == 0, "no MCS yet at 8 MHz SGI: %u, want 0", (unsigned)v);
+    CHECK((v = at(MMRC_BW_16MHZ, MMRC_MCS0, 0, &s)) == 0, "16 MHz (no table row): %u, want 0", (unsigned)v);
+    s.rc.reference_table = NULL;
+    CHECK(at(MMRC_BW_1MHZ, MMRC_MCS0, 0, &s) == 0 && umac_rc_get_expected_tput_kbps(NULL) == 0, "no table / no station: 0");
+    s.rc.reference_table = &tb;
+    CHECK(bat_mode_kbps_to_units(true, true, true, at(MMRC_BW_1MHZ, MMRC_MCS0, 0, &s)) == 3,
+          "1 MHz MCS0 reaches the engine as 3 (x 100 kbit/s)");
+    return fails != 0;
+}
+EOF
+why=""
+if [ "$(grep -c . "$T/fn.c")" -lt 20 ]; then
+  why="the helper or the rate table was not found"
+elif ! ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} $SIMNODE_INCS -I"$FW/morselib/src/umac/rc" -I"$T" \
+       -I../../../main -I../../../main/bat -o "$T/t" "$T/t.c" ../../../main/bat_mode.c 2>"$T/cc.log"; then
+  why="did not build: $(head -3 "$T/cc.log" | tr '\n' ' ')"
+elif ! why=$("$T/t" 2>&1); then
+  why="${why:-crashed}"
+else
+  why=""
+fi
+rm -rf "$T"
+if [ -z "$why" ]; then
+  ok "rate control's expected throughput is kbit/s from mmrc's table, 0 outside it, 100 kbit/s units to the engine"
+else
+  bad "umac_rc_get_expected_tput_kbps: $why"
+fi
+
+# 37. Mesh peer records are deleted on the event loop, while the TX entry (netif, batman
+#     engine) and the RX filter (chip driver task) look them up on their own tasks, between
+#     umac_datapath_mesh_read_begin and _read_end. A record is freed only by the reclaim
+#     (mesh_free_retired_), and nothing under the spinlock. test_simnode_datapath and _batman drive
+#     the interleavings; this keeps an edit from dropping the bracket or adding a free path.
+DP=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/datapath
+why=""
+frees=$(awk '/^[a-zA-Z_].*\(/ && !/;$/ { fn=$0 } /mmosal_free\(/ { print fn }' "$DP/umac_datapath_mesh.c" | sort -u)
+case "$frees" in
+  "static void mesh_free_retired_("*) [ "$(printf '%s\n' "$frees" | grep -c .)" = 1 ] || \
+    why="$why umac_datapath_mesh.c frees outside mesh_free_retired_ ($frees);" ;;
+  *) why="$why umac_datapath_mesh.c frees outside mesh_free_retired_ ($frees);" ;;
+esac
+in_cs=$(awk '/MMOSAL_TASK_ENTER_CRITICAL\(\)/ { c++ } /MMOSAL_TASK_EXIT_CRITICAL\(\)/ { c-- }
+  c > 0 && /mmpkt_release\(|mmosal_free\(|mmpkt_list_clear\(|mesh_free_retired_\(/ { printf "%d ", NR }' \
+  "$DP/umac_datapath_mesh.c")
+[ -z "$in_cs" ] || why="$why umac_datapath_mesh.c frees under the spinlock (line $in_cs);"
+for f in umac_datapath_tx_frame_resolve umac_datapath_rx_frame_filter; do
+  n=$(awk -v f="$f(" '/umac_datapath_mesh_read_begin\(\)/ { r=1 } /umac_datapath_mesh_read_end\(/ { r=0 }
+    index($0, f) && !/^static / { print (r ? "in" : "out") }' "$DP/umac_datapath.c" | tr '\n' ' ')
+  [ "$n" = "in " ] || why="$why $f is called outside read_begin/read_end or more than once ($n);"
+done
+if [ -z "$why" ]; then
+  ok "peer records: TX entry and RX filter read them between read_begin/end, freed only by the reclaim, never under the spinlock"
+else
+  bad "mesh peer record lifetime: $why"
+fi
+
+# 38. NAPT (main/nat.c, which batman mode also uses for the tether) is enabled on the tcpip
+#     thread: the first ip_napt_enable_netif arms lwIP's NAPT timer with sys_timeout, which
+#     inserts into tcpip's unlocked timer list (no core locking in any sdkconfig). enforce_state
+#     is compiled out of nat.c and ticked with the HaLow side's address appearing on the third
+#     tick: NAPT goes on for both inside netifs then, or for USB alone without an AP, with every
+#     NAPT call inside esp_netif_tcpip_exec; and statically no function outside one it runs
+#     calls the NAPT API.
+NC=../../../main/nat.c
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^static bool s_napt_logged/ {p=1} /^static void nat_task/ {exit} p' "$NC" > "$T/fn.c"
+cat > "$T/t.c" <<'EOF'
+/* enforce_state, compiled out of main/nat.c, against a model of esp_netif and lwIP's NAPT API.
+ * An ip_napt_enable_netif outside esp_netif_tcpip_exec is counted. */
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef int esp_err_t;
+#define ESP_OK 0
+typedef struct { uint32_t addr; } esp_ip4_addr_t;
+typedef struct { esp_ip4_addr_t ip, netmask, gw; } esp_netif_ip_info_t;
+typedef struct esp_netif_obj esp_netif_t;
+struct netif { uint8_t napt; };
+#define IPSTR "%u.%u.%u.%u"
+#define IP2STR(p) (unsigned)((p)->addr & 0xff), (unsigned)((p)->addr >> 8 & 0xff), (unsigned)((p)->addr >> 16 & 0xff), (unsigned)((p)->addr >> 24)
+#define ESP_LOGI(tag, ...) ((void)(tag))
+#define ESP_LOGW(tag, ...) ((void)(tag))
+static const char *TAG = "t";
+static int in_tcpip, outside, timer_arms, napt_table;
+struct esp_netif_obj { const char *key; int present; struct netif lw; esp_netif_ip_info_t ip; };
+static struct esp_netif_obj STA = { "WIFI_STA_DEF", 1 }, USB = { "USB", 1 }, AP = { "WIFI_AP_DEF", 1 };
+static bool warthog_mesh_bridge_active(void) { return false; }
+static esp_netif_t *esp_netif_get_handle_from_ifkey(const char *k)
+{
+    esp_netif_t *n = !strcmp(k, STA.key) ? &STA : !strcmp(k, USB.key) ? &USB : !strcmp(k, AP.key) ? &AP : NULL;
+    return n && n->present ? n : NULL;
+}
+static esp_err_t esp_netif_get_ip_info(esp_netif_t *n, esp_netif_ip_info_t *i) { *i = n->ip; return ESP_OK; }
+static esp_err_t esp_netif_set_default_netif(esp_netif_t *n) { (void)n; return ESP_OK; } /* IDF: IPC into tcpip */
+static void *esp_netif_get_netif_impl(esp_netif_t *n) { return &n->lw; }
+static esp_err_t esp_netif_tcpip_exec(esp_err_t (*fn)(void *), void *ctx)
+{
+    in_tcpip++;
+    esp_err_t e = fn(ctx);
+    in_tcpip--;
+    return e;
+}
+/* The first enable of any netif is ip_napt_init: mem_calloc, then sys_timeout(ip_napt_tmr). */
+static int ip_napt_enable_netif(struct netif *n, int en)
+{
+    outside += !in_tcpip;
+    timer_arms += en && !napt_table;
+    napt_table |= en;
+    n->napt = en != 0;
+    return 1;
+}
+#include "fn.c"
+static int fails;
+#define CHECK(c, ...) do { if (!(c)) { fails++; printf(__VA_ARGS__); printf(" | "); } } while (0)
+int main(void)
+{
+    for (int tick = 0; tick < 5; tick++) {
+        if (tick == 2) STA.ip.ip.addr = 0x6600290au; /* 10.41.0.102 on bat0, or the HaLow STA's lease */
+        enforce_state();
+        if (tick == 1) CHECK(!USB.lw.napt && !AP.lw.napt, "NAPT on before the HaLow side had an address");
+    }
+    CHECK(USB.lw.napt && AP.lw.napt && timer_arms == 1, "NAPT not on for both inside netifs (usb %d ap %d, "
+          "timer armed %d times)", USB.lw.napt, AP.lw.napt, timer_arms);
+    CHECK(outside == 0, "%d NAPT calls outside tcpip context (the first arms lwIP's timer list from the nat task)",
+          outside);
+    memset(&USB.lw, 0, sizeof(USB.lw));
+    memset(&AP.lw, 0, sizeof(AP.lw));
+    AP.present = 0;
+    s_napt_logged = false;
+    enforce_state();
+    CHECK(USB.lw.napt && !AP.lw.napt && outside == 0, "without the AP netif: want NAPT on USB alone, in tcpip "
+          "context (usb %d, %d outside)", USB.lw.napt, outside);
+    return fails != 0;
+}
+EOF
+why=""
+if ! grep -q '^static void enforce_state(' "$T/fn.c"; then
+  why="enforce_state not found"
+elif ! ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -I"$T" -o "$T/t" "$T/t.c" 2>"$T/cc.log"; then
+  why="did not build: $(head -3 "$T/cc.log" | tr '\n' ' ')"
+elif ! why=$("$T/t" 2>&1); then
+  why="${why:-crashed}"
+else
+  why=""
+fi
+rm -rf "$T"
+why="$why$(lwip_only_in_tcpip "$NC" nat_napt_on_ 'ip_napt_[a-z_]+[(]')"
+if [ -z "$why" ]; then
+  ok "NAPT: enabled on both inside netifs once the HaLow side has an address, only in tcpip context"
+else
+  bad "nat.c NAPT enable: $why"
+fi
+
+# 39. Every key= of the AT+BATSTAT? port line (bat_port_stat_line in main/bat_port.c) is
+#     named, in backticks, in the AT+BATSTAT? row of wiki/AT-Command-Reference.md, so a new
+#     port counter cannot ship undocumented.
+BP=../../../main/bat_port.c
+ATREF=../../../wiki/AT-Command-Reference.md
+keys=$(awk '/"\+BATSTAT: port / {p=1} p {print} p && /\\r\\n"/ {exit}' "$BP" |
+  sed -n 's/^[^"]*"\(.*\)".*$/\1/p' | tr ' ' '\n' | sed -n 's/^\([a-z_][a-z_0-9]*\)=.*/\1/p')
+row=$(grep '^| `AT+BATSTAT?`' "$ATREF")
+why=""
+[ "$(printf '%s\n' "$keys" | grep -c .)" -ge 20 ] || why=" the port line's keys were not found in $BP ($keys);"
+[ -n "$row" ] || why="$why no AT+BATSTAT? row in $ATREF;"
+for k in $keys; do
+  case "$row" in *"\`$k\`"*) ;; *) why="$why $k;" ;; esac
+done
+if [ -z "$why" ]; then
+  ok "every AT+BATSTAT? port key ($(printf '%s\n' "$keys" | grep -c .)) is documented in the AT reference"
+else
+  bad "AT+BATSTAT? port keys missing from the AT reference row:$why"
 fi
 
 [ $fail -eq 0 ] && echo "GLUE INVARIANTS OK" || echo "GLUE INVARIANTS FAILED"

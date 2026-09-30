@@ -342,9 +342,8 @@ uint32_t umac_mesh_fwd_glue_next_seq(void)
 
 /* An 802.3 frame from the TX entry, now that @p ra is its next hop: queued
  * the way a fresh TX would be, classified first. @returns false (frame not
- * taken) when @p ra is not a peer. Same peer-record lifetime as every other
- * enqueue in this file: del_peer on another task can free the record
- * between the lookup and the queue -- a shape the SDK's own TX path shares. */
+ * taken) when @p ra is not a peer. Off the event loop it runs inside the TX
+ * entry's read section, so the record it finds is not freed before the queue. */
 static bool send_now_(struct umac_data *umacd, struct mmpkt *pkt, const uint8_t *ra)
 {
     struct umac_sta_data *stad = umac_datapath_mesh_find_peer(ra);
@@ -644,6 +643,13 @@ void umac_mesh_fwd_glue_hwmp_rx(const uint8_t *body, uint16_t len, const uint8_t
             g_warthog_hwmp_unprotected++;
             return;
         }
+    }
+    else if (!census && !is_protected)
+    {
+        /* Under SAE it arrives only Protected (umac_datapath_mesh_hwmp_rx_ok); one in the
+         * clear must not go on under our MGTK, which every MFP peer opens. */
+        g_warthog_hwmp_unprotected++;
+        return;
     }
     else if (g_warthog_mesh_secure && census)
     {

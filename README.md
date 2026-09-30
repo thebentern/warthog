@@ -62,7 +62,7 @@ Warthog is not one device role. A node runs an **uplink** and presents
 | **Host** | Gives the machine it is plugged into a USB Ethernet adapter (`192.168.4.1/24`) | always on |
 | **Client** | 2.4 GHz AP so phones and IoT clients share the uplink (`192.168.5.1/24`) | always on |
 | **Station uplink** | Joins an existing HaLow access point | default builds |
-| **Mesh uplink** | 802.11s peer-to-peer, no infrastructure | `AT+MESHEN=1` on any build; `warthog-mesh-sae` for SAE/AMPE |
+| **Mesh uplink** | 802.11s peer-to-peer, no infrastructure | `AT+MESHEN=1` on any build; `warthog-mesh-sae` for SAE/AMPE (`warthog-mesh-sae-swccmp` against OpenMANET) |
 
 Both downstream surfaces are live at once. The two uplink modes are mutually
 exclusive; which one runs is a runtime setting (`AT+MESHEN`), as are the mesh
@@ -313,6 +313,16 @@ pio run -e warthog-us -t upload
 pio device monitor -e warthog-us
 ```
 
+A board already running Warthog needs no buttons: send `AT+DLMODE` on its
+console, then flash the ROM port it re-enumerates as (`303a:0009`) and leave
+with a watchdog reset, which boots the new image
+([Flashing](wiki/Flashing.md#reflashing-a-running-board)):
+
+```bash
+python -m esptool --chip esp32s3 --port /dev/cu.usbmodemXXXX --baud 921600 \
+  --before no-reset --after watchdog-reset write-flash 0x0 .pio/build/warthog-us/firmware.factory.bin
+```
+
 Configure HaLow credentials at build time:
 
 ```bash
@@ -384,7 +394,10 @@ A node first asks for a DHCP lease on the mesh; a peer whose mesh interface is
 bridged to a LAN with a DHCP server can answer it. With no offer within
 6 s it addresses itself statically from its own MAC — `10.77.<mac[4]>.<mac[5]>/16`
 — so `3c:1a:cc:4c:83:a5` is `10.77.131.165`. `AT+MESHDHCP=0` skips the DHCP
-attempt.
+attempt. Batman mode differs: the address comes up on the first batman route,
+with a 45 s DHCP wait, an ARP-probed `10.41.253.x/16` fallback beside which DHCP
+keeps being asked, and a new lease when the old one's router leaves
+([Batman Mode](wiki/Batman-Mode.md)).
 
 ```
 AT+MPMPEERS?                     peers, handshake state, AMPE key counters
@@ -416,10 +429,18 @@ access point, stayed in that AP's `br-lan`, and unbridging it drops it out of
 the `lan` firewall zone. Both are covered, with the diagnostic signature of
 each, in [`docs/mesh-openmanet.md`](docs/mesh-openmanet.md). A node set up by
 OpenMANET's LuCI mesh wizard instead runs SAE (mesh ID `openmanet`, passphrase
-`changeme123` unless changed) and makes its mesh interface a batman-adv member
-of `bat0`, which Warthog does not implement. Per source (not measured), a
-Warthog can peer with such a node but has no IP path to it or to anything
-behind it. Current builds try DHCP first and learn the hosts behind a bridged
+`changeme123` unless changed) and makes its mesh interface a batman-adv
+(BATMAN_V) member of `bat0`. In plain mesh mode a Warthog peers with such a node
+but, per source (not measured), has no IP path into `bat0`. `AT+MESHBATMAN=1`
+makes it a BATMAN_V member instead ([Batman Mode](wiki/Batman-Mode.md)); against
+the wizard's SAE mesh that needs the host-CCMP build `warthog-mesh-sae-swccmp`,
+because `warthog-mesh-sae` refuses it. Measured on air on 2026-09-29/30 against
+two OpenMANET 1.8.0 Pis (batman-adv 2025.4) whose `bat0` was set up by hand, one
+hop apart: batman tables both ways, a DHCP lease from a Pi, pings, and
+Meshtastic's group into a Pi's LAN; not against a wizard node or over more than
+one hop. A Linux node's unicast above about 1000 bytes reaches a Warthog only
+with the node's RTS threshold off (`iw phy <phy> set rts off`; 1000 on both
+bench Pis). Current builds try DHCP first and learn the hosts behind a bridged
 peer from Address Extension; neither has been on a radio against a bridged
 node.
 
@@ -497,20 +518,22 @@ The CDC console (`/dev/cu.usbmodemXXXX`) carries all ESP-IDF logs after USB-OTG 
 | 4 | lwIP NAPT bridge | ✅ end-to-end internet verified (host → USB → HaLow → upstream → 8.8.8.8) |
 | 5 | Polish (LEDs, AT, NVS) | ✅ partial — LED state machine, AT commands, NVS persistence shipped. Windows RNDIS, NCM (iOS) and a web UI deferred. |
 | 6 | 802.11s mesh over HaLow | ✅ peering, data plane and HWMP path selection; 3-node warthog mesh verified |
-| 7 | OpenMANET / OpenWrt interop | ✅ unencrypted mesh: 0–3% loss, 8–19 ms against OpenMANET 1.8.0. SAE/AMPE peering also verified cross-vendor; its data plane is not — see [`docs/mesh-openmanet.md`](docs/mesh-openmanet.md) |
+| 7 | OpenMANET / OpenWrt interop | ✅ unencrypted mesh: 0–3% loss, 8–19 ms against OpenMANET 1.8.0. SAE/AMPE peering verified cross-vendor; its data plane on `warthog-mesh-sae-swccmp` only, in batman mode (2026-09-30) — see [`docs/mesh-openmanet.md`](docs/mesh-openmanet.md) |
 | 8 | 802.11s forwarding + L2 bridge | 🧪 implemented, host-tested and simulated (`sim_mesh`: relay, flood, proxy, link loss, TTL); **no forwarded or bridged frame has been on a radio** — see [Mesh Mode](wiki/Mesh-Mode.md#forwarding) |
+| 9 | BATMAN_V member (`AT+MESHBATMAN=1`) | ✅ one hop from two OpenMANET 1.8.0 Pis (batman-adv 2025.4), `warthog-mesh-sae-swccmp`, 2026-09-29/30: tables, gateway, DHCP, pings, Meshtastic into the Pi's LAN; no relaying measured — see [Batman Mode](wiki/Batman-Mode.md#measured-on-air) |
 
 SAE/AMPE is implemented: the `warthog-mesh-sae` build derives a per-link MTK
 per peer, and peering interoperates with an SAE-configured OpenMANET node (the
-verified peer was configured by hand). One limit applies: the **encrypted** data
-plane is warthog-to-warthog only — against OpenMANET the verified result is the
-unencrypted mesh above, because every 802.11s peer generates its own group key
-and Warthog puts only its own TX group key in the chip: on this chip firmware a
-second group-key install on the mesh interface (the same key at another AID)
-broke group decryption (measured; the Linux order, our own key at AID 0 first,
-is untested). So a peer's group-addressed frames are not decrypted in hardware;
-each peer's group key is kept on the host, where only host software CCMP
-(`warthog-mesh-sae-swccmp`) can use it.
+verified peer was configured by hand). One limit applies: with chip crypto the
+**encrypted** data plane is warthog-to-warthog only, because every 802.11s peer
+generates its own group key and Warthog puts only its own TX group key in the
+chip: on this chip firmware a second group-key install on the mesh interface
+(the same key at another AID) broke group decryption (measured; the Linux order,
+our own key at AID 0 first, is untested). So a peer's group-addressed frames are
+not decrypted in hardware; each peer's group key is kept on the host, where only
+host software CCMP (`warthog-mesh-sae-swccmp`) can use it. That build carried
+encrypted traffic with OpenMANET 1.8.0 on air on 2026-09-29/30, in batman
+mode.
 
 Mesh is no longer confined to the capability builds: `AT+MESHEN=1` enables it
 on any image, region envs included, and the mesh ID, passphrase and channel are
@@ -525,9 +548,15 @@ Implemented but not measured on air, likewise: L2 bridge mode (`AT+MESHBRIDGE=1`
 — USB, Wi-Fi AP and mesh as one segment, NAT off; builds on every env with the
 lwIP bridge compiled in, has not carried a packet).
 
+BATMAN_V member mode (`AT+MESHBATMAN=1` — a clean-room batman-adv compat-15
+member of an OpenMANET `bat0`) is measured on air one hop from OpenMANET 1.8.0
+(phase 9); relaying for other nodes, a wizard-configured node and the
+remaining items in [Batman Mode](wiki/Batman-Mode.md#not-yet-measured) are not.
+
 Not implemented: per-transmitter group keys in the chip (the host keeps one
-per peer, above), multicast across the mesh on a leaf, batman-adv, Windows
-RNDIS, and a web UI.
+per peer, above), multicast across the mesh on a leaf, batman-adv's distributed
+ARP table, multicast optimisation, gateway mode and bridge loop avoidance,
+Windows RNDIS, and a web UI.
 
 ### What is measured, and what is not
 
@@ -539,10 +568,22 @@ mesh, and cross-vendor SAE/AMPE peering to an OpenMANET node, on 2026-09-20.
 The unencrypted data-plane figures in phase 7, against OpenMANET **1.8.0**. On
 2026-09-21, an OpenMANET **24.10** (`r28739-d9340319c6`) baseline: the peer's
 mesh configuration, the absence of a batman fabric on an un-wizarded node, and
-proxied endpoints crossing the mesh on air.
+proxied endpoints crossing the mesh on air. On 2026-09-29 and 2026-09-30,
+`warthog-mesh-sae-swccmp` against two OpenMANET 1.8.0 Pis on an SAE mesh
+(`ieee80211w=2`), in batman mode: host CCMP opening the Pis' group frames and
+unicast; the Pis' protected group PREQs taken and answered, so they held an
+`ACTIVE` path to each Warthog (after the fix in
+[Management frame protection](#management-frame-protection-80211w)); batman neighbours,
+originators and translation tables both ways; the Warthogs choosing the gateway
+Pi; a DHCP lease from a Pi;
+pings; Meshtastic's group into a Pi's LAN; heap and stack in batman mode. Also
+measured then: a Linux node's unicast above about 1000 bytes never reaches a
+Warthog while the node's RTS threshold is on (1000 on both Pis), and the chip
+hands the host unicast data addressed to other stations
+([Batman Mode](wiki/Batman-Mode.md#measured-on-air)).
 
-**Not measured.** Everything added from 2026-09-21 on is compiled, reviewed and
-where possible host-tested, but has not run on a radio: receive-side Address
+**Not measured.** Everything else added from 2026-09-21 on is compiled, reviewed
+and where possible host-tested, but has not run on a radio: receive-side Address
 Extension against a real bridged peer; leaf-mode learning of hosts behind any
 mesh node (with the relay that carried them) and the Address Extension mode 2
 replies to them; DHCP-first netif bring-up; runtime channel configuration on a
@@ -554,21 +595,28 @@ the re-install of each surviving link's own AMPE key when an SAE peer is
 removed; a peer's advertised group-key RSC used as its replay floor; the
 nonzero own-MGTK PN base and its re-install (`-DWARTHOG_MESH_MGTK_PN_BASE`,
 set only on the swccmp bench builds, because it assumes the chip honours an
-installed group key's PN); the board reset on a chip restart while the mesh
+installed group key's PN; a relay's or bridge's group path selection on those
+builds depends on it); the board reset on a chip restart while the mesh
 interface is up; peer-capacity signalling at 4 peers (the accepting bit,
 Close(53), the re-announce and the SAE offer gate); PREQ/PREP lifetimes up to
 60 s and the 600 s sweep of lapsed paths and proxy entries; the Meshtastic
 repeater's one-socket-per-interface receive and send (the repeater was measured
 on air before that change); AT replies longer than the 512-byte USB FIFO, now
-sent in pieces under a port lock; `AT+MESHPMF=1`; and the whole of 802.11s
+sent in pieces under a port lock; `AT+MESHPMF=1`; a relay's or bridge's group
+path selection sent as group-addressed privacy under our MGTK (receiving a
+node's is measured);
+Block Ack frames to a peer that runs MFP (an OpenMANET wizard node) sent protected, so A-MPDU sessions can
+form with it where every ADDBA was dropped before; batman mode beyond one hop
+and against a wizard-configured node; the receive filter's drop of unicast
+data addressed to other stations (`not_ours`), and whether the chip hands up
+unicast management frames addressed to them too (`mgmt_nours`, counted, not
+dropped); and the whole of 802.11s
 forwarding and bridge mode — every forwarding decision is host-tested and a
 multi-node simulator drives the shipping code through relay, flood, proxy,
 link-loss and TTL scenarios, but no forwarded frame has been on a radio, and
 whether the chip delivers third-party frames to the host at all is the
-`fwdcand` question above. Host software CCMP has **never been observed working
-on air** — `swccmp ok` has not been seen above zero, for unicast or group — and
-its refusal of a unicast keyed with a group key (`AT+SWCCMP?` `grpkey=`) is
-host-tested only.
+`fwdcand` question above. Host software CCMP's refusal of a unicast keyed with
+a group key (`AT+SWCCMP?` `grpkey=`) is host-tested only.
 
 **What the unmeasured receive-side work does to the measured path.** A
 previous revision of this paragraph claimed warthog never emits a Mesh Control
@@ -650,17 +698,52 @@ MFP is off by default: the SAE build's mesh join advertises no management frame
 protection (`AT+MESHPMF=0`). An OpenMANET peer running `ieee80211w=2` still
 peers with it.
 
-Path selection (HWMP PREQ, PREP, PERR) follows each peer's MFP, as mac80211
-does. A keyed SAE peer runs MFP once its AMPE has delivered an IGTK (hostap
-sends one exactly when the peer runs `ieee80211w` 1 or 2; 2 is the OpenMANET
-wizard default), once it sends us protected unicast path selection, or, with
-`AT+MESHPMF=1`, always. The RSN element of a peering Open is not used: nothing
-authenticates it. Toward such a peer:
+Unicast path selection (HWMP PREQ, PREP, PERR) follows each peer's MFP, as
+mac80211 does. A keyed SAE peer runs MFP once its AMPE has delivered an IGTK
+(hostap sends one exactly when the peer runs `ieee80211w` 1 or 2; 2 is the
+OpenMANET wizard default), once it sends us protected unicast path selection, or,
+with `AT+MESHPMF=1`, always. The RSN element of a peering Open is not used: nothing
+authenticates it. Toward such a peer unicast path selection goes out
+CCMP-protected under that link's key, by the same route as its data: the chip
+(`HW_ENC`), or host CCMP on the swccmp builds; and from it, it must arrive
+protected.
 
-- unicast path selection goes out CCMP-protected under that link's key, by the
-  same route as its data: the chip (`HW_ENC`), or host CCMP on the swccmp builds;
-- unicast path selection from it must arrive protected, and group path
-  selection from it must carry an MMIE; anything else is refused.
+Group path selection is group-addressed privacy (802.11 Table 9-47; mac80211's
+`ieee80211_is_group_privacy_action`), whatever either side's MFP: on an SAE mesh
+mac80211 sends every group PREQ and PERR CCMP-protected under its own MGTK, with
+the Protected bit and no MMIE, and from a peer that runs MFP it drops a group one
+in the clear or carrying a BIP MMIE. Warthog does the same, and refuses one in the
+clear from a peer without MFP too (below). Its own group path
+selection (a relay's broadcast PREQs and PERRs, a bridge's broadcast PREQs) goes
+out Protected under its own MGTK, sealed by the chip as its group data is, one
+frame for every peer; before hostap delivers that MGTK, or while its install in
+the chip has failed (retried with the next peer), it goes in the clear. A
+peer's group path selection is taken only if it arrived Protected, host CCMP
+opened it under that peer's MGTK (from its AMPE), and its PN is above that key's
+management replay counter, whose floor is the RSC the AMPE carried. Answering it
+is the only way a 1.8.0 node, which sends Warthog unicast only over an HWMP path,
+gets that path. In the clear it is refused from every established peer, MFP or
+not. That is stricter than mac80211, which takes it in the clear from a peer
+without MFP, and loses nothing against it: every established SAE peer's AMPE
+delivered its MGTK, and mac80211 and Warthog both protect group path selection
+with it. Taken in the clear, anyone on the channel could send it in the name of a
+peer without MFP and have a relay re-send it under Warthog's MGTK, which every MFP
+node opens. It is also refused with an MMIE (18 or 26 octets, as mac80211 finds
+one), under another key id, or opened by the chip: the chip's only group key is
+Warthog's own MGTK, which every peer holds, so such a frame could be forged in the
+sender's name by any of them. The chip cannot open a peer's group
+path selection, so only the swccmp builds with host CCMP on can take it, as for
+group data, whether it comes from a Linux node or a Warthog relay or bridge; on
+`warthog-mesh-sae` a wizard node never gets a path to Warthog. The same holds
+between Warthogs: on `warthog-mesh-sae`, `-nochipkey`, and a swccmp build with
+host CCMP off, a relay or bridge takes no group PREQ or PERR from another Warthog,
+at either `AT+MESHPMF` setting, where before this change they were taken in the
+clear (`0`) or with a BIP MMIE (`1`). Updating every Warthog does not bring that
+back: relay discovery between Warthogs under SAE needs a swccmp build with host
+CCMP on (`-swccmp-on`, or `AT+SWCCMP=1` after each boot). A Warthog image from
+before this change refuses a Protected group frame and sends group path selection
+in the clear or with an MMIE, both of which this one refuses: update every Warthog
+on an SAE mesh together.
 
 Under SAE, a protected unicast management frame is accepted only under the
 link's pairwise key id; one under a group key, which every mesh member holds, is
@@ -671,41 +754,56 @@ chip decrypted. Path selection from a station whose link AMPE has not keyed
 (one the supplicant added before SAE finished) is refused, as mac80211 takes it
 only from an established peer.
 
-A group frame carrying an MMIE is accepted only if the MIC verifies under the
-sender's IGTK (installed host-side from its AMPE Open) and the IPN is above the
-last one seen, whatever the sender's MFP. Our own group path selection carries a
-BIP-CMAC-128 MMIE only when we hold an IGTK, which hostap generates only with
-`AT+MESHPMF=1`. Group path selection, with or without an MMIE, is built and
-sent on the umac event loop: from another task (the network stack) it is queued
-for it, up to four frames, and dropped if the queue or the loop's event queue is
-full. A relay (`AT+MESHFWD=1`) broadcasts PREQs and PERRs, a bridge
-(`AT+MESHBRIDGE=1`) broadcasts PREQs, and a peer running MFP drops them without
-an MMIE: against an OpenMANET mesh, set `AT+MESHPMF=1` on a relay or bridge. A
-leaf sends only unicast path selection (its keepalive PREQs and its PREPs) and
-works with it off. An open mesh and a non-SAE keyed mesh protect nothing more;
+Group path selection is built and sent on the umac event loop: from another
+task (the network stack) it is queued for it, up to four frames, and dropped if
+the queue or the loop's event queue is full. A leaf sends only unicast path
+selection (its PREPs); a relay (`AT+MESHFWD=1`) broadcasts PREQs and PERRs, a
+bridge (`AT+MESHBRIDGE=1`) PREQs. None needs `AT+MESHPMF=1` against an
+OpenMANET mesh. An open mesh and a non-SAE keyed mesh protect nothing more;
 their group path selection is queued the same way.
 
 `AT+MESHPMF=1` (stored; applies after `AT+RESET`) sets PMF to *required* in the
 mesh join (`umac/supplicant_shim/supplicant_core_mesh.c`): the RSN capabilities
-ask for MFP, hostap's `mesh_rsn` generates a TX IGTK and sends it in every AMPE
-Open, and every keyed peer is treated as running MFP. A peer that runs MFP off
-still accepts our protected unicast path selection (mac80211 decrypts it with
-the link key), but drops our MMIE-protected group path selection unless it
-parsed our IGTK; mac80211 behaves the same between two nodes whose
-`ieee80211w` differ.
+ask for MFP, hostap's `mesh_rsn` generates an IGTK and sends it in every AMPE
+Open (nothing of Warthog's carries an MMIE), and every keyed peer is treated as
+running MFP. A peer that runs MFP off still accepts our protected unicast path
+selection (mac80211 decrypts it with the link key).
 
-`AT+MESHFWDSTAT?` counts it: `hwmp prot/unprotected/unestab/mmie/nommie/bipfail`
-for path selection received, `hwmp tx prot/mmie/nommie` for sent, `qdrop` for
+`AT+MESHFWDSTAT?` counts it: `hwmp prot/unprotected/unestab/gp/mmie/nommie`
+for path selection received, `hwmp tx prot/gp/plain` for sent, `qdrop` for
 group frames dropped instead of queued and `qfail` for queued ones the event loop
 could not send, `mgmt prot chip/host/nodec` for
-protected management frames opened by the chip, by host CCMP, or by neither,
-`grpkey` for protected unicast ones refused under a group key, and `igtk` for
-peer IGTKs installed. None of this path
-selection protection has been on a radio: whether the chip encrypts a
-management frame on the mesh interface, and whether it hands one up decrypted,
-are what `mgmt prot` and `hwmp tx prot` are for.
+protected management frames opened by the chip (unicast only: a group one it opens
+counts as `mgmt gp own` instead), by host CCMP, or by neither (a group one counts
+in `mgmt gp nodec` as well),
+`grpkey` for protected unicast ones refused under a group key, `mgmt gp
+nodec/own/key/replay` for protected group ones refused, and `igtk` for
+peer IGTKs installed.
 
-**Not measured.** `AT+MESHPMF=1` has never been run on air.
+**Measured broken, fixed from source, re-measured.** On 2026-09-29, against
+OpenMANET 1.8.0 nodes with `ieee80211w=2`, Warthog refused every group PREQ the
+nodes sent (then counted `bipfail`, though host CCMP had opened each one), so no
+node held a path to it and no unicast from a node arrived. The group rules above
+come from mac80211's source (`net/mac80211/rx.c`, `tx.c`, `wpa.c`) and the host
+tests. On 2026-09-30 (`warthog-mesh-sae-swccmp`, batman mode, `AT+MESHPMF=0`)
+the nodes' `iw dev wlh0 mpath dump` listed both Warthogs `ACTIVE` at hop count
+1, `hwmp gp` counted their group PREQs taken, and their unicast arrived. The
+group path selection a Warthog relay or bridge sends rests on two chip
+properties that are unmeasured. One is whether the chip encrypts a group management frame under
+Warthog's MGTK at all. The other applies to `-swccmp` and `-swccmp-on`, which
+install that MGTK at a nonzero TX PN and advertise one below it as its Key RSC: a
+node, or another Warthog, takes our group PREQs and PERRs only if the chip starts
+the key at that PN. If it does not, every one is dropped as a replay, and each
+re-install (`mgtk_reinst`, now after every AMPE Open that follows a relay's or
+bridge's group path selection, not only with `AT+MESHGRP=1`) reuses PNs under the
+same key. The node's `iw dev wlh0 mpath dump` showing Warthog `ACTIVE` settles
+neither: that path comes from the node's own PREQ and Warthog's unicast PREP, and
+`hwmp tx gp` counts frames sent, not taken. [OpenMANET
+Interop](wiki/OpenMANET-Interop.md#management-frame-protection-peering-does-not-need-it-path-selection-does)
+has the check that does. Every other build installs our MGTK at PN 0 and
+advertises RSC 0, so a peer that joins or re-peers can be fed each of our earlier
+group frames under that key once, until the MGTK changes. `AT+MESHPMF=1` has
+never been run on air.
 
 ### For anything that actually needs confidentiality
 

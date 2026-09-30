@@ -7,6 +7,7 @@
 - [Host Mode](Host-Mode)
 - [Client Mode](Client-Mode)
 - [Mesh Mode](Mesh-Mode)
+- [Batman Mode](Batman-Mode)
 - [OpenMANET Interop](OpenMANET-Interop)
 - [OpenMANET Gateway](OpenMANET-Gateway)
 

@@ -924,6 +924,12 @@ int mmwpas_set_key(void *priv, struct wpa_driver_set_key_params *params)
                 key.rx_seq[UMAC_KEY_RX_COUNTER_SPACE_DEFAULT] |= ((uint64_t)(params->seq[ii]))
                                                                  << (ii * 8);
             }
+            /* warthog: the RSC floors every TID's counter, not only TID 0's. */
+            for (int t = UMAC_KEY_RX_COUNTER_SPACE_DEFAULT + 1; t <= UMAC_KEY_RX_COUNTER_SPACE_TID7;
+                 t++)
+            {
+                key.rx_seq[t] = key.rx_seq[UMAC_KEY_RX_COUNTER_SPACE_DEFAULT];
+            }
         }
 
         status = umac_keys_install_key(stad, vif_id, &key);

@@ -6,10 +6,11 @@ on it — ATAK, a browser, whatever — without a Raspberry Pi strapped to each 
 That is what warthog is for here. A warthog node joins your mesh as an ordinary
 802.11s peer, and presents two client surfaces on the other side: a **2.4 GHz
 Wi-Fi access point** and a **USB Ethernet adapter**. A phone joins the AP or
-plugs into the cable, and it can reach the nodes on your mesh. That needs a
-node whose mesh interface is not in `bat0`: on a mesh built by OpenMANET's
-mesh wizard a warthog peers but its clients reach nothing (see
-[Setup — OpenMANET](#setup--openmanet)).
+plugs into the cable, and it can reach the nodes on your mesh. On a
+mesh built by OpenMANET's mesh wizard (mesh interface in `bat0`) a warthog in
+plain mesh mode peers but its clients reach nothing; there it has to run as a
+batman member ([Batman Mode](Batman-Mode)). See
+[Setup — OpenMANET](#setup--openmanet).
 
 ```
                  ┌──── HaLow 802.11s mesh (OpenMANET) ────┐
@@ -68,10 +69,16 @@ AT+MESHSEC=0
 This persists. Skipping it produces perfect peering and zero data — the single
 most common way to end up confused.
 
-Against an SAE node, flash `warthog-mesh-sae` instead of step 1 and set
-`AT+MESHID=` and `AT+MESHPASS=` to the node's values, then `AT+RESET`. SAE
-peering is verified on hardware; encrypted data between warthog and OpenMANET
-is not yet.
+Against an SAE node (every wizard node), flash `warthog-mesh-sae-swccmp`
+instead of step 1, set `AT+MESHID=` and `AT+MESHPASS=` to the node's values,
+then `AT+RESET`. Its host CCMP must be on: `AT+SWCCMP=1` after each boot, or
+batman mode (below), which arms it, or the `warthog-mesh-sae-swccmp-on` build.
+`warthog-mesh-sae` peers with the node but cannot open its group frames, so a
+1.8.0 node gets no path to the Warthog, and batman mode refuses that build; keep
+it for meshes of Warthogs only. Encrypted data between a Warthog and OpenMANET
+1.8.0 was measured on 2026-09-29/30: `warthog-mesh-sae-swccmp` in batman mode
+against Pis whose `bat0` was set up by hand ([Batman Mode](Batman-Mode#measured-on-air)).
+Plain mesh mode against an SAE node was not measured separately.
 
 **3. Confirm it joined.**
 
@@ -109,11 +116,12 @@ that costs people hours.
 
 **First, run `ip addr show bat0`.** If `bat0` exists, the node was configured by
 OpenMANET's mesh wizard: `wlh0` is a batman-adv (BATMAN_V) hard interface of
-`bat0`, not a `br-lan` port. Warthog does not implement batman-adv, so against
-such a node it peers but gets no DHCP lease and no IP path, and the unbridging
-below would remove `wlh0` from `bat0`. Not measured; see
-[OpenMANET Interop](OpenMANET-Interop). The steps below are for a node without
-`bat0`.
+`bat0`, not a `br-lan` port. Against such a node a warthog in plain mesh mode
+peers but gets no DHCP lease and no IP path, and the unbridging below would
+remove `wlh0` from `bat0`: leave the node as it is and use
+[Batman Mode](Batman-Mode) (`AT+MESHBATMAN=1`) instead, measured on air against
+nodes whose `bat0` was set up by hand, not yet against a wizard node. The
+steps below are for a node without `bat0`.
 
 **Take the mesh interface out of the bridge.** The interface keeps
 `network='lan'`, so `wlh0` is in `br-lan`. A bridged mesh interface cannot

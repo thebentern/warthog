@@ -30,12 +30,23 @@ enum umac_key_type
 };
 
 
+/* warthog: QoS data has one counter per TID (802.11-2020 12.5.3.4.4, as mac80211).
+ * DEFAULT is TID 0's; non-QoS data and BIP use it too. */
 enum umac_key_rx_counter_space
 {
     UMAC_KEY_RX_COUNTER_SPACE_DEFAULT,
+    UMAC_KEY_RX_COUNTER_SPACE_TID7 = UMAC_KEY_RX_COUNTER_SPACE_DEFAULT + MMWLAN_MAX_QOS_TID,
     UMAC_KEY_RX_COUNTER_SPACE_IND_ROBUST_MGMT,
     UMAC_KEY_RX_COUNTER_NUM
 };
+
+/* warthog: the counter a QoS data frame on @p tid is checked against; TIDs 8-15 use TID 0's. */
+static inline enum umac_key_rx_counter_space umac_keys_rx_counter_space_for_tid(uint8_t tid)
+{
+    return (tid <= MMWLAN_MAX_QOS_TID)
+               ? (enum umac_key_rx_counter_space)(UMAC_KEY_RX_COUNTER_SPACE_DEFAULT + tid)
+               : UMAC_KEY_RX_COUNTER_SPACE_DEFAULT;
+}
 
 
 struct umac_key

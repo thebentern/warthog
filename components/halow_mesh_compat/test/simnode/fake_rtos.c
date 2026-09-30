@@ -73,9 +73,59 @@ static bool take_fail_(void)
     return f;
 }
 
+/* Address reuse on demand. A real heap hands a freed block to the next caller of its size,
+ * which is when a stale pointer checked by address names the wrong object. Armed with a
+ * block, its free parks it and the next calloc of @p size gets it back, zeroed. */
+static const void *s_recycle_block;
+static size_t s_recycle_size;
+static void *s_recycle_parked;
+
+void simnode_recycle_arm(const void *block, size_t size)
+{
+    free(s_recycle_parked); /* parked and never reused: freed for real */
+    s_recycle_parked = NULL;
+    s_recycle_block = block;
+    s_recycle_size = size;
+}
+
 void *mmosal_malloc_(size_t size) { if (take_fail_()) { return NULL; } void *p = malloc(size); if (p) { s_live_allocs++; } return p; }
-void *mmosal_calloc(size_t n, size_t size) { if (take_fail_()) { return NULL; } void *p = calloc(n, size); if (p) { s_live_allocs++; } return p; }
-void mmosal_free(void *p) { if (p) { s_live_allocs--; free(p); } }
+void *mmosal_calloc(size_t n, size_t size)
+{
+    if (take_fail_()) { return NULL; }
+    void *p = NULL;
+    if (s_recycle_parked != NULL && n * size == s_recycle_size)
+    {
+        p = s_recycle_parked;
+        s_recycle_parked = NULL;
+        memset(p, 0, s_recycle_size);
+    }
+    else
+    {
+        p = calloc(n, size);
+    }
+    if (p) { s_live_allocs++; }
+    return p;
+}
+
+/* A free under the spinlock: on the firmware a packet's free can run the TX flow-control
+ * callback, which has no business inside a critical section. */
+static unsigned s_crit;
+static unsigned s_free_in_crit;
+unsigned simnode_frees_in_critical(void) { return s_free_in_crit; }
+
+void mmosal_free(void *p)
+{
+    if (p == NULL) { return; }
+    s_live_allocs--;
+    s_free_in_crit += (s_crit != 0u);
+    if (p == s_recycle_block && s_recycle_parked == NULL)
+    {
+        s_recycle_block = NULL;
+        s_recycle_parked = p;
+        return;
+    }
+    free(p);
+}
 /** Live allocations, so a test can assert the firmware leaks no packets. */
 unsigned simnode_live_allocs(void) { return s_live_allocs; }
 
@@ -96,10 +146,22 @@ void mmosal_mutex_delete(struct mmosal_mutex *mu)
     if (mu != NULL) { pthread_mutex_destroy(&mu->m); free(mu); }
 }
 
+/* The event loop running between a task's steps: at its next mutex take, before it holds it. */
+struct umac_data;
+bool umac_core_evtloop_is_active(struct umac_data *umacd);
+static void (*s_lock_hook)(void);
+void simnode_set_lock_hook(void (*cb)(void)) { s_lock_hook = cb; }
+
 bool mmosal_mutex_get(struct mmosal_mutex *mu, uint32_t timeout_ms)
 {
     (void)timeout_ms; /* the harness never blocks: a wait here would be a bug */
     if (mu == NULL) { return false; }
+    void (*cb)(void) = s_lock_hook;
+    if (cb != NULL && !umac_core_evtloop_is_active(NULL))
+    {
+        s_lock_hook = NULL;
+        cb();
+    }
     pthread_mutex_lock(&mu->m);
     return true;
 }
@@ -143,7 +205,6 @@ int mmosal_printf(const char *fmt, ...)
 const char *mmosal_task_name(void) { return "simnode"; }
 
 /* Critical sections nest in the firmware; a counter keeps that honest. */
-static unsigned s_crit;
 void mmosal_task_enter_critical(void) { s_crit++; }
 void mmosal_task_exit_critical(void) { if (s_crit) { s_crit--; } }
 unsigned simnode_in_critical(void) { return s_crit; }

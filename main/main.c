@@ -7,6 +7,7 @@
 #include "nvs_flash.h"
 
 #include "at.h"
+#include "bat_port.h"
 #include "cfg.h"
 #include "halow.h"
 #include "mudp.h"
@@ -66,8 +67,9 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(750));
     (void)warthog_wifi_ap_start();
 
-    /* Bridge mode replaces NAT and the multicast repeater with one L2 segment. */
-    if (warthog_cfg_get_mesh_bridge()) {
+    /* Bridge mode replaces NAT and the multicast repeater with one L2 segment.
+     * Batman mode refuses bridge at the setter; this only guards a stale NVS pair. */
+    if (warthog_cfg_get_mesh_bridge() && !warthog_bat_port_running()) {
         uint8_t mesh_mac[6] = { 0 };
         mmwlan_get_mac_addr(mesh_mac);
         esp_err_t be = warthog_mesh_bridge_start(mmhalow_get_netif(), mesh_mac);

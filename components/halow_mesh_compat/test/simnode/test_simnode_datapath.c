@@ -22,13 +22,14 @@
  * 802.11-2020 s9.2.4.7.3 and mac80211 describe -- not that a mac80211 peer
  * accepts them.
  *
- * One engine verdict is deliberately absent. UMAC_MESH_FWD_DROP_OWN cannot be
+ * Two engine verdicts are deliberately absent. UMAC_MESH_FWD_DROP_OWN cannot be
  * reached through the real receive path: umac_datapath_rx_frame_filter drops a
  * frame whose SA is our own address (addr4 on a 4-address frame, addr3 on a
  * 3-address one) before the Mesh Control is ever parsed. Measured here -- both
  * shapes are refused upstream with filt_reason 7 -- so the engine's own check
  * is defence in depth, and a test that claimed to exercise it would be
- * exercising the filter instead.
+ * exercising the filter instead. UMAC_MESH_FWD_DROP_NOT_FOR_US likewise: the
+ * filter drops a unicast whose RA is not us first, filt_reason 9 (t_rx_not_ours).
  */
 #include <stdio.h>
 #include <string.h>
@@ -40,6 +41,7 @@
 #include "umac_mesh_fwd.h"
 #include "umac_mesh_fwd_glue.h"
 #include "umac_mesh_ies.h"
+#include "umac/datapath/umac_datapath_private.h" /* umac_datapath_mesh_read_begin/end */
 
 /* Defined in warthog_globals.c, exactly as main/at.c defines them on the
  * firmware. rxdrop_reason is how the datapath records WHICH rule dropped a
@@ -56,6 +58,7 @@ static int failures;
 static const uint8_t W[6]  = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 }; /* us */
 static const uint8_t A[6]  = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x0a }; /* peer A */
 static const uint8_t C[6]  = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x0c }; /* peer C */
+static const uint8_t D[6]  = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x0d }; /* a peer that joins late */
 static const uint8_t E[6]  = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x0e }; /* not a peer */
 static const uint8_t H[6]  = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x77 }; /* host behind us */
 static const uint8_t H2[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x88 }; /* host behind A */
@@ -312,6 +315,290 @@ static void t_tx_group_replica_ae2(void)
           "normalised: addr1 back to the group, addr3 back to the mesh source");
 }
 
+/* The netif task resolves the peer and walks the replica copies on its own task, while
+ * the event loop's del_peer frees a peer. del_peer runs here at the first copy's
+ * allocation: after the lookup chose A, before A's own frame is queued. */
+static void del_a_(void) { simnode_del_peer(A); }
+static void arm_del_a_(void) { simnode_set_tx_alloc_hook(del_a_); } /* past the frame's own */
+
+static void t_tx_del_peer_mid_walk(void)
+{
+    printf("--- TX: a peer deleted while a broadcast's copies are made gets nothing queued ---\n");
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    const unsigned live = simnode_live_allocs();
+    simnode_set_tx_alloc_hook(arm_del_a_);
+    CHECK(simnode_host_tx(BC, W, PAY, sizeof(PAY)), "host broadcasts");
+    simnode_set_tx_alloc_hook(NULL);
+    CHECK(simnode_outbox_count() == 1 && frame_to(C) != NULL,
+          "C gets its copy, deleted A none (%u frames)", simnode_outbox_count());
+    CHECK(simnode_live_allocs() + 1u == live,
+          "A's record is freed and its frame released, not queued to it (%u -> %u live)", live,
+          simnode_live_allocs());
+}
+
+/* The event loop's del_peer between another task's lookup and its use of the record: inside
+ * the lookup, after the record pointer is loaded and before the record is read (the peer-read
+ * hook), or after the lookup chose a record and before its frame is queued (the lock hook). */
+static unsigned s_loop_ran;
+static void loop_del_a_(void) { s_loop_ran++; simnode_del_peer(A); }
+static void loop_del_a_add_d_(void) { s_loop_ran++; simnode_del_peer(A); (void)simnode_add_peer(D); }
+
+static void t_tx_del_peer_mid_lookup(void)
+{
+    printf("--- TX: a peer deleted while the netif task's lookup reads it is not read freed ---\n");
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    unsigned live = simnode_live_allocs();
+    s_loop_ran = 0;
+    simnode_set_peer_read_hook(loop_del_a_);
+    CHECK(simnode_host_tx(BC, W, PAY, sizeof(PAY)), "host broadcasts");
+    simnode_set_peer_read_hook(NULL);
+    CHECK(s_loop_ran == 1, "del_peer(A) ran after the lookup loaded A's record, before it read it");
+    CHECK(simnode_outbox_count() == 1 && frame_to(C) != NULL,
+          "C gets the broadcast, deleted A nothing (%u frames)", simnode_outbox_count());
+    CHECK(simnode_live_allocs() + 1u == live, "A's record is freed once the TX is done (%u -> %u live)",
+          live, simnode_live_allocs());
+
+    (void)simnode_add_peer(A);
+    simnode_outbox_clear();
+    live = simnode_live_allocs();
+    s_loop_ran = 0;
+    simnode_set_peer_read_hook(loop_del_a_);
+    CHECK(simnode_host_tx(A, W, PAY, sizeof(PAY)), "host sends to A");
+    simnode_set_peer_read_hook(NULL);
+    CHECK(s_loop_ran == 1 && simnode_outbox_count() == 0,
+          "A, deleted while the lookup read it, gets nothing (%u frames)", simnode_outbox_count());
+    CHECK(simnode_live_allocs() + 1u == live, "its record freed and its frame released (%u -> %u live)",
+          live, simnode_live_allocs());
+}
+
+static void t_tx_peer_replaced_mid_tx(void)
+{
+    printf("--- TX: A deleted and D added between the lookup and the queue, D free to land at "
+           "A's old address: A's frame does not go to D ---\n");
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    CHECK(simnode_recycle_peer_record(A), "armed: the next record allocated after A's is freed takes its address");
+    s_loop_ran = 0;
+    simnode_set_lock_hook(loop_del_a_add_d_);
+    CHECK(simnode_host_tx(A, W, PAY, sizeof(PAY)), "host sends to A");
+    simnode_set_lock_hook(NULL);
+    CHECK(s_loop_ran == 1, "del_peer(A) and add_peer(D) ran after the lookup chose A, before the queue");
+    CHECK(frame_to(D) == NULL && simnode_outbox_count() == 0,
+          "nothing meant for A reaches D (%u frames, %s to D)", simnode_outbox_count(),
+          frame_to(D) != NULL ? "one" : "none");
+    (void)simnode_recycle_peer_record(NULL);
+    simnode_outbox_clear();
+    CHECK(simnode_host_tx(D, W, PAY, sizeof(PAY)) && simnode_outbox_count() == 1 && frame_to(D) != NULL,
+          "D is an ordinary peer afterwards");
+
+    const struct umac_sta_data *d_rec = umac_datapath_mesh_find_peer(D);
+    CHECK(simnode_recycle_peer_record(D), "control: armed on D's record");
+    simnode_del_peer(D);
+    CHECK(simnode_add_peer(E) && d_rec != NULL && umac_datapath_mesh_find_peer(E) == d_rec,
+          "with no reader inside, E's record lands at D's old address: the reuse above was possible");
+    (void)simnode_recycle_peer_record(NULL);
+}
+
+/* Reclamation driven directly: each read_begin/read_end pair stands for one task's TX or RX
+ * filter call, and the pairs overlap as two tasks' calls do. */
+static void t_retired_record_reclaim(void)
+{
+    printf("--- peer records: freed once no reader that could hold one is left, "
+           "whatever readers came after ---\n");
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    unsigned live = simnode_live_allocs();
+    simnode_del_peer(C);
+    CHECK(simnode_live_allocs() + 1u == live, "with no reader inside, del_peer frees at once");
+
+    live = simnode_live_allocs();
+    const uint8_t x = umac_datapath_mesh_read_begin();
+    simnode_del_peer(A);
+    CHECK(simnode_live_allocs() == live, "A, deleted while reader X is inside, stays allocated");
+    const uint8_t y = umac_datapath_mesh_read_begin();
+    umac_datapath_mesh_read_end(x);
+    CHECK(simnode_live_allocs() + 1u == live,
+          "freed when X leaves, while Y, which came after A was gone, is still inside (%u -> %u)", live,
+          simnode_live_allocs());
+
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    live = simnode_live_allocs();
+    simnode_del_peer(A);
+    const uint8_t z = umac_datapath_mesh_read_begin();
+    simnode_del_peer(C);
+    CHECK(simnode_live_allocs() == live, "A deleted while Y reads, C while Y and Z read: both held");
+    umac_datapath_mesh_read_end(y);
+    CHECK(simnode_live_allocs() + 1u == live, "Y leaves: A is freed, C still waits for Z (%u -> %u)",
+          live, simnode_live_allocs());
+    umac_datapath_mesh_read_end(z);
+    CHECK(simnode_live_allocs() + 2u == live, "Z leaves: C is freed (%u -> %u)", live,
+          simnode_live_allocs());
+}
+
+static void t_dying_slot_not_reused(void)
+{
+    printf("--- peer slots: one whose record a reader may still hold is not reused until it is freed ---\n");
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    CHECK(simnode_add_peer(A) && simnode_add_peer(C) && simnode_add_peer(D) && simnode_add_peer(H),
+          "four peers fill the table");
+    const uint8_t x = umac_datapath_mesh_read_begin();
+    simnode_del_peer(A);
+    CHECK(!umac_datapath_mesh_has_free_slot() && !simnode_add_peer(E),
+          "A deleted while a reader is inside: its slot stays taken, E is refused");
+    umac_datapath_mesh_read_end(x);
+    CHECK(umac_datapath_mesh_has_free_slot() && simnode_add_peer(E),
+          "the reader leaves, A's record is freed, E gets the slot");
+}
+
+static void t_del_peer_releases_outside_critical(void)
+{
+    printf("--- del_peer: a peer's queued frames are released outside the critical section ---\n");
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    const unsigned live = simnode_live_allocs();
+    CHECK(simnode_host_tx_nopump(A, W, PAY, sizeof(PAY)) && simnode_host_tx_nopump(A, W, PAY, sizeof(PAY)),
+          "two frames queued to A, not yet sent");
+    const unsigned in_crit = simnode_frees_in_critical();
+    simnode_del_peer(A);
+    CHECK(simnode_frees_in_critical() == in_crit, "none freed under the spinlock (%u)",
+          simnode_frees_in_critical() - in_crit);
+    simnode_pump();
+    CHECK(simnode_outbox_count() == 0 && simnode_live_allocs() + 1u == live,
+          "both released, none sent, A's record freed (%u frames, %u -> %u live)",
+          simnode_outbox_count(), live, simnode_live_allocs());
+}
+
+/* ---- 3b. del_peer: no umac timeout outlives the record it points into ----
+ *
+ * Three timeouts hold a peer's record: the ADDBA request retry (umac_ba.c, its
+ * record and a session inside it), the RX reorder flush (the record) and the
+ * defragmenter's (a fragment chain inside it). The event loop runs each on a
+ * pointer it was given, so one left pending when del_peer frees the record reads
+ * and writes freed heap (SAN=1 reports it). A-MPDU on, as the board runs. */
+
+extern volatile uint32_t g_warthog_reord_buffered;
+
+/* The first Block Ack action frame (category 3) with action @p act we sent to @p da. */
+static const struct simnode_frame *ba_to(const uint8_t *da, uint8_t act)
+{
+    for (unsigned i = 0; i < simnode_outbox_count(); i++)
+    {
+        const struct simnode_frame *f = simnode_outbox_get(i);
+        if (f->is_mgmt && f->len >= 27u && f->bytes[0] == 0xd0 && MAC_EQ(&f->bytes[4], da) &&
+            f->bytes[24] == 3u && f->bytes[25] == act)
+        {
+            return f;
+        }
+    }
+    return NULL;
+}
+
+/* A peer's NDP ADDBA Request for TID 0: immediate policy, 16 frames, no BA timeout. */
+static uint16_t mk_addba_req(uint8_t *f, const uint8_t *ta)
+{
+    memset(f, 0, 33);
+    f[0] = 0xd0;
+    memcpy(&f[4], W, 6);
+    memcpy(&f[10], ta, 6);
+    memcpy(&f[16], ta, 6);
+    const uint16_t ps = (uint16_t)((1u << 1) | (16u << 6));
+    f[24] = 3;   /* Block Ack */
+    f[25] = 128; /* NDP ADDBA Request */
+    f[26] = 9;   /* dialog token */
+    f[27] = (uint8_t)ps;
+    f[28] = (uint8_t)(ps >> 8);
+    return 33u;  /* BA timeout and starting sequence control: 0 */
+}
+
+/* A unicast data frame from @p ta at sequence @p seq, fragment @p frag. */
+static uint16_t mk_uni_seq(uint8_t *f, const uint8_t *ta, uint16_t seq, uint8_t frag, bool more)
+{
+    const struct umac_mesh_ctrl mc = { .flags = 0, .ttl = 5, .seq = 900u + seq };
+    uint16_t n = mk_uni(f, W, ta, W, ta, &mc, PAY, sizeof(PAY));
+    f[1] = (uint8_t)(f[1] | (more ? 0x04u : 0u));
+    f[22] = (uint8_t)((seq << 4) | (frag & 0x0fu));
+    f[23] = (uint8_t)(seq >> 4);
+    return n;
+}
+
+static void t_del_peer_stops_peer_timeouts(void)
+{
+    printf("--- del_peer: no umac timeout outlives the peer record it points into ---\n");
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    simnode_set_ampdu(true);
+    const unsigned live0 = simnode_live_allocs();
+    uint8_t f[256];
+
+    /* The originator's ADDBA retry. */
+    (void)simnode_add_peer(A);
+    struct umac_sta_data *rec = umac_datapath_mesh_find_peer(A);
+    CHECK(simnode_host_tx(A, W, PAY, sizeof(PAY)) && ba_to(A, 128) != NULL &&
+              simnode_timeouts_holding(rec) == 1u,
+          "a unicast to A sends an ADDBA; its retry timeout holds A's record (%u)",
+          simnode_timeouts_holding(rec));
+    const struct simnode_frame *q = ba_to(A, 128);
+    CHECK(q != NULL && (q->bytes[1] & 0x40u) == 0u && (q->tx_flags & MMDRV_TX_FLAG_HW_ENC) == 0u,
+          "(pin) on an open mesh it goes in the clear");
+    simnode_del_peer(A);
+    CHECK(simnode_timeouts_holding(rec) == 0u, "del_peer(A) cancels it (%u left)",
+          simnode_timeouts_holding(rec));
+    simnode_outbox_clear();
+    simnode_advance_run(250);
+    CHECK(simnode_outbox_count() == 0u, "so nothing runs on the freed record: no DELBA (%u frames)",
+          simnode_outbox_count());
+
+    (void)simnode_add_peer(A);
+    simnode_outbox_clear();
+    (void)simnode_host_tx(A, W, PAY, sizeof(PAY));
+    simnode_outbox_clear();
+    simnode_advance_run(150);
+    CHECK(ba_to(A, 130) != NULL, "(pin) left alone, the unanswered ADDBA times out into a DELBA to A");
+    simnode_del_peer(A);
+
+    /* A frame parked for reordering, and its flush timeout. */
+    (void)simnode_add_peer(A);
+    rec = umac_datapath_mesh_find_peer(A);
+    simnode_outbox_clear();
+    uint16_t n = mk_addba_req(f, A);
+    CHECK(simnode_rx(f, n, -50) && ba_to(A, 129) != NULL, "A's ADDBA request is accepted");
+    const uint32_t parked = g_warthog_reord_buffered;
+    n = mk_uni_seq(f, A, 5, 0, false);
+    (void)simnode_rx(f, n, -50);
+    CHECK(g_warthog_reord_buffered - parked == 1u && simnode_timeouts_holding(rec) == 1u &&
+              simnode_live_allocs() == live0 + 2u,
+          "sequence 5 while 0 is expected is parked, with a flush timeout on A's record");
+    simnode_del_peer(A);
+    CHECK(simnode_timeouts_holding(rec) == 0u && simnode_live_allocs() == live0,
+          "del_peer(A) cancels it and releases the parked frame (%u timeouts, %u -> %u live)",
+          simnode_timeouts_holding(rec), live0, simnode_live_allocs());
+    simnode_host_rx_clear();
+    simnode_advance_run(150);
+    CHECK(simnode_host_rx_count() == 0u, "and nothing is delivered from the freed record");
+
+    /* A fragment chain, and its expiry. */
+    (void)simnode_add_peer(A);
+    rec = umac_datapath_mesh_find_peer(A);
+    n = mk_uni_seq(f, A, 7, 0, true);
+    (void)simnode_rx(f, n, -50);
+    CHECK(simnode_timeouts_holding(rec) == 1u && simnode_live_allocs() == live0 + 2u,
+          "a first fragment from A opens a chain with an expiry timeout on A's record");
+    simnode_del_peer(A);
+    CHECK(simnode_timeouts_holding(rec) == 0u && simnode_live_allocs() == live0,
+          "del_peer(A) cancels it and releases the chain (%u timeouts, %u -> %u live)",
+          simnode_timeouts_holding(rec), live0, simnode_live_allocs());
+    simnode_advance_run(1200);
+    CHECK(simnode_live_allocs() == live0, "and the chain's expiry never runs (%u live)",
+          simnode_live_allocs());
+    simnode_set_ampdu(false);
+}
+
 /* ---- 4. proxied source: a host behind us (bridge mode) ------------------ */
 
 static void t_tx_proxied_source(void)
@@ -407,6 +694,38 @@ static void t_rx_deliver(void)
     int16_t rssi = 0;
     CHECK(simnode_rssi_for(A, &rssi) && rssi == -60,
           "and the datapath reported A's RSSI (%d)", rssi);
+}
+
+static void t_rx_filter_del_peer_mid_lookup(void)
+{
+    printf("--- RX: a peer deleted while the driver task's filter reads it is not read or written freed ---\n");
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    const unsigned live = simnode_live_allocs();
+    uint8_t frame[256];
+    struct umac_mesh_ctrl mc = { .flags = 0, .ttl = 31, .seq = 101 };
+    uint16_t n = mk_uni(frame, W, A, W, A, &mc, PAY, sizeof(PAY));
+    s_loop_ran = 0;
+    simnode_set_peer_read_hook(loop_del_a_);
+    CHECK(simnode_rx(frame, n, -60), "A sends us a unicast");
+    simnode_set_peer_read_hook(NULL);
+    CHECK(s_loop_ran == 1, "del_peer(A) ran after the filter loaded A's record, before it read it");
+    CHECK(simnode_host_rx_count() == 0, "a frame from a peer gone before the loop took it is not delivered");
+    CHECK(simnode_live_allocs() + 1u == live, "A's record freed and the frame released (%u -> %u live)",
+          live, simnode_live_allocs());
+
+    (void)simnode_add_peer(A);
+    const unsigned live2 = simnode_live_allocs();
+    mc.seq = 102;
+    n = mk_uni(frame, W, A, W, A, &mc, PAY, sizeof(PAY));
+    s_loop_ran = 0;
+    simnode_set_rx_filter_hook(loop_del_a_);
+    CHECK(simnode_rx(frame, n, -60), "A sends us another");
+    simnode_set_rx_filter_hook(NULL);
+    CHECK(s_loop_ran == 1 && simnode_host_rx_count() == 0,
+          "del_peer(A) between the filter's lookup and its duplicate-cache write: not delivered");
+    CHECK(simnode_live_allocs() + 1u == live2, "A's record freed and the frame released (%u -> %u live)",
+          live2, simnode_live_allocs());
 }
 
 /* ---- 7. receive: relay, with the TTL decremented ------------------------ */
@@ -1125,6 +1444,34 @@ static void rx_expect_drop_(const char *what, const uint8_t *frame, uint16_t n,
           simnode_outbox_count(), simnode_host_rx_count());
 }
 
+/* ---- 12. receive: a unicast whose RA is another station ------------------
+ *
+ * The MM6108 hands up unicast data addressed to other stations: measured on air
+ * (2026-09-30), a warthog heard another warthog's frames to a Linux node and host
+ * CCMP tried each under the sender's key. In 802.11s a unicast for us, relayed or
+ * not, carries our address as RA (addr1), so one that does not is never ours. The
+ * receive filter drops it, reason 9 (AT+FILTSTAT? not_ours=), before the duplicate
+ * check, the reorder window or any decryption sees it. Group frames are not judged. */
+
+extern volatile uint32_t g_warthog_filt_hist[10], g_warthog_filt_reason;
+extern volatile uint32_t g_warthog_reord_outdated;
+
+static void rx_expect_not_ours_(const char *what, const uint8_t *frame, uint16_t n)
+{
+    simnode_outbox_clear();
+    simnode_host_rx_clear();
+    const uint32_t no0 = g_warthog_filt_hist[9], rd0 = g_warthog_rxdrop_count;
+    (void)simnode_rx(frame, n, -60);
+    CHECK(g_warthog_filt_hist[9] == no0 + 1u && g_warthog_filt_reason == 9u,
+          "%s -> dropped by the receive filter, not_ours +%lu, reason 9 (got %lu)", what,
+          (unsigned long)(g_warthog_filt_hist[9] - no0), (unsigned long)g_warthog_filt_reason);
+    CHECK(g_warthog_rxdrop_count == rd0 && simnode_outbox_count() == 0 &&
+              simnode_host_rx_count() == 0,
+          "   and never reached the datapath (%lu drops there, %u relayed, %u delivered)",
+          (unsigned long)(g_warthog_rxdrop_count - rd0), simnode_outbox_count(),
+          simnode_host_rx_count());
+}
+
 static void t_rx_drops(void)
 {
     printf("--- RX: the verdicts that refuse a frame ---\n");
@@ -1145,10 +1492,11 @@ static void t_rx_drops(void)
                     frame, mk_uni(frame, W, A, C, A, &mc, PAY, sizeof(PAY)),
                     UMAC_MESH_FWD_DROP_TTL);
 
+    /* Never reaches the engine's own RA check (UMAC_MESH_FWD_DROP_NOT_FOR_US): the receive
+     * filter takes it first (t_rx_not_ours). */
     memset(&mc, 0, sizeof(mc)); mc.ttl = 31; mc.seq = 602;
-    rx_expect_drop_("a unicast whose RA is somebody else",
-                    frame, mk_uni(frame, C, A, E, A, &mc, PAY, sizeof(PAY)),
-                    UMAC_MESH_FWD_DROP_NOT_FOR_US);
+    rx_expect_not_ours_("a unicast whose RA is somebody else",
+                        frame, mk_uni(frame, C, A, E, A, &mc, PAY, sizeof(PAY)));
 
     /* AE 1 is the group form; on a 4-address unicast it is meaningless, and
      * guessing at what the sender meant is how an endpoint gets rewritten. */
@@ -1283,6 +1631,199 @@ static void t_rx_drops(void)
           simnode_host_rx_count());
 }
 
+static void t_rx_not_ours(void)
+{
+    printf("--- RX: a unicast whose RA is another station is not ours, relayed or not ---\n");
+    uint8_t frame[256];
+    struct umac_mesh_ctrl mc;
+
+    /* A leaf that hears both hops of A -> C -> us. The first names C as RA and us as
+     * mesh DA; taking it too would hand our host the packet twice. */
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    memset(&mc, 0, sizeof(mc)); mc.ttl = 31; mc.seq = 700;
+    rx_expect_not_ours_("leaf: A's frame for us, on its hop to our neighbour C",
+                        frame, mk_uni(frame, C, A, W, A, &mc, PAY, sizeof(PAY)));
+    mc.ttl = 30;
+    uint16_t n = mk_uni(frame, W, C, W, A, &mc, PAY, sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    CHECK(simnode_host_rx_count() == 1u, "C's relay of it, RA us, is delivered: once (%u)",
+          simnode_host_rx_count());
+
+    /* A's AE-2 replica of a broadcast, the copy meant for C: ours comes separately. */
+    memset(&mc, 0, sizeof(mc)); mc.flags = UMAC_MESH_CTRL_AE_A5A6; mc.ttl = 31; mc.seq = 701;
+    memcpy(mc.eaddr1, BC, 6); memcpy(mc.eaddr2, H2, 6);
+    rx_expect_not_ours_("A's broadcast replica addressed to C",
+                        frame, mk_uni(frame, C, A, C, A, &mc, PAY, sizeof(PAY)));
+    const uint32_t no0 = g_warthog_filt_hist[9];
+    mc.seq = 702;
+    n = mk_uni(frame, W, A, W, A, &mc, PAY, sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    const struct simnode_hostrx *r = simnode_host_rx_get(0);
+    CHECK(simnode_host_rx_count() == 1u && r != NULL && MAC_EQ(r->da, BC) &&
+              g_warthog_filt_hist[9] == no0,
+          "and the replica addressed to us is delivered as the broadcast (%u)",
+          simnode_host_rx_count());
+    simnode_host_rx_clear();
+    memset(&mc, 0, sizeof(mc)); mc.ttl = 31; mc.seq = 703;
+    n = mk_grp(frame, BC, A, A, &mc, PAY, sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    CHECK(simnode_host_rx_count() == 1u && g_warthog_filt_hist[9] == no0,
+          "a group-addressed frame is not judged by its RA: delivered (%u)",
+          simnode_host_rx_count());
+
+    /* A relay: RA us and mesh DA C is still relayed; the next hop's copy onward is not ours. */
+    fresh(/*fwd=*/true, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    memset(&mc, 0, sizeof(mc)); mc.ttl = 31; mc.seq = 710;
+    n = mk_uni(frame, W, A, C, A, &mc, PAY, sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    const struct simnode_frame *out = frame_to(C);
+    CHECK(out != NULL && !out->is_mgmt && g_warthog_filt_hist[9] == no0,
+          "relay: A's frame for C with RA us goes on to C (%u frames out)",
+          simnode_outbox_count());
+    mc.ttl = 30;
+    rx_expect_not_ours_("relay: C's copy of a frame onward to E", frame,
+                        mk_uni(frame, E, C, E, A, &mc, PAY, sizeof(PAY)));
+
+    /* The duplicate check keeps one sequence number per TA and TID, while a sender numbers
+     * each receiver apart: A's frame to C must not make A's retry to us a duplicate. */
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    memset(&mc, 0, sizeof(mc)); mc.ttl = 31; mc.seq = 720;
+    n = mk_uni(frame, C, A, C, A, &mc, PAY, sizeof(PAY));
+    frame[22] = 0x50; frame[23] = 0x00;           /* sequence number 5 */
+    rx_expect_not_ours_("A's frame to C, sequence 5", frame, n);
+    mc.seq = 721;
+    n = mk_uni(frame, W, A, W, A, &mc, PAY, sizeof(PAY));
+    frame[1] = (uint8_t)(frame[1] | 0x08u);       /* Retry */
+    frame[22] = 0x50; frame[23] = 0x00;
+    (void)simnode_rx(frame, n, -60);
+    CHECK(simnode_host_rx_count() == 1u,
+          "A's frame to us at sequence 5, marked Retry, is delivered, not a duplicate (%u, filt %lu)",
+          simnode_host_rx_count(), (unsigned long)g_warthog_filt_reason);
+
+    /* Block Ack: one reorder window per TA and TID, which a frame numbered in A's space
+     * toward C would move once its flush timeout released it. */
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    simnode_set_ampdu(true);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    simnode_outbox_clear();
+    n = mk_addba_req(frame, A);
+    CHECK(simnode_rx(frame, n, -50) && ba_to(A, 129) != NULL, "A's ADDBA request is accepted");
+    const uint32_t parked0 = g_warthog_reord_buffered, old0 = g_warthog_reord_outdated;
+    memset(&mc, 0, sizeof(mc)); mc.ttl = 31; mc.seq = 730;
+    n = mk_uni(frame, C, A, C, A, &mc, PAY, sizeof(PAY));
+    frame[22] = 0x40; frame[23] = 0x06;           /* sequence number 100 */
+    rx_expect_not_ours_("A's frame to C, sequence 100, in a Block Ack session with us", frame, n);
+    CHECK(g_warthog_reord_buffered == parked0, "and it is not parked in A's reorder window");
+    simnode_advance_run(150);
+    simnode_host_rx_clear();
+    for (uint16_t sn = 0; sn < 2u; sn++)
+    {
+        n = mk_uni_seq(frame, A, sn, 0, false);
+        (void)simnode_rx(frame, n, -50);
+    }
+    CHECK(simnode_host_rx_count() == 2u && g_warthog_reord_outdated == old0,
+          "A's frames to us, sequences 0 and 1, are delivered after its flush timeout "
+          "(%u, %lu outdated)",
+          simnode_host_rx_count(), (unsigned long)(g_warthog_reord_outdated - old0));
+    simnode_set_ampdu(false);
+}
+
+/* ---- 12b. receive: a unicast management frame whose RA is another station ------
+ *
+ * Whether the MM6108 hands these up as it does data is not measured. Until it is, the
+ * receive filter counts each one (AT+FILTSTAT? mgmt_nours=, with the last one's first 16
+ * octets) and drops none: dropping them would also drop anything the chip hands up with
+ * an addr1 that is not ours but is meant for us. Counted ahead of the pre-association
+ * gate, so an unprotected action frame and one from a station that is not a peer count
+ * too. Beacons are not judged (the chip rewrites their addresses), nor group frames, nor
+ * data (reason 9, t_rx_not_ours). */
+
+extern volatile uint32_t g_warthog_filt_mgmt_nours, g_warthog_filt_drop;
+extern volatile uint8_t g_warthog_filt_mgmt_nours_hdr[16];
+
+static void t_rx_mgmt_not_ours(void)
+{
+    printf("--- RX: unicast management addressed to another station is counted, not dropped ---\n");
+    uint8_t frame[256];
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    simnode_set_ampdu(true);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+
+    uint32_t mn0 = g_warthog_filt_mgmt_nours, fd0 = g_warthog_filt_drop;
+    memset((void *)g_warthog_filt_mgmt_nours_hdr, 0, sizeof(g_warthog_filt_mgmt_nours_hdr));
+    uint16_t n = mk_addba_req(frame, A);
+    memcpy(&frame[4], C, 6);
+    (void)simnode_rx(frame, n, -50);
+    CHECK(g_warthog_filt_mgmt_nours == mn0 + 1u && g_warthog_filt_drop == fd0,
+          "A's unprotected ADDBA request to C: counted (mgmt_nours +%lu), not dropped by the "
+          "filter (+%lu)",
+          (unsigned long)(g_warthog_filt_mgmt_nours - mn0),
+          (unsigned long)(g_warthog_filt_drop - fd0));
+    CHECK(g_warthog_filt_mgmt_nours_hdr[0] == 0xd0u &&
+              MAC_EQ((const uint8_t *)&g_warthog_filt_mgmt_nours_hdr[4], C) &&
+              MAC_EQ((const uint8_t *)&g_warthog_filt_mgmt_nours_hdr[10], A),
+          "  the snapshot: frame control d0, addr1 C, addr2 A");
+
+    mn0 = g_warthog_filt_mgmt_nours;
+    n = mk_addba_req(frame, A);
+    frame[26] = 10;
+    (void)simnode_rx(frame, n, -50);
+    CHECK(g_warthog_filt_mgmt_nours == mn0, "A's ADDBA request to us is not counted (+%lu)",
+          (unsigned long)(g_warthog_filt_mgmt_nours - mn0));
+
+    /* A wildcard probe request, and a beacon with addr1 zero, as an S1G conversion may leave it. */
+    mn0 = g_warthog_filt_mgmt_nours;
+    memset(frame, 0, 64);
+    frame[0] = 0x40;
+    memcpy(&frame[4], BC, 6);
+    memcpy(&frame[10], A, 6);
+    memcpy(&frame[16], BC, 6);
+    (void)simnode_rx(frame, 26u, -50);
+    memset(frame, 0, 64);
+    frame[0] = 0x80;
+    frame[32] = 0x64;
+    (void)simnode_rx(frame, 36u, -50);
+    CHECK(g_warthog_filt_mgmt_nours == mn0,
+          "a broadcast probe request and a beacon with addr1 00:00:00:00:00:00 are not counted "
+          "(+%lu)",
+          (unsigned long)(g_warthog_filt_mgmt_nours - mn0));
+
+    mn0 = g_warthog_filt_mgmt_nours;
+    const uint32_t no0 = g_warthog_filt_hist[9];
+    struct umac_mesh_ctrl mc = { .flags = 0, .ttl = 31, .seq = 740 };
+    n = mk_uni(frame, C, A, C, A, &mc, PAY, sizeof(PAY));
+    (void)simnode_rx(frame, n, -50);
+    CHECK(g_warthog_filt_mgmt_nours == mn0 && g_warthog_filt_hist[9] == no0 + 1u,
+          "A's data to C is not_ours (reason 9), not mgmt_nours (+%lu)",
+          (unsigned long)(g_warthog_filt_mgmt_nours - mn0));
+
+    /* Protected, from E, no peer: the filter drops it as unknown_sender, after counting it. */
+    mn0 = g_warthog_filt_mgmt_nours;
+    memset(frame, 0, 64);
+    frame[0] = 0xd0;
+    frame[1] = 0x40;
+    memcpy(&frame[4], C, 6);
+    memcpy(&frame[10], E, 6);
+    memcpy(&frame[16], E, 6);
+    frame[27] = 0x20;                               /* CCMP header: Ext IV */
+    frame[32] = 3;
+    (void)simnode_rx(frame, 48u, -50);
+    CHECK(g_warthog_filt_mgmt_nours == mn0 + 1u && g_warthog_filt_reason == 6u &&
+              MAC_EQ((const uint8_t *)&g_warthog_filt_mgmt_nours_hdr[10], E),
+          "a Protected action frame from E, no peer, to C: counted (+%lu), then dropped as "
+          "unknown_sender (reason %lu)",
+          (unsigned long)(g_warthog_filt_mgmt_nours - mn0), (unsigned long)g_warthog_filt_reason);
+    simnode_set_ampdu(false);
+}
+
 /* ---- leaf mode: the service tick frees lapsed proxy entries ------------ */
 
 static void t_leaf_proxy_sweep(void)
@@ -1319,9 +1860,17 @@ int main(void)
     t_tx_unicast_4addr();
     t_tx_group_3addr_standard();
     t_tx_group_replica_ae2();
+    t_tx_del_peer_mid_walk();
+    t_tx_del_peer_mid_lookup();
+    t_tx_peer_replaced_mid_tx();
+    t_retired_record_reclaim();
+    t_dying_slot_not_reused();
+    t_del_peer_releases_outside_critical();
+    t_del_peer_stops_peer_timeouts();
     t_tx_proxied_source();
     t_tx_proxied_destination();
     t_rx_deliver();
+    t_rx_filter_del_peer_mid_lookup();
     t_rx_forward_unicast();
     t_rx_forward_eapol();
     t_rx_forward_keyed();
@@ -1332,6 +1881,8 @@ int main(void)
     t_rx_replica_normalise();
     t_rx_proxied_endpoints();
     t_rx_drops();
+    t_rx_not_ours();
+    t_rx_mgmt_not_ours();
 
     /* Peer records are the only other thing on this heap, and del_peer frees
      * them (and drains their queues). With every peer gone, anything still
@@ -1340,6 +1891,8 @@ int main(void)
     CHECK(simnode_live_allocs() == 0,
           "no packet buffer was orphaned across the whole run (%u live)",
           simnode_live_allocs());
+    CHECK(simnode_frees_in_critical() == 0,
+          "and none was freed inside a critical section (%u)", simnode_frees_in_critical());
     simnode_stop();
 
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }

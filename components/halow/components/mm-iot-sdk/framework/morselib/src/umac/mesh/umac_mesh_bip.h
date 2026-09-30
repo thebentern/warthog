@@ -2,8 +2,9 @@
  * Copyright 2026 Warthog contributors
  * SPDX-License-Identifier: GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial
  *
- * BIP-CMAC-128 (IEEE 802.11-2020 12.5.4) for group-addressed mesh action frames:
- * the MMIE a peer running MFP requires on a broadcast PREQ or PERR.
+ * BIP-CMAC-128 (IEEE 802.11-2020 12.5.4) and its MMIE. Group path selection does not use
+ * it: mac80211 protects group Mesh Action frames with its MGTK (group-addressed privacy) and
+ * drops one carrying an MMIE from an MFP peer, so the datapath only parses one, to refuse it.
  */
 #pragma once
 
@@ -14,6 +15,8 @@
 /** MMIE: element id, length, Key ID (2), IPN (6), MIC (8). Always the last element. */
 #define UMAC_MESH_MMIE_EID 76u
 #define UMAC_MESH_MMIE_LEN 18u
+/** The MMIE of BIP-CMAC-256 and BIP-GMAC: the same, with a 16-octet MIC. */
+#define UMAC_MESH_MMIE16_LEN 26u
 /** The only key ids an IGTK may carry. */
 #define UMAC_MESH_IGTK_ID_MIN 4u
 #define UMAC_MESH_IGTK_ID_MAX 5u
@@ -34,6 +37,10 @@ size_t umac_mesh_bip_protect(const uint8_t key[16], uint16_t key_id, uint64_t ip
 
 /** Key ID and IPN of the MMIE that ends @p body; false when it does not end in one. */
 bool umac_mesh_bip_parse(const uint8_t *body, size_t len, uint16_t *key_id, uint64_t *ipn);
+
+/** True when @p body ends in an MMIE of either length, as mac80211's
+ *  ieee80211_get_mmie_keyidx finds one. */
+bool umac_mesh_bip_has_mmie(const uint8_t *body, size_t len);
 
 /** True when the MMIE ending @p body carries a MIC that verifies under @p key.
  *  The IPN replay check is the caller's, and only after this returns true. */

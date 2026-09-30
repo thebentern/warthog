@@ -115,3 +115,15 @@ int mmwlan_mesh_fwd_render(char *buf, uint32_t len)
 {
     return umac_mesh_fwd_glue_render(buf, len);
 }
+
+enum mmwlan_status mmwlan_mesh_query_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max,
+                                                uint8_t *count)
+{
+    return umac_mesh_peer_links_snapshot(umac_data_get_umacd(), out, max, count);
+}
+
+uint8_t mmwlan_mesh_get_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max)
+{
+    uint8_t n = 0;
+    return mmwlan_mesh_query_peer_links(out, max, &n) == MMWLAN_SUCCESS ? n : 0;
+}

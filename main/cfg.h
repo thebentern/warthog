@@ -79,7 +79,7 @@ esp_err_t warthog_cfg_set_mesh_enable(uint8_t enable);
  * A bridged OpenMANET node (mesh interface in br-lan) serves DHCP on that
  * bridge, so a lease puts us on its LAN with no change on the node. A
  * wizard-configured node enslaves the interface to bat0 instead: no lease and
- * no IP path, since batman-adv is not implemented here.
+ * no IP path unless AT+MESHBATMAN=1 makes this node a BATMAN_V member.
  *
  * The static fallback applies whenever no lease arrives, which includes every
  * warthog-to-warthog mesh. */
@@ -108,12 +108,20 @@ esp_err_t warthog_cfg_set_mesh_grp(uint8_t on);
  * the AMPE payload differently, so it is deliberately not reachable from here.
  * An OpenMANET peer (ieee80211w=2) reached ESTAB with a warthog that had it
  * off, because the framing follows our own RSN element, and unicast path
- * selection to an MFP peer is protected either way. With 1, our group path
- * selection carries a BIP MMIE (a relay or bridge needs it for an MFP peer to
- * accept its PREQs) and plaintext path selection from any keyed peer is
- * refused. Not run on air. Next boot. */
+ * selection to an MFP peer is protected either way; group path selection goes
+ * under our MGTK either way, as mac80211 sends it. With 1, hostap makes and
+ * sends our IGTK and plaintext path selection from any keyed peer is refused.
+ * Not run on air. Next boot. */
 uint8_t   warthog_cfg_get_mesh_pmf(void);
 esp_err_t warthog_cfg_set_mesh_pmf(uint8_t on);
+
+/* BATMAN_V member mode (AT+MESHBATMAN): 0 = off (default), 1 = on. Next boot. */
+uint8_t   warthog_cfg_get_mesh_batman(void);
+esp_err_t warthog_cfg_set_mesh_batman(uint8_t on);
+
+/* batman link-throughput override in 100 kbit/s units; 0 = rate control (default). Next boot. */
+uint32_t  warthog_cfg_get_mesh_battp(void);
+esp_err_t warthog_cfg_set_mesh_battp(uint32_t units);
 
 /* Candidate RSSI floor, dBm, -255..0: a neighbour heard at or below it is not
  * offered to SAE or opened toward. 0 or -255 is off. Default -80, OpenMANET's

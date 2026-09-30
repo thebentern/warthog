@@ -28,6 +28,7 @@ struct umac_evt;
 
 /* warthog mesh-support fork: mesh_start event references this by pointer. */
 struct mmwlan_mesh_args;
+struct mmwlan_mesh_peer_link;
 
 
 typedef void (*umac_evt_handler_t)(struct umac_data *umacd, const struct umac_evt *evt);
@@ -266,6 +267,20 @@ struct umac_evt
 
             volatile enum mmwlan_status *status;
         } mesh_start;
+
+        /* warthog: mmwlan_mesh_get_peer_links() snapshot. */
+        struct
+        {
+            struct mmwlan_mesh_peer_link *out;
+
+            uint8_t max;
+
+            uint8_t *n;
+
+            struct mmosal_semb *semb;
+
+            volatile enum mmwlan_status *status;
+        } mesh_peer_links;
 
         struct
         {

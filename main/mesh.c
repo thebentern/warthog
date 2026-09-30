@@ -10,11 +10,19 @@
 #include "mmwlan_mesh.h"
 #include "region.h"
 #include "esp_netif.h"
+#include "esp_netif_net_stack.h"
+#include "esp_timer.h"
+#include "lwip/dhcp.h"
+#include "lwip/etharp.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/netif.h"
+#include "lwip/prot/dhcp.h"
 #include "mmhalow.h"
 #include "cfg.h"
 #include "mesh_diag.h"
 #include "mesh_bridge.h"
+#include "bat_mode.h"
+#include "bat_port.h"
 
 /* 802.11s security. Default OFF, which matches only a peer set to encryption='none':
  * OpenMANET's mesh wizard writes SAE. The warthog-mesh-sae env turns it on. The
@@ -172,7 +180,7 @@ static void mesh_netif_up_(void)
 
     /* A bridged OpenMANET node (mesh iface in br-lan) serves DHCP on the bridge;
      * a lease joins its LAN. A wizard node's iface is a bat0 port and gives none
-     * (no batman-adv here). Without a lease the static address below is used. */
+     * unless batman mode runs (mesh_bat_netif_poll_). Else the static address below. */
     if (warthog_cfg_get_mesh_dhcp()) {
         esp_netif_action_connected(netif, NULL, 0, NULL);
         if (esp_netif_dhcpc_start(netif) == ESP_OK) {
@@ -201,6 +209,262 @@ static void mesh_netif_up_(void)
     ESP_LOGI(TAG, "mesh: netif up at " IPSTR, IP2STR(&ip.ip));
 }
 
+/* Batman mode: bat0 comes up on the first originator with a route; bat_mode_bat0_step decides
+ * the rest. lwIP's DHCP client runs beside a held address, which only a lease replaces. */
+#define MESH_BAT_ROUTER_ARP_TICKS 5 /* an unknown or unresolved router MAC is ARPed every 5th tick */
+static struct bat_mode_bat0 s_bat0;      /* probe task only */
+static esp_netif_ip_info_t s_bat_held;   /* probe task only: the address an attempt keeps */
+static int64_t s_bat_poll_us;            /* probe task only */
+static struct {                          /* probe task only: the lease's router */
+    uint32_t ip;
+    uint8_t  mac[6];
+    bool     known, unresolved;
+    uint8_t  asked;
+} s_bat_rtr;
+static portMUX_TYPE s_bat_view_mux = portMUX_INITIALIZER_UNLOCKED;
+static struct bat_mode_bat0 s_bat0_seen; /* AT+MESHBATMAN?'s copy, under s_bat_view_mux */
+static struct bat_mode_bat0_view s_bat_view;
+
+enum { MESH_BAT_IO_READ, MESH_BAT_IO_PROBE, MESH_BAT_IO_START, MESH_BAT_IO_STOP, MESH_BAT_IO_HOLD };
+struct mesh_bat_io {
+    esp_netif_t *netif;
+    uint8_t op;
+    ip4_addr_t cand;          /* READ with look: answered an ARP probe? PROBE: probe it */
+    bool look, ask_router;    /* READ */
+    esp_netif_ip_info_t hold; /* HOLD */
+    esp_netif_ip_info_t now;  /* READ results from here on */
+    bool running, binding, leased, taken, router_known;
+    uint8_t router_mac[6];
+};
+
+/* tcpip context: every lwIP call bat0 addressing makes. */
+static esp_err_t mesh_bat_io_(void *ctx)
+{
+    struct mesh_bat_io *io = ctx;
+    struct netif *lw = esp_netif_get_netif_impl(io->netif);
+    if (lw == NULL) {
+        return ESP_FAIL;
+    }
+    struct eth_addr *eth;
+    const ip4_addr_t *ip;
+    switch (io->op) {
+    case MESH_BAT_IO_PROBE: /* RFC 5227: bat0 has no address, so the sender IP is 0 */
+        (void)etharp_query(lw, &io->cand, NULL);
+        return ESP_OK;
+    case MESH_BAT_IO_START: /* dhcp_start leaves the address alone until a lease binds */
+        return dhcp_start(lw) == ERR_OK ? ESP_OK : ESP_FAIL;
+    case MESH_BAT_IO_STOP: /* nothing is bound, so lwIP keeps the address; esp_netif agrees */
+        dhcp_release_and_stop(lw);
+        (void)esp_netif_dhcpc_stop(io->netif);
+        return ESP_OK;
+    case MESH_BAT_IO_HOLD: { /* decided here: lwIP may have bound, or begun ARP-checking an offer, since READ */
+        const struct dhcp *d = netif_dhcp_data(lw);
+        if (dhcp_supplied_address(lw) || !ip4_addr_isany_val(*netif_ip4_addr(lw)) ||
+            (d != NULL && d->state == DHCP_STATE_CHECKING)) { /* an address change would suspend that check */
+            return ESP_ERR_INVALID_STATE;
+        }
+        netif_set_addr(lw, (const ip4_addr_t *)&io->hold.ip, (const ip4_addr_t *)&io->hold.netmask,
+                       (const ip4_addr_t *)&io->hold.gw);
+        return ESP_OK;
+    }
+    default:
+        break;
+    }
+    io->now.ip.addr = ip4_addr_get_u32(netif_ip4_addr(lw));
+    io->now.netmask.addr = ip4_addr_get_u32(netif_ip4_netmask(lw));
+    io->now.gw.addr = ip4_addr_get_u32(netif_ip4_gw(lw));
+    const struct dhcp *d = netif_dhcp_data(lw);
+    io->running = d != NULL && d->state != DHCP_STATE_OFF;
+    io->binding = d != NULL && (d->state == DHCP_STATE_REQUESTING || d->state == DHCP_STATE_CHECKING);
+    io->leased = dhcp_supplied_address(lw) != 0;
+    if (io->look) {
+        io->taken = etharp_find_addr(lw, &io->cand, &eth, &ip) >= 0;
+    }
+    if (io->now.gw.addr != 0) {
+        if (etharp_find_addr(lw, netif_ip4_gw(lw), &eth, &ip) >= 0) {
+            memcpy(io->router_mac, eth->addr, 6);
+            io->router_known = true;
+        }
+        if (io->ask_router) { /* always a broadcast request; the reply puts its MAC back in TT */
+            (void)etharp_query(lw, netif_ip4_gw(lw), NULL);
+        }
+    }
+    return ESP_OK;
+}
+
+static void mesh_bat_candidate_(unsigned attempt, esp_netif_ip_info_t *ip)
+{
+    uint8_t soft[6], a[4];
+    warthog_bat_port_soft_mac(soft);
+    bat_mode_static_ip(soft, attempt, a);
+    IP4_ADDR(&ip->ip, a[0], a[1], a[2], a[3]);
+    IP4_ADDR(&ip->netmask, 255, 255, 0, 0);
+    bat_mode_static_gw(a);
+    IP4_ADDR(&ip->gw, a[0], a[1], a[2], a[3]);
+}
+
+/* The held address with the static gateway: its lease's router, if it had one, is gone. */
+static esp_netif_ip_info_t mesh_bat_held_(void)
+{
+    esp_netif_ip_info_t h = s_bat_held;
+    uint8_t g[4];
+    bat_mode_static_gw(g);
+    IP4_ADDR(&h.gw, g[0], g[1], g[2], g[3]);
+    return h;
+}
+
+/* The lease's router: its MAC from lwIP's ARP table, learned once per router address. */
+static uint8_t mesh_bat_router_(const struct mesh_bat_io *io, bool leased)
+{
+    if (io->now.gw.addr != s_bat_rtr.ip) {
+        memset(&s_bat_rtr, 0, sizeof(s_bat_rtr));
+        s_bat_rtr.ip = io->now.gw.addr;
+    }
+    if (io->router_known) {
+        memcpy(s_bat_rtr.mac, io->router_mac, 6);
+        s_bat_rtr.known = true;
+    }
+    if (!leased || !s_bat_rtr.known) {
+        s_bat_rtr.unresolved = false;
+        warthog_bat_port_watch(NULL);
+        return leased ? bat_mode_router_state(s_bat_rtr.ip != 0, false, -1, 0) : BAT_MODE_ROUTER_NONE;
+    }
+    struct bat_client_route r = { 0 };
+    warthog_bat_port_watch(s_bat_rtr.mac);
+    const int answer = warthog_bat_port_watch_answer(s_bat_rtr.mac, &r);
+    /* A router that sent nothing into batman for 600 s leaves TT (tt 4.2): ARP it back, next tick first. */
+    if (answer == 0 && !s_bat_rtr.unresolved) {
+        s_bat_rtr.asked = 0;
+    }
+    s_bat_rtr.unresolved = answer == 0;
+    return bat_mode_router_state(s_bat_rtr.ip != 0, true, answer, r.ogm_age_ms);
+}
+
+static void mesh_bat_netif_poll_(void)
+{
+    esp_netif_t *netif = mmhalow_get_netif();
+    if (netif == NULL) {
+        return;
+    }
+    const int64_t now_us = esp_timer_get_time();
+    const uint32_t elapsed = s_bat_poll_us ? (uint32_t)((now_us - s_bat_poll_us) / 1000)
+                                           : MESH_PROBE_BURST_PERIOD_MS;
+    s_bat_poll_us = now_us;
+    const bool leased = bat_mode_bat0_leased(&s_bat0);
+    esp_netif_ip_info_t cand;
+    mesh_bat_candidate_(s_bat0.attempt, &cand);
+    struct mesh_bat_io io = { .netif = netif, .op = MESH_BAT_IO_READ, .look = bat_mode_bat0_probing(&s_bat0) };
+    io.cand.addr = cand.ip.addr;
+    io.ask_router = leased && (!s_bat_rtr.known || s_bat_rtr.unresolved) &&
+                    s_bat_rtr.asked++ % MESH_BAT_ROUTER_ARP_TICKS == 0;
+    if (esp_netif_tcpip_exec(mesh_bat_io_, &io) != ESP_OK) {
+        return;
+    }
+    struct bat_gw gw;
+    const uint8_t gws = warthog_bat_port_gw(&gw); /* as many as the engine reports: a second one is a rise too */
+    const struct bat_mode_bat0_in in = {
+        .elapsed_ms = elapsed, .routes = warthog_bat_port_routes(), .dhcp = warthog_cfg_get_mesh_dhcp() != 0,
+        .dhcp_running = io.running, .leased = io.leased, .have_ip = io.now.ip.addr != 0, .taken = io.taken,
+        .gws = gws, .binding = io.binding, .router = mesh_bat_router_(&io, leased),
+    };
+    const uint8_t before = s_bat0.attempt;
+    const enum bat_mode_bat0_act act = bat_mode_bat0_step(&s_bat0, &in);
+    switch (act) {
+    case BAT0_START_DHCP:
+        /* Started now, or left in INIT while bat0 is down; bringing bat0 up starts it then. */
+        if (!io.running) {
+            (void)esp_netif_dhcpc_start(netif);
+        }
+        esp_netif_action_connected(netif, NULL, 0, NULL); /* up; starts a client still in INIT */
+        ESP_LOGI(TAG, "batman: first route; DHCP on bat0 for up to %d s", BAT_MODE_DHCP_WAIT_MS / 1000);
+        break;
+    case BAT0_LEASED:
+        ESP_LOGI(TAG, "batman: DHCP lease " IPSTR " via " IPSTR " on bat0", IP2STR(&io.now.ip), IP2STR(&io.now.gw));
+        break;
+    case BAT0_PROBE: {
+        struct mesh_bat_io op = { .netif = netif, .op = MESH_BAT_IO_STOP };
+        (void)esp_netif_tcpip_exec(mesh_bat_io_, &op);
+        const esp_netif_ip_info_t none = { 0 };
+        (void)esp_netif_set_ip_info(netif, &none); /* an RFC 5227 probe goes out without an address */
+        esp_netif_action_connected(netif, NULL, 0, NULL); /* up, with DHCP stopped */
+        mesh_bat_candidate_(s_bat0.attempt, &cand);
+        op.op = MESH_BAT_IO_PROBE;
+        op.cand.addr = cand.ip.addr;
+        (void)esp_netif_tcpip_exec(mesh_bat_io_, &op);
+        if (s_bat0.ticks == 0) {
+            ESP_LOGI(TAG, "batman: %s; ARP-probing " IPSTR, s_bat0.attempt != before ? "address in use"
+                     : (in.dhcp ? "no DHCP lease" : "AT+MESHDHCP=0"), IP2STR(&cand.ip));
+        }
+        break;
+    }
+    case BAT0_STATIC:
+        mesh_bat_candidate_(s_bat0.attempt, &s_bat_held);
+        (void)esp_netif_set_ip_info(netif, &s_bat_held); /* DHCP was stopped by the probes */
+        esp_netif_action_connected(netif, NULL, 0, NULL);
+        ESP_LOGW(TAG, "batman: bat0 static at " IPSTR " via " IPSTR "%s", IP2STR(&s_bat_held.ip),
+                 IP2STR(&s_bat_held.gw),
+                 s_bat0.attempt >= BAT_MODE_STATIC_TRIES ? " (every probed candidate was in use)" : "");
+        break;
+    case BAT0_ROUTER_LOST:
+    case BAT0_RETRY: {
+        if (act == BAT0_ROUTER_LOST) {
+            s_bat_held = io.now;
+            ESP_LOGW(TAG, "batman: router " IPSTR " unreachable for %lu s; DHCP again, keeping " IPSTR,
+                     IP2STR(&io.now.gw), (unsigned long)(s_bat0.lost_ms / 1000), IP2STR(&io.now.ip));
+        } else {
+            ESP_LOGI(TAG, "batman: DHCP again beside " IPSTR " (attempt %lu)", IP2STR(&s_bat_held.ip),
+                     (unsigned long)s_bat0.retries);
+        }
+        struct mesh_bat_io op = { .netif = netif, .op = MESH_BAT_IO_START };
+        if (esp_netif_tcpip_exec(mesh_bat_io_, &op) != ESP_OK) {
+            ESP_LOGW(TAG, "batman: the DHCP client did not start"); /* the next tick ends the attempt */
+        }
+        break;
+    }
+    case BAT0_HOLD: {
+        struct mesh_bat_io op = { .netif = netif, .op = MESH_BAT_IO_HOLD, .hold = mesh_bat_held_() };
+        if (esp_netif_tcpip_exec(mesh_bat_io_, &op) == ESP_OK) {
+            ESP_LOGW(TAG, "batman: a DHCP server took " IPSTR " back mid-attempt; re-applied", IP2STR(&op.hold.ip));
+        }
+        break;
+    }
+    case BAT0_RETRY_FAIL: {
+        struct mesh_bat_io op = { .netif = netif, .op = MESH_BAT_IO_STOP };
+        (void)esp_netif_tcpip_exec(mesh_bat_io_, &op);
+        const esp_netif_ip_info_t h = mesh_bat_held_();
+        (void)esp_netif_set_ip_info(netif, &h); /* the same address; the gateway becomes the static one */
+        ESP_LOGW(TAG, "batman: no DHCP lease; keeping " IPSTR " via " IPSTR, IP2STR(&h.ip), IP2STR(&h.gw));
+        break;
+    }
+    default:
+        break;
+    }
+    esp_netif_ip_info_t shown = io.now;
+    if (act != BAT0_NONE) {
+        (void)esp_netif_get_ip_info(netif, &shown);
+    }
+    portENTER_CRITICAL(&s_bat_view_mux);
+    s_bat0_seen = s_bat0;
+    s_bat_view = (struct bat_mode_bat0_view){ .s = &s_bat0_seen, .router = in.router, .dhcp = in.dhcp,
+                                              .gw = gws != 0, .gw_down = gw.down, .gw_up = gw.up };
+    memcpy(s_bat_view.ip, &shown.ip.addr, 4); /* network order: the first octet first */
+    memcpy(s_bat_view.router_ip, &shown.gw.addr, 4);
+    memcpy(s_bat_view.gw_orig, gw.orig, 6);
+    portEXIT_CRITICAL(&s_bat_view_mux);
+}
+
+int warthog_mesh_bat0_line(char *buf, size_t len)
+{
+    struct bat_mode_bat0 s;
+    struct bat_mode_bat0_view v;
+    portENTER_CRITICAL(&s_bat_view_mux);
+    s = s_bat0_seen;
+    v = s_bat_view;
+    portEXIT_CRITICAL(&s_bat_view_mux);
+    v.s = &s;
+    return bat_mode_bat0_line(&v, buf, len);
+}
+
 static void mesh_probe_burst_task(void *arg)
 {
     (void)arg;
@@ -220,7 +484,9 @@ static void mesh_probe_burst_task(void *arg)
         /* Either MPM counts: warthog's own (open mesh) or hostap's (SAE --
          * where warthog's MPM is deliberately disabled and this gate used to
          * keep the netif down forever, leaving a keyed link with no L3). */
-        if (g_warthog_mpm_estab || g_warthog_hostap_estab) {
+        if (warthog_bat_port_running()) {
+            mesh_bat_netif_poll_();
+        } else if (g_warthog_mpm_estab || g_warthog_hostap_estab) {
             mesh_netif_up_();
         }
 
@@ -540,7 +806,16 @@ void warthog_mesh_smoke_test(void)
     args.beacon_interval_tu = WARTHOG_MESH_BEACON_TU;
     s_mesh_beacon_tu = args.beacon_interval_tu;
 
+    /* Before the first peer can exist: the RX hook, the soft interface and the
+     * datapath's batman gate all have to be in place for it. */
+    (void)warthog_bat_port_start();
+
     enum mmwlan_status st = mmwlan_mesh_enable(&args);
+    if (st == MMWLAN_SUCCESS) {
+        warthog_bat_port_mesh_up();
+    } else {
+        warthog_bat_port_mesh_failed();
+    }
 
     /* : mmwlan_mesh_enable() returns SUCCESS only when BOTH
      * ADD_INTERFACE(type=MESH) and MESH_CONFIG(START) were accepted by the

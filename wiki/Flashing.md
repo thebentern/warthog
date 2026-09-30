@@ -41,6 +41,26 @@ Releases carry per-region binaries and a POSIX flasher:
 | `*.elf` | — | Symbols, for `addr2line` on a panic backtrace |
 | `SHA256SUMS.txt` | — | Covers every asset |
 
+## Reflashing a running board
+
+No buttons, while the firmware's CDC console answers `AT`:
+
+1. Send `AT+DLMODE`. The board resets into the ROM bootloader and
+   re-enumerates as `303a:0009`.
+2. Flash that port and leave with a watchdog reset:
+
+```bash
+python -m esptool --chip esp32s3 --port /dev/cu.usbmodemXXXX --baud 921600 \
+  --before no-reset --after watchdog-reset write-flash 0x0 .pio/build/<env>/firmware.factory.bin
+```
+
+`AT+DLMODE` sets the ROM's force-download flag, which survives a chip reset:
+boards were repeatedly found still in download mode after resets (boot log
+`rst:0x15 (USB_UART_CHIP_RESET)`), and the watchdog reset clears it and boots
+the new image. Used on the bench on 2026-09-29/30; the same esptool line boots a
+board found sitting in download mode. `tools/bench/flash.sh` resets with
+`--after hard-reset` and then power-cycles the hub port.
+
 ## Several boards at once
 
 `tools/bench/flash.sh` flashes a bench of boards in sequence. It finds whichever

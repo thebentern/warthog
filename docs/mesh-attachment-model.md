@@ -1,16 +1,18 @@
 # Mesh attachment model: how Warthog should join an OpenMANET network
 
 Warthog can attach to an OpenMANET HaLow network three ways. This records
-which one is built, what each costs, and what each gives up — so the choice is
+which are built, what each costs, and what each gives up — so the choice is
 made on evidence rather than re-argued.
 
-**Short version.** Warthog today is a non-forwarding 802.11s mesh point (model
-A) or a plain STA leaf (model B). By default neither relays; `AT+MESHFWD=1`
-adds 802.11s HWMP forwarding, host-tested and not yet on a radio. If you need a
-relay — an airborne node extending coverage between two nodes that cannot hear
-each other — on a bare or bridged 802.11s network the answer is HWMP
-forwarding, not batman-adv. Inside a wizard-configured OpenMANET `bat0` fabric
-relaying is unproven.
+**Short version.** Warthog is a non-forwarding 802.11s mesh point (model A), a
+plain STA leaf (model B), or, opt-in, a BATMAN_V member (model C,
+`AT+MESHBATMAN=1`). By default none relays; `AT+MESHFWD=1` adds 802.11s HWMP
+forwarding, host-tested and not yet on a radio. If you need a relay — an
+airborne node extending coverage between two nodes that cannot hear each other
+— on a bare or bridged 802.11s network the answer is HWMP forwarding. Inside a
+wizard-configured OpenMANET `bat0` fabric it is model C, which relays as batman
+does; measured on air on 2026-09-29/30 as a one-hop member of two OpenMANET
+1.8.0 Pis' hand-made `bat0`, and not yet as a relay.
 
 ## The models
 
@@ -19,8 +21,9 @@ relaying is unproven.
 Warthog peers directly with OpenMANET nodes over 802.11s. SAE/AMPE peering is
 verified cross-vendor (2026-09-20: three-node mesh, all links `ESTAB`, two
 simultaneous AMPE pairwise keys on one Warthog). Unencrypted data passes at
-0–3% loss; the encrypted data plane has not yet carried traffic cross-vendor,
-see *Prerequisite: group-addressed frames*.
+0–3% loss. Encrypted data needs host CCMP (`warthog-mesh-sae-swccmp`), measured
+cross-vendor on air only in model C so far; see *Prerequisite: group-addressed
+frames*.
 
 Gives up: relaying. Warthog is a leaf. It is reachable by, and can reach, the
 peers it can hear — and nothing beyond them.
@@ -35,10 +38,36 @@ Gives up: peer-to-peer topology. Needs infrastructure, and the AP is a single
 point of failure. The AP-VAP-alongside-mesh variant on an OpenMANET node is
 untested.
 
-### C. BATMAN_V subset in firmware — **not built, and not recommended**
+### C. BATMAN_V member in firmware — **built, opt-in (`AT+MESHBATMAN=1`), measured on air one hop from OpenMANET 1.8.0**
 
-Ethertype 0x4305, compat 15, ELP, OGMv2, unicast/broadcast, and TT
-announcement of the tethered client MAC.
+A clean-room BATMAN_V engine (`main/bat/`, compat 15): ELP, OGMv2 with
+aggregation and forwarding, broadcast, unicast and 4-address unicast,
+fragmentation, ICMP, and the translation table with requests, full and
+changes-only responses and temporary entries. It announces the node's own bat0
+MAC (tethered hosts stay NATed) and relays for others. Not implemented: DAT,
+multicast optimisation, gateway announcements, BLA, network coding, ELP probes.
+The HaLow netif becomes the soft interface (MTU 1460), broadcasts leave as AE-2
+per-peer copies or standard group frames (`AT+MESHGRP`; three copies 5 ms apart,
+at most 5 broadcasts taken at once), and 802.11s forwarding
+and bridge mode are refused alongside it. It runs on the open builds and the
+host-CCMP (`-swccmp`) SAE builds; `warthog-mesh-sae` cannot decrypt peers' group
+frames and refuses it. Verified: engine unit, golden-capture, simulator and
+hostile-input tests; the firmware port (`bat_port.c`, the AT setters, the bat0
+addressing in `mesh.c`) run on the host against FreeRTOS, ESP-IDF and morselib
+fakes; the air frames through the real datapath, host CCMP included (simnode);
+black-box runs against batman-adv 2024.3 in a Linux VM over veth; the AE-2
+broadcast shape against mac80211 (`mac80211_hwsim`); the engine inside a Linux
+host program on an OpenMANET Pi against batman-adv 2025.4 on a second Pi. On
+Warthogs (`warthog-mesh-sae-swccmp`, 2026-09-29/30), against two OpenMANET 1.8.0
+Pis (batman-adv 2025.4) whose `bat0` was set up by hand, all one hop apart:
+neighbours, originators and translation tables both ways, the gateway Pi chosen
+by the Warthogs, a DHCP lease from a Pi, pings from a Pi's LAN, and Meshtastic's group reaching it. A
+Linux node's unicast above about 1000 bytes arrives only with its RTS threshold
+off. Not measured: a wizard-configured node, and a path of two or more hops (so
+no Warthog relaying). See `wiki/Batman-Mode.md`.
+
+Gives up: plain IP over 802.11s. In batman mode only batman frames cross the
+mesh, so every node on it must speak batman.
 
 ## Cost
 
@@ -49,10 +78,11 @@ a **~170 KiB** DRAM heap arena. No PSRAM.
 | Option | Effort | Flash | RAM | Notes |
 |---|---|---|---|---|
 | HWMP forwarding | ~600–1,200 LOC, 2–6 weeks | small | small | reuses the mesh port already in the build; range reflects two independent estimates |
-| BATMAN_V subset | ~2,000–2,500 LOC, 6–10 weeks | 25–40 KB | 4–6 KB | 16-entry originator table, 4 neighbours, dedup window, one 4 KB task |
+| BATMAN_V member (built) | ~3,500 LOC engine + ~1,800 LOC port and morselib | 31.7 KB code (engine 24.6 KB, port 7.2 KB; `warthog-us`, 2026-09-28) | 363 B static (port 239 B, bat0 addressing 124 B) and 28 B of RTC memory (kept sequence numbers); ≈ 58 KB heap only while batman runs, plus up to 16 received frames lwIP has not read (≈ 24 KB, at most ≈ 33 KB) | flash (`.text` and `.literal` of the batman objects; 3.8 KB of constants besides) and static RAM from the build map; heap computed from the Xtensa object sizes: engine 32.5 KB, RX/TX frame slots 15.7 KB, render buffer 4 KB, 6 KB task stack; the received frames replace the radio receive buffers lwIP holds with batman off. Measured on `warthog-mesh-sae-swccmp` (2026-09-29/30): about 53 KB heap free right after boot; with 3–4 SAE peers, host CCMP and batman, 22–31 KB free, minimum 10.9–20 KB, largest block 8.7–15 KB |
 
-**Size is not the constraint for either option.** Do not scope this on flash
-or RAM; both fit with room to spare.
+**Flash is not the constraint for either option.** RAM is tight on the
+host-CCMP build in batman mode: the lowest free heap measured was 10.9 KB, with
+an 8.7 KB largest block.
 
 ## Why HWMP forwarding, not batman-adv
 
@@ -60,18 +90,20 @@ This applies to bare or bridged 802.11s networks: peers whose mesh interface
 stands alone or sits in `br-lan`, with no `bat0`. Relaying inside a
 wizard-configured OpenMANET `bat0` fabric is unproven: the wizard sets mesh11sd
 `mesh_fwding='0'`, so its nodes do not forward 802.11s frames and multi-hop is
-batman's job, and no Warthog has been measured against such a node.
+batman's job, and no Warthog relay has been measured in a `bat0` fabric.
 
-1. **Batman-adv is broadcast-first, and encrypted broadcast is Warthog's
-   least-proven path.** OGMs flood; the translation table floods.
+1. **Batman-adv is broadcast-first, and encrypted broadcast needs host
+   CCMP.** OGMs flood; the translation table floods.
    `AT+MESHGRP=1` sends standard 802.11s group frames, but Warthog puts only
    its own MGTK in the chip, so under SAE a peer's group frames decrypt only
-   through host CCMP, which has not run on air (see *Prerequisite:
+   through host CCMP, which does so on air (see *Prerequisite:
    group-addressed frames*). HWMP's control plane rides the management path
    instead, which does not use the data-plane group key; toward a peer running
-   MFP (the wizard's `ieee80211w=2`) it must itself be protected (CCMP unicast;
-   BIP group, which Warthog's own group frames carry only with `AT+MESHPMF=1`),
-   which is implemented and not measured.
+   MFP (the wizard's `ieee80211w=2`) it must itself be protected (CCMP unicast
+   under the link key; group under the sender's MGTK, group-addressed privacy as
+   mac80211 sends it on any SAE mesh, which only host CCMP opens on Warthog),
+   which is measured for a node's group PREQ and the Warthog's unicast PREP
+   (2026-09-30) and not for a Warthog relay's group path selection.
 2. **HWMP is already half-present.** The mesh port answers path requests
    aimed at it today. Forwarding is the missing branch, not a new subsystem.
 > **Update.** The forwarding layer described below as future work now exists
@@ -136,12 +168,14 @@ have with `ip addr show bat0` before believing either story** — that one
 command is the difference, and this document previously told you the answer
 without asking the question.
 
-What remains true regardless: Warthog is not a batman originator. Against a
-node that *is* on `bat0` it peers at L2 but gets no IP path: a batman hardif
-hands only batman frames (ethertype 0x4305) to `bat0`, so Warthog's IP and ARP
-never reach `br-ahwlan` or the DHCP server on it, and Warthog falls back to its
-static `10.77.x.y/16`. It is absent from `batctl originators` and outside that
-L2 domain. None of this is measured; no `bat0` node has been on the bench.
+In plain mesh mode Warthog is not a batman originator. Against a node that
+*is* on `bat0` it peers at L2 but gets no IP path: a batman hardif hands only
+batman frames (ethertype 0x4305) to `bat0`, so Warthog's IP and ARP never reach
+`br-ahwlan` or the DHCP server on it, and Warthog falls back to its static
+`10.77.x.y/16`. It is absent from `batctl originators` and outside that L2
+domain. With `AT+MESHBATMAN=1` (model C) it is a member instead, measured on
+air on 2026-09-29/30 against a `bat0` set up by hand on two OpenMANET Pis; a
+plain-mode Warthog against a `bat0` node is not measured.
 
 Two ways out, and they are genuinely different products:
 
@@ -152,16 +186,17 @@ Two ways out, and they are genuinely different products:
   unproven: wizard nodes run `mesh_fwding='0'`, and nothing has been measured
   against one. It does *not* make Warthog a visible batman originator or
   announce its tethered client in the translation table.
-- **A BATMAN_V subset in firmware.** Only this makes Warthog a routed member
-  the rest of the OpenMANET tooling can see. Note a licensing constraint:
-  batman-adv is GPL-2.0-only and morselib here is GPL-3.0-or-later, so this
-  must be a clean-room implementation of the protocol, not a port of the
-  Linux source.
+- **A BATMAN_V member in firmware** — model C, built. Only this makes Warthog a
+  routed member that `batctl n`, `batctl o` and `batctl tg` on OpenMANET nodes
+  show. openmanetd's node list, host names and address reservation still do not:
+  they are fed by alfred, which Warthog does not run. batman-adv is
+  GPL-2.0-only and morselib here is GPL-3.0-or-later, so it is a clean-room
+  implementation of the protocol, not a port of the Linux source.
 
 For the drone-relay goal between bare or bridged 802.11s nodes, forwarding is
-the answer; inside a `bat0` fabric it is unproven. For "Warthog appears in
-`batctl originators` and ATAK discovery works end to end", only the subset
-does, and it is not enough alone: OpenMANET's CoT is IPv4 multicast to
+the answer; inside a `bat0` fabric it is model C. For "Warthog appears in
+`batctl originators` and ATAK discovery works end to end", only model C does,
+and it is not enough alone: OpenMANET's CoT is IPv4 multicast to
 `239.2.3.1:6969` on `br-ahwlan`, which a NATed Warthog must also repeat to its
 tethered client (`main/mudp.c` repeats only Meshtastic's group).
 
@@ -227,11 +262,20 @@ TX, compiled only into the `warthog-mesh-sae-swccmp` builds) is implemented
 and keeps a per-transmitter key for every peer. Host CCMP refuses a unicast
 frame keyed with a group key (`grpkey=` on `AT+SWCCMP?`).
 
-What remains is **measurement**: no run has yet shown `AT+SWCCMP?` reporting
-`ok > 0` on live traffic, and the 3-address group-frame AAD path has never
-executed on hardware. Until that is confirmed, treat encrypted group traffic
-as unproven — and note that a broadcast-dependent design (batman) inherits
-that risk, while HWMP's control plane on the management path does not.
+Measured on air on 2026-09-29 (`warthog-mesh-sae-swccmp`, batman mode, two
+OpenMANET 1.8.0 Pis): host CCMP opened the Pis' 3-address group frames (ELP,
+OGMs, broadcasts, group PREQs), `AT+SWCCMP?` `tried=69 ok=69` on one board. No
+Pi sent unicast to a Warthog that day (their paths stayed `RESOLVING`). On
+2026-09-30, after the group-privacy fix, host CCMP opened the Pis' unicast too:
+`batctl ping` from a Pi to each Warthog 5/5, and DHCP leases from a Pi's
+dnsmasq. The chip also hands up unicast data between two other stations, which
+host CCMP then counted as `micfail` (the 2026-09-30 fail line held one: addr1 a
+Pi, addr2 the other Warthog); the receive filter now drops those on addr1 first
+(`not_ours`, host-tested). Unicast management frames between two other stations
+are only counted (`mgmt_nours` in `AT+FILTSTAT?`): whether the chip hands those
+up is not measured, and a Protected one from a peer still reaches host CCMP. Batman mode refuses `warthog-mesh-sae`, whose chip
+crypto drops every peer's group frame, and on the `-swccmp` builds depends on
+host CCMP group RX.
 
 ## Cheaper partial relays worth knowing about
 
@@ -285,9 +329,10 @@ So two questions need a radio, and a relay needs both answered yes:
    `wiki/OpenMANET-Interop.md` answers it, once the first answer is yes.
 
 **Do not test the first by overhearing.** A Warthog "in range of two peers but
-addressed by neither" receives frames whose addr1 is another station. Every
-802.11 receiver filters on addr1 — acknowledgement depends on it — so that setup
-reads zero whether addr3 is filtered or not.
+addressed by neither" receives data frames whose addr1 is another station. The
+MM6108 does hand those up (measured on 2026-09-30), but the receive filter drops them
+before the datapath (`not_ours` in `AT+FILTSTAT?`), so they never count in
+`fwdcand`: that setup reads zero whether addr3 is filtered or not.
 
 ### The experiment
 

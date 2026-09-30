@@ -3,14 +3,15 @@
  *
  * Everything between the 802.3 host interface and mmdrv_tx_frame() is the REAL
  * firmware: umac_mesh.c, umac_mesh_fwd_glue.c, the forwarding engine, the path
- * and proxy tables, umac_datapath.c and umac_datapath_mesh.c, the packet
- * buffers and the STA table. Only the chip (fake_chip.c) and the RTOS
- * (fake_rtos.c) are replaced, plus the radio stack below the mesh
- * (fake_radio_stack.c, generated).
+ * and proxy tables, umac_datapath.c and umac_datapath_mesh.c, Block Ack
+ * (umac_ba.c), the packet buffers and the STA table. Only the chip
+ * (fake_chip.c) and the RTOS (fake_rtos.c) are replaced, plus the radio stack
+ * below the mesh (fake_radio_stack.c, generated).
  *
  * What this cannot tell you: anything the radio does. No modulation, no
  * timing, no interference, no chip behaviour beyond a TX status per data frame
- * and the group key slot's PN, and nothing about what a real mac80211 peer
+ * (and per frame under our group key) and the group key slot's PN, and nothing
+ * about what a real mac80211 peer
  * does with the bytes. A green run here means the firmware's
  * own logic is consistent, not that it works on the air.
  */
@@ -24,7 +25,7 @@
 /** A frame the firmware handed to the chip: the exact bytes that would have
  *  gone on the air. */
 struct simnode_frame {
-    uint8_t  bytes[512];
+    uint8_t  bytes[1600]; /* a 1500-byte payload in its largest shape, host CCMP included */
     uint16_t len;
     bool     is_mgmt;
     uint8_t  vif_id;
@@ -64,6 +65,10 @@ void simnode_set_mesh_id(const uint8_t *id, uint8_t len);
 
 /** The gates AT+MESHFWD / MESHBRIDGE / MESHGRP / MESHSEC set. */
 void simnode_set_gates(bool fwd, bool bridge, bool grp_std, bool secure);
+
+/** A-MPDU as the board runs it (config on, the chip's capability set), so unicast data
+ *  starts Block Ack sessions through the real umac_ba.c. Off by default; survives a start. */
+void simnode_set_ampdu(bool on);
 
 /* ---- peers ------------------------------------------------------------ */
 
@@ -124,6 +129,8 @@ bool simnode_tx_send_held(unsigned i);
 bool simnode_tx_return_held(unsigned i);
 /** True once the group slot encrypted a frame; @p top gets the highest PN it used. */
 bool simnode_group_pn_top(uint64_t *top);
+/** Frames the group slot has encrypted since the simulator was loaded. */
+unsigned simnode_group_pn_draws(void);
 
 /* ---- driving ---------------------------------------------------------- */
 
@@ -201,8 +208,29 @@ size_t simnode_last_new_peer(uint8_t addr[6], const uint8_t **ies);
 /** Live allocations, for leak assertions. */
 unsigned simnode_live_allocs(void);
 unsigned simnode_in_critical(void);
+/** Blocks freed inside a critical section so far (packets included). */
+unsigned simnode_frees_in_critical(void);
 /** Run @p cb once, at the next TX packet allocation: between build_mgmt_frame()'s two passes. */
 void simnode_set_tx_alloc_hook(void (*cb)(void));
+
+/* ---- the event loop between another task's steps ------------------------
+ *
+ * A test's own calls stand for the tasks that are not the event loop (the netif and
+ * batman engine TX, the chip driver's RX filter). These run @p cb, standing for the
+ * loop, once, at an exact point inside such a task; the loop's own calls do not fire them. */
+
+/** At the next read of a peer record's address (umac_sta_data_matches_peer_addr): the
+ *  record pointer is loaded, the record is read after @p cb returns. */
+void simnode_set_peer_read_hook(void (*cb)(void));
+/** At the next mutex take (the forwarding glue's lock), before it is held. */
+void simnode_set_lock_hook(void (*cb)(void));
+/** In the RX filter, after it looked a sender's record up and before it writes that
+ *  record's duplicate cache (at its own-address check, umac_interface_addr_matches_mac_addr). */
+void simnode_set_rx_filter_hook(void (*cb)(void));
+/** Once @p mac's station record is freed, the next station record allocated takes its
+ *  address, as a heap gives a freed block to the next caller of its size. NULL disarms,
+ *  freeing a block parked and never reused. False if @p mac is not a peer. */
+bool simnode_recycle_peer_record(const uint8_t *mac);
 unsigned simnode_rssi_calls(void);
 bool simnode_rssi_for(const uint8_t *ta, int16_t *rssi);
 unsigned simnode_timeouts_registered(void);
@@ -210,6 +238,9 @@ unsigned simnode_timeouts_registered(void);
 void simnode_fail_next_timeout(void);
 /** umac_core timeouts registered and not yet fired or dequeued. */
 unsigned simnode_timeouts_pending(void);
+/** Pending timeouts with an argument inside station record @p rec (addresses only: it may be
+ *  freed). A record del_peer freed must have none left. */
+unsigned simnode_timeouts_holding(const void *rec);
 /** Fire every umac_core timeout due at the current virtual time, earliest first,
  *  then run the event loop, as the core task would. @returns how many fired. */
 unsigned simnode_run_timeouts(void);
@@ -218,5 +249,46 @@ void simnode_advance_run(uint32_t ms);
 
 /** The +MESHPATH / table dump the AT command prints. */
 int simnode_render_paths(char *buf, uint32_t len);
+
+/* ---- BATMAN_V member mode (main/bat_port.c) ---------------------------- */
+
+/** The gate AT+MESHBATMAN sets at boot (g_warthog_mesh_batman). */
+void simnode_set_batman(bool on);
+
+/** An 802.3 frame of any ethertype from the host side, as bat_port.c's mmwlan_tx_pkt:
+ *  @p ra non-NULL sends to that peer only (mmwlan_tx_metadata.ra), NULL looks the DA up.
+ *  @returns the mmwlan_status the datapath returned; the frame is consumed either way. */
+int simnode_host_tx_eth(const uint8_t *ra, const uint8_t da[6], const uint8_t sa[6],
+                        uint16_t ethertype, const uint8_t *payload, uint16_t payload_len);
+
+/** A frame the extended RX callback took (the hook bat_port.c registers): the whole
+ *  802.3 frame and the transmitter address the datapath passed with it. */
+struct simnode_extrx {
+    uint8_t  frame[1600];
+    uint16_t len;       /* whole 802.3 frame, header included (frame holds the first 1600) */
+    uint8_t  ta[6];
+    bool     have_ta;
+};
+/** On: register the extended RX callback, which silences the raw one, as on the firmware.
+ *  Off: the raw callback again. Survives simnode_start. */
+void simnode_set_rx_ext_cb(bool on);
+/** As simnode_set_rx_ext_cb, registered for VIF @p vif (an mmwlan_vif) only; bat_port.c,
+ *  like simnode_set_rx_ext_cb, uses MMWLAN_VIF_UNSPECIFIED (STA and AP). */
+void simnode_set_rx_ext_cb_vif(bool on, unsigned vif);
+unsigned simnode_ext_rx_count(void);
+const struct simnode_extrx *simnode_ext_rx_get(unsigned i);
+void simnode_ext_rx_clear(void);
+
+/** What rate control reports for peer @p mac: @p kbps when @p valid, else none (0). */
+void simnode_set_peer_tput(const uint8_t mac[6], uint32_t kbps, bool valid);
+struct mmwlan_mesh_peer_link;
+/** umac_mesh_peer_links_snapshot, which mmwlan_mesh_query_peer_links runs: on the event loop
+ *  (@p on_loop), else as from the port's task. The simulator runs no loop behind a wait, so
+ *  off the loop only a failed post means anything: fill the queue first (simnode_evt_fill).
+ *  @returns the mmwlan_status. */
+int simnode_peer_links_query(struct mmwlan_mesh_peer_link *out, uint8_t max, uint8_t *count,
+                             bool on_loop);
+/** simnode_peer_links_query on the event loop; the count, 0 on failure. */
+uint8_t simnode_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max);
 
 #endif /* SIMNODE_H */

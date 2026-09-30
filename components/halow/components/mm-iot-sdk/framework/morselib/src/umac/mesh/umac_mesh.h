@@ -40,6 +40,9 @@ enum mmwlan_status umac_mesh_add_datapath_peer(const uint8_t *peer_addr);
 
 bool umac_mesh_sae_active(void);
 
+/** Our mesh address, from mesh start (zero before). */
+const uint8_t *umac_mesh_own_addr(void);
+
 /** Offer a SAE candidate heard at @p rssi to hostap; a new peer is skipped at or
  *  below the RSSI floor, while held off after a failed SAE, or when the table is full. */
 void umac_mesh_offer_sae_candidate(const uint8_t *addr, const uint8_t *ies, size_t ies_len,
@@ -112,6 +115,13 @@ enum mmwlan_status umac_mesh_disable_mesh(struct umac_data *umacd);
 
 /** Count of peers in the ESTABLISHED state. */
 uint8_t umac_mesh_get_peer_count(struct umac_data *umacd);
+
+/** mmwlan_mesh_query_peer_links(): up to @p max peers into @p out, taken on the umac event
+ *  loop (directly when already on it). @p count gets how many on MMWLAN_SUCCESS; on any
+ *  other status no snapshot was taken, @p count is 0 and @p out is untouched. */
+enum mmwlan_status umac_mesh_peer_links_snapshot(struct umac_data *umacd,
+                                                 struct mmwlan_mesh_peer_link *out, uint8_t max,
+                                                 uint8_t *count);
 
 
 /**

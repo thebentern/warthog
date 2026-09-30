@@ -119,13 +119,17 @@ extern volatile uint32_t g_warthog_txst_data_last_flags;
 extern volatile uint32_t g_warthog_rxframe_entry;
 extern volatile uint32_t g_warthog_filter_entry;
 extern volatile uint32_t g_warthog_filt_reason, g_warthog_filt_drop;
-extern volatile uint32_t g_warthog_filt_hist[9];
+extern volatile uint32_t g_warthog_filt_hist[10];
+extern volatile uint32_t g_warthog_filt_mgmt_nours;
+extern volatile uint8_t g_warthog_filt_mgmt_nours_hdr[16];
 extern volatile uint32_t g_warthog_rx_meshctrl_stripped;
 extern volatile uint32_t g_warthog_rx_meshctrl_ae;
 extern volatile uint32_t g_warthog_rx_fwd_candidate;
 extern volatile uint8_t  g_warthog_rx_fwd_last_da[6];
 extern volatile uint32_t g_warthog_mesh_seq;
 extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge;
+/* BATMAN_V member mode (AT+MESHBATMAN): batman broadcasts go out as AE-2 replicas. */
+extern volatile uint32_t g_warthog_mesh_batman;
 extern volatile uint16_t g_warthog_fc_ring[32];
 extern volatile uint32_t g_warthog_fc_ring_idx;
 extern volatile uint32_t g_warthog_rxdrop_reason;
@@ -588,6 +592,8 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
 
     uint16_t llc_ethertype;
     uint8_t tid_index = MMDRV_SEQ_NUM_BASELINE;
+    /* warthog: the replay counter this frame is judged against; per TID for QoS data. */
+    enum umac_key_rx_counter_space rx_space = UMAC_KEY_RX_COUNTER_SPACE_DEFAULT;
     const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
     struct umac_8023_hdr header_8023 = { 0 };
     bool mesh_ctrl_present = false;
@@ -608,6 +614,10 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         {
             tid_index = dot11_qos_control_get_tid(qos_control->field);
         }
+        /* Group frames too: a peer's multicast on two ACs can leave its chip with PNs
+         * interleaved. The TID is in the CCMP nonce, so no frame moves between counters. */
+        rx_space = umac_keys_rx_counter_space_for_tid(
+            (uint8_t)dot11_qos_control_get_tid(qos_control->field));
         /* Bit 8 means Mesh Control only in an MBSS; in a BSS it is TXOP/queue size. */
         mesh_ctrl_present = data->ops == &datapath_ops_mesh &&
                             (le16toh(qos_control->field) & 0x0100) != 0;
@@ -726,8 +736,7 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
                 g_warthog_rxdrop_reason = 96; g_warthog_rxdrop_count++; goto drop;
             }
         }
-        if (ccmp_header == NULL ||
-            !ccmp_is_valid(stad, ccmp_header, UMAC_KEY_RX_COUNTER_SPACE_DEFAULT))
+        if (ccmp_header == NULL || !ccmp_is_valid(stad, ccmp_header, rx_space))
         {
 
             umac_stats_increment_datapath_rx_ccmp_failures(umacd);
@@ -818,7 +827,7 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         }
         /* Leaf mode learns proxied hosts too, or a reply goes out with the host as
          * mesh DA, which no mesh node accepts. Only below the reason-3 and 93 gates. */
-        if (!g_warthog_mesh_fwd && !g_warthog_mesh_bridge && ae_len != 0)
+        if (!g_warthog_mesh_fwd && !g_warthog_mesh_bridge && !g_warthog_mesh_batman && ae_len != 0)
         {
             struct umac_mesh_ctrl lmc; uint16_t lused = 0;
             if (umac_mesh_ctrl_parse(mc, (uint16_t)mmpkt_get_data_length(rxbufview), &lmc, &lused))
@@ -1386,6 +1395,10 @@ drop:
  * unicast ones under a key id other than the link's pairwise key. */
 extern volatile uint32_t g_warthog_mgmt_prot_chip, g_warthog_mgmt_prot_host,
     g_warthog_mgmt_prot_nodec, g_warthog_mgmt_prot_grpkey;
+/* Group-addressed ones (group-addressed privacy, under the sender's MGTK): opened by neither,
+ * by the chip (so under our own MGTK), under a key id not the sender's MGTK, or replayed. */
+extern volatile uint32_t g_warthog_mgmt_gp_nodec, g_warthog_mgmt_gp_own, g_warthog_mgmt_gp_key,
+    g_warthog_mgmt_gp_replay;
 
 static bool umac_datapath_process_mgmt_frame_ccmp_header(struct umac_data *umacd,
                                                          struct umac_sta_data *stad,
@@ -1403,7 +1416,15 @@ static bool umac_datapath_process_mgmt_frame_ccmp_header(struct umac_data *umacd
     const struct mmdrv_rx_metadata *rx_metadata = mmdrv_get_rx_metadata(rxbuf);
     const bool mesh_sae = umac_data_get_datapath(umacd)->ops == &datapath_ops_mesh &&
                           umac_mesh_sae_active();
+    const bool group = mm_mac_addr_is_multicast(dot11_get_ra(header));
     bool decrypted = (rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED) != 0;
+    /* As rxdrop 95, and before any replay counter moves: the chip's only group key is our
+     * own MGTK, which every peer holds, so a group frame it opened is forged in the TA's name. */
+    if (mesh_sae && decrypted && group)
+    {
+        g_warthog_mgmt_gp_own++;
+        return false;
+    }
     if (mesh_sae && decrypted)
     {
         g_warthog_mgmt_prot_chip++;
@@ -1429,6 +1450,10 @@ static bool umac_datapath_process_mgmt_frame_ccmp_header(struct umac_data *umacd
         if (mesh_sae)
         {
             g_warthog_mgmt_prot_nodec++;
+            if (group)
+            {
+                g_warthog_mgmt_gp_nodec++;
+            }
         }
         MMLOG_WRN("Received frame without HW Decryption (FC: 0x%04x).\n",
                   le16toh(frame_control_le));
@@ -1442,16 +1467,28 @@ static bool umac_datapath_process_mgmt_frame_ccmp_header(struct umac_data *umacd
     uint8_t *ccmp_header = mmpkt_remove_from_start(rxbufview, DOT11_CCMP_HEADER_LEN);
     /* As host CCMP refuses: every member holds a peer's MGTK, so a unicast under it
      * could have been sent by any of them in that peer's name. */
-    if (mesh_sae && stad != NULL && ccmp_header != NULL &&
-        !mm_mac_addr_is_multicast(dot11_get_ra(header)) &&
+    if (mesh_sae && stad != NULL && ccmp_header != NULL && !group &&
         (int)((ccmp_header[3] & 0xc0u) >> 6) !=
             umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE))
     {
         g_warthog_mgmt_prot_grpkey++;
         return false;
     }
+    /* And a group frame only under the sender's MGTK (mac80211 rx.c: link_sta->gtk[keyid]). */
+    if (mesh_sae && stad != NULL && ccmp_header != NULL && group &&
+        umac_keys_get_key_type(stad, (uint8_t)((ccmp_header[3] & 0xc0u) >> 6)) !=
+            UMAC_KEY_TYPE_GROUP)
+    {
+        g_warthog_mgmt_gp_key++;
+        return false;
+    }
+    /* Group ones on that MGTK's management counter, apart from its data TIDs, as mac80211. */
     if (!ccmp_is_valid(stad, ccmp_header, UMAC_KEY_RX_COUNTER_SPACE_IND_ROBUST_MGMT))
     {
+        if (mesh_sae && group && ccmp_header != NULL)
+        {
+            g_warthog_mgmt_gp_replay++;
+        }
         MMLOG_WRN("Unable to validate frame security, dropping.\n");
         umac_stats_increment_datapath_rx_ccmp_failures(umacd);
         return false;
@@ -1802,6 +1839,18 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
         goto exit;
     }
 
+    /* A census, not a drop: whether the MM6108 hands up unicast management addressed to other
+     * stations, as it does data, is unmeasured. Beacons are skipped: the chip rewrites them. */
+    if (data->ops == &datapath_ops_mesh &&
+        dot11_frame_control_get_type(header->frame_control) == DOT11_FC_TYPE_MGMT &&
+        dot11_frame_control_get_subtype(header->frame_control) != DOT11_FC_SUBTYPE_BEACON &&
+        !mm_mac_addr_is_multicast(dot11_get_ra(header)) &&
+        !mm_mac_addr_is_equal(dot11_get_ra(header), umac_mesh_own_addr()))
+    {
+        g_warthog_filt_mgmt_nours++;
+        memcpy((void *)g_warthog_filt_mgmt_nours_hdr, header, sizeof(g_warthog_filt_mgmt_nours_hdr));
+    }
+
     if (!umac_datapath_rx_frame_allowed_pre_association(data,
                                                         frame_ver_type_subtype,
                                                         header->frame_control))
@@ -1823,6 +1872,20 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
         {
             MMLOG_INF("Source address matches our MAC address, dropping received frame.\n");
             g_warthog_filt_hist[7]++; g_warthog_filt_reason = 7; g_warthog_filt_drop++;
+            drop_frame = true;
+            goto exit;
+        }
+
+        /* The MM6108 in mesh mode hands up unicast data addressed to other stations
+         * (measured on air). A unicast for us, relayed or not, carries our address as RA,
+         * so this one is not ours: drop it before the duplicate check, the reorder window
+         * and any decryption (host CCMP would try it under the TA's key: micfail). */
+        if (data->ops == &datapath_ops_mesh &&
+            dot11_frame_control_get_type(header->frame_control) == DOT11_FC_TYPE_DATA &&
+            !mm_mac_addr_is_multicast(dot11_get_ra(header)) &&
+            !umac_interface_addr_matches_mac_addr(stad, dot11_get_ra(header)))
+        {
+            g_warthog_filt_hist[9]++; g_warthog_filt_reason = 9; g_warthog_filt_drop++;
             drop_frame = true;
             goto exit;
         }
@@ -1887,6 +1950,15 @@ void umac_datapath_stad_flush(struct umac_data *umacd, struct umac_sta_data *sta
     umac_datapath_flush_rx_reorder_list(stad, sta_data);
     datapath_defrag_deinit(umacd, &sta_data->defrag_data);
     umac_datapath_stad_flush_txq(umacd, stad);
+}
+
+void umac_datapath_stad_teardown(struct umac_data *umacd, struct umac_sta_data *stad)
+{
+    struct umac_datapath_sta_data *sta_data = umac_sta_data_get_datapath(stad);
+    (void)umac_core_cancel_timeout(umacd, umac_datapath_rx_reorder_timeout_handler, umacd, stad);
+    /* Released, not delivered: the peer is already out of the table. */
+    mmpkt_list_clear(&sta_data->rx_reorder_list);
+    datapath_defrag_deinit(umacd, &sta_data->defrag_data);
 }
 
 static void umac_datapath_flush_txq(struct umac_data *umacd);
@@ -2109,7 +2181,15 @@ void umac_datapath_rx_frame(struct umac_data *umacd, struct mmpkt *rxbuf)
                   (size_t)mmpkt_get_data_length(rxbufview));
     }
 
-    if (umac_datapath_rx_frame_filter(umacd, rxbufview))
+    /* The chip driver's task: the filter reads the sender's mesh peer record as a reader. */
+    const bool mesh = data->ops == &datapath_ops_mesh;
+    const uint8_t side = mesh ? umac_datapath_mesh_read_begin() : 0u;
+    const bool drop = umac_datapath_rx_frame_filter(umacd, rxbufview);
+    if (mesh)
+    {
+        umac_datapath_mesh_read_end(side);
+    }
+    if (drop)
     {
         if (s_rx_frame_count <= 16 || (s_rx_frame_count % 100) == 0)
         {
@@ -2521,10 +2601,31 @@ static uint32_t umac_datapath_calculate_tx_timeout_ms(struct umac_data *umacd, b
     }
 }
 
+static enum mmwlan_status umac_datapath_tx_frame_resolve(struct umac_data *umacd,
+                                                         struct mmpkt *txbuf,
+                                                         enum umac_datapath_frame_encryption enc,
+                                                         const uint8_t *ra);
+
+/* Runs on the caller's task (lwIP's, the batman engine's): mesh peers are resolved as a reader. */
 enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
                                           struct mmpkt *txbuf,
                                           enum umac_datapath_frame_encryption enc,
                                           const uint8_t *ra)
+{
+    const bool mesh = umac_data_get_datapath(umacd)->ops == &datapath_ops_mesh;
+    const uint8_t side = mesh ? umac_datapath_mesh_read_begin() : 0u;
+    enum mmwlan_status status = umac_datapath_tx_frame_resolve(umacd, txbuf, enc, ra);
+    if (mesh)
+    {
+        umac_datapath_mesh_read_end(side);
+    }
+    return status;
+}
+
+static enum mmwlan_status umac_datapath_tx_frame_resolve(struct umac_data *umacd,
+                                                         struct mmpkt *txbuf,
+                                                         enum umac_datapath_frame_encryption enc,
+                                                         const uint8_t *ra)
 {
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
     enum mmwlan_status status = MMWLAN_ERROR;
@@ -2552,6 +2653,11 @@ enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
     else
     {
         stad = data->ops->lookup_stad_by_peer_addr(umacd, ra);
+        /* Under SAE a slot exists before AMPE keys it; a frame queued to it is only dropped at TX. */
+        if (stad != NULL && data->ops == &datapath_ops_mesh && !umac_datapath_mesh_peer_estab(ra))
+        {
+            stad = NULL;
+        }
         addr_type = "RA";
         addr = ra;
     }
@@ -2602,6 +2708,7 @@ enum mmwlan_status umac_datapath_tx_frame(struct umac_data *umacd,
         /* Leaf mode shapes only a unicast to a learned host; broadcasts and
          * everything else keep the measured leaf shape. */
         if (g_warthog_mesh_fwd || g_warthog_mesh_bridge ||
+            (g_warthog_mesh_batman && mm_mac_addr_is_multicast(header_8023->dest_addr)) ||
             umac_mesh_fwd_glue_leaf_proxied(header_8023->dest_addr))
         {
             umac_mesh_fwd_glue_tx_classify(txbuf, header_8023->dest_addr, header_8023->src_addr);
@@ -2706,7 +2813,20 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
 
     int key_id = -1;
     MMOSAL_DEV_ASSERT(data->ops != NULL);
-    if ((data->ops->get_sta_state(stad) == MMWLAN_STA_CONNECTED))
+    if (data->ops == &datapath_ops_mesh)
+    {
+        /* A mesh peer's MFP is per link (umac_datapath_mesh_peer_mfp), never the record's PMF
+         * mode; host CCMP may hand back a new frame, or none (dropped, counted). */
+        mmpkt_close(&txbufview);
+        txbuf = umac_datapath_mesh_protect_mgmt(txbuf, &key_id);
+        if (txbuf == NULL)
+        {
+            return MMWLAN_ERROR;
+        }
+        txbufview = mmpkt_open(txbuf);
+        tx_metadata = mmdrv_get_tx_metadata(txbuf);
+    }
+    else if ((data->ops->get_sta_state(stad) == MMWLAN_STA_CONNECTED))
     {
 
         if (umac_sta_data_pmf_is_required(stad) && frame_is_robust_mgmt(txbufview))

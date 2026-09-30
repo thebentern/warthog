@@ -31,6 +31,28 @@ static esp_netif_t *get_netif(const char *key)
  * direct API so both downstream surfaces get NAT. Full diagnosis +
  * tcpdump evidence in docs/napt-notes.md. */
 
+struct nat_napt_io {
+    esp_netif_t *usb, *ap;
+    int usb_napt, ap_napt;
+};
+
+/* tcpip context: the first ip_napt_enable_netif arms lwIP's NAPT timer (sys_timeout). */
+static esp_err_t nat_napt_on_(void *ctx)
+{
+    struct nat_napt_io *io = ctx;
+    struct netif *usb_lwip = io->usb ? (struct netif *)esp_netif_get_netif_impl(io->usb) : NULL;
+    struct netif *ap_lwip = io->ap ? (struct netif *)esp_netif_get_netif_impl(io->ap) : NULL;
+    if (usb_lwip) {
+        ip_napt_enable_netif(usb_lwip, 1);
+    }
+    if (ap_lwip) {
+        ip_napt_enable_netif(ap_lwip, 1);
+    }
+    io->usb_napt = usb_lwip ? usb_lwip->napt : -1;
+    io->ap_napt = ap_lwip ? ap_lwip->napt : -1;
+    return ESP_OK;
+}
+
 static void enforce_state(void)
 {
     if (warthog_mesh_bridge_active()) {
@@ -67,28 +89,12 @@ static void enforce_state(void)
 
     esp_netif_set_default_netif(halow);
 
-    struct netif *usb_lwip = NULL;
-    struct netif *ap_lwip = NULL;
-    esp_netif_t *usb = get_netif("USB");
-    esp_netif_t *ap = get_netif("WIFI_AP_DEF");
-    if (usb) {
-        usb_lwip = (struct netif *)esp_netif_get_netif_impl(usb);
-    }
-    if (ap) {
-        ap_lwip = (struct netif *)esp_netif_get_netif_impl(ap);
-    }
-    if (usb_lwip) {
-        ip_napt_enable_netif(usb_lwip, 1);
-    }
-    if (ap_lwip) {
-        ip_napt_enable_netif(ap_lwip, 1);
-    }
+    struct nat_napt_io io = { .usb = get_netif("USB"), .ap = get_netif("WIFI_AP_DEF") };
+    (void)esp_netif_tcpip_exec(nat_napt_on_, &io);
 
     if (!s_napt_logged) {
         ESP_LOGI(TAG, "NAPT on inside netifs (usb=%d ap=%d); HaLow default route: ip=" IPSTR " gw=" IPSTR,
-                 usb_lwip ? usb_lwip->napt : -1,
-                 ap_lwip ? ap_lwip->napt : -1,
-                 IP2STR(&halow_ip.ip), IP2STR(&halow_ip.gw));
+                 io.usb_napt, io.ap_napt, IP2STR(&halow_ip.ip), IP2STR(&halow_ip.gw));
         s_napt_logged = true;
     }
 }

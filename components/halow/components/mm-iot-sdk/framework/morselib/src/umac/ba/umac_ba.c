@@ -15,9 +15,19 @@
 #include "umac/datapath/umac_datapath.h"
 #include "umac/core/umac_core.h"
 
+static void umac_ba_addba_req_timeout_handler(void *arg1, void *arg2);
+
 void umac_ba_deinit(struct umac_sta_data *stad)
 {
     struct umac_ba_sta_data *data = umac_sta_data_get_ba(stad);
+    /* An ADDBA retry points into the sessions: none may outlive them (a freed mesh peer). */
+    for (unsigned tid = 0; tid < UMAC_BA_MAX_SESSIONS; tid++)
+    {
+        (void)umac_core_cancel_timeout(umac_sta_data_get_umacd(stad),
+                                       umac_ba_addba_req_timeout_handler,
+                                       stad,
+                                       &data->sessions.originator[tid]);
+    }
     memset(data, 0, sizeof(*data));
 }
 

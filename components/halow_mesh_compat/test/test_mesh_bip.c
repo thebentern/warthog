@@ -10,7 +10,8 @@
  *    (FC with Retry/PwrMgt/MoreData masked, A1..A3, body, MIC field zeroed),
  *    rebuilt here on omac1_aes_128, on the IEEE 802.11 M.9.1 frame and a PREQ.
  * Then the verifier: every field the MIC covers must break it, the fields the
- * standard masks must not, and a body that does not end in an MMIE is not one.
+ * standard masks must not, and a body that does not end in an MMIE is not one;
+ * and the detector the datapath refuses one with, which also knows the 26-octet MMIE.
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -211,6 +212,26 @@ static void t_verify(void)
           "nor anything shorter than an MMIE");
 }
 
+/* What the datapath refuses as "carries an MMIE": either length mac80211's
+ * ieee80211_get_mmie_keyidx finds (rx.c: struct ieee80211_mmie, then ieee80211_mmie_16). */
+static void t_has_mmie(void)
+{
+    uint8_t b[64];
+    memset(b, 0x3c, sizeof(b));
+    b[64 - 18] = 76; b[64 - 17] = 16;
+    CHECK(umac_mesh_bip_has_mmie(b, sizeof(b)), "an 18-octet MMIE ends the body");
+    b[64 - 18] = 0x3c; b[64 - 17] = 0x3c;
+    b[64 - 26] = 76; b[64 - 25] = 24;
+    CHECK(umac_mesh_bip_has_mmie(b, sizeof(b)) && !umac_mesh_bip_parse(b, sizeof(b), NULL, NULL),
+          "so does a 26-octet one (BIP-CMAC-256, BIP-GMAC), which the 18-octet parse does not see");
+    CHECK(!umac_mesh_bip_has_mmie(b + 64 - 25, 25) && !umac_mesh_bip_has_mmie(NULL, 26),
+          "nor anything shorter than one");
+    b[64 - 25] = 16;
+    CHECK(!umac_mesh_bip_has_mmie(b, sizeof(b)), "a 76 at 26 from the end whose length is not 24 is none");
+    b[64 - 25] = 24; b[64 - 26] = 75;
+    CHECK(!umac_mesh_bip_has_mmie(b, sizeof(b)), "nor is a trailing element that is not 76");
+}
+
 int main(void)
 {
     printf("=== BIP-CMAC-128: the MMIE on group-addressed path selection ===\n");
@@ -218,6 +239,7 @@ int main(void)
     t_vs_hostap();
     t_mmie_matches_reference();
     t_verify();
+    t_has_mmie();
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("test_mesh_bip: all passed\n");
     return 0;

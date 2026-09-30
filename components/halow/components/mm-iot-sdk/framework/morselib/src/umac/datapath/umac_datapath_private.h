@@ -98,3 +98,11 @@ void umac_datapath_mesh_own_group_tx_note(void);
 /** The chip reported TX status for a frame counted by tx_note: it draws no further PN. */
 void umac_datapath_mesh_own_group_tx_done(void);
 struct umac_sta_data *umac_datapath_mesh_first_peer_except(const uint8_t *excl);
+/** A robust unicast management frame to a peer that runs MFP, protected as path selection is:
+ *  the frame to send (a new one under host CCMP, @p txbuf released), NULL if it could not be
+ *  sealed (released, counted); @p key_id is the key the chip encrypts under, else -1. */
+struct mmpkt *umac_datapath_mesh_protect_mgmt(struct mmpkt *txbuf, int *key_id);
+/** Around every use of mesh peer records off the event loop: a record found in between is
+ *  not freed before read_end, which takes the value read_begin returned. Never blocks. */
+uint8_t umac_datapath_mesh_read_begin(void);
+void umac_datapath_mesh_read_end(uint8_t side);

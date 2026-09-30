@@ -547,6 +547,22 @@ cleanup:
     return NULL;
 }
 
+uint32_t umac_rc_get_expected_tput_kbps(struct umac_sta_data *stad)
+{
+    struct umac_rc_sta_data *sta_data = (stad != NULL) ? umac_sta_data_get_rc(stad) : NULL;
+    if (sta_data == NULL || sta_data->reference_table == NULL)
+    {
+        return 0;
+    }
+    struct mmrc_rate best = mmrc_sta_get_best_rate(sta_data->reference_table);
+    /* The throughput table covers MCS0..10 at 1/2/4/8 MHz only. */
+    if (best.rate >= MMRC_MCS_UNUSED || best.bw > MMRC_BW_8MHZ)
+    {
+        return 0;
+    }
+    return mmrc_calculate_theoretical_throughput(best) / 1000u;
+}
+
 void umac_rc_free_rc_stats(struct mmwlan_rc_stats *stats)
 {
     if (stats != NULL)

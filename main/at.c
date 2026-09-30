@@ -19,6 +19,8 @@
 #include "mesh.h"
 #include "cdc_out.h"
 #include "usb_net.h"
+#include "bat_mode.h"
+#include "bat_port.h"
 
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -44,6 +46,7 @@
 #include "freertos/semphr.h"
 
 #include <ctype.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -76,7 +79,7 @@ static void reply_ok(void)
 static void reply_error(const char *why)
 {
     if (why) {
-        char buf[80];
+        char buf[128];
         snprintf(buf, sizeof(buf), "+ERR: %s\r\n", why);
         cdc_write(buf);
     }
@@ -452,6 +455,11 @@ volatile uint32_t g_warthog_swccmp_short = 0;
 volatile uint32_t g_warthog_swccmp_last_keyid = 0;
 volatile uint32_t g_warthog_swccmp_last_aadlen = 0;
 volatile uint8_t g_warthog_swccmp_last_aad[32] = { 0 };
+/* The last MIC failure alone (AT+SWCCMP? second line): body length, key id, PN, 802.11 header. */
+volatile uint32_t g_warthog_swccmp_fail_len = 0;
+volatile uint32_t g_warthog_swccmp_fail_keyid = 0;
+volatile uint8_t g_warthog_swccmp_fail_pn[6] = { 0 };
+volatile uint8_t g_warthog_swccmp_fail_hdr[32] = { 0 };
 volatile uint32_t g_warthog_mpm_tx_conv = 0;
 volatile uint32_t g_warthog_mpm_rx_conv = 0;
 
@@ -494,6 +502,8 @@ volatile uint32_t g_warthog_mesh_key_fail = 0;
 volatile uint32_t g_warthog_mesh_secure = 1;
 /* Forwarding and bridge gates, seeded from NVS in mesh.c before the mesh starts. */
 volatile uint32_t g_warthog_mesh_fwd = 0, g_warthog_mesh_bridge = 0, g_warthog_mesh_grp = 0;
+/* BATMAN_V member mode, running this boot (set by bat_port.c before the mesh starts). */
+volatile uint32_t g_warthog_mesh_batman = 0;
 /* Mesh MFP. Read once by the supplicant shim while it builds the mesh config,
  * so unlike AT+MESHSEC= this one cannot be flipped under a live mesh. */
 volatile uint32_t g_warthog_mesh_pmf = 0;
@@ -508,10 +518,10 @@ volatile uint32_t g_warthog_fwd_hold = 0, g_warthog_fwd_hold_tx = 0, g_warthog_f
 volatile uint32_t g_warthog_fwd_drop_tblfull = 0; /* path table: no slot for a new destination */
 volatile uint32_t g_warthog_fwd_pend_tx = 0, g_warthog_fwd_pend_drop = 0, g_warthog_hwmp_prot = 0;
 volatile uint32_t g_warthog_hwmp_unprotected = 0, g_warthog_hwmp_mmie = 0, g_warthog_hwmp_nommie = 0;
-/* SAE path-selection MFP: MMIEs refused; frames sent protected, with and without an MMIE;
- * group frames for BIP that could not be queued to the event loop. */
-volatile uint32_t g_warthog_hwmp_bipfail = 0, g_warthog_hwmp_tx_prot = 0;
-volatile uint32_t g_warthog_hwmp_tx_mmie = 0, g_warthog_hwmp_tx_nommie = 0;
+/* SAE path selection: group taken Protected (group-addressed privacy); unicast sent protected,
+ * group sent under our MGTK or in the clear (no MGTK); group frames not queued to the loop. */
+volatile uint32_t g_warthog_hwmp_gp = 0, g_warthog_hwmp_tx_prot = 0;
+volatile uint32_t g_warthog_hwmp_tx_gp = 0, g_warthog_hwmp_tx_plain = 0;
 volatile uint32_t g_warthog_hwmp_tx_qdrop = 0;
 /* Group path selection queued for the umac event loop that it then failed to build or send. */
 volatile uint32_t g_warthog_hwmp_tx_qfail = 0;
@@ -522,6 +532,13 @@ volatile uint32_t g_warthog_hwmp_unestab = 0;
 volatile uint32_t g_warthog_mgmt_prot_chip = 0, g_warthog_mgmt_prot_host = 0;
 volatile uint32_t g_warthog_mgmt_prot_nodec = 0, g_warthog_ampe_igtk_installed = 0;
 volatile uint32_t g_warthog_mgmt_prot_grpkey = 0;
+/* Protected group ones: opened by neither, by the chip (under our own MGTK, so refused),
+ * under a key id not the sender's MGTK (refused), or replayed. */
+volatile uint32_t g_warthog_mgmt_gp_nodec = 0, g_warthog_mgmt_gp_own = 0;
+volatile uint32_t g_warthog_mgmt_gp_key = 0, g_warthog_mgmt_gp_replay = 0;
+/* Robust unicast management frames (Block Ack) sent to a peer that runs MFP: protected by the
+ * chip, sealed with host CCMP, or dropped because they could not be sealed. */
+volatile uint32_t g_warthog_mgmt_tx_chip = 0, g_warthog_mgmt_tx_host = 0, g_warthog_mgmt_tx_drop = 0;
 
 /* Data-plane counters (AT+DATASTAT?). rxtap_data = data frames the chip
  * delivered; stad_hit/miss = whether the peer table resolved the sender;
@@ -673,16 +690,21 @@ volatile uint32_t g_warthog_reord_last_exp = 0;  /* expected at that moment */
 
 /* RX frame-filter drop accounting.
  *
- * umac_datapath_rx_frame_filter() has eight ways to discard a frame and, until
+ * umac_datapath_rx_frame_filter() has nine ways to discard a frame and, until
  * now, none of them incremented anything: filter= counts frames ENTERING, so a
  * peer whose traffic dies inside reads as 42 in and 1 delivered with every drop
  * counter at zero. Reasons, in the order they appear in that function:
  *   1 short (frame control)   2 RTS          3 beacon filtered
  *   4 short (header)          5 no datapath ops
- *   6 unknown sender          7 SA is our own address    8 duplicate frame
+ *   6 unknown sender          7 SA is our own address
+ *   9 mesh unicast data whose RA (addr1) is another station   8 duplicate frame
  * A histogram plus the last reason is enough to name the cause in one read. */
 volatile uint32_t g_warthog_filt_reason = 0, g_warthog_filt_drop = 0;
-volatile uint32_t g_warthog_filt_hist[9] = { 0 };
+volatile uint32_t g_warthog_filt_hist[10] = { 0 };
+/* Mesh unicast management (beacons aside) whose addr1 is another station: counted, not
+ * dropped, with the last one's first 16 octets (AT+FILTSTAT? second line). */
+volatile uint32_t g_warthog_filt_mgmt_nours = 0;
+volatile uint8_t g_warthog_filt_mgmt_nours_hdr[16] = { 0 };
 
 /* HWMP path selection. A mac80211 peer will not send a unicast data frame to a
  * neighbour it has no PATH to (unless mesh_nolearn is on, as on OpenMANET
@@ -976,6 +998,47 @@ static void cmd_mping(char *args)
     reply_ok();
 }
 
+/* The AT+MESHCFG? mode and batman lines, libc only: the glue guard compiles these
+ * out of this file and checks the longest output fits line[320]. */
+struct meshcfg_mode {
+    bool fwd, bridge_active, bridge_stored, bat_running, bat_stored, grp_std;
+    const char *bat_reason;
+    unsigned neigh, routes, copies;
+    uint32_t tput_override;
+    uint8_t self[6], soft[6];
+};
+
+static int meshcfg_mode_line_(char *buf, size_t len, const struct meshcfg_mode *m)
+{
+    if (m->bat_running) {
+        return snprintf(buf, len,
+                        "+MESHCFG: forwarding=no routing=batman_v l2=no(NAT) "
+                        "multicast=meshtastic(239.0.0.69) batman=yes(neigh=%u routes=%u "
+                        "soft=%02x:%02x:%02x:%02x:%02x:%02x)\r\n",
+                        m->neigh, m->routes, m->soft[0], m->soft[1], m->soft[2], m->soft[3],
+                        m->soft[4], m->soft[5]);
+    }
+    /* Stored for next boot is not a refusal: only a reason this boot's start gave. */
+    const bool refused = m->bat_stored && m->bat_reason != NULL && strcmp(m->bat_reason, "off") != 0;
+    return snprintf(buf, len, "+MESHCFG: forwarding=%s routing=%s l2=%s multicast=%s batman=%s%s%s\r\n",
+                    m->fwd ? "yes(802.11s)" : "no", m->fwd ? "hwmp" : "none",
+                    m->bridge_active ? "bridge" : (m->bridge_stored ? "no(NAT;bridge-failed)" : "no(NAT)"),
+                    m->bridge_active ? "all(bridged)" : "meshtastic(239.0.0.69)",
+                    refused ? "refused(" : "no", refused ? m->bat_reason : "", refused ? ")" : "");
+}
+
+static int meshcfg_bat_line_(char *buf, size_t len, const struct meshcfg_mode *m)
+{
+    return snprintf(buf, len,
+                    "+MESHCFG: batman self=%02x:%02x:%02x:%02x:%02x:%02x "
+                    "soft=%02x:%02x:%02x:%02x:%02x:%02x hard_mtu=%u soft_mtu=%u bcast=%s "
+                    "copies=%u tput_override=%lu\r\n",
+                    m->self[0], m->self[1], m->self[2], m->self[3], m->self[4], m->self[5],
+                    m->soft[0], m->soft[1], m->soft[2], m->soft[3], m->soft[4], m->soft[5],
+                    (unsigned)BAT_HARD_MTU_DEFAULT, (unsigned)BAT_SOFT_MTU_DEFAULT,
+                    m->grp_std ? "std" : "replicate", m->copies, (unsigned long)m->tput_override);
+}
+
 /* AT+MESHCFG? -- every value a peer matches on, plus what this node will not
  * do. Interop failures are mismatches, and comparing them one AT verb at a
  * time is how they get missed; the capability lines are here so nobody has to
@@ -999,13 +1062,14 @@ static void cmd_meshcfg(void)
              WARTHOG_REGION_NAME, WARTHOG_COUNTRY_CODE);
     cdc_write(line);
     snprintf(line, sizeof(line),
-             "+MESHCFG: enable=%u secure=%u pmf=%s dhcp=%u fwd=%u bridge=%u grp=%s id='%s' "
+             "+MESHCFG: enable=%u secure=%u pmf=%s dhcp=%u fwd=%u bridge=%u grp=%s batman=%u id='%s' "
              "pass=%u chars\r\n",
              (unsigned)warthog_cfg_get_mesh_enable(), (unsigned)warthog_cfg_get_mesh_secure(),
              warthog_cfg_get_mesh_pmf() ? "required" : "off",
              (unsigned)warthog_cfg_get_mesh_dhcp(), (unsigned)warthog_cfg_get_mesh_fwd(),
              (unsigned)warthog_cfg_get_mesh_bridge(),
-             warthog_cfg_get_mesh_grp() ? "std" : "replicate", id, (unsigned)strlen(pw));
+             warthog_cfg_get_mesh_grp() ? "std" : "replicate",
+             (unsigned)warthog_cfg_get_mesh_batman(), id, (unsigned)strlen(pw));
     cdc_write(line);
     if (g_warthog_applied_chan == 0) {
         snprintf(line, sizeof(line),
@@ -1038,14 +1102,28 @@ static void cmd_meshcfg(void)
     }
     /* Stated, not implied. Each of these is a real limitation an OpenMANET
      * operator will otherwise discover on the drone. */
-    snprintf(line, sizeof(line), "+MESHCFG: forwarding=%s routing=%s l2=%s multicast=%s batman=no\r\n",
-             g_warthog_mesh_fwd ? "yes(802.11s)" : "no",
-             g_warthog_mesh_fwd ? "hwmp" : "none",
-             /* The live bridge, not the stored flag: a failed start falls back to NAT. */
-             warthog_mesh_bridge_active() ? "bridge"
-                 : (g_warthog_mesh_bridge ? "no(NAT;bridge-failed)" : "no(NAT)"),
-             warthog_mesh_bridge_active() ? "all(bridged)" : "meshtastic(239.0.0.69)");
+    struct meshcfg_mode m = {
+        .fwd = g_warthog_mesh_fwd != 0,
+        /* The live bridge, not the stored flag: a failed start falls back to NAT. */
+        .bridge_active = warthog_mesh_bridge_active(),
+        .bridge_stored = g_warthog_mesh_bridge != 0,
+        .bat_running = warthog_bat_port_running(),
+        .bat_stored = warthog_cfg_get_mesh_batman() != 0,
+        .bat_reason = bat_mode_reason_text((enum bat_mode_reason)warthog_bat_port_reason()),
+        .neigh = warthog_bat_port_neighs(),
+        .routes = warthog_bat_port_routes(),
+        .grp_std = g_warthog_mesh_grp != 0,
+        .copies = warthog_bat_port_bcast_copies(),
+        .tput_override = warthog_bat_port_tput_override(),
+    };
+    warthog_bat_port_hard_mac(m.self);
+    warthog_bat_port_soft_mac(m.soft);
+    meshcfg_mode_line_(line, sizeof(line), &m);
     cdc_write(line);
+    if (m.bat_running) {
+        meshcfg_bat_line_(line, sizeof(line), &m);
+        cdc_write(line);
+    }
     reply_ok();
 }
 
@@ -1130,15 +1208,22 @@ static void cmd_hwmpstat(void)
 }
 static void cmd_filtstat(void)
 {
-    char buf[220];
+    char buf[240];
     snprintf(buf, sizeof(buf),
              "+FILTSTAT: drop=%lu last=%lu | short_fc=%lu rts=%lu beacon=%lu short_hdr=%lu "
-             "no_ops=%lu unknown_sender=%lu sa_is_us=%lu dup=%lu\r\n",
+             "no_ops=%lu unknown_sender=%lu sa_is_us=%lu dup=%lu not_ours=%lu\r\n",
              (unsigned long)g_warthog_filt_drop, (unsigned long)g_warthog_filt_reason,
              (unsigned long)g_warthog_filt_hist[1], (unsigned long)g_warthog_filt_hist[2],
              (unsigned long)g_warthog_filt_hist[3], (unsigned long)g_warthog_filt_hist[4],
              (unsigned long)g_warthog_filt_hist[5], (unsigned long)g_warthog_filt_hist[6],
-             (unsigned long)g_warthog_filt_hist[7], (unsigned long)g_warthog_filt_hist[8]);
+             (unsigned long)g_warthog_filt_hist[7], (unsigned long)g_warthog_filt_hist[8],
+             (unsigned long)g_warthog_filt_hist[9]);
+    cdc_write(buf);
+    int off = snprintf(buf, sizeof(buf), "+FILTSTAT: mgmt_nours=%lu last=",
+                       (unsigned long)g_warthog_filt_mgmt_nours);
+    for (int i = 0; i < 16; i++)
+        off += snprintf(buf + off, sizeof(buf) - off, "%02x", g_warthog_filt_mgmt_nours_hdr[i]);
+    snprintf(buf + off, sizeof(buf) - off, "\r\n");
     cdc_write(buf);
     reply_ok();
 }
@@ -1742,6 +1827,130 @@ static void cmd_mtu(void)
     reply_ok();
 }
 
+/* ---- BATMAN_V member mode (bat_port.c) ---------------------------------- */
+
+/* The refusal an AT setter gives; NULL = allowed. */
+static const char *bat_refusal_(enum bat_mode_reason r)
+{
+    switch (r) {
+    case BAT_MODE_FWD:         return "AT+MESHFWD=1 is set; batman needs 802.11s forwarding off";
+    case BAT_MODE_BRIDGE:      return "AT+MESHBRIDGE=1 is set; batman mode NATs the tethered side";
+    case BAT_MODE_NO_GROUP_RX: return "this build cannot hear peers' group frames under SAE; "
+                                      "use warthog-mesh-sae-swccmp or an open mesh";
+    default:                   return NULL;
+    }
+}
+
+/* AT+MESHBATMAN=<0|1>: persisted, next boot. */
+static void cmd_meshbatman_set(char *args)
+{
+    char *a = trim(args);
+    if ((a[0] != '0' && a[0] != '1') || a[1] != '\0') {
+        reply_error("usage: AT+MESHBATMAN=<0|1>");
+        return;
+    }
+    const uint8_t on = (uint8_t)(a[0] - '0');
+    if (on) {
+        /* Mesh off is not refused here: AT+MESHEN=1 may follow. */
+        const char *why = bat_refusal_(bat_mode_check(1, 1, warthog_cfg_get_mesh_fwd(),
+                                                      warthog_cfg_get_mesh_bridge(),
+                                                      warthog_bat_port_sae_build(),
+                                                      warthog_bat_port_host_ccmp_build()));
+        if (why != NULL) {
+            reply_error(why);
+            return;
+        }
+    }
+    if (warthog_cfg_set_mesh_batman(on) != ESP_OK) {
+        reply_error("nvs write failed");
+        return;
+    }
+    cdc_write("+MESHBATMAN: stored; takes effect on next boot (AT+RESET)\r\n");
+    reply_ok();
+}
+
+static void cmd_meshbatman_query(void)
+{
+    char line[BAT_MODE_BAT0_LINE];
+    snprintf(line, sizeof(line), "+MESHBATMAN: stored=%u running=%u reason=%s\r\n",
+             (unsigned)warthog_cfg_get_mesh_batman(), warthog_bat_port_running() ? 1u : 0u,
+             bat_mode_reason_text((enum bat_mode_reason)warthog_bat_port_reason()));
+    cdc_write(line);
+    if (warthog_bat_port_running()) {
+        (void)warthog_mesh_bat0_line(line, sizeof(line));
+        cdc_write(line);
+    }
+    reply_ok();
+}
+
+/* AT+MESHBATTP=<units of 100 kbit/s>: the whole argument, 0..4294967295; 0 = rate control. */
+static void cmd_meshbattp_set(char *args)
+{
+    char *a = trim(args);
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(a, &end, 10);
+    if (a[0] < '0' || a[0] > '9' || end == a || *end != '\0' || errno != 0 || v > 0xFFFFFFFFull) {
+        reply_error("usage: AT+MESHBATTP=<units of 100 kbit/s, 0 = auto>");
+        return;
+    }
+    if (warthog_cfg_set_mesh_battp((uint32_t)v) != ESP_OK) {
+        reply_error("nvs write failed");
+        return;
+    }
+    cdc_write("+MESHBATTP: stored; takes effect on next boot (AT+RESET)\r\n");
+    reply_ok();
+}
+
+static void cmd_meshbattp_query(void)
+{
+    char line[48];
+    const uint32_t v = warthog_cfg_get_mesh_battp();
+    snprintf(line, sizeof(line), "+MESHBATTP: %lu%s\r\n", (unsigned long)v, v ? "" : " (auto)");
+    cdc_write(line);
+    reply_ok();
+}
+
+/* AT+BATN? AT+BATO? AT+BATTG? AT+BATTL? AT+BATSTAT? (@mac: AT+BATO= / AT+BATTG=, one node): the engine
+ * renders on its own task, one BAT_RENDER_BUF chunk per round trip, until the listing ends. */
+static void cmd_bat_render(enum bat_render_kind k, const uint8_t *mac)
+{
+    uint32_t cursor = 0;
+    do {
+        const uint32_t from = cursor;
+        const char *out = NULL;
+        int r = warthog_bat_port_render(k, mac, &cursor, &out);
+        if (r == WARTHOG_BAT_RENDER_NOT_RUNNING) {
+            char why[64];
+            snprintf(why, sizeof(why), "batman not running (%s)",
+                     bat_mode_reason_text((enum bat_mode_reason)warthog_bat_port_reason()));
+            reply_error(why);
+            return;
+        }
+        if (r != WARTHOG_BAT_RENDER_OK) {
+            reply_error("batman engine busy");
+            return;
+        }
+        cdc_write(out);
+        warthog_bat_port_render_done();
+        if (cursor != BAT_RENDER_DONE && cursor <= from) {
+            reply_error("batman render stalled"); /* a cursor only moves forward: never loop on one */
+            return;
+        }
+    } while (cursor != BAT_RENDER_DONE);
+    reply_ok();
+}
+
+static void cmd_bat_render_mac(enum bat_render_kind k, const char *args, const char *usage)
+{
+    uint8_t mac[6];
+    if (!bat_mode_parse_mac(args, mac)) {
+        reply_error(usage);
+        return;
+    }
+    cmd_bat_render(k, mac);
+}
+
 static void cmd_erase(void)
 {
     if (warthog_cfg_erase() != ESP_OK) {
@@ -1955,7 +2164,13 @@ static void dispatch(char *line)
         reply_ok();
     } else if (strcasecmp(verb, "MESHFWD") == 0 && terminator == '=') {
         unsigned long v = strtoul(args, NULL, 10);
-        if (warthog_cfg_set_mesh_fwd((uint8_t)v) == ESP_OK) {
+        if (v > 1) { /* before the cast: 257 would store 1 past the batman refusal */
+            reply_error("usage: AT+MESHFWD=<0|1>");
+        } else if (v == 1 && bat_mode_check(warthog_cfg_get_mesh_batman(), 1, 1, 0,
+                                            warthog_bat_port_sae_build(),
+                                            warthog_bat_port_host_ccmp_build()) == BAT_MODE_FWD) {
+            reply_error("AT+MESHBATMAN=1 is set; batman needs it off");
+        } else if (warthog_cfg_set_mesh_fwd((uint8_t)v) == ESP_OK) {
             cdc_write("+MESHFWD: stored; takes effect on next boot (AT+RESET)\r\n");
             reply_ok();
         } else { reply_error("usage: AT+MESHFWD=<0|1>"); }
@@ -1965,14 +2180,16 @@ static void dispatch(char *line)
         if (w <= 0) { cdc_write("+MESHPATH: (empty)\r\n"); } else { cdc_write(big); }
         reply_ok();
     } else if (strcasecmp(verb, "MESHFWDSTAT") == 0 && terminator == '?') {
-        static char line[768]; /* AT task only; kept off its 4 KB stack */
+        static char line[896]; /* AT task only; kept off its 4 KB stack */
         snprintf(line, sizeof(line),
                  "+MESHFWDSTAT: on=%lu fwd uni=%lu grp=%lu nomem=%lu | drop own=%lu dup=%lu ttl=%lu "
                  "nopath=%lu nofwd=%lu bad=%lu full=%lu tblfull=%lu | perr_tx=%lu preq_tx=%lu | relay preq=%lu prep=%lu perr=%lu "
                  "| pend tx=%lu drop=%lu | hold n=%lu tx=%lu drop=%lu "
-                 "| hwmp prot=%lu unprotected=%lu unestab=%lu mmie=%lu nommie=%lu bipfail=%lu "
-                 "| hwmp tx prot=%lu mmie=%lu nommie=%lu qdrop=%lu qfail=%lu "
-                 "| mgmt prot chip=%lu host=%lu nodec=%lu grpkey=%lu | igtk=%lu\r\n",
+                 "| hwmp prot=%lu unprotected=%lu unestab=%lu gp=%lu mmie=%lu nommie=%lu "
+                 "| hwmp tx prot=%lu gp=%lu plain=%lu qdrop=%lu qfail=%lu "
+                 "| mgmt prot chip=%lu host=%lu nodec=%lu grpkey=%lu "
+                 "| mgmt gp nodec=%lu own=%lu key=%lu replay=%lu | mgmt tx chip=%lu host=%lu drop=%lu "
+                 "| igtk=%lu\r\n",
                  (unsigned long)g_warthog_mesh_fwd, (unsigned long)g_warthog_fwd_uni,
                  (unsigned long)g_warthog_fwd_grp, (unsigned long)g_warthog_fwd_nomem,
                  (unsigned long)g_warthog_fwd_drop_own, (unsigned long)g_warthog_fwd_drop_dup,
@@ -1986,14 +2203,17 @@ static void dispatch(char *line)
                  (unsigned long)g_warthog_fwd_hold, (unsigned long)g_warthog_fwd_hold_tx,
                  (unsigned long)g_warthog_fwd_hold_drop,
                  (unsigned long)g_warthog_hwmp_prot, (unsigned long)g_warthog_hwmp_unprotected,
-                 (unsigned long)g_warthog_hwmp_unestab,
+                 (unsigned long)g_warthog_hwmp_unestab, (unsigned long)g_warthog_hwmp_gp,
                  (unsigned long)g_warthog_hwmp_mmie, (unsigned long)g_warthog_hwmp_nommie,
-                 (unsigned long)g_warthog_hwmp_bipfail, (unsigned long)g_warthog_hwmp_tx_prot,
-                 (unsigned long)g_warthog_hwmp_tx_mmie, (unsigned long)g_warthog_hwmp_tx_nommie,
+                 (unsigned long)g_warthog_hwmp_tx_prot,
+                 (unsigned long)g_warthog_hwmp_tx_gp, (unsigned long)g_warthog_hwmp_tx_plain,
                  (unsigned long)g_warthog_hwmp_tx_qdrop, (unsigned long)g_warthog_hwmp_tx_qfail,
                  (unsigned long)g_warthog_mgmt_prot_chip, (unsigned long)g_warthog_mgmt_prot_host,
                  (unsigned long)g_warthog_mgmt_prot_nodec, (unsigned long)g_warthog_mgmt_prot_grpkey,
-                 (unsigned long)g_warthog_ampe_igtk_installed);
+                 (unsigned long)g_warthog_mgmt_gp_nodec, (unsigned long)g_warthog_mgmt_gp_own,
+                 (unsigned long)g_warthog_mgmt_gp_key, (unsigned long)g_warthog_mgmt_gp_replay,
+                 (unsigned long)g_warthog_mgmt_tx_chip, (unsigned long)g_warthog_mgmt_tx_host,
+                 (unsigned long)g_warthog_mgmt_tx_drop, (unsigned long)g_warthog_ampe_igtk_installed);
         cdc_write(line);
         reply_ok();
     } else if (strcasecmp(verb, "MESHFWD") == 0 && terminator == '?') {
@@ -2025,7 +2245,13 @@ static void dispatch(char *line)
         reply_ok();
     } else if (strcasecmp(verb, "MESHBRIDGE") == 0 && terminator == '=') {
         unsigned long v = strtoul(args, NULL, 10);
-        if (warthog_cfg_set_mesh_bridge((uint8_t)v) == ESP_OK) {
+        if (v > 1) { /* before the cast: 257 would store 1 past the batman refusal */
+            reply_error("usage: AT+MESHBRIDGE=<0|1>");
+        } else if (v == 1 && bat_mode_check(warthog_cfg_get_mesh_batman(), 1, 0, 1,
+                                            warthog_bat_port_sae_build(),
+                                            warthog_bat_port_host_ccmp_build()) == BAT_MODE_BRIDGE) {
+            reply_error("AT+MESHBATMAN=1 is set; batman needs it off");
+        } else if (warthog_cfg_set_mesh_bridge((uint8_t)v) == ESP_OK) {
             cdc_write("+MESHBRIDGE: stored; takes effect on next boot (AT+RESET)\r\n");
             reply_ok();
         } else { reply_error("usage: AT+MESHBRIDGE=<0|1>"); }
@@ -2046,6 +2272,28 @@ static void dispatch(char *line)
         reply_ok();
     } else if (strcasecmp(verb, "MESHCFG") == 0 && terminator == '?') {
         cmd_meshcfg();
+    } else if (strcasecmp(verb, "MESHBATMAN") == 0 && terminator == '=') {
+        cmd_meshbatman_set(args);
+    } else if (strcasecmp(verb, "MESHBATMAN") == 0 && terminator == '?') {
+        cmd_meshbatman_query();
+    } else if (strcasecmp(verb, "MESHBATTP") == 0 && terminator == '=') {
+        cmd_meshbattp_set(args);
+    } else if (strcasecmp(verb, "MESHBATTP") == 0 && terminator == '?') {
+        cmd_meshbattp_query();
+    } else if (strcasecmp(verb, "BATN") == 0 && terminator == '?') {
+        cmd_bat_render(BAT_RENDER_NEIGH, NULL);
+    } else if (strcasecmp(verb, "BATO") == 0 && terminator == '?') {
+        cmd_bat_render(BAT_RENDER_ORIG, NULL);
+    } else if (strcasecmp(verb, "BATO") == 0 && terminator == '=') {
+        cmd_bat_render_mac(BAT_RENDER_ORIG, args, "usage: AT+BATO=<mac>");
+    } else if (strcasecmp(verb, "BATTG") == 0 && terminator == '?') {
+        cmd_bat_render(BAT_RENDER_TT_GLOBAL, NULL);
+    } else if (strcasecmp(verb, "BATTG") == 0 && terminator == '=') {
+        cmd_bat_render_mac(BAT_RENDER_TT_GLOBAL, args, "usage: AT+BATTG=<mac>");
+    } else if (strcasecmp(verb, "BATTL") == 0 && terminator == '?') {
+        cmd_bat_render(BAT_RENDER_TT_LOCAL, NULL);
+    } else if (strcasecmp(verb, "BATSTAT") == 0 && terminator == '?') {
+        cmd_bat_render(BAT_RENDER_STAT, NULL);
     } else if (strcasecmp(verb, "MESHEN") == 0 && terminator == '?') {
         char line[64];
         snprintf(line, sizeof(line), "+MESHEN: %u\r\n", (unsigned)warthog_cfg_get_mesh_enable());
@@ -2137,7 +2385,13 @@ static void dispatch(char *line)
         off += snprintf(hx + off, sizeof(hx) - off, "\r\n");
         cdc_write(hx); reply_ok();
     } else if (strcasecmp(verb, "SWCCMP") == 0 && terminator == '=') {
-        g_warthog_host_ccmp_on = (args != NULL && atoi(trim(args)) != 0) ? 1u : 0u;
+        const uint32_t on = (args != NULL && atoi(trim(args)) != 0) ? 1u : 0u;
+        /* Host CCMP is the only way peers' ELP/OGM/BCAST (group frames) reach us under SAE. */
+        if (!on && warthog_bat_port_running() && warthog_bat_port_host_ccmp_build()) {
+            reply_error("batman is running; host CCMP must stay on");
+            return;
+        }
+        g_warthog_host_ccmp_on = on;
         char b[64];
         snprintf(b, sizeof(b), "+SWCCMP: host ccmp %s\r\n",
                  g_warthog_host_ccmp_on ? "ON" : "OFF");
@@ -2156,6 +2410,16 @@ static void dispatch(char *line)
         for (uint32_t i = 0; i < 32 && i < g_warthog_swccmp_last_aadlen && off < (int)sizeof(b) - 4; i++)
             off += snprintf(b + off, sizeof(b) - off, "%02x", g_warthog_swccmp_last_aad[i]);
         off += snprintf(b + off, sizeof(b) - off, "\r\n");
+        cdc_write(b);
+        off = snprintf(b, sizeof(b), "+SWCCMP: fail len=%lu keyid=%lu pn=",
+                       (unsigned long)g_warthog_swccmp_fail_len,
+                       (unsigned long)g_warthog_swccmp_fail_keyid);
+        for (int i = 5; i >= 0; i--)
+            off += snprintf(b + off, sizeof(b) - off, "%02x", g_warthog_swccmp_fail_pn[i]);
+        off += snprintf(b + off, sizeof(b) - off, " hdr=");
+        for (int i = 0; i < 32; i++)
+            off += snprintf(b + off, sizeof(b) - off, "%02x", g_warthog_swccmp_fail_hdr[i]);
+        snprintf(b + off, sizeof(b) - off, "\r\n");
         cdc_write(b); reply_ok();
     } else if (strcasecmp(verb, "PLINKSTAT") == 0 && terminator == '?') {
         char b[96];

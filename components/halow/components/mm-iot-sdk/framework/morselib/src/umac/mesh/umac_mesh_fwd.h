@@ -62,7 +62,7 @@ enum umac_mesh_fwd_drop {
     UMAC_MESH_FWD_DROP_NONE = 0,
     UMAC_MESH_FWD_DROP_OWN,       /* our own frame came back */
     UMAC_MESH_FWD_DROP_DUP,       /* recent multicast cache hit */
-    UMAC_MESH_FWD_DROP_NOT_FOR_US,/* unicast, RA not us -- chip should not deliver these */
+    UMAC_MESH_FWD_DROP_NOT_FOR_US,/* unicast, RA not us -- the chip does; the RX filter drops them first */
     UMAC_MESH_FWD_DROP_NO_FWD,    /* would forward, forwarding disabled */
     UMAC_MESH_FWD_DROP_TTL,
     UMAC_MESH_FWD_DROP_NO_PATH,   /* the reason a HOLD carries */

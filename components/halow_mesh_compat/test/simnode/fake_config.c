@@ -15,7 +15,10 @@
 #include "umac/config/umac_config.h"
 #include "umac/interface/umac_interface.h"
 #include "umac/connection/umac_connection.h"
+#include "umac/core/umac_core.h"
 #include "umac/data/umac_data.h"
+#include "umac/datapath/umac_datapath.h"
+#include "umac/twt/umac_twt.h"
 #include "mmdrv.h"
 
 #define SIMNODE_CHAN_COUNT 3
@@ -53,7 +56,7 @@ const struct mmwlan_s1g_channel *simnode_channel(void) { return &s_channels[0]; 
  * board: the interface exists before any frame is built. The harness has to
  * stand in for that. Capabilities are zeroed rather than invented -- a
  * zeroed capability set is the conservative one, and the mesh path does not
- * depend on any particular bit. */
+ * depend on any particular bit. simnode_set_ampdu sets the one Block Ack needs. */
 
 static struct morse_caps s_caps;
 static uint8_t s_own_mac[6];
@@ -83,10 +86,15 @@ bool umac_interface_get_control_response_bw_1mhz_out_enabled(struct umac_data *u
     return false;
 }
 
+/* Interface types added so far: umac_interface.c answers a vif id only for a type that
+ * is active, and a mesh node has only UMAC_INTERFACE_MESH (the RX path then delivers on
+ * the AP VIF, as on the firmware). */
+static uint16_t s_active_types;
+
 uint16_t umac_interface_get_vif_id(struct umac_data *umacd, uint16_t type_mask)
 {
-    (void)umacd; (void)type_mask;
-    return s_vif_id;
+    (void)umacd;
+    return (type_mask & s_active_types) != 0u ? s_vif_id : UMAC_INTERFACE_VIF_ID_INVALID;
 }
 
 enum mmwlan_status umac_interface_get_mac_addr(struct umac_sta_data *stad, uint8_t *mac_addr)
@@ -97,9 +105,20 @@ enum mmwlan_status umac_interface_get_mac_addr(struct umac_sta_data *stad, uint8
     return MMWLAN_SUCCESS;
 }
 
+/* The RX filter asks this with the record it just looked up, then writes that record's
+ * duplicate cache: the hook runs the event loop in between. */
+static void (*s_rx_filter_hook)(void);
+void simnode_set_rx_filter_hook(void (*cb)(void)) { s_rx_filter_hook = cb; }
+
 bool umac_interface_addr_matches_mac_addr(struct umac_sta_data *stad, const uint8_t *addr)
 {
     (void)stad;
+    void (*cb)(void) = s_rx_filter_hook;
+    if (cb != NULL && !umac_core_evtloop_is_active(NULL))
+    {
+        s_rx_filter_hook = NULL;
+        cb();
+    }
     return addr != NULL && memcmp(addr, s_own_mac, 6) == 0;
 }
 
@@ -128,11 +147,54 @@ void simnode_fail_vif_add(bool fail) { s_vif_add_fails = fail; }
 enum mmwlan_status umac_interface_add(struct umac_data *umacd, enum umac_interface_type type,
                                       const uint8_t *mac_addr, uint16_t *vif_id)
 {
-    (void)umacd; (void)type;
+    (void)umacd;
     if (s_vif_add_fails) { return MMWLAN_ERROR; }
+    s_active_types |= (uint16_t)type;
     if (mac_addr != NULL) { simnode_set_identity(mac_addr, s_vif_id); }
     if (vif_id != NULL) { *vif_id = s_vif_id; }
     return MMWLAN_SUCCESS;
+}
+
+/* umac_ba.c's source address: ours, once an interface is up (umac_interface.c). */
+const uint8_t *umac_interface_peek_mac_addr(struct umac_sta_data *stad)
+{
+    (void)stad;
+    return s_active_types != 0u ? s_own_mac : NULL;
+}
+
+/* ---- A-MPDU ------------------------------------------------------------
+ *
+ * The board runs with it (umac_config.c defaults ampdu_enabled on, the MM6108 reports
+ * the capability), so every unicast data frame can start a Block Ack session. Off here
+ * unless a test turns it on: the suites written before umac_ba.c was linked count frames. */
+static bool s_ampdu;
+
+void simnode_set_ampdu(bool on)
+{
+    s_ampdu = on;
+    const unsigned bit = (unsigned)MORSE_CAPS_AMPDU;
+    if (on) { s_caps.flags[bit >> 5] |= 1u << (bit & 31u); }
+    else    { s_caps.flags[bit >> 5] &= ~(1u << (bit & 31u)); }
+}
+
+bool umac_config_is_ampdu_enabled(struct umac_data *umacd)
+{
+    (void)umacd;
+    return s_ampdu;
+}
+
+uint32_t umac_config_get_datapath_rx_reorder_list_maxlen(struct umac_data *umacd)
+{
+    (void)umacd;
+    return UMAC_DATAPATH_DEFAULT_RXREORDERQ_MAXLEN;
+}
+
+/* TWT off: a blocking management TX waits the default timeout (umac_config.c). */
+const struct mmwlan_twt_config_args *umac_twt_get_config(struct umac_data *umacd)
+{
+    (void)umacd;
+    static const struct mmwlan_twt_config_args none;
+    return &none;
 }
 
 const struct mmwlan_sta_args *umac_connection_get_sta_args(struct umac_data *umacd)

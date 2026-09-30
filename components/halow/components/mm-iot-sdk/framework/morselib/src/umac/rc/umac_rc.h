@@ -47,4 +47,7 @@ struct mmwlan_rc_stats *umac_rc_get_rc_stats(struct umac_sta_data *stad);
 
 void umac_rc_free_rc_stats(struct mmwlan_rc_stats *stats);
 
+/* warthog: theoretical throughput of rate control's best-throughput rate, kbit/s; 0 = none yet. */
+uint32_t umac_rc_get_expected_tput_kbps(struct umac_sta_data *stad);
+
 

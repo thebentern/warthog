@@ -93,8 +93,9 @@ AT+MPING=<peer's 10.77.x.y>,4
 
 ✅ Expected: four replies. Against an OpenMANET peer set to
 `encryption='none'`, `AT+MESHSEC=0` first; a node set up by OpenMANET's mesh
-wizard runs SAE and needs `warthog-mesh-sae` (step 10) with its mesh ID and
-passphrase. See [OpenMANET Gateway](OpenMANET-Gateway).
+wizard runs SAE and needs `warthog-mesh-sae-swccmp` with `AT+SWCCMP=1` (or batman
+mode) and its mesh ID and passphrase; `warthog-mesh-sae` (step 10) peers with it
+but cannot open its group frames. See [OpenMANET Gateway](OpenMANET-Gateway).
 
 ## 10. Encrypted mesh — SAE/AMPE (two boards)
 

@@ -194,6 +194,20 @@ bool umac_mesh_bip_parse(const uint8_t *body, size_t len, uint16_t *key_id, uint
     return true;
 }
 
+bool umac_mesh_bip_has_mmie(const uint8_t *body, size_t len)
+{
+    if (umac_mesh_bip_parse(body, len, NULL, NULL))
+    {
+        return true;
+    }
+    if (body == NULL || len < UMAC_MESH_MMIE16_LEN)
+    {
+        return false;
+    }
+    const uint8_t *e = body + len - UMAC_MESH_MMIE16_LEN;
+    return e[0] == UMAC_MESH_MMIE_EID && e[1] == UMAC_MESH_MMIE16_LEN - 2u;
+}
+
 bool umac_mesh_bip_verify(const uint8_t key[16], const uint8_t hdr[UMAC_MESH_BIP_HDR_LEN],
                           const uint8_t *body, size_t len)
 {

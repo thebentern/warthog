@@ -37,6 +37,7 @@
 #include "common/mac_address.h"
 #include "umac/stats/umac_stats.h"
 #include "umac/rc/umac_rc.h"
+#include "umac/ba/umac_ba.h"
 #include "umac/keys/umac_keys.h"
 #include "umac/keys/umac_keys_data.h"
 #include "umac/keys/connection_keys.h"
@@ -45,7 +46,10 @@
 #include <string.h>
 #include "umac/mesh/umac_mesh.h"
 #include "umac/mesh/umac_mesh_bip.h"
+#include "umac/mesh/umac_mesh_ccmp_hdr.h"
 #include "umac/mesh/umac_mesh_ies.h"
+#include "umac/frames/frames_common.h" /* frame_is_robust_mgmt */
+#include "mmwlan_mesh.h"
 
 /* Data-plane counters (storage in main/at.c; AT+DATASTAT?). */
 extern volatile uint32_t g_warthog_tx_data_enq;
@@ -304,6 +308,11 @@ static bool s_peer_estab[MESH_MAX_PEERS];
 /* Per slot: the peer runs MFP. Set by its IGTK (AMPE carries one only from a peer with
  * ieee80211w != 0) or a protected unicast path-selection frame; cleared with the slot. */
 static bool s_peer_mfp[MESH_MAX_PEERS];
+/* Per slot: the record del_peer unlinked from it, until no reader on another task can hold
+ * it (see read_begin); the slot is not reused before. old: every reader that can hold it is
+ * counted on the side new readers no longer join. */
+static struct umac_sta_data *s_dying[MESH_MAX_PEERS];
+static bool s_dying_old[MESH_MAX_PEERS];
 static uint8_t s_own_addr[6];
 static uint16_t s_num_pkts_queued;
 
@@ -311,7 +320,7 @@ bool umac_datapath_mesh_has_free_slot(void)
 {
     for (int i = 0; i < MESH_MAX_PEERS; i++)
     {
-        if (s_peers[i] == NULL)
+        if (s_peers[i] == NULL && s_dying[i] == NULL)
         {
             return true;
         }
@@ -332,6 +341,7 @@ static void mesh_capacity_(struct umac_mesh_ies_capacity *out)
     out->peerings = estab;
 }
 
+/* Each slot is loaded once: off the event loop del_peer may empty it between two loads. */
 static struct umac_sta_data *mesh_find_peer_(const uint8_t *addr)
 {
     if (addr == NULL)
@@ -340,9 +350,10 @@ static struct umac_sta_data *mesh_find_peer_(const uint8_t *addr)
     }
     for (int i = 0; i < MESH_MAX_PEERS; i++)
     {
-        if (s_peers[i] != NULL && umac_sta_data_matches_peer_addr(s_peers[i], addr))
+        struct umac_sta_data *p = s_peers[i];
+        if (p != NULL && umac_sta_data_matches_peer_addr(p, addr))
         {
-            return s_peers[i];
+            return p;
         }
     }
     return NULL;
@@ -352,7 +363,8 @@ static int mesh_slot_of_(const uint8_t *addr)
 {
     for (int i = 0; addr != NULL && i < MESH_MAX_PEERS; i++)
     {
-        if (s_peers[i] != NULL && umac_sta_data_matches_peer_addr(s_peers[i], addr))
+        struct umac_sta_data *p = s_peers[i];
+        if (p != NULL && umac_sta_data_matches_peer_addr(p, addr))
         {
             return i;
         }
@@ -360,17 +372,99 @@ static int mesh_slot_of_(const uint8_t *addr)
     return -1;
 }
 
+/* ---- Readers off the event loop ------------------------------------------- *
+ *
+ * Peers are added and deleted only on the umac event loop, but two paths resolve peer
+ * records on other tasks: the TX entry (lwIP's tcpip thread, the batman engine task) and
+ * the RX filter (the chip driver task). Each runs between read_begin and read_end.
+ * del_peer unlinks a record at once and frees it only after every reader inside at that
+ * moment has left, so a record a reader found stays allocated, and no new record takes its
+ * address, until the reader is done. Its slot is not reused until then. Nobody waits on
+ * anybody. New readers move to the other count once a record is waiting, so a steady
+ * stream of readers cannot hold one forever.
+ */
+static uint16_t s_readers[2];
+static uint8_t s_readers_cur; /* the count new readers join */
+
+/* In the critical section: detach into @p out every record no reader can hold. */
+static unsigned mesh_reclaim_locked_(struct umac_sta_data *out[MESH_MAX_PEERS])
+{
+    unsigned n = 0;
+    while (s_readers[s_readers_cur ^ 1u] == 0u)
+    {
+        bool waiting = false;
+        for (int i = 0; i < MESH_MAX_PEERS; i++)
+        {
+            if (s_dying[i] != NULL && s_dying_old[i])
+            {
+                out[n++] = s_dying[i];
+                s_dying[i] = NULL;
+            }
+            else if (s_dying[i] != NULL)
+            {
+                s_dying_old[i] = true;
+                waiting = true;
+            }
+        }
+        if (!waiting)
+        {
+            break;
+        }
+        s_readers_cur ^= 1u; /* every reader that can hold those is on the other side now */
+    }
+    return n;
+}
+
+uint8_t umac_datapath_mesh_read_begin(void)
+{
+    MMOSAL_TASK_ENTER_CRITICAL();
+    const uint8_t side = s_readers_cur;
+    s_readers[side]++;
+    MMOSAL_TASK_EXIT_CRITICAL();
+    return side;
+}
+
+static void mesh_free_retired_(struct umac_sta_data *const done[], unsigned n)
+{
+    for (unsigned i = 0; i < n; i++)
+    {
+        mmosal_free(done[i]);
+    }
+}
+
+void umac_datapath_mesh_read_end(uint8_t side)
+{
+    struct umac_sta_data *done[MESH_MAX_PEERS];
+    MMOSAL_TASK_ENTER_CRITICAL();
+    s_readers[side & 1u]--;
+    const unsigned n = mesh_reclaim_locked_(done);
+    MMOSAL_TASK_EXIT_CRITICAL();
+    mesh_free_retired_(done, n);
+}
+
+/* Event loop, once it is done with a record it unlinked from @p slot: freed now, or by the
+ * last reader that may hold it. */
+static void mesh_retire_(int slot, struct umac_sta_data *stad)
+{
+    struct umac_sta_data *done[MESH_MAX_PEERS];
+    MMOSAL_TASK_ENTER_CRITICAL();
+    s_dying[slot] = stad;
+    s_dying_old[slot] = false;
+    const unsigned n = mesh_reclaim_locked_(done);
+    MMOSAL_TASK_EXIT_CRITICAL();
+    mesh_free_retired_(done, n);
+}
+
 /* ---- Management frame protection for path selection (SAE only) ---------- */
 
 extern volatile uint32_t g_warthog_mesh_pmf;
 extern volatile uint32_t g_warthog_hwmp_prot, g_warthog_hwmp_unprotected;
-extern volatile uint32_t g_warthog_hwmp_mmie, g_warthog_hwmp_nommie, g_warthog_hwmp_bipfail;
+extern volatile uint32_t g_warthog_hwmp_gp, g_warthog_hwmp_mmie, g_warthog_hwmp_nommie;
 extern volatile uint32_t g_warthog_hwmp_unestab;
 extern volatile uint32_t g_warthog_ampe_igtk_installed;
-/* Longest group body an MMIE is checked on: what our own TX would ever send. */
-#define UMAC_MESH_BIP_BODY_MAX 640u
 
-/* Our own TX IGTK, generated by hostap only with AT+MESHPMF=1. */
+/* Our own IGTK, generated by hostap only with AT+MESHPMF=1. Nothing of ours carries an
+ * MMIE (group path selection uses our MGTK), so its IPN stays where AMPE reports it. */
 static struct
 {
     bool valid;
@@ -838,7 +932,7 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
     int slot = -1;
     for (int i = 0; i < MESH_MAX_PEERS; i++)
     {
-        if (s_peers[i] == NULL)
+        if (s_peers[i] == NULL && s_dying[i] == NULL)
         {
             slot = i;
             break;
@@ -1200,15 +1294,16 @@ void umac_datapath_mesh_hwmp_tx_key(const uint8_t *da, struct umac_mesh_hwmp_txk
     }
     if ((da[0] & 0x01) != 0)
     {
-        MMOSAL_TASK_ENTER_CRITICAL();
-        if (s_own_igtk.valid)
+        /* Group-addressed privacy, as mac80211 (tx.c ieee80211_select_link_key): our own
+         * MGTK whenever we hold one, whatever each peer's MFP, and by the chip as our group
+         * data. An MFP peer drops it in the clear, and drops it with an MMIE. Not while the
+         * chip's group slot is empty: nobody could open what it sent under that key id. */
+        const int kid = umac_datapath_mesh_own_group_key_id();
+        if (kid >= 0 && s_group_key_in_chip)
         {
-            out->how = UMAC_MESH_HWMP_PROT_BIP;
-            out->key_id = s_own_igtk.id;
-            memcpy(out->key, s_own_igtk.key, UMAC_KEY_AES_128_LEN);
-            out->pn = ++s_own_igtk.ipn;
+            out->how = UMAC_MESH_HWMP_PROT_GROUP;
+            out->key_id = (uint8_t)kid;
         }
-        MMOSAL_TASK_EXIT_CRITICAL();
         return;
     }
     const int slot = mesh_slot_of_(da);
@@ -1240,36 +1335,81 @@ void umac_datapath_mesh_hwmp_tx_key(const uint8_t *da, struct umac_mesh_hwmp_txk
     out->how = UMAC_MESH_HWMP_PROT_CHIP;
 }
 
-/* Verify an MMIE with this peer's IGTK, then (only then) move its replay floor. */
-static bool mesh_bip_ok_(int slot, const uint8_t *hdr, const uint8_t *body, uint32_t len,
-                         uint16_t kid, uint64_t ipn)
+extern volatile uint32_t g_warthog_swccmp_tx_fail;
+/* AT+MESHFWDSTAT? mgmt tx: protected by the chip, sealed by host CCMP, dropped unsealed. */
+extern volatile uint32_t g_warthog_mgmt_tx_chip, g_warthog_mgmt_tx_host, g_warthog_mgmt_tx_drop;
+bool umac_mesh_tx_host_ccmp_mgmt(const uint8_t key[16], uint8_t key_id, uint64_t pn,
+                                 uint8_t *frame, uint32_t len);
+
+/* umac_ba.c's Block Ack frames: mac80211 drops a robust unicast one from an MFP peer
+ * unprotected (rx.c ieee80211_drop_unencrypted_mgmt), as it does path selection. */
+struct mmpkt *umac_datapath_mesh_protect_mgmt(struct mmpkt *txbuf, int *key_id)
 {
-    if (slot < 0 || kid < UMAC_MESH_IGTK_ID_MIN || kid > UMAC_MESH_IGTK_ID_MAX ||
-        len > UMAC_MESH_BIP_BODY_MAX)
+    const uint32_t hdr = sizeof(struct dot11_hdr);
+    struct umac_mesh_hwmp_txkey k = { .how = UMAC_MESH_HWMP_PROT_NONE };
+    *key_id = -1;
+    struct mmpktview *v = mmpkt_open(txbuf);
+    uint8_t *f = mmpkt_get_data_start(v);
+    const uint32_t len = mmpkt_get_data_length(v);
+    if (len > hdr && !mm_mac_addr_is_multicast(dot11_get_da((struct dot11_hdr *)f)) &&
+        frame_is_robust_mgmt(v))
     {
-        return false;
+        umac_datapath_mesh_hwmp_tx_key(dot11_get_da((struct dot11_hdr *)f), &k);
     }
-    struct umac_sta_data *stad = s_peers[slot];
-    struct connection_keys_data *kd = &umac_sta_data_get_keys(stad)->keys;
-    uint8_t key[UMAC_KEY_AES_128_LEN];
-    bool have = false;
-    MMOSAL_TASK_ENTER_CRITICAL();
-    const struct umac_key *k = kd->keys[kid];
-    if (k != NULL && k->key_type == UMAC_KEY_TYPE_IGTK && k->key_len == UMAC_KEY_AES_128_LEN)
+    if (k.how == UMAC_MESH_HWMP_PROT_CHIP)
     {
-        memcpy(key, k->key_data, sizeof(key));
-        have = true;
+        f[1] |= 0x40u; /* the chip adds CCMP, as for a PMF station's robust frame */
+        *key_id = k.key_id;
+        g_warthog_mgmt_tx_chip++;
     }
-    MMOSAL_TASK_EXIT_CRITICAL();
-    return have && umac_mesh_bip_verify(key, hdr, body, len) &&
-           umac_keys_check_and_update_rx_replay(stad, (uint8_t)kid, ipn,
-                                                UMAC_KEY_RX_COUNTER_SPACE_DEFAULT) ==
-               MMWLAN_SUCCESS;
+    if (k.how != UMAC_MESH_HWMP_PROT_HOST)
+    {
+        mmpkt_close(&v);
+        return txbuf;
+    }
+    /* build_mgmt_frame leaves no room for the CCMP header and MIC: copy into a frame that has it. */
+    const uint32_t n = len + UMAC_CCMP_HDR_LEN + UMAC_CCMP_MIC_LEN;
+    struct mmpkt *out = umac_datapath_alloc_raw_tx_mmpkt(MMDRV_PKT_CLASS_MGMT, 0, n);
+    bool ok = false;
+    if (out != NULL)
+    {
+        struct mmpktview *ov = mmpkt_open(out);
+        uint8_t *o = mmpkt_append(ov, n);
+        memcpy(o, f, hdr);
+        memset(o + hdr, 0, UMAC_CCMP_HDR_LEN);
+        memcpy(o + hdr + UMAC_CCMP_HDR_LEN, f + hdr, len - hdr);
+        memset(o + n - UMAC_CCMP_MIC_LEN, 0, UMAC_CCMP_MIC_LEN);
+        ok = umac_mesh_tx_host_ccmp_mgmt(k.key, k.key_id, k.pn, o, n);
+        mmpkt_close(&ov);
+        *mmdrv_get_tx_metadata(out) = *mmdrv_get_tx_metadata(txbuf);
+    }
+    else
+    {
+        g_warthog_swccmp_tx_fail++;
+    }
+    mmpkt_close(&v);
+    mmpkt_release(txbuf);
+    if (!ok && out != NULL)
+    {
+        mmpkt_release(out);
+    }
+    if (ok)
+    {
+        g_warthog_mgmt_tx_host++;
+    }
+    else
+    {
+        g_warthog_mgmt_tx_drop++;
+    }
+    return ok ? out : NULL;
 }
 
-/* mac80211 parity: only from an ESTAB peer (mesh_rx_path_sel_frame); from one that runs
- * MFP, unicast must be protected and group must carry an MMIE (rx.c
- * ieee80211_drop_unencrypted_mgmt); an MMIE is checked always. */
+/* mac80211 parity (rx.c ieee80211_rx_h_decrypt, ieee80211_drop_unencrypted_mgmt): only from
+ * an ESTAB peer (mesh_rx_path_sel_frame); unicast from one that runs MFP must be protected.
+ * Group path selection is group-addressed privacy: Protected, opened under the sender's MGTK
+ * and replay-checked on the way here. Stricter than mac80211, never in the clear or with an
+ * MMIE: every ESTAB peer's AMPE delivered its MGTK and it protects with it, and a relay
+ * re-sends what it takes under our MGTK, which every MFP peer opens. */
 bool umac_datapath_mesh_hwmp_rx_ok(const uint8_t *frame, uint32_t len)
 {
     if (frame == NULL || len < UMAC_MESH_BIP_HDR_LEN || !umac_mesh_sae_active())
@@ -1284,15 +1424,11 @@ bool umac_datapath_mesh_hwmp_rx_ok(const uint8_t *frame, uint32_t len)
         g_warthog_hwmp_unestab++;
         return false;
     }
-    const bool mfp = mesh_slot_mfp_(slot);
-    const uint8_t *body = frame + UMAC_MESH_BIP_HDR_LEN;
-    const uint32_t blen = len - UMAC_MESH_BIP_HDR_LEN;
-
     if (!group)
     {
         if (!prot)
         {
-            if (mfp)
+            if (mesh_slot_mfp_(slot))
             {
                 g_warthog_hwmp_unprotected++;
                 return false;
@@ -1307,31 +1443,20 @@ bool umac_datapath_mesh_hwmp_rx_ok(const uint8_t *frame, uint32_t len)
         }
         return true;
     }
-    uint16_t kid = 0;
-    uint64_t ipn = 0;
     if (prot)
     {
-        /* Group path selection is never CCMP-protected; only our own MGTK could open it. */
-        g_warthog_hwmp_bipfail++;
-        return false;
-    }
-    if (!umac_mesh_bip_parse(body, blen, &kid, &ipn))
-    {
-        g_warthog_hwmp_nommie++;
-        if (mfp)
-        {
-            g_warthog_hwmp_unprotected++;
-            return false;
-        }
+        /* No MFP latch: mac80211 protects every group Mesh Action frame when it has an MGTK. */
+        g_warthog_hwmp_gp++;
         return true;
     }
-    g_warthog_hwmp_mmie++;
-    if (!mesh_bip_ok_(slot, frame, body, blen, kid, ipn))
+    if (umac_mesh_bip_has_mmie(frame + UMAC_MESH_BIP_HDR_LEN, len - UMAC_MESH_BIP_HDR_LEN))
     {
-        g_warthog_hwmp_bipfail++;
+        g_warthog_hwmp_mmie++;
         return false;
     }
-    return true; /* verified under its IGTK, whose install already marked it MFP */
+    g_warthog_hwmp_nommie++;
+    g_warthog_hwmp_unprotected++;
+    return false;
 }
 
 struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr)
@@ -1378,25 +1503,32 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
                     umac_mesh_fwd_glue_peer_lost(umac_sta_data_peek_peer_addr(stad));
                 }
             }
+            /* Unlink and take the queue in one critical section: a TX on another task that
+             * looked this stad up re-checks the table under it before queueing
+             * (mesh_queue_one_), so nothing lands in the queue once it is taken. */
+            struct mmpkt *pkt;
+            struct mmpkt_list gone = MMPKT_LIST_INIT;
+            MMOSAL_TASK_ENTER_CRITICAL();
             s_peers[i] = NULL;
             s_peer_mfp[i] = false;
-            /* Tell the chip the station is gone, then drain the queue. */
+            while ((pkt = umac_sta_data_pop_pkt(stad)) != NULL)
+            {
+                s_num_pkts_queued--;
+                mmpkt_list_append(&gone, pkt);
+            }
+            MMOSAL_TASK_EXIT_CRITICAL();
+            mmpkt_list_clear(&gone);
+            /* Tell the chip the station is gone. */
             (void)mmdrv_update_sta_state(umac_sta_data_get_vif_id(stad),
                                          umac_sta_data_get_aid(stad),
                                          umac_sta_data_peek_peer_addr(stad),
                                          MORSE_STA_NOTEXIST);
-            /* Drain anything still queued for the dead link. */
-            struct mmpkt *pkt;
-            MMOSAL_TASK_ENTER_CRITICAL();
-            while ((pkt = umac_sta_data_pop_pkt(stad)) != NULL)
-            {
-                s_num_pkts_queued--;
-                mmpkt_release(pkt);
-            }
-            MMOSAL_TASK_EXIT_CRITICAL();
             umac_rc_stop(stad);
+            /* Loop timeouts point into the record (ADDBA retry, RX reorder, defrag): stop them. */
+            umac_ba_deinit(stad);
+            umac_datapath_stad_teardown(umac_sta_data_get_umacd(stad), stad);
             uint16_t vif_id = umac_sta_data_get_vif_id(stad);
-            mmosal_free(stad);
+            mesh_retire_(i, stad); /* a reader on another task may still hold it */
 
             /* The key slot is VIF-wide but it lives against the station it was
              * installed for, so removing that station takes the key with it
@@ -1423,6 +1555,25 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
             }
         }
     }
+}
+
+uint8_t umac_datapath_mesh_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max)
+{
+    uint8_t n = 0;
+    for (int i = 0; out != NULL && i < MESH_MAX_PEERS && n < max; i++)
+    {
+        if (s_peers[i] == NULL)
+        {
+            continue;
+        }
+        struct mmwlan_mesh_peer_link *l = &out[n++];
+        memset(l, 0, sizeof(*l));
+        umac_sta_data_get_peer_addr(s_peers[i], l->addr);
+        l->estab = s_peer_estab[i] ? 1u : 0u;
+        l->expected_tput_kbps = umac_rc_get_expected_tput_kbps(s_peers[i]);
+        l->rc_valid = l->expected_tput_kbps != 0 ? 1u : 0u;
+    }
+    return n;
 }
 
 uint8_t umac_datapath_mesh_peer_count(void)
@@ -1539,13 +1690,30 @@ static enum mmwlan_sta_state mesh_get_sta_state(struct umac_sta_data *stad)
 
 /* --- TX queue: per-peer, mirroring umac_ap_queue_pkt/tx_dequeue_frame ---- */
 
+/* @p stad was looked up off the event loop (the netif or batman engine task), so del_peer
+ * may have unlinked it since: queue only while it is still in the table, checked by pointer
+ * under the critical section del_peer unlinks in. Before read_end it is not freed, so no
+ * new record can have its address. */
 static void mesh_queue_one_(struct umac_data *umacd, struct umac_sta_data *stad,
                             struct mmpkt *txbuf)
 {
+    bool live = false;
     MMOSAL_TASK_ENTER_CRITICAL();
-    umac_sta_data_queue_pkt(stad, txbuf);
-    umac_stats_update_datapath_txq_high_water_mark(umacd, ++s_num_pkts_queued);
+    for (int i = 0; i < MESH_MAX_PEERS && !live; i++)
+    {
+        live = (s_peers[i] == stad);
+    }
+    if (live)
+    {
+        umac_sta_data_queue_pkt(stad, txbuf);
+        umac_stats_update_datapath_txq_high_water_mark(umacd, ++s_num_pkts_queued);
+    }
     MMOSAL_TASK_EXIT_CRITICAL();
+    if (!live)
+    {
+        mmpkt_release(txbuf); /* as del_peer's drain would have */
+        return;
+    }
     g_warthog_tx_data_enq++;
 }
 
@@ -1637,8 +1805,9 @@ static void mesh_enqueue_tx_frame(struct umac_data *umacd,
         /* Copy to every peer except the one we were handed, which takes the
          * original. A failed copy drops that peer's replica only. A relayed
          * group frame also skips the neighbour it came from.
-         * Under SAE an unkeyed candidate gets none: TX would drop it, and a failed
-         * SAE frees such a slot. This narrows del_peer racing this walk; the race remains. */
+         * Under SAE an unkeyed candidate gets none: TX would drop it, and a failed SAE frees
+         * such a slot. A peer del_peer unlinks during this walk gets nothing queued
+         * (mesh_queue_one_). */
         const struct mmdrv_tx_metadata *md0 = mmdrv_get_tx_metadata(txbuf);
         for (int i = 0; i < MESH_MAX_PEERS; i++)
         {
