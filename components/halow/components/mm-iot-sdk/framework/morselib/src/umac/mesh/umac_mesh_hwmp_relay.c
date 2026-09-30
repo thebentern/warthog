@@ -13,11 +13,33 @@ static bool eq_(const uint8_t *a, const uint8_t *b)
     return memcmp(a, b, 6) == 0;
 }
 
+/* The element's Lifetime (TU) is the path's, as in mac80211's
+ * hwmp_route_info_get(), capped so a forged one cannot pin a slot. ms >= tu,
+ * so the pre-clamp keeps tu * 1024 inside 32 bits: no 64-bit divide. */
+static uint32_t lifetime_ms_(const struct umac_mesh_hwmp_ctx *c, uint32_t tu)
+{
+    if (tu >= c->max_lifetime_ms)
+    {
+        return c->max_lifetime_ms;
+    }
+    uint32_t ms = (tu * 1024u) / 1000u;
+    return ms < c->max_lifetime_ms ? ms : c->max_lifetime_ms;
+}
+_Static_assert(UMAC_MESH_PATH_LIFETIME_MAX_MS <= UINT32_MAX / 1024u, "TU conversion must fit 32 bits");
+
 static void none_(struct umac_mesh_hwmp_action *out, enum umac_mesh_hwmp_drop *why,
                   enum umac_mesh_hwmp_drop reason)
 {
     if (out != NULL) { out->kind = UMAC_MESH_HWMP_NONE; out->body_len = 0; }
     if (why != NULL) { *why = reason; }
+}
+
+/* umac_mesh_path_update() refuses only a live path it already holds, or a new
+ * destination when every slot holds a live path. */
+static enum umac_mesh_hwmp_drop refused_(const struct umac_mesh_hwmp_ctx *c, const uint8_t *dst)
+{
+    return umac_mesh_path_lookup(c->tbl, dst, c->now_ms) != NULL ? UMAC_MESH_HWMP_DROP_NOT_FRESH
+                                                                 : UMAC_MESH_HWMP_DROP_TABLE_FULL;
 }
 
 static void preq_(const struct umac_mesh_hwmp_ctx *c, const struct hwmp_preq *q,
@@ -34,10 +56,10 @@ static void preq_(const struct umac_mesh_hwmp_ctx *c, const struct hwmp_preq *q,
      * answer nor forward, which is the duplicate suppression. */
     bool fresh = umac_mesh_path_update(c->tbl, q->orig_addr, ta, q->orig_sn,
                                        q->metric + c->link_metric, (uint8_t)(q->hop_count + 1u),
-                                       c->path_lifetime_ms, c->now_ms);
+                                       lifetime_ms_(c, q->lifetime), c->now_ms);
     if (!fresh)
     {
-        none_(out, why, UMAC_MESH_HWMP_DROP_NOT_FRESH);
+        none_(out, why, refused_(c, q->orig_addr));
         return;
     }
     if (umac_mesh_hwmp_targets_us(q, c->own_addr))
@@ -85,16 +107,16 @@ static void prep_(const struct umac_mesh_hwmp_ctx *c, const struct hwmp_prep *p,
     /* Path to the TARGET (the answerer) is via the transmitter. */
     bool fresh = umac_mesh_path_update(c->tbl, p->target_addr, ta, p->target_sn,
                                        p->metric + c->link_metric, (uint8_t)(p->hop_count + 1u),
-                                       c->path_lifetime_ms, c->now_ms);
+                                       lifetime_ms_(c, p->lifetime), c->now_ms);
     if (eq_(p->orig_addr, c->own_addr))
     {
         /* Our own request answered; the path is installed, nothing to send. */
-        none_(out, why, fresh ? UMAC_MESH_HWMP_DROP_NONE : UMAC_MESH_HWMP_DROP_NOT_FRESH);
+        none_(out, why, fresh ? UMAC_MESH_HWMP_DROP_NONE : refused_(c, p->target_addr));
         return;
     }
     if (!fresh)
     {
-        none_(out, why, UMAC_MESH_HWMP_DROP_NOT_FRESH);
+        none_(out, why, refused_(c, p->target_addr));
         return;
     }
     if (!c->forwarding)

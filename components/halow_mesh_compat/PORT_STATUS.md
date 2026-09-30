@@ -8,8 +8,9 @@ host-side 802.11s mesh. Updated as each unit lands.
 > cannot do mesh) was disproved. The MM6108's shipping fullmac firmware does
 > accept `MORSE_CMD_INTERFACE_TYPE_MESH`, and Warthog now runs 802.11s mesh
 > point mode on it via `components/halow/.../umac/mesh/` — including SAE/AMPE
-> peering against stock OpenMANET. Nothing in this directory is built. It is
-> kept for the history of how the softmac route was scoped and costed.
+> peering against an SAE-configured OpenMANET node. Nothing in this directory
+> is built into firmware; only the host tests under `test/` run. It is kept for
+> the history of how the softmac route was scoped and costed.
 >
 > Current state lives in `../../docs/mesh-openmanet.md` and
 > `../../wiki/Mesh-Mode.md`.

@@ -727,12 +727,9 @@ static int mmwpas_send_action_mesh(void *priv, unsigned int freq, unsigned int w
     return umac_mesh_tx_action(dst, data, (uint16_t)data_len) < 0 ? -1 : 0;
 }
 
-/* The payoff: keys that SAE and AMPE actually derived, rather than a constant.
- *
- * mesh_rsn installs the per-link MTK (mesh_mpm.c:928) and the group MGTK
- * (:938) through here. Anything else -- IGTK/BIP, or a key with no peer
- * address -- is accepted and ignored rather than failed, so a build without
- * management-frame protection does not take the peering down with it. */
+/* AMPE's keys: each link's MTK, each MGTK, and the IGTKs (ours against the broadcast
+ * address, a peer's when it runs MFP), which stay host-side for BIP. Anything else is
+ * accepted and ignored rather than failed, so it cannot take the peering down. */
 static int mmwpas_set_key_mesh(void *priv, struct wpa_driver_set_key_params *params)
 {
     (void)priv;
@@ -742,7 +739,23 @@ static int mmwpas_set_key_mesh(void *priv, struct wpa_driver_set_key_params *par
     }
     if (params->alg == WPA_ALG_NONE)
     {
-        return 0;  /* key removal: the peer teardown path already clears these */
+        /* Peer keys go with the peer; our own IGTK is the one key cleared here. */
+        static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+        if ((params->addr == NULL || (params->addr[0] & 0x01) != 0) &&
+            (params->key_idx == 4 || params->key_idx == 5))
+        {
+            (void)umac_datapath_mesh_set_igtk(bcast, NULL, 0, (uint16_t)params->key_idx,
+                                              NULL, 0);
+        }
+        return 0;
+    }
+    if (params->alg == WPA_ALG_BIP_CMAC_128 && params->addr != NULL)
+    {
+        enum mmwlan_status st = umac_datapath_mesh_set_igtk(params->addr, params->key,
+                                                            (uint8_t)params->key_len,
+                                                            (uint16_t)params->key_idx,
+                                                            params->seq, params->seq_len);
+        return (st == MMWLAN_SUCCESS) ? 0 : -1;
     }
     if (params->alg != WPA_ALG_CCMP)
     {
@@ -755,9 +768,11 @@ static int mmwpas_set_key_mesh(void *priv, struct wpa_driver_set_key_params *par
         return 0;
     }
     bool pairwise = (params->key_idx == 0);
+    /* For a peer's MGTK, seq is the Key RSC its AMPE carried: the replay floor. */
     enum mmwlan_status st = umac_datapath_mesh_set_peer_key(params->addr, params->key,
                                                             (uint8_t)params->key_len,
-                                                            (uint8_t)params->key_idx, pairwise);
+                                                            (uint8_t)params->key_idx, pairwise,
+                                                            params->seq, params->seq_len);
     return (st == MMWLAN_SUCCESS) ? 0 : -1;
 }
 
@@ -790,6 +805,20 @@ static int mmwpas_sta_add_mesh(void *priv, struct hostapd_sta_add_params *params
     return 0;
 }
 
+/* mesh_rsn.c asks for our own MGTK's Key RSC (addr NULL) for every AMPE Open. */
+static int mmwpas_get_seq_num_mesh(const char *ifname, void *priv, const uint8_t *addr,
+                                   int idx, int link_id, uint8_t *seq)
+{
+    MM_UNUSED(ifname);
+    MM_UNUSED(priv);
+    MM_UNUSED(link_id);
+    if (addr != NULL || seq == NULL || idx < 0 || idx > 0xff)
+    {
+        return -1;
+    }
+    return (umac_datapath_mesh_own_group_rsc((uint8_t)idx, seq) == MMWLAN_SUCCESS) ? 0 : -1;
+}
+
 static int mmwpas_sta_remove_mesh(void *priv, const u8 *addr)
 {
     MM_UNUSED(priv);
@@ -820,7 +849,7 @@ const struct wpa_driver_ops mmwlan_wpas_ops_mesh = {
     .send_mlme = mmwpas_send_mlme,
     .set_country = mmwpas_set_country,
     .get_country = mmwpas_get_country,
-    .get_seqnum = mmwpas_get_seq_num,
+    .get_seqnum = mmwpas_get_seq_num_mesh,
     /* AP-specific ops left NULL so the supplicant's null-check skips them
      * instead of dispatching into AP internals that assume an AP context.
      *

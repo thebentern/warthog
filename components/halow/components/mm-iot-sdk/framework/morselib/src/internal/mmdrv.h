@@ -632,14 +632,16 @@ struct mmdrv_tx_metadata
     uint8_t enc;
 
     /* -- Warthog mesh forwarding sidecar (host-only; never sent to the chip) -- */
+    /* The flags share one byte: yaps-hw.c's TX pool assert has 2 bytes to spare. */
     struct
     {
-        uint8_t mc[18];        /* Mesh Control to emit; mc_len 0 = build the default */
+        uint8_t mc[18];            /* Mesh Control to emit; mc_len 0 = build the default */
         uint8_t mc_len;
-        uint8_t addr_valid;    /* use mesh_da/mesh_sa for addr3/addr4 */
+        uint8_t addr_valid : 1;    /* use mesh_da/mesh_sa for addr3/addr4 */
+        uint8_t exclude_valid : 1; /* group replication skips this peer (the sender) */
+        uint8_t own_group : 1;     /* counted in flight under our MGTK until its TX status */
         uint8_t mesh_da[6];
         uint8_t mesh_sa[6];
-        uint8_t exclude_valid; /* group replication skips this peer (the sender) */
         uint8_t exclude_ta[6];
     } mesh;
 };

@@ -21,6 +21,10 @@ enum warthog_mesh_diag {
     /* No channel pinned -- the radio holds the whole country list, so its
      * operating channel is neither chosen nor observable. */
     WARTHOG_MESH_DIAG_CHAN_UNPINNED,
+    /* Every new peering we would start was refused by the candidate RSSI floor. */
+    WARTHOG_MESH_DIAG_BELOW_FLOOR,
+    /* No beacons, but probe requests name our mesh: a peer that does not beacon. */
+    WARTHOG_MESH_DIAG_BEACONLESS_PEER,
     /* Pinned and applied, but nothing is audible on it. */
     WARTHOG_MESH_DIAG_NOTHING_AUDIBLE,
     /* Beacons are arriving and we still will not peer. */
@@ -35,9 +39,43 @@ struct warthog_mesh_diag_in {
     unsigned int applied_chan;
     /* Bus-level beacon pages; this is what separates the last two causes. */
     uint32_t     beacons_heard;
+    /* Probe requests naming our mesh: how a beaconless peer is heard. */
+    uint32_t     mesh_probes;
+    /* New peerings the RSSI floor refused, and ones it let through, from frames
+     * naming our mesh. These three count over warthog_mesh_diag_window. */
+    uint32_t     floor_skips;
+    uint32_t     floor_passes;
 };
 
 enum warthog_mesh_diag warthog_mesh_diagnose(const struct warthog_mesh_diag_in *in);
+
+/* The floor and probe inputs above as cumulative totals, as the counters hold them. */
+struct warthog_mesh_diag_counts {
+    uint32_t mesh_probes;
+    uint32_t floor_skips;
+    uint32_t floor_passes;
+};
+
+/* What the diagnosis counts over: from the no-peers report before last, or from
+ * the last tick with a peer, to now. An old sighting stops masking a cause two
+ * reports on, and every report spans at least one full report period. */
+struct warthog_mesh_diag_window {
+    struct warthog_mesh_diag_counts start; /* totals at the window's start */
+    struct warthog_mesh_diag_counts last;  /* totals at the last report */
+};
+
+/* Peered: the window starts again at @p now. */
+void warthog_mesh_diag_window_reset(struct warthog_mesh_diag_window *w,
+                                    const struct warthog_mesh_diag_counts *now);
+
+/* A no-peers report was made at @p now: the window now starts at the previous one. */
+void warthog_mesh_diag_window_roll(struct warthog_mesh_diag_window *w,
+                                   const struct warthog_mesh_diag_counts *now);
+
+/* Set @p in's probe and floor inputs to what the totals @p now gained in the window. */
+void warthog_mesh_diag_window_fill(const struct warthog_mesh_diag_window *w,
+                                   const struct warthog_mesh_diag_counts *now,
+                                   struct warthog_mesh_diag_in *in);
 
 /* One line naming the cause and what to do about it. Never NULL. */
 const char *warthog_mesh_diag_text(enum warthog_mesh_diag d);

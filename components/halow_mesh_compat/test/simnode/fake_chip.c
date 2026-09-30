@@ -6,9 +6,10 @@
  * can assert on the exact bytes that would have gone on the air -- addresses,
  * QoS control, Mesh Control, Address Extension, the lot.
  *
- * Everything above this line is the real firmware. Nothing below it is
- * simulated at all: no modulation, no timing, no interference, no chip
- * behaviour. What the radio does with these bytes is exactly what the
+ * Everything above this line is the real firmware. Below it only two things
+ * the host sees back are modelled: a TX status per data frame, and the group key
+ * slot's TX PN, drawn when a frame is sent. No modulation, no timing, no
+ * interference. What the radio does with these bytes is exactly what the
  * simulator cannot tell you.
  */
 #include <stdbool.h>
@@ -19,6 +20,8 @@
 #include "mmpkt.h"
 #include "mmdrv.h"
 #include "simnode.h" /* the one definition of struct simnode_frame the tests read */
+#include "umac/data/umac_data.h"
+#include "umac/datapath/umac_datapath.h"
 
 #ifndef SIMNODE_OUTBOX_MAX
 #define SIMNODE_OUTBOX_MAX 64u
@@ -35,6 +38,77 @@ void simnode_outbox_clear(void) { s_outbox_n = 0; s_outbox_dropped = 0; }
 const struct simnode_frame *simnode_outbox_get(unsigned i)
 {
     return (i < s_outbox_n) ? &s_outbox[i] : NULL;
+}
+
+/* The group key slot (aid 0) and its TX PN. Only the chip advances it, one PN per frame
+ * it encrypts there, from the install PN up; the host cannot read it. */
+static struct {
+    bool     valid;
+    uint8_t  key_idx;
+    uint64_t next_pn;
+    bool     used;
+    uint64_t top;
+} s_grp;
+
+bool simnode_group_pn_top(uint64_t *top)
+{
+    if (top != NULL) { *top = s_grp.top; }
+    return s_grp.used;
+}
+
+/* The chip sends @p pkt, or hands it back untried, then reports its TX status up the
+ * real path; the datapath releases it once the event loop takes that status. */
+static void chip_finish_(struct mmpkt *pkt, bool sent)
+{
+    struct mmdrv_tx_metadata *md = mmdrv_get_tx_metadata(pkt);
+    struct mmpktview *v = mmpkt_open(pkt);
+    const uint8_t *d = mmpkt_get_data_start(v);
+    const bool group_ra = mmpkt_get_data_length(v) >= 10u && (d[4] & 0x01u) != 0u;
+    mmpkt_close(&v);
+    if (sent && (md->flags & MMDRV_TX_FLAG_HW_ENC) != 0u && group_ra && s_grp.valid &&
+        md->key_idx == s_grp.key_idx)
+    {
+        uint64_t pn = s_grp.next_pn++;
+        if (!s_grp.used || pn > s_grp.top) { s_grp.top = pn; }
+        s_grp.used = true;
+    }
+    md->attempts = sent ? 1u : 0u;
+    md->status_flags = !sent ? MMDRV_TX_STATUS_DUTY_CYCLE_CANT_SEND
+                     : (md->flags & MMDRV_TX_FLAG_NO_ACK) != 0u ? MMDRV_TX_STATUS_FLAG_NO_ACK : 0u;
+    umac_datapath_handle_tx_status(umac_data_get_umacd(), pkt);
+}
+
+/* Frames waiting in the chip's queue while simnode_tx_hold is on, oldest first. */
+static struct mmpkt *s_held[SIMNODE_OUTBOX_MAX];
+static unsigned s_held_n;
+static bool s_hold;
+
+void simnode_tx_hold(bool on) { s_hold = on; }
+unsigned simnode_tx_held(void) { return s_held_n; }
+
+static struct mmpkt *take_held_(unsigned i)
+{
+    if (i >= s_held_n) { return NULL; }
+    struct mmpkt *pkt = s_held[i];
+    memmove(&s_held[i], &s_held[i + 1u], (s_held_n - i - 1u) * sizeof(s_held[0]));
+    s_held_n--;
+    return pkt;
+}
+
+bool simnode_tx_send_held(unsigned i)
+{
+    struct mmpkt *pkt = take_held_(i);
+    if (pkt == NULL) { return false; }
+    chip_finish_(pkt, true);
+    return true;
+}
+
+bool simnode_tx_return_held(unsigned i)
+{
+    struct mmpkt *pkt = take_held_(i);
+    if (pkt == NULL) { return false; }
+    chip_finish_(pkt, false);
+    return true;
 }
 
 int mmdrv_tx_frame(struct mmpkt *pkt, bool is_mgmt)
@@ -60,18 +134,35 @@ int mmdrv_tx_frame(struct mmpkt *pkt, bool is_mgmt)
         s_outbox_dropped++;
     }
     mmpkt_close(&v);
-    /* The real driver takes ownership and releases on TX completion. */
-    mmpkt_release(pkt);
+    /* Management frames' status feeds hostap and rate control, neither linked: freed as sent. */
+    if (is_mgmt)
+    {
+        mmpkt_release(pkt);
+        return 0;
+    }
+    /* The driver owns it now; the chip sends it and reports its status, at once unless held. */
+    if (s_hold && s_held_n < SIMNODE_OUTBOX_MAX)
+    {
+        s_held[s_held_n++] = pkt;
+        return 0;
+    }
+    chip_finish_(pkt, true);
     return 0;
 }
 
 /* The driver's packet allocators. The real ones come from a driver-owned pool;
  * heap-backed ones with the same headroom contract are the honest stand-in,
  * because what the firmware depends on is the headroom, not the pool. */
+static void (*s_tx_alloc_hook)(void);
+void simnode_set_tx_alloc_hook(void (*cb)(void)) { s_tx_alloc_hook = cb; }
+
 struct mmpkt *mmdrv_alloc_mmpkt_for_tx(uint8_t pkt_class, uint32_t space_at_start,
                                        uint32_t space_at_end)
 {
     (void)pkt_class;
+    void (*cb)(void) = s_tx_alloc_hook;
+    s_tx_alloc_hook = NULL;
+    if (cb != NULL) { cb(); }
     return mmpkt_alloc_on_heap(space_at_start, space_at_end,
                                sizeof(struct mmdrv_tx_metadata));
 }
@@ -142,9 +233,23 @@ const struct simnode_keyinst *simnode_keyinst_get(unsigned i)
 }
 void simnode_keyinst_clear(void) { s_keyinst_n = 0; }
 
+static unsigned s_install_fail_next;
+void simnode_fail_next_install_key(void) { s_install_fail_next++; }
+
 int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_conf)
 {
+    if (s_install_fail_next != 0u)
+    {
+        s_install_fail_next--;
+        return -5;
+    }
     s_cfg.keys_installed++;
+    if (key_conf != NULL && !key_conf->is_pairwise)
+    {
+        s_grp.valid = true;
+        s_grp.key_idx = key_conf->key_idx;
+        s_grp.next_pn = key_conf->tx_pn;
+    }
     if (key_conf != NULL && s_keyinst_n < SIMNODE_KEYINST_MAX)
     {
         struct simnode_keyinst *k = &s_keyinst[s_keyinst_n++];

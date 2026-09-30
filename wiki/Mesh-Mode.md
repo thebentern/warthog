@@ -77,7 +77,8 @@ AT+MPING=10.77.199.248,4
 ## Forwarding
 
 `AT+MESHFWD=1` then `AT+RESET` turns a node from a leaf into a relay. What
-changes, all of it 802.11s as mac80211 does it:
+changes, all of it 802.11s as vanilla mac80211 does it, within Warthog's own
+limits, unless a point says otherwise:
 
 - **Path selection is relayed.** A PREQ for a third party is rebroadcast with
   the hop cost added; the path back to its originator is installed via
@@ -86,10 +87,13 @@ changes, all of it 802.11s as mac80211 does it:
   PERR from a node that is not our next hop is ignored, so a third party
   cannot knock out routes it is not on. The same request heard twice — via a
   second neighbour, replayed, or forged with a stale number — is neither
-  answered nor forwarded.
+  answered nor forwarded. A route through a different next hop must be 10 %
+  better to replace ours at an equal sequence number; OpenMANET's patched
+  mac80211 (999-0027) demands that at a newer sequence number too.
 - **Data is relayed.** A unicast whose mesh destination is someone else goes
-  to that destination's next hop at TTL − 1; with no path, a PERR goes back
-  to the sender. A group frame is delivered locally and rebroadcast once at
+  to that destination's next hop at TTL − 1; with no path it is held while
+  the relay discovers the destination itself (below), and no PERR goes back.
+  A group frame is delivered locally and rebroadcast once at
   TTL − 1, with its original source and sequence number kept so every relay's
   duplicate cache sees the same identity — that cache is what stops two
   relays in range of each other rebroadcasting a frame to each other until
@@ -97,46 +101,96 @@ changes, all of it 802.11s as mac80211 does it:
   out as one unicast per peer (excluding the sender) carrying the group
   address in Address Extension, which a mac80211 receiver rebuilds into the
   real Ethernet frame and floods on its bridge.
-- **Paths are refreshed before they lapse.** A path in use with under a
-  second left triggers a fresh PREQ while still carrying traffic, so a
-  multi-hop flow never waits on rediscovery.
-- **The first frame of a flow waits for the PREP.** A unicast to a node with
-  no path yet is held (up to 4 frames, 2 per destination, 2 s) and sent when
-  the path is installed, as mac80211 does, instead of being lost the way an
+- **A path lives as long as its originator says.** Its expiry is the
+  Lifetime field of the PREQ or PREP that installed it (TU × 1.024, rounded
+  down), only ever extended, and capped at 60 s. An upstream mac80211 node
+  advertises 4882 TU (4999 ms); OpenMANET 1.8.0 advertises 48828 TU
+  (49999 ms). The table holds 32 paths. A lapsed or dead path stays listed
+  in `AT+MESHPATH?` until 600 s after its expiry, then is freed, as mac80211
+  does.
+- **Paths are refreshed before they lapse.** A path carrying traffic we
+  originate triggers a fresh PREQ when under a second is left, while still
+  carrying traffic, so a multi-hop flow never waits on rediscovery. A relay
+  does not refresh a path it only forwards on. OpenMANET's originator
+  refreshes when under 10 s is left.
+- **The first frame of a flow waits for the PREP.** A unicast we originate
+  to a node with no path yet is held (up to 4 frames, 2 per destination, 3 s)
+  and sent when the path is installed, as mac80211 does, instead of being lost the way an
   unanswered ARP is. Held frames are released or dropped both when a
   path-selection frame arrives and on the 2 s service tick, so a peer that
   never answers cannot park transmit buffers, and a target still waiting has
   its PREQ re-asked on that tick — one broadcast PREQ is unacknowledged, so
   losing it must cost a delay rather than the frame. The store is deliberately
-  shallow (4 frames, 2 per destination, 3 s) against mac80211's 10 per path and
-  its four-step retry ladder: these are transmit-pool buffers shared with our
-  own traffic and with peering, and a burst opened before discovery completes
+  shallow (4 frames, 2 per destination, 3 s) against mac80211's 10 per path
+  (OpenMANET's 50) and its four-step retry ladder: these are transmit-pool
+  buffers shared with our own traffic and with peering, and a burst opened before discovery completes
   keeps its newest frames, not its oldest.
-- **Discovery is rate-limited.** A frame for a destination with no path
-  triggers a PREQ and is dropped for the upper layer to retry, as an
-  unanswered ARP already is; PREQs go out at most once per target per 500 ms
-  and at most one every 50 ms overall, so a host scanning unknown addresses
-  cannot turn the node into a broadcast source.
+- **A relayed frame with no path is held while the relay discovers it.** As
+  OpenMANET's patched mac80211 does (999-0027), a unicast to relay whose mesh
+  destination has no path and is not a peer (under SAE, one whose link AMPE
+  has keyed) is kept, and the relay sends its
+  own PREQ for that destination at 0, 0.4, 1.2, 2.8 and 4.8 s (a 400 ms
+  timeout doubling to a 2 s cap, four retries), with OpenMANET's 48828 TU
+  lifetime so the path its PREP installs lasts as long as the upstream's (our
+  own discoveries keep 4882 TU). A step counts only once its PREQ has gone
+  out, so one held back by the rate limit below, still queued for the event
+  loop or left without a buffer is retried, not skipped; no two PREQs for a
+  destination are allowed within the 400 ms per-destination interval. The
+  PREP releases the held frames
+  oldest first, exactly as forwards: the originator's mesh addresses, sequence
+  number and Address Extension, one hop of TTL. Unanswered, they are dropped
+  silently at 6.8 s. No PERR is sent: vanilla mac80211 sends one
+  (no-forwarding, sequence number 0), no OpenMANET configuration does. The
+  store takes 4 relayed frames, 2 per destination, oldest dropped first, in
+  slots apart from our own 4 so relaying never evicts them. Of the 20-block
+  transmit pool, 4 own + 4 relayed + 8 queued to one next hop still leaves 4
+  for our own traffic and the PREQ/PREP that resolve the hold; OpenMANET
+  queues 50 per destination. A leaf or bridge-only node never holds or
+  discovers for anyone else, and a frame whose mesh destination is a group
+  address is dropped as no path, never discovered (mac80211 refuses a path to
+  one). Nothing is held while the transmit pool is paused (its PKTMEM
+  flow-control source; OpenMANET's patch 900 drops forwards while the queue is
+  stopped); a scan or standby pause does not refuse a hold. A released frame
+  whose next hop already has 8 queued is dropped like a forward. There is no
+  gate fallback: Warthog does not act on RANN. `AT+MESHFWDSTAT?` `hold` counts
+  frames held, sent and lost; `AT+MESHPATH?` `relay_held` is how many wait
+  now.
+- **Discovery is rate-limited.** PREQs are allowed at most once per target
+  per 400 ms, however many targets are asked, and at most one every 50 ms
+  overall (one queued for the event loop leaves when the loop runs it), so a
+  host scanning unknown addresses cannot turn the node into a broadcast
+  source. A relay's PREQ held
+  back by either limit goes out when it clears; its ladder step waits for it.
 - **Proxied endpoints are learned.** A frame that arrived with Address
   Extension teaches which mesh node the real source sits behind; a later
   frame to that host goes to that node with both ends in AE 2.
-- **Losing a neighbour** drops every path through it and announces each
-  destination with a PERR at its sequence number + 1 — the +1 is what makes
-  every other node accept the announcement as newer than what it holds.
+- **Losing a neighbour** drops every path through it and announces up to 8
+  of those destinations with a PERR at its sequence number + 1 — the +1 is
+  what makes a node routing through us accept the announcement as newer than
+  what it holds. mac80211 differs: it deletes those paths silently when a
+  peer link closes, and sends a PERR for them only when transmit failures
+  break a link, at most one per 100 TU.
 - **The Mesh Configuration capability** advertises Forwarding only while the
   gate is on, so a peer never routes through a node that will drop its
   frames.
 - **What a relay refuses.** Path selection from anyone not an established
-  peer — which today is a transmitter-address compare, not an authentication
-  boundary, because Warthog's own mesh runs without management-frame
-  protection; the moment a peer does send protected path selection, a
-  plaintext frame claiming to be that peer is refused (`AT+MESHFWDSTAT?`
-  `prot`/`unprotected`; `mmie`/`nommie` count what group-addressed ones
-  carry); a proxied address that
+  peer — a transmitter-address compare, not an authentication boundary, for a
+  peer that runs without management-frame protection; under SAE a station the
+  supplicant added before AMPE keyed its link is not one, in any mode
+  (`unestab`), and no frame held for discovery is handed to it; from a keyed
+  SAE peer that runs MFP, plaintext unicast path selection and group path
+  selection without a valid MMIE (see the README's MFP section); from any SAE peer,
+  protected unicast path selection under a group key (`mgmt prot grpkey`);
+  and on any mesh, once a peer has sent protected path selection, a plaintext
+  frame claiming to be it
+  (`AT+MESHFWDSTAT?` `prot`/`unprotected`/`unestab`/`mmie`/`nommie`/`bipfail`);
+  a proxied address that
   is us, a neighbour, or a node we hold a path to, so one Address Extension
   frame cannot redirect a neighbour's traffic; more than 8 hosts per node,
-  or any newcomer while the host table is full of live entries; a PERR for
-  the same unroutable destination more than twice a second; and a forwarded
+  or any newcomer while the host table is full of live entries; path
+  selection naming a destination we hold no path for (a PREQ's originator or
+  a PREP's target, including the answer to our own discovery) while every
+  path slot is live (`AT+MESHFWDSTAT?` `tblfull`); and a forwarded
   frame when the next hop already has 8 queued, so a relay cannot starve its
   own traffic or peering of buffers.
 
@@ -169,7 +223,9 @@ open mesh, use it.
   instead of replying and the discovery walks the full path and back.
   mac80211 sets the bit on a path refresh — where we match it exactly — but
   leaves it clear on an initial discovery, so an intermediate node may answer
-  in one hop. What we give up is that optimisation, not connectivity: the
+  in one hop; OpenMANET's patched mac80211 (999-0027) sets it on every
+  data-triggered PREQ and every retry, as we do. What we give up is that
+  optimisation, not connectivity: the
   target itself answers any PREQ naming it whatever the bit says, and relays
   forward a Target Only PREQ unchanged. The path we install is then always the
   target's own answer rather than a relay's cached idea of it, which is the
@@ -232,7 +288,7 @@ default.
 `AT+MESHBRIDGE=1` then `AT+RESET` replaces NAT with one layer-2 segment. The
 USB netif, the Wi-Fi AP and the mesh netif become ports of an lwIP bridge
 whose MAC is the mesh MAC; the bridge is the node's L3 interface and takes a
-DHCP lease from the mesh (an OpenMANET node's dnsmasq) or the static
+DHCP lease from the mesh (a bridged OpenMANET node's dnsmasq) or the static
 `10.77.x.y` fallback, exactly as the mesh netif did.
 
 What this buys: a tethered host's frames leave the mesh carrying the host's
@@ -240,7 +296,11 @@ own MAC in Address Extension and come back the same way, and its address
 comes from the mesh's DHCP server, so two hosts on opposite sides of a mesh
 are distinct. That is the precondition CoT and mDNS discovery were missing —
 under NAT every warthog's host is `192.168.4.x`, and the addresses those
-protocols carry in their payloads alias the receiver's own subnet.
+protocols carry in their payloads alias the receiver's own subnet. Against
+OpenMANET this holds only for a node whose mesh interface is a bridge port: a
+node set up by its mesh wizard keeps its DHCP server and applications on
+`br-ahwlan` behind `bat0`, which a Warthog cannot reach
+([OpenMANET Interop](OpenMANET-Interop)).
 
 What it costs: the USB and AP DHCP servers stop, so a tethered host gets an
 address only if the mesh has a DHCP server (on a warthog-only mesh, use a
@@ -327,9 +387,13 @@ knows — override it with `-DWARTHOG_MESH_PASSPHRASE='"your-passphrase"'` if
 images must be safe before they are configured. Every node on the mesh needs
 the same one.
 
-On boot the node authenticates each SAE peer it discovers (SAE Commit/Confirm,
-NIST P-256), then AMPE derives a per-link pairwise key (MTK) and each side
-sends the other its own group key (MGTK). The MTK and Warthog's own MGTK go
+On boot the node authenticates each SAE peer it discovers (SAE Commit/Confirm).
+Warthog always starts SAE with group 19 (NIST P-256) and accepts a peer's
+commit in 19, 20 or 21 (P-384, P-521). Keep 19 in an OpenMANET `sae_group`
+list; a list without it relies on the peer's commit and is unmeasured. The
+MODP groups 15 and 16 are not supported. AMPE then derives a per-link
+pairwise key (MTK) and each side sends the other its own group key (MGTK).
+The MTK and Warthog's own MGTK go
 into the chip; a peer's MGTK stays in the host keychain, because the chip has
 one group slot. Peering completes in a single
 Open/Confirm exchange and data flows CCMP-encrypted end to end. Verify:
@@ -349,10 +413,31 @@ host keychain, so one peer reads 2. `AT+KEYINST?` shows the pairwise key on the
 peer's AID and Warthog's own group key on AID 0. Bench-measured: peering +
 keying in one exchange, 8/8 pings at 0% loss, ~16 ms RTT over the keyed link.
 
+Each MGTK travels with a Key RSC, the receiver's replay floor for it: group
+frames at or below it are dropped (rxdrop 5). Warthog installs a peer's MGTK
+with the RSC that peer advertised (little-endian, as mac80211 reads it);
+installing the same key again on a live link keeps its counter. The floor is
+enforced only where host CCMP decrypts a peer's group frames:
+`warthog-mesh-sae-swccmp` with `AT+SWCCMP=1`, or `-swccmp-on`. Other builds
+drop those frames before the replay check (rxdrop 4, or 95). What Warthog
+advertises for its own MGTK depends on the build: `warthog-mesh-sae-swccmp`
+and `-swccmp-on` put it into the chip at a nonzero TX PN base and advertise one
+below it, re-installing at a fresh base when an Open follows group traffic
+(`mgtk_reinst` on `AT+MPMPEERS?`); every other build installs it at PN 0 and
+advertises 0. Neither is measured on air.
+
 A SAE node ignores open-mesh nodes sharing the Mesh ID (and vice versa) — the
 Mesh Configuration's Authentication Protocol Identifier must match before a
 candidate is even offered to the supplicant. The two security worlds coexist
 on air without disturbing each other.
+
+A SAE node's beacons and probe responses carry the RSN element its peering
+frames carry (hostap's: RSN version 1, CCMP-128, AKM SAE); an open node's carry
+none. A mac80211 peer drops a beacon or probe response whose RSN presence does
+not match its own mesh security, so without it a beaconing SAE peer such as
+OpenMANET never takes Warthog as a candidate. Probe requests carry a
+zero-length SSID and the Mesh ID element, the only shape mac80211 answers.
+Per source; not measured on air.
 
 `AT+SAEBRIDGE=0` makes a SAE node deaf to peer candidates (a debugging state);
 it defaults on.
@@ -366,7 +451,9 @@ AT+MESHSEC=0     → open; re-peers within ~2 s
 
 Keyed uses **one hardcoded key, identical on every warthog image** — a counting
 sequence, `00 11 22 ... ee ff`. Anyone holding the firmware holds the key.
-Against OpenMANET you must run open (or use SAE on both sides — see the
+It never matches OpenMANET. A node set up by OpenMANET's mesh wizard runs SAE
+and needs `warthog-mesh-sae` with its mesh ID and passphrase; run open only
+against a node set to `encryption='none'` (see the
 [OpenMANET interop page](OpenMANET-Interop)).
 
 The setting persists in NVS, though a factory flash overwrites that partition,
@@ -385,25 +472,110 @@ An 802.11s node will not send a **unicast** frame to a neighbour it has no
 So a node that does not answer path requests looks like this: broadcast works,
 ARP arrives, unicast never leaves, and every status counter reads healthy.
 
-Warthog participates in both directions — it advertises itself with a path
-request every 2 s and answers requests aimed at it:
+Warthog participates in both directions — on an open mesh it advertises
+itself with a path request every 2 s, and in every mode it answers requests
+aimed at it:
 
 ```
 AT+HWMPSTAT?
-+HWMPSTAT: rx=234 preq_rx=75 preq_tx=142 prep_rx=159 prep_tx=75 parse_fail=0 not_ours=0
++HWMPSTAT: rx=234 preq_rx=75 preq_tx=142 prep_rx=159 prep_tx=75 parse_fail=0 not_ours=0 rann_rx=0 perr_rx=0
 ```
 
 `preq_rx` matching `prep_tx` means every request aimed at us was answered.
-`parse_fail` should be 0.
+`parse_fail` should be 0. `rann_rx` and `perr_rx` count root announcements
+(never acted on) and path errors received.
+
+## Peer capacity
+
+A node peers with at most 4 others: one datapath station per peer, and on an
+open mesh one peering link per peer.
+
+- **Accepting bit.** Bit 0 of the Mesh Configuration capability octet
+  ("Accepting Additional Mesh Peerings") is 1 while a peer slot is free and 0
+  while all 4 are taken, in beacons and probe responses, and in Warthog's own
+  peering frames on an open mesh; under SAE, hostap's Open and Confirm always
+  set it, as OpenMANET's do. A probe response to a node that already holds a
+  slot carries 1, so a
+  peer that rebooted can peer again. Formation Info carries the number of
+  established peers, capped at 63.
+- **Open mesh.** An Open from a fifth node is answered with Close reason 53
+  (MESH-MAX-PEERS). After receiving Close(53), Warthog sends that node no Open
+  for 30 s; an Open from that node is still answered and ends the hold-off.
+  While 4 nodes are held off, Warthog opens toward no new node, and a Close(53)
+  arriving then holds off every new node for 30 s.
+  While full, each established peer is sent a probe response carrying 1 in
+  answer to its S1G beacons, at most once per 10 s. Warthog does not open
+  toward a neighbour from its beacons when their Mesh Configuration clears
+  bit 0 or names another authentication protocol, and answers that
+  neighbour's S1G beacons at most once per 10 s (at most 8 such answers in
+  any 10 s). A probe request carries no Mesh Configuration, so a
+  neighbour's probe requests still draw Opens, repeated on its beacons until
+  it answers or 8 go unanswered; a full neighbour's Close(53) holds them off
+  for 30 s. An Open from another node takes the link of a neighbour that has
+  answered none of Warthog's Opens, and that neighbour is sent Close reason
+  52, so it cannot hold the last link. A peering that reaches ESTAB when no
+  station can be allocated is closed with reason 53 (`add_fail` in
+  `AT+PEERS?`).
+- **SAE.** While full, a new node is not offered to the SAE supplicant;
+  `offer_full` in `AT+MPMPEERS?` counts these. A node that holds a slot is
+  still offered. Every S1G beacon naming our mesh from a neighbour above the
+  RSSI floor is answered with a probe response, with no 10 s limit: about one
+  a second per beaconing OpenMANET neighbour. The slot is taken when the
+  supplicant adds the station, before
+  SAE completes, so nodes still authenticating count toward the 4 but not
+  toward Formation Info. If SAE has not completed when the supplicant's
+  10-19 s authentication timer fires, the station and its slot are freed at
+  once (`sae_fail`), with no retries and no blocked state, and that node is
+  not offered again for 30 s (`held`). An SAE Commit from the node ends the
+  hold-off and it is offered at once, if the RSSI floor and a free slot allow.
+  So a neighbour that never completes SAE, such as a full node or one that
+  never learns Warthog, holds a slot for one timer period and then waits out
+  the hold-off, rather than holding it through three retries and the blocked
+  state (up to ~300 s). If SAE completes but the peering does not reach
+  ESTAB, the supplicant frees the station when its peering state machine
+  gives up (at most about 1.6 s of retries and holding), and the node is held
+  off the same way (`plink_fail`). While a node is held off, its Mesh Peering
+  Open is refused before the supplicant sees it (`held`): the supplicant would
+  otherwise give it a station on a key cached from a completed SAE. No group
+  frame is queued to a node until AMPE has keyed its link. Host-simulated, not
+  measured on air.
+- **RSSI floor.** A neighbour heard at or below `AT+MESHRSSI=` (default
+  -80 dBm) is not offered to the SAE supplicant, its Mesh Peering Open is
+  refused under SAE unless it already holds a slot, and on an open mesh no
+  peering is started toward it from its beacons; its S1G beacons are answered
+  at most once per 10 s. OpenMANET ignores beacons and probe responses it
+  hears at or below its `mesh_rssi_threshold` (-80 dBm on a fresh 1.8.0
+  image, -85 on 1.6.5-1.7.x and nodes upgraded from them), so under SAE it
+  starts no peering with a node it hears that weakly. The threshold does not apply to an
+  Open, so it still takes a PMKSA-cached one from a node it peered with before:
+  hostap keeps the key of a completed SAE up to 12 h, until reboot, and
+  Warthog sends such an Open toward any node it hears above its own floor.
+  Warthog measures the signal at its own receiver, so the two gates agree only
+  on a roughly symmetric link. On an open mesh a link below the floor forms
+  only when the other side initiates:
+  its own Open is answered, and its probe requests draw Warthog's Open, so two
+  Warthogs below the floor still peer. Under SAE, between two Warthogs, such a
+  link needs the floor lowered on both ends (`AT+MESHRSSI=0` turns it off).
+  `skipped` in `AT+MESHRSSI?` counts refusals of frames that name our mesh;
+  when the floor has refused new peerings and passed none since the no-peers report before
+  last (or since a peer was last up), the no-peers report and `AT+MESHCFG?`
+  name it as the cause.
 
 ## Limits
 
+- **At most 4 peers per node.** See [Peer capacity](#peer-capacity).
 - **No forwarding by default.** A leaf (`AT+MESHFWD=0`, `AT+MESHBRIDGE=0`)
   answers path requests that target it and ignores the rest, so two nodes that
-  cannot hear each other will not relay through it. It does learn a host behind
-  a direct peer from Address Extension and addresses replies to that host via
-  the peer in AE 2 (host-tested, not yet on air); any other unknown unicast
-  goes to the first peer.
+  cannot hear each other will not relay through it. It does learn a host
+  behind any mesh node from Address Extension a peer carried, and addresses
+  replies to that node in AE 2, handed to the node if it is a peer, else to
+  the peer that carried the host's traffic (host-tested, not yet on air). It
+  sends no PREQ for them. If that relay has no path to the node, a vanilla
+  mac80211 relay drops the reply with a PERR, so first contact from a far
+  host on an idle mesh can fail; a warthog relay, and OpenMANET's patched
+  mac80211 with forwarding on, hold it and discover the node (warthog
+  simulated, OpenMANET read from its source; neither measured).
+  Any other unknown unicast goes to the first peer.
   `AT+MESHFWD=1` makes the node a relay ([Forwarding](#forwarding)), which is
   host-tested and simulated, not yet run on air.
 - SAE/AMPE requires the `warthog-mesh-sae` build; the default smoke build still peers open or with the fixed key.

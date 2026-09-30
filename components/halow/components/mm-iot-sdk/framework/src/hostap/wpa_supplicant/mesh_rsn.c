@@ -26,43 +26,25 @@
 #include "mesh_rsn.h"
 
 extern volatile unsigned int g_warthog_ampe_start;
+/* umac_mesh.c: frees the station's datapath slot and holds the address off. */
+extern void umac_mesh_sae_failed(const u8 *addr);
 
 #define MESH_AUTH_TIMEOUT 10
-#define MESH_AUTH_RETRY 3
 #define MESH_RSN_FRAME_MIC_OFFSET 6
 
 void mesh_auth_timer(void *eloop_ctx, void *user_data)
 {
 	struct wpa_supplicant *wpa_s = eloop_ctx;
 	struct sta_info *sta = user_data;
-	struct hostapd_data *hapd;
 
-	if (sta->sae->state != SAE_ACCEPTED) {
-		wpa_printf(MSG_DEBUG, "AUTH: Re-authenticate with " MACSTR
-			   " (attempt %d) ",
-			   MAC2STR(sta->addr), sta->sae_auth_retry);
-		wpa_msg(wpa_s, MSG_INFO, MESH_SAE_AUTH_FAILURE "addr=" MACSTR,
-			MAC2STR(sta->addr));
-		if (sta->sae_auth_retry < MESH_AUTH_RETRY) {
-			mesh_rsn_auth_sae_sta(wpa_s, sta);
-		} else {
-			hapd = wpa_s->ifmsh->bss[0];
-
-			if (sta->sae_auth_retry > MESH_AUTH_RETRY) {
-				ap_free_sta(hapd, sta);
-				return;
-			}
-
-			/* block the STA if exceeded the number of attempts */
-			wpa_mesh_set_plink_state(wpa_s, sta, PLINK_BLOCKED);
-			sta->sae->state = SAE_NOTHING;
-			wpa_msg(wpa_s, MSG_INFO, MESH_SAE_AUTH_BLOCKED "addr="
-				MACSTR " duration=%d",
-				MAC2STR(sta->addr),
-				hapd->conf->ap_max_inactivity);
-		}
-		sta->sae_auth_retry++;
-	}
+	if (sta->sae->state == SAE_ACCEPTED)
+		return;
+	wpa_msg(wpa_s, MSG_INFO, MESH_SAE_AUTH_FAILURE "addr=" MACSTR,
+		MAC2STR(sta->addr));
+	/* Warthog: the station holds one of four datapath slots. Free it on the
+	 * first failure; umac_mesh's hold-off replaces the retries and BLOCKED. */
+	umac_mesh_sae_failed(sta->addr);
+	ap_free_sta(wpa_s->ifmsh->bss[0], sta);
 }
 
 

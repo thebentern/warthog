@@ -44,7 +44,9 @@ AT+MPMPEERS?
 
 `s1g_bcn=0` means no mesh beacons are being heard. Channel, mesh ID, bandwidth
 or operating class do not match. Every one of them must be identical across the
-mesh, and a mismatch produces no error — just silence.
+mesh, and a mismatch produces no error — just silence. A peer in beaconless
+mode sends no beacons and reads the same; `AT+MESHCFG?` names that case when
+its probe requests name our mesh.
 
 ## Mesh: peer seen but never establishes
 
@@ -59,6 +61,16 @@ node rebooted, and ignores Opens carrying a new link id.
 Warthog recovers on its own: after 8 unanswered Opens it sends a Close and
 restarts the handshake. If it does not recover, restart the peer's mesh.
 
+## Mesh: a fifth node never peers
+
+A node peers with at most 4 others ([Peer capacity](Mesh-Mode#peer-capacity)).
+On the full node `AT+PEERS?` shows `count=4`, and on a SAE mesh `offer_full`
+climbs in `AT+MPMPEERS?`. On an open mesh a Warthog newcomer shows
+`close_reason=53` in `AT+MPMSTAT?`, retries every 30 s, and peers once one of
+the 4 leaves or is expired (30 s of silence). On a SAE mesh a peer that goes
+silent is never expired, so its slot frees only when it sends Close or the full
+node restarts.
+
 ## Mesh: established, but only broadcast works
 
 The signature is distinctive — ARP arrives, pings do not, and the peer's
@@ -69,11 +81,12 @@ peering does not create one. Check that the node is advertising itself:
 
 ```
 AT+HWMPSTAT?
-+HWMPSTAT: rx=234 preq_rx=75 preq_tx=142 prep_rx=159 prep_tx=75 parse_fail=0 not_ours=0
++HWMPSTAT: rx=234 preq_rx=75 preq_tx=142 prep_rx=159 prep_tx=75 parse_fail=0 not_ours=0 rann_rx=0 perr_rx=0
 ```
 
-`preq_tx` should be climbing. `preq_rx` should match `prep_tx` — every request
-aimed at us answered. `parse_fail` above 0 means frames are arriving in a shape
+`preq_tx` should be climbing on an open mesh. It counts only the per-peer
+keepalive PREQ, which SAE does not send, so under SAE it stays 0. `preq_rx`
+should match `prep_tx` — every request aimed at us answered. `parse_fail` above 0 means frames are arriving in a shape
 the node does not understand; `AT+HWMPDUMP?` shows the bytes.
 
 On the peer, `iw dev wlh0 mpath dump` should show a resolved next hop, not
@@ -88,7 +101,8 @@ AT+MESHSEC?
 
 Keyed Warthog against an unencrypted peer. Peering is unaffected because it
 happens in management frames; only data dies. `AT+MESHSEC=0` for an open peer
-such as stock OpenMANET.
+(an OpenMANET node only if an operator set `encryption='none'`; its mesh
+wizard configures SAE).
 
 ## Mesh: frames arrive but nothing is delivered
 

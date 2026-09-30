@@ -119,6 +119,9 @@ bool umac_mesh_path_update(struct umac_mesh_pathtbl *t, const uint8_t *dst,
         memset(e, 0, sizeof(*e));
         memcpy(e->dst, dst, 6);
         e->used = true;
+        /* As mac80211's mesh_path_new: 0 would read as the future once uptime
+         * passes 2^31 ms, and the path would never expire. */
+        e->exp_ms = now_ms;
     }
     memcpy(e->next_hop, next_hop, 6);
     e->sn = sn;
@@ -128,7 +131,7 @@ bool umac_mesh_path_update(struct umac_mesh_pathtbl *t, const uint8_t *dst,
     /* Only ever extend: a shorter lifetime in a later frame does not cut a
      * path off early. */
     uint32_t exp = now_ms + lifetime_ms;
-    if (!e->used || past_(now_ms, e->exp_ms) || (int32_t)(exp - e->exp_ms) > 0)
+    if (past_(now_ms, e->exp_ms) || (int32_t)(exp - e->exp_ms) > 0)
     {
         e->exp_ms = exp;
     }
@@ -186,6 +189,40 @@ uint32_t umac_mesh_path_lose_next_hop(struct umac_mesh_pathtbl *t, const uint8_t
     return n;
 }
 
+uint32_t umac_mesh_path_expire(struct umac_mesh_pathtbl *t, uint32_t now_ms)
+{
+    if (t == NULL)
+    {
+        return 0;
+    }
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < UMAC_MESH_PATH_MAX; i++)
+    {
+        struct umac_mesh_path *e = &t->p[i];
+        if (e->used && past_(now_ms, e->exp_ms + UMAC_MESH_PATH_EXPIRE_MS))
+        {
+            memset(e, 0, sizeof(*e));
+            n++;
+        }
+    }
+    for (uint32_t i = 0; i < UMAC_MESH_PROXY_MAX; i++)
+    {
+        struct umac_mesh_proxy *x = &t->x[i];
+        if (x->used && past_(now_ms, x->exp_ms + UMAC_MESH_PATH_EXPIRE_MS))
+        {
+            memset(x, 0, sizeof(*x));
+            n++;
+        }
+        else if (x->used && x->uni && (uint32_t)(now_ms - x->uni_ms) > UMAC_MESH_LEAF_VIA_HOLD_MS)
+        {
+            /* Hold over: keep its age bounded, or it wraps to 0 and re-arms. Keep
+             * uni itself, which also exempts the entry from eviction. */
+            x->uni_ms = now_ms - UMAC_MESH_LEAF_VIA_HOLD_MS;
+        }
+    }
+    return n;
+}
+
 bool umac_mesh_proxy_learn(struct umac_mesh_pathtbl *t, const uint8_t *ext,
                            const uint8_t *mesh_sta, uint32_t now_ms)
 {
@@ -224,7 +261,103 @@ bool umac_mesh_proxy_learn(struct umac_mesh_pathtbl *t, const uint8_t *ext,
     memcpy(slot->mesh_sta, mesh_sta, 6);
     slot->exp_ms = now_ms + UMAC_MESH_PROXY_LIFETIME_MS;
     slot->used = true;
+    slot->leaf = false;
+    slot->uni = false;
     return true;
+}
+
+static bool evictable_(const struct umac_mesh_proxy *x) { return x->leaf && !x->uni; }
+
+static bool older_(const struct umac_mesh_proxy *x, const struct umac_mesh_proxy *than)
+{
+    return than == NULL || (int32_t)(x->exp_ms - than->exp_ms) < 0;
+}
+
+bool umac_mesh_proxy_learn_leaf(struct umac_mesh_pathtbl *t, const uint8_t *ext,
+                                const uint8_t *mesh_sta, const uint8_t *via, bool uni,
+                                uint32_t now_ms)
+{
+    if (t == NULL || ext == NULL || mesh_sta == NULL || via == NULL)
+    {
+        return false;
+    }
+    struct umac_mesh_proxy *slot = NULL, *existing = NULL, *own_victim = NULL, *any_victim = NULL;
+    uint32_t owned = 0;
+    for (uint32_t i = 0; i < UMAC_MESH_PROXY_MAX; i++)
+    {
+        struct umac_mesh_proxy *x = &t->x[i];
+        bool live = x->used && !past_(now_ms, x->exp_ms);
+        if (!live)
+        {
+            if (slot == NULL) { slot = x; }
+            continue;
+        }
+        if (eq_(x->ext, ext))
+        {
+            existing = x;
+            continue;
+        }
+        bool mine = eq_(x->mesh_sta, mesh_sta);
+        owned += mine ? 1u : 0u;
+        if (evictable_(x) && older_(x, any_victim)) { any_victim = x; }
+        if (mine && evictable_(x) && older_(x, own_victim)) { own_victim = x; }
+    }
+    if (existing != NULL)
+    {
+        slot = existing;
+    }
+    else if (owned >= UMAC_MESH_PROXY_PER_NODE)
+    {
+        slot = own_victim; /* a node's own flood churns only its own hints */
+    }
+    else if (slot == NULL)
+    {
+        slot = any_victim;
+    }
+    if (slot == NULL)
+    {
+        return false;
+    }
+    if (slot != existing)
+    {
+        memset(slot, 0, sizeof(*slot));
+        memcpy(slot->ext, ext, 6);
+    }
+    else if (!eq_(slot->mesh_sta, mesh_sta))
+    {
+        /* A pin vouches for a relay's path to the old node, not to this one. */
+        slot->uni = false;
+        slot->uni_ms = 0;
+    }
+    memcpy(slot->mesh_sta, mesh_sta, 6);
+    memmove(slot->via, via, 6);
+    if (uni)
+    {
+        slot->uni = true;
+        slot->uni_ms = now_ms;
+    }
+    slot->leaf = true;
+    slot->used = true;
+    slot->exp_ms = now_ms + UMAC_MESH_PROXY_LIFETIME_MS;
+    return true;
+}
+
+const struct umac_mesh_proxy *umac_mesh_proxy_entry(const struct umac_mesh_pathtbl *t,
+                                                    const uint8_t *ext, uint32_t now_ms)
+{
+    if (t == NULL || ext == NULL)
+    {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < UMAC_MESH_PROXY_MAX; i++)
+    {
+        const struct umac_mesh_proxy *x = &t->x[i];
+        if (x->used && !past_(now_ms, x->exp_ms) && eq_(x->ext, ext))
+        {
+            return x;
+        }
+    }
+    return NULL;
 }
 
 void umac_mesh_proxy_touch(struct umac_mesh_pathtbl *t, const uint8_t *ext, uint32_t now_ms)

@@ -205,6 +205,43 @@ int main(void)
         CHECK(umac_ccmp_build_aad(q, a3) == 28, "4-addr non-QoS AAD is 28 bytes");
     }
 
+    /* ---- management frames ---------------------------------------------
+     *
+     * The subtype is masked for data only (IEEE 802.11-2020 12.5.3.3.3; mac80211
+     * ccmp_gcmp_aad). A robust management frame keeps it, or a Deauthentication and a
+     * Mesh Action would authenticate alike. Vectors: the unicast Deauthentication
+     * header of IEEE 802.11 Annex M.9.2 (CCMP with management frame protection), and
+     * the Mesh Action PREP header warthog seals, each with Retry/PwrMgt/MoreData set
+     * on the air and a nonzero sequence number, which the AAD must not see. */
+    {
+        static const uint8_t DEAUTH[24] = {
+            0xc0, 0x38, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x00,
+        };
+        static const uint8_t DEAUTH_AAD[22] = {
+            0xc0, 0x40, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        };
+        static const uint8_t ACTION[24] = {
+            0xd0, 0x78, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x35, 0x12,
+        };
+        static const uint8_t ACTION_AAD[22] = {
+            0xd0, 0x40, 0x02, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x05, 0x00,
+        };
+        uint8_t m[UMAC_CCMP_AAD_MAXLEN];
+        CHECK(umac_ccmp_build_aad(DEAUTH, m) == 22 && memcmp(m, DEAUTH_AAD, 22) == 0,
+              "M.9.2 Deauthentication: AAD keeps subtype 12 (fc %02x %02x)", m[0], m[1]);
+        CHECK(umac_ccmp_build_aad(ACTION, m) == 22 && memcmp(m, ACTION_AAD, 22) == 0,
+              "Mesh Action: AAD keeps subtype 13, fragment 5 (fc %02x %02x)", m[0], m[1]);
+        uint8_t mn[13];
+        static const uint8_t MPN[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+        umac_ccmp_build_nonce(DEAUTH, MPN, mn);
+        CHECK(mn[0] == 0x10 && memcmp(&mn[1], &DEAUTH[10], 6) == 0 && mn[12] == 0x01,
+              "its nonce: management flag, A2, PN");
+    }
+
     printf(failures ? "\nFAILED (%d)\n" : "\nALL TESTS PASSED\n", failures);
     return failures ? 1 : 0;
 }

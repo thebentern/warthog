@@ -91,8 +91,10 @@ AT+MPMPEERS?
 AT+MPING=<peer's 10.77.x.y>,4
 ```
 
-✅ Expected: four replies. Against an OpenMANET peer, `AT+MESHSEC=0` first
-— stock OpenMANET is unencrypted. See [OpenMANET Gateway](OpenMANET-Gateway).
+✅ Expected: four replies. Against an OpenMANET peer set to
+`encryption='none'`, `AT+MESHSEC=0` first; a node set up by OpenMANET's mesh
+wizard runs SAE and needs `warthog-mesh-sae` (step 10) with its mesh ID and
+passphrase. See [OpenMANET Gateway](OpenMANET-Gateway).
 
 ## 10. Encrypted mesh — SAE/AMPE (two boards)
 
@@ -108,7 +110,8 @@ AT+KEYINST?
 ✅ Expected:
 - `AT+SAERX?` shows `ESTAB=1` and low single-digit `act=`/`rxact=` counts —
   peering completes in one Open/Confirm exchange, not a retransmit storm.
-- `AT+MPMPEERS?` shows `ampe_mtk=1 ampe_mgtk=1` — AMPE-derived keys installed.
+- `AT+MPMPEERS?` shows `ampe_mtk=1 ampe_mgtk=2` — AMPE-derived keys installed
+  (the peer's pairwise key; our own group key and the peer's).
 - `AT+KEYINST?` shows `n=2`: a pairwise key on the peer's AID and the group
   key on AID 0.
 
@@ -118,7 +121,8 @@ AT+MPING=<peer's 10.77.x.y>,8
 
 ✅ Expected: 8/8 replies over the CCMP-encrypted link (bench: ~16 ms RTT).
 
-If an open-mesh node shares the Mesh ID (an OpenMANET box in stock config),
+If an open-mesh node shares the Mesh ID (an OpenMANET node set to
+`encryption='none'`),
 the SAE boards must still key up beside it, and `AT+SAERX?` must show
 `status=0` / `rxfail_sa=000000` — no failure statuses from the open node,
 because it is never offered as a candidate.

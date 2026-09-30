@@ -97,7 +97,6 @@ def audit_peer(target, bind, mesh_id, sae):
         "wireless.default_radio1.mesh_id": mesh_id,
         "wireless.default_radio1.encryption": "sae" if sae else "none",
         "mesh11sd.mesh_beaconless.mesh_beacon_less_mode": "1",
-        "mesh11sd.mesh_dynamic_peering.enabled": "1",
     }
     got = {}
     for k in list(want) + ["wireless.radio1.channel", "wireless.radio1.country"]:
@@ -137,15 +136,15 @@ def configure_peer(target, bind, mesh_id, sae, passphrase):
         "uci set wireless.default_radio1.encryption='%s'" % enc,
     ]
     if sae:
-        cmds += ["uci set wireless.default_radio1.key='%s'" % passphrase,
-                 # OpenMANET ships H2E-only; warthog sends hunt-and-peck commits.
-                 "uci set wireless.default_radio1.sae_pwe='2'"]
+        # No sae_pwe: mesh SAE is hunt-and-peck on both sides whatever it says.
+        cmds += ["uci set wireless.default_radio1.key='%s'" % passphrase]
     cmds += [
         "uci commit wireless",
-        # Beaconless is mandatory on MM6108: with beaconing the chip firmware
-        # faults on the mesh-beacon path and wlh0 goes down.
+        # Not needed for discovery (warthog's SAE beacons carry RSN; from source,
+        # not measured). Kept because a bench Pi's MM6108 faulted on the mesh-beacon
+        # path with beaconing on (chip firmware unrecorded). Dynamic peering is not
+        # set: beaconless mode bypasses it.
         "uci set mesh11sd.mesh_beaconless.mesh_beacon_less_mode='1'",
-        "uci set mesh11sd.mesh_dynamic_peering.enabled='1'",
         "uci commit mesh11sd",
         "wifi down radio1", "sleep 4", "wifi up radio1",
     ]
@@ -168,7 +167,8 @@ def main():
     ap.add_argument("--mesh-id", default="halowmesh")
     ap.add_argument("--passphrase", default="warthog-mesh")
     ap.add_argument("--sae", action="store_true",
-                    help="encrypted mesh; without it, the open mesh stock OpenMANET ships")
+                    help="SAE mesh, as OpenMANET's mesh wizard writes; without it, "
+                         "an open mesh (encryption='none')")
     ap.add_argument("--negative", action="store_true",
                     help="also run the mismatch cases")
     ap.add_argument("--fwd", action="store_true",

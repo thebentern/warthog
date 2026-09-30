@@ -8,7 +8,9 @@ This document is the setup procedure, the settings that must match, and the
 failure modes — all of it measured against OpenMANET 1.8.0 on a Raspberry Pi 4
 with a Seeed HaLow HAT, and two Warthog nodes.
 
-Verified result, stock peer configuration, unencrypted mesh:
+Verified result against a peer hand-configured as an open mesh
+(`encryption='none'`, mesh ID `halowmesh`; not the stock or wizard
+configuration):
 
 | Direction | Result |
 |---|---|
@@ -44,7 +46,10 @@ applied on the next boot):
 S1G channel 42 at 2 MHz is what Warthog pins by default. Verify your peer's
 actual channel (`morse_cli -i wlh0 channel`) and match it; do not assume.
 Change any of the first five and you must change them on every node, Warthog and
-Linux alike — a mismatch produces a silent non-event, not an error.
+Linux alike — a mismatch produces a silent non-event, not an error. The
+OpenMANET mesh wizard defaults to mesh ID `openmanet` and passphrase
+`changeme123`; set `AT+MESHID=` (and `AT+MESHPASS=` on the SAE build) to what
+the peer actually runs.
 
 Flash as usual (hold **BOOT**, tap **RESET**, release BOOT):
 
@@ -93,7 +98,10 @@ address to report.
 
 Tested on OpenMANET 1.8.0, Raspberry Pi 4, Seeed HaLow HAT (MM6108).
 
-Configure the mesh interface to match the Warthog build:
+Convert the stock HaLow access point into an open mesh that matches
+`warthog-mesh-smoke` run with `AT+MESHSEC=0`. This is a hand configuration, not
+what the OpenMANET mesh wizard produces (SAE with `ieee80211w=2`, default mesh
+ID `openmanet`, `wlh0` a batman hardif of `bat0`; see *Encryption*):
 
 ```sh
 uci set wireless.radio1.hwmode='11ah'
@@ -107,7 +115,8 @@ Then three steps that are easy to miss and each produce a total, silent failure.
 
 ### 1. Take the mesh interface out of the bridge
 
-OpenWrt puts `wlh0` in `br-lan` by default. A bridged mesh interface cannot hold
+An interface converted by hand keeps the stock `network='lan'`, so `wlh0` sits
+in `br-lan`. A bridged mesh interface cannot hold
 its own address and traffic entering the mesh from a bridge is *proxied* traffic,
 which in 802.11s needs address extension and a mesh gate. Symptom: the peer
 answers nothing, `iw dev wlh0 mpath dump` stays empty, and an address configured
@@ -144,10 +153,12 @@ Make it permanent by assigning the interface to a zone in
 
 ### 3. Nothing else
 
-In particular you do **not** need `mesh_nolearn=1`, and you should not use it.
-It bypasses path discovery for established peers and looks like a fix, but
-OpenWrt resets it to `0` every ~10 seconds, so a link built on it works in bursts
-and fails in between. Warthog answers path discovery properly — see below.
+In particular you do **not** need `mesh_nolearn=1`. It bypasses path discovery
+for established peers and looks like a fix, but mesh11sd re-applies
+`mesh11sd.mesh_params.mesh_nolearn` (stock `'0'`) every 10 s, so a value set
+with `iw` works in bursts and fails in between. Warthog answers path discovery
+properly — see below. A wizard node runs `mesh_nolearn` 0 on 1.8.0 (the wizard
+writes a key named `nolearn`, which nothing reads) and 1 on 1.8.1-dev.
 
 ## How paths are established
 
@@ -184,12 +195,15 @@ nobody is answering.
 ## Encryption
 
 > **Real 802.11s security is the `warthog-mesh-sae` build**: SAE (Dragonfly,
-> group 19) authentication and AMPE per-link key exchange, hardware-validated
+> hunt-and-peck; Warthog commits in group 19 and accepts 19, 20 or 21 from a
+> peer) authentication and AMPE per-link key exchange, hardware-validated
 > warthog↔warthog (peering + keying in one exchange, 0% loss over the CCMP
 > link). Every node needs the same passphrase (`AT+MESHPASS=`, build default
-> `-DWARTHOG_MESH_PASSPHRASE`, `warthog-mesh`). A standard secured
-> 802.11s stack such as OpenMANET's speaks the same protocol; configure its
-> `wpa_supplicant` for mesh SAE with the matching passphrase.
+> `-DWARTHOG_MESH_PASSPHRASE`, `warthog-mesh`). OpenMANET's mesh wizard
+> (`encryption='sae'`) already produces a compatible SAE setup: match its mesh
+> ID and passphrase; no `sae_pwe` or group setting is needed. If you set
+> `sae_group` on the node, keep 19 in it (MODP 15 and 16 are not supported),
+> and do not use `ieee80211w=1` or `encryption='sae-mixed'`.
 >
 > The legacy `AT+MESHSEC=1` keyed mode on the non-SAE build encrypts data
 > frames with a 16-byte constant compiled into every image
@@ -206,9 +220,13 @@ AT+MESHSEC?      → +MESHSEC: 1 (keyed)
 AT+MESHSEC=0     → open, re-peers within ~2 s
 ```
 
-Stock OpenMANET ships `encryption='none'`, so **interoperating with it today
-requires `AT+MESHSEC=0`** on every Warthog node. Keyed mode uses a fixed shared
-key that a Linux peer does not have; the two cannot carry data to each other.
+A fresh OpenMANET image has no mesh (its HaLow radio is an SAE access point),
+and the LuCI mesh wizard always writes `encryption='sae'`, which netifd-morse
+runs with `ieee80211w=2`, so **a wizard node needs the `warthog-mesh-sae`
+build**; an SAE node ignores an open Warthog's beacons. `AT+MESHSEC=0` is for a peer an
+operator set to `encryption='none'` (by hand, as above, or in openmanetd's
+setup, which offers None). Keyed mode uses a fixed shared key that a Linux
+peer does not have; the two cannot carry data to each other.
 
 The setting persists in NVS, so a node that loses power comes back able to
 talk to the same peer. Before it did not, and a rebooted node would peer
@@ -251,7 +269,7 @@ iw dev wlh0 station dump | grep -E 'Station|plink'
 
 ```
 AT+HWMPSTAT?
-+HWMPSTAT: rx=234 preq_rx=75 preq_tx=142 prep_rx=159 prep_tx=75 parse_fail=0 not_ours=0
++HWMPSTAT: rx=234 preq_rx=75 preq_tx=142 prep_rx=159 prep_tx=75 parse_fail=0 not_ours=0 rann_rx=0 perr_rx=0
 ```
 
 `preq_tx` climbing means the node is advertising itself. `preq_rx` matching
@@ -271,6 +289,7 @@ AT+MPING=10.77.191.116,8
 | Symptom | Look at | Usual cause |
 |---|---|---|
 | No peers at all | `AT+MPMPEERS?` shows `(none)`, `s1g_bcn=0` | Channel, mesh ID or bandwidth mismatch. All must match exactly. |
+| Beacons heard, no peers | the diagnosis line of `AT+MESHCFG?`, `AT+MESHRSSI?` | Signal at or below -80 dBm: Warthog's floor (`AT+MESHRSSI`) or the peer's `mesh_rssi_threshold` (-85 on OpenMANET 1.6.5–1.7.x and nodes upgraded from them). Or an open Warthog against an SAE peer. |
 | Peer seen, never establishes | `estab=0`, `opens` climbing, `close_tx` rising | Peer holds a stale link from before your reboot. Warthog recovers after 8 Opens; if it does not, restart the peer's mesh. |
 | Established, broadcast only | `iw ... mpath dump` empty or next hop all zeros | Path discovery unanswered. Check `AT+HWMPSTAT?` `preq_tx` is climbing. |
 | ARP resolves, ping rejected | peer answers `ICMP ... unreachable` | Peer firewall. The mesh interface is not in a zone — see step 2 above. |
@@ -292,10 +311,23 @@ stack.
   whether the chip hands a relay frame to the host is unmeasured
   (`docs/mesh-attachment-model.md`).
 - SAE/AMPE (`warthog-mesh-sae`) peers cross-vendor, but its data plane has not
-  yet carried traffic with an OpenMANET peer. The chip holds one pairwise and
-  one group key, so more than one keyed peer, and any peer's group frames,
-  need host CCMP (`warthog-mesh-sae-swccmp`), which has not run on air.
-- `AT+MESHPMF=1` negotiates management frame protection only: no IGTK is
-  installed, and path-selection frames go out unprotected.
+  yet carried traffic with an OpenMANET peer. Warthog's chip firmware
+  (`mm6108.mbin` 1.17.6, as morselib drives it) was measured keeping one
+  pairwise key, the last install winning, and failing group RX from more than
+  one peer (`docs/mesh-attachment-model.md`); Warthog puts only its own group
+  key in the chip. More than one keyed peer, and any peer's group frames,
+  therefore need host CCMP (`warthog-mesh-sae-swccmp`), which has not run on
+  air.
+  OpenMANET's Linux driver runs different chip firmware (mm6108-2.0.1),
+  installs each peer's keys at that peer's AID, and falls back to software
+  crypto per key.
+- A beaconing SAE node (the wizard default) starts SAE with Warthog only after
+  a beacon or probe response from it that carries an RSN element, which
+  Warthog's SAE build sends. That is from source, not measured.
+- Path selection to a peer running MFP (the OpenMANET wizard's `ieee80211w=2`)
+  is CCMP-protected, and group path selection from it must carry a BIP MMIE
+  that verifies; a relay's own broadcast PREQs and PERRs, and a bridge's
+  PREQs, carry one only with `AT+MESHPMF=1`. Not measured on air, including
+  whether the chip encrypts or decrypts management frames on the mesh interface.
 - `AT+MESHSEC=1` on the non-SAE build uses one published key on every node.
 - batman-adv is not implemented.

@@ -35,7 +35,7 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
            ../src/dot11ah/debug.c
 
 TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
-           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mudp_classify test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd sim_mesh
+           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd sim_mesh test_supp_mesh_conf test_mesh_bip
 
 # ---- simnode: the real stack with only the chip and the RTOS replaced ----
 #
@@ -45,7 +45,7 @@ TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
 # the frame the firmware would have handed to the radio. It covers the glue,
 # which is the one mesh file no freestanding test can link.
 SIMNODE      := simnode
-SIMNODE_TESTS := test_simnode_smoke test_simnode_peering test_simnode_datapath test_simnode_multinode test_simnode_glue test_simnode_keys test_simnode_keys_nochip
+SIMNODE_TESTS := test_simnode_smoke test_simnode_peering test_simnode_datapath test_simnode_multinode test_simnode_glue test_simnode_keys test_simnode_keys_nochip test_simnode_keys_pnbase_off test_simnode_keys_nochip_pnbase_off test_simnode_capacity test_simnode_discovery test_simnode_mfp test_simnode_mfp_swccmp
 # Appended after the fact: TESTS above is an immediate assignment, so a
 # reference to this from there would expand to nothing.
 TESTS += $(SIMNODE_TESTS)
@@ -60,7 +60,9 @@ SIMNODE_INCS = -I$(SIMNODE)/hostshim -Ihostcompat -I../../halow/components/shims
 SIMNODE_REAL = $(addprefix $(SDKMESH)/,umac_mesh.c umac_mesh_fwd_glue.c umac_mesh_fwd.c \
                   umac_mesh_ctrl.c umac_mesh_rmc.c umac_mesh_pathtbl.c umac_mesh_hwmp.c \
                   umac_mesh_hwmp_relay.c umac_mesh_ies.c umac_mesh_plink_tbl.c \
-                  umac_mesh_ccmp_hdr.c umac_mesh_beacon.c umac_mesh_rx_crypto.c umac_mesh_ccm.c) \
+                  umac_mesh_ccmp_hdr.c umac_mesh_beacon.c umac_mesh_rx_crypto.c umac_mesh_ccm.c \
+                  umac_mesh_bip.c) \
+                $(addprefix $(HAP)/crypto/,aes-internal.c aes-internal-enc.c) \
                 $(addprefix $(FW)/morselib/src/umac/datapath/,umac_datapath.c umac_datapath_mesh.c datapath_defrag.c) \
                 $(addprefix $(FW)/morselib/src/common/,mmpkt.c mmpkt_list.c mac_address.c) \
                 $(addprefix $(FW)/morselib/src/umac/data/,umac_sta_data.c umac_data.c) \
@@ -108,7 +110,7 @@ region:
 # simnode tests link and drive the glue (SIMNODE_REAL) but cannot observe either.
 glueguard:
 	@echo "=== forwarding glue invariants ==="
-	@sh ./test_glue_guard.sh
+	@CC="$(CC)" sh ./test_glue_guard.sh
 
 # Note: -I$(SDKMESH) ONLY, deliberately not $(INCS) -- if these tests could see
 # the compat/dot11ah headers, an SDK dependency could sneak into umac_mesh_ies.c
@@ -120,6 +122,10 @@ test_mesh_diag: test_mesh_diag.c $(MAINDIR)/mesh_diag.c
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $^ -o $@
 
 test_mudp_classify: test_mudp_classify.c $(MAINDIR)/mudp_classify.c $(MAINDIR)/mudp_classify.h
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $(filter %.c,$^) -o $@
+
+# AT output into the 512 B CDC TX FIFO: a long reply and its OK arrive whole.
+test_cdc_out: test_cdc_out.c $(MAINDIR)/cdc_out.c $(MAINDIR)/cdc_out.h
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $(filter %.c,$^) -o $@
 
 # The simulator links every forwarding TU the firmware ships.
@@ -155,7 +161,7 @@ test_simnode_peering: $(SIMNODE)/test_simnode_peering.c $(SIMNODE_SRCS) $(SIMNOD
 # private statics while libc stays shared. RTLD_LOCAL plus macOS's two-level
 # namespace (-Bsymbolic on ELF) is what keeps node B's calls bound to node B's
 # own code rather than to whichever copy loaded first.
-SIMNODE_NODES := 3
+SIMNODE_NODES := 4
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 SIMNODE_SO      := .dylib
@@ -186,12 +192,77 @@ test_simnode_glue: $(SIMNODE)/test_simnode_glue.c $(SIMNODE_SRCS) $(SIMNODE_HDRS
 
 # The SAE key lifecycle: our own MGTK, which key a broadcast uses, and what a
 # surviving link keeps when a peer goes -- read off the fake chip's INSTALL_KEY log.
+# Built with WARTHOG_MESH_MGTK_PN_BASE, which no env pairs with chip-held AMPE keys:
+# it tests our MGTK's PN base and Key RSC, and one PN allocator with chip MTKs (18).
 test_simnode_keys: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+
+# Peer capacity: the accepting bit, Formation Info, Close(53), the hold-off, the
+# SAE offer gate and failed-SAE hold-off, and the candidate RSSI floor.
+test_simnode_capacity: $(SIMNODE)/test_simnode_capacity.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
 
-# The same file on the warthog-mesh-sae-nochipkey/-swccmp key path: AMPE keys stay host-only.
+# What a mac80211 peer needs before it takes us as a candidate: the RSN element
+# in beacon and probe response under SAE only, and a Mesh ID probe request.
+test_simnode_discovery: $(SIMNODE)/test_simnode_discovery.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+
+# The same file as warthog-mesh-sae-swccmp builds it: AMPE keys stay host-only, and
+# host CCMP is compiled in but not armed (-swccmp-on arms it at boot).
 test_simnode_keys_nochip: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1 -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+
+# And as warthog-mesh-sae ships: no MGTK PN base, so its install PN and Key RSC stay 0.
+test_simnode_keys_pnbase_off: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+
+# As warthog-mesh-sae-nochipkey: host-only AMPE keys, no MGTK PN base.
+test_simnode_keys_nochip_pnbase_off: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+
+# ---- the mesh supplicant shim against real hostap headers -----------------
+#
+# supplicant_core_mesh.c and hostap's ap_config.c, unmodified, compiled with the
+# firmware's own hostap defines (scraped from the component's CMakeLists, so the
+# struct layouts and #ifdef paths are the shipping ones) and the REAL hostap
+# includes.h -- not the hostcompat shadow the crypto tests use.
+HOSTAP_CMAKE := ../../halow/components/hostap/CMakeLists.txt
+# Each define in the set(BUILD_DEFINES ...) block must be NAME or NAME=<digits>, one per line.
+# SUPP_DEFS_BAD collects any other line, and any other BUILD_DEFINES mention; the recipe stops on it.
+HASH := \#
+SUPP_DEF_LINES := sed -n '/^set(BUILD_DEFINES/,/^)/p' $(HOSTAP_CMAKE) | sed -e 's/$(HASH).*//' \
+                    -e 's/^set(BUILD_DEFINES//' -e 's/^)//' -e '/^[[:space:]]*$$/d'
+SUPP_DEF_RE := ^[[:space:]]*\([A-Z][A-Z0-9_]*\(=[0-9]*\)\{0,1\}\)[[:space:]]*$$
+SUPP_DEFS := $(shell $(SUPP_DEF_LINES) | sed -n 's/$(SUPP_DEF_RE)/-D\1/p')
+SUPP_DEF_USES := -e '^set(BUILD_DEFINES' -e '$${BUILD_DEFINES}'
+SUPP_DEFS_BAD := $(shell { $(SUPP_DEF_LINES) | grep -v '$(SUPP_DEF_RE)'; \
+                   sed 's/$(HASH).*//' $(HOSTAP_CMAKE) | grep 'BUILD_DEFINES' | grep -v $(SUPP_DEF_USES); } | \
+                   tr '\n' '|')
+SUPP_INCS := -include hostcompat/hostap_prelude.h -I$(FW)/src -I$(FW)/src/hostap -I$(HAP) \
+             -I$(HAP)/utils -I$(HAP)/common -I$(FW)/src/hostap/wpa_supplicant \
+             -I$(FW)/morselib/include -I$(FW)/morselib/src -I$(FW)/src/mmutils \
+             -I$(FW)/morselib/src/internal -I$(FW)/morselib/mmrc/src/core \
+             -I$(FW)/morselib/src/umac/rc/mmrc_osal -I../../halow/components/shims/include/esp32s3 \
+             -I$(SIMNODE)/hostshim -idirafter hostcompat
+SUPP_HDRS := hostcompat/hostap_prelude.h $(HOSTAP_CMAKE) $(wildcard $(HAP)/ap/*.h) \
+             $(wildcard $(FW)/src/hostap/wpa_supplicant/mesh*.h) \
+             $(wildcard $(FW)/morselib/src/umac/supplicant_shim/*.h)
+
+# The SAE group list the shim hands hostap: contents, order, that the real
+# hostapd_config_free() can release it (bss->conf aliases conf->bss[0]), and its OOM path.
+test_supp_mesh_conf: test_supp_mesh_conf.c $(FW)/morselib/src/umac/supplicant_shim/supplicant_core_mesh.c \
+                     $(HAP)/ap/ap_config.c $(SIMNODE)/warthog_globals.c $(SUPP_HDRS)
+	$(if $(SUPP_DEFS_BAD),$(error $(HOSTAP_CMAKE): BUILD_DEFINES line(s) the SUPP_DEFS scrape does not parse: $(SUPP_DEFS_BAD)))
+	$(if $(SUPP_DEFS),,$(error $(HOSTAP_CMAKE): the SUPP_DEFS scrape found no BUILD_DEFINES))
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-void-pointer-to-int-cast $(SUPP_DEFS) $(SUPP_INCS) $(filter %.c,$^) -o $@
+
+# Path selection against a peer running MFP: CCMP on unicast HWMP, BIP on group, and
+# what an SAE node accepts. Once as the chip-key builds ship, once as -swccmp does.
+test_simnode_mfp: $(SIMNODE)/test_simnode_mfp.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
+
+test_simnode_mfp_swccmp: $(SIMNODE)/test_simnode_mfp.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1 -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(filter %.c,$^) -o $@
 
 test_mesh_fwd: test_mesh_fwd.c $(SDKMESH)/umac_mesh_fwd.c $(SDKMESH)/umac_mesh_ctrl.c $(SDKMESH)/umac_mesh_rmc.c $(SDKMESH)/umac_mesh_pathtbl.c $(SDKMESH)/umac_mesh_hwmp.c $(MESHIES) $(MESHHDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
@@ -242,6 +313,12 @@ test_ccm_crosscheck: test_ccm_crosscheck.c $(SDKMESH)/umac_mesh_ccm.c $(CCMSRC)
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-parameter -Wno-sign-compare \
 	  -Ihostcompat -I$(SDKMESH) -I$(HOSTAP)/src/utils -I$(HOSTAP)/src/crypto -I$(HOSTAP)/src -I$(HOSTAP) $^ -o $@
 
+# BIP-CMAC-128 (the MMIE on group path selection) against RFC 4493, hostap's
+# omac1_aes_128, and wlantest's bip_protect construction.
+test_mesh_bip: test_mesh_bip.c $(SDKMESH)/umac_mesh_bip.c $(SDKMESH)/umac_mesh_bip.h $(HOSTAP)/src/crypto/aes-omac1.c $(CCMSRC)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-parameter -Wno-sign-compare \
+	  -Ihostcompat -I$(SDKMESH) -I$(HOSTAP)/src/utils -I$(HOSTAP)/src/crypto -I$(HOSTAP)/src -I$(HOSTAP) $(filter %.c,$^) -o $@
+
 test_mesh_data_hdr: test_mesh_data_hdr.c $(MESHIES)
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(SDKMESH) $(filter %.c,$^) -o $@
 
@@ -254,6 +331,7 @@ freestanding:
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_hwmp.c && echo "ok   umac_mesh_hwmp.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/mesh_diag.c && echo "ok   mesh_diag.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/mudp_classify.c && echo "ok   mudp_classify.c is freestanding"
+	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/cdc_out.c && echo "ok   cdc_out.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_ctrl.c && echo "ok   umac_mesh_ctrl.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_rmc.c && echo "ok   umac_mesh_rmc.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_pathtbl.c && echo "ok   umac_mesh_pathtbl.c is freestanding"

@@ -44,9 +44,9 @@ esp_err_t warthog_cfg_set_dns(const char *dns);
 /* Mesh data-plane protection: 1 = keyed (a fixed shared key), 0 = open.
  *
  * Persisted because the alternative is worse than it looks: an unencrypted
- * peer such as stock OpenMANET needs 0, and a node that forgets across reboot
- * comes back peering perfectly and carrying no data, with nothing in any log
- * to say why. Default is the keyed build behaviour. */
+ * peer (an OpenMANET node set to encryption='none') needs 0, and a node that
+ * forgets across reboot comes back peering perfectly and carrying no data,
+ * with nothing in any log to say why. Default is the keyed build behaviour. */
 uint8_t   warthog_cfg_get_mesh_secure(void);
 esp_err_t warthog_cfg_set_mesh_secure(uint8_t secure);
 
@@ -106,14 +106,20 @@ esp_err_t warthog_cfg_set_mesh_grp(uint8_t on);
  *
  * Only these two -- "optional" is the one setting that makes the two ends size
  * the AMPE payload differently, so it is deliberately not reachable from here.
- * An OpenMANET peer emits ieee80211w=2 and reports MFP: yes, and that is NOT a
- * reason to turn this on: such a peer reached ESTAB with a warthog that had it
- * off, because the framing follows our own RSN element. This is for a peer that
- * actually refuses unprotected peering. It only negotiates MFP: the mesh
- * set_key drops non-CCMP keys, so no IGTK is installed and nothing enforces it.
- * Not run on air. Next boot. */
+ * An OpenMANET peer (ieee80211w=2) reached ESTAB with a warthog that had it
+ * off, because the framing follows our own RSN element, and unicast path
+ * selection to an MFP peer is protected either way. With 1, our group path
+ * selection carries a BIP MMIE (a relay or bridge needs it for an MFP peer to
+ * accept its PREQs) and plaintext path selection from any keyed peer is
+ * refused. Not run on air. Next boot. */
 uint8_t   warthog_cfg_get_mesh_pmf(void);
 esp_err_t warthog_cfg_set_mesh_pmf(uint8_t on);
+
+/* Candidate RSSI floor, dBm, -255..0: a neighbour heard at or below it is not
+ * offered to SAE or opened toward. 0 or -255 is off. Default -80, OpenMANET's
+ * mesh_rssi_threshold. Applies at once (AT+MESHRSSI=) and persists. */
+int16_t   warthog_cfg_get_mesh_rssi(void);
+esp_err_t warthog_cfg_set_mesh_rssi(int16_t dbm);
 
 /* S1G channel pin, stored and returned as a set.
  *

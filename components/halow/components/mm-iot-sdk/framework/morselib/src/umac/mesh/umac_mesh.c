@@ -42,19 +42,23 @@
 /* install mesh-mode datapath ops on mesh startup so frames
  * pass the data->ops NULL check in umac_datapath_rx_frame_filter. */
 #include "umac/datapath/umac_datapath.h"
+#include "umac/datapath/umac_datapath_private.h" /* umac_datapath_mesh_find_peer */
 /* set the per-VIF operating channel via regdb. */
 #include "umac/regdb/umac_regdb.h"
 #include "umac/ies/s1g_capabilities.h"
 #include "umac/mesh/umac_mesh_hwmp.h"
+#include "umac/mesh/umac_mesh_fwd_glue.h"
 /* mesh beacon constructor. Replaces the NULL return in
  * mmdrv_host_get_beacon() when the chip asks for a mesh beacon template. */
 #include "umac_mesh_beacon.h"
+#include "umac_mesh_bip.h"
+#include "umac_mesh_ccmp_hdr.h"
 #include "umac_mesh_ies.h"
 /* For mmwlan_get_mac_addr() — we need own_addr to stamp into addr2/addr3. */
 #include "mmwlan.h"
 /* manual probe-request burst to test chip TX path. */
 #include "umac/frames/frames_common.h"     /* build_mgmt_frame, mgmt_frame_builder_t */
-#include "umac/frames/probe_request.h"     /* frame_probe_request_build, frame_data_probe_request */
+#include "dot11/dot11_utils.h"               /* dot11_build_pv0_mgmt_header */
 #include "umac/frames/probe_response.h"    /* frame_probe_response_build, frame_data_probe_response */
 #include "umac/frames/action.h"           /* frame_action_build, frame_data_action */
 #include "umac/rc/umac_rc.h"               /* umac_rc_init_rate_table_mgmt */
@@ -109,7 +113,7 @@ extern volatile uint32_t g_warthog_mpm_expired;
 extern volatile uint32_t g_warthog_mpm_close_tx;
 extern volatile uint32_t g_warthog_hwmp_rx, g_warthog_hwmp_preq_rx, g_warthog_hwmp_preq_tx;
 extern volatile uint32_t g_warthog_hwmp_prep_tx, g_warthog_hwmp_parse_fail, g_warthog_hwmp_not_ours;
-extern volatile uint32_t g_warthog_hwmp_prep_rx;
+extern volatile uint32_t g_warthog_hwmp_prep_rx, g_warthog_hwmp_rann_rx, g_warthog_hwmp_perr_rx;
 extern volatile uint8_t g_warthog_hwmp_dump[48];
 extern volatile uint16_t g_warthog_hwmp_dump_len, g_warthog_hwmp_dump_full;
 extern volatile uint32_t g_warthog_cryptohost_req, g_warthog_cryptohost_done;
@@ -118,10 +122,44 @@ extern volatile uint32_t g_warthog_ccmp_kat_ran;
 void umac_datapath_mesh_service_rekey(void);
 extern volatile char g_warthog_mpm_links[256];
 extern volatile uint32_t g_warthog_mesh_peer_add_fail;
+extern volatile uint32_t g_warthog_sae_offer_full;
+extern volatile uint32_t g_warthog_sae_fail, g_warthog_sae_offer_held, g_warthog_plink_fail;
+extern volatile int32_t g_warthog_mesh_rssi_floor;
+extern volatile uint32_t g_warthog_mesh_rssi_skip, g_warthog_mesh_rssi_pass;
+
+/* Every established MPM link takes a datapath slot. */
+MM_STATIC_ASSERT(MPM_MAX_LINKS <= UMAC_DATAPATH_MESH_MAX_PEERS,
+                 "MPM_MAX_LINKS exceeds the datapath peer table");
 
 static struct umac_data *s_mesh_umacd = NULL;
 static uint16_t s_mesh_vif_id = 0;
 static uint8_t s_mesh_own_addr[6] = {0};
+
+struct mesh_probe_req_args_
+{
+    const uint8_t *sta_address;
+    const uint8_t *mesh_id;
+    uint8_t mesh_id_len;
+};
+
+/* Broadcast mesh probe request: wildcard SSID, Mesh ID, then S1G Capabilities,
+ * the order the Morse driver sends. mac80211 and the Morse beaconless path
+ * answer only a probe carrying a Mesh ID element and a zero-length SSID. */
+static void mesh_probe_req_build_(struct umac_data *umacd, struct consbuf *buf, void *params)
+{
+    const struct mesh_probe_req_args_ *a = (const struct mesh_probe_req_args_ *)params;
+    struct dot11_hdr *hdr = (struct dot11_hdr *)consbuf_reserve(buf, sizeof(*hdr));
+    if (hdr != NULL)
+    {
+        dot11_build_pv0_mgmt_header(hdr, DOT11_FC_SUBTYPE_PROBE_REQ, 0, mac_addr_broadcast,
+                                    a->sta_address, mac_addr_broadcast);
+    }
+    uint8_t ies[UMAC_MESH_PROBE_REQ_IES_MAXLEN];
+    uint16_t n = umac_mesh_ies_build_probe_req(ies, (uint16_t)sizeof(ies), a->mesh_id,
+                                               a->mesh_id_len);
+    consbuf_append(buf, ies, n);
+    ie_s1g_capabilities_build(umacd, buf);
+}
 
 /* shared mesh BSSID derived from CRC32(mesh_id). Both
  * peers on the same mesh_id compute the same value. The beacon constructor
@@ -163,6 +201,11 @@ bool umac_mesh_validate_args(struct umac_data *umacd, const struct mmwlan_mesh_a
     }
     return true;
 }
+
+static void mesh_bip_out_reset_(void);
+
+/* Set before the post and cleared by the handler, so at most one is queued. */
+static volatile bool s_service_queued;
 
 enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
                                          const struct mmwlan_mesh_args *args)
@@ -527,13 +570,9 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
      * (mmdrv_start_beaconing). Only now is it safe to let the firmware start
      * requesting beacons, because mmdrv_host_get_beacon() can actually answer.
      *
-     * mbca_config must be NON-ZERO (see mmdrv_mesh_config in driver.c): zero
-     * selects beaconless mode, which contradicts enable_beaconing=1 and leaves
-     * the chip accepting START while never beaconing -- exactly what we
-     * measured on air before this change.
-     *
-     * The firmware runs an MBSS TBTT-selection scan (~2 s) before the first
-     * beacon interrupt, so expect a short delay before beacons appear. */
+     * enable_beaconing selects beaconing, not MBCA: mmdrv_mesh_config sends
+     * mbca_config 0 with every MBCA timer 0, as the beaconing Linux MM8108
+     * measured in driver.c was sent. */
     ret = mmdrv_mesh_config(vif_id, /*start=*/true, /*enable_beaconing=*/true);
     if (ret != 0)
     {
@@ -558,10 +597,10 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
      * in mesh mode, or whether the chip's mesh state machine just discards
      * any TX request submitted via the datapath.
      *
-     * Test: manually construct a broadcast probe request (with the mesh_id
-     * as SSID, mimicking Linux's mesh_beaconless probe path), tag it with
+     * Test: manually construct a broadcast probe request (wildcard SSID plus
+     * Mesh ID, as Linux's mesh_beaconless probe path sends), tag it with
      * the mesh VIF id, and submit via mmdrv_tx_frame. Then watch:
-     *   - mmdrv_tx_frame# diagnostic — counts the chip TX submission
+     *   - mmdrv_tx_frame# diagnostic (MMLOG_DBG) — counts the chip TX submission
      *   - mmdrv_host_process_tx_status# diagnostic — counts chip-reported completion
      *
      * Outcomes:
@@ -580,15 +619,12 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
     {
         extern struct mmpkt *build_mgmt_frame(struct umac_data *umacd,
                                                mgmt_frame_builder_t builder, void *params);
-        struct frame_data_probe_request preq = {
-            .bssid = mac_addr_broadcast,
-            .sta_address = own_addr,  /* uses own_addr from above */
-            .ssid = args->mesh_id,
-            .ssid_len = args->mesh_id_len,
-            .extra_ies = NULL,
-            .extra_ies_len = 0,
+        struct mesh_probe_req_args_ preq = {
+            .sta_address = own_addr,
+            .mesh_id = args->mesh_id,
+            .mesh_id_len = args->mesh_id_len,
         };
-        struct mmpkt *probe = build_mgmt_frame(umacd, frame_probe_request_build, &preq);
+        struct mmpkt *probe = build_mgmt_frame(umacd, mesh_probe_req_build_, &preq);
         if (probe == NULL)
         {
             MMLOG_ERR("mesh: [step29] build_mgmt_frame(probe_request) failed — "
@@ -610,7 +646,7 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
             else
             {
                 MMLOG_INF("mesh: [step29] mmdrv_tx_frame(probe_request) submitted OK — "
-                          "watch for mmdrv_tx_frame#1 + mmdrv_host_process_tx_status#1 logs\n");
+                          "watch for the mmdrv_host_process_tx_status#1 log\n");
             }
         }
     }
@@ -620,6 +656,8 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
      * umac_mesh_get_args() to populate the wpa_ssid (mesh_id + security). */
     memcpy(&s_mesh_args, args, sizeof(s_mesh_args));
     s_mesh_args_valid = true;
+    mesh_bip_out_reset_();
+    s_service_queued = false; /* a core stop may have dropped a posted service event */
 
     /* stash state for the periodic probe-request burst. */
     s_mesh_umacd = umacd;
@@ -655,12 +693,12 @@ enum mmwlan_status umac_mesh_disable_mesh(struct umac_data *umacd)
  *
  * Called from the mesh-probe FreeRTOS task in main/mesh.c every 2s after
  * mesh_enable returns SUCCESS. Each call builds a fresh probe-request frame
- * carrying the mesh_id as SSID, then submits to mmdrv_tx_frame.
+ * (wildcard SSID, Mesh ID element), then submits to mmdrv_tx_frame.
  *
  * Returns 0 on success, negative on error.
  *
  * Diagnostic value: per-call the chip-side counters surface
- *   - mmdrv_tx_frame#N: submission seen at chip-cmd layer
+ *   - mmdrv_tx_frame#N (MMLOG_DBG builds): submission seen at chip-cmd layer
  *   - mmdrv_host_process_tx_status#N: chip-reported completion
  * If those numbers climb in lockstep, chip TX works for mesh. If the peer
  * board's mmdrv_host_process_rx_frame#N also climbs, the chip can RX foreign-
@@ -680,13 +718,15 @@ enum mmwlan_status umac_mesh_disable_mesh(struct umac_data *umacd)
  * warthog's own clock rather than a peer's. */
 static void mpm_expire_stale_(uint32_t now_ms);
 
-void umac_mesh_service_tick(void)
+
+/* Station teardown runs here, on the umac event loop, because the RX path
+ * dereferences those stations there; the probe task only posts this. */
+static void mesh_service_evt_(struct umac_data *umacd, const struct umac_evt *evt)
 {
-    if (s_mesh_umacd == NULL || !s_mesh_args_valid)
-    {
-        return;
-    }
-    umac_datapath_mesh_service_rekey(); /* AT+REKEY=<n>, serviced here */
+    (void)umacd;
+    (void)evt;
+    s_service_queued = false;
+    umac_datapath_mesh_service_rekey(); /* AT+REKEY=<n>, AT+MESHRELINK */
 
     /* Expire dead peers on OUR clock. The only other caller runs when a
      * neighbour transmits, which is the peer's clock -- and a peer going
@@ -695,14 +735,24 @@ void umac_mesh_service_tick(void)
      * held forever. */
     mpm_expire_stale_(mmosal_get_time_ms());
 
-    /* Frames held for discovery: released or dropped here too, so a peer that
-     * never answers does not park TX buffers until the next HWMP frame. */
+    /* Held frames released or dropped, lapsed paths and proxies freed, PREQs re-asked:
+     * here, so the tick's path selection is sent by the loop rather than queued for it. */
+    umac_mesh_fwd_glue_tick();
+}
+
+void umac_mesh_service_tick(void)
+{
+    if (s_mesh_umacd == NULL || !s_mesh_args_valid)
     {
-        extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge;
-        extern void umac_mesh_fwd_glue_tick(void);
-        if (g_warthog_mesh_fwd || g_warthog_mesh_bridge)
+        return;
+    }
+    if (!s_service_queued)
+    {
+        const struct umac_evt evt = UMAC_EVT_INIT(mesh_service_evt_);
+        s_service_queued = true;
+        if (!umac_core_evt_queue(s_mesh_umacd, &evt))
         {
-            umac_mesh_fwd_glue_tick();
+            s_service_queued = false; /* loop down or queue full: the next tick retries */
         }
     }
 
@@ -763,15 +813,12 @@ int umac_mesh_tx_broadcast_probe(void)
 
     umac_mesh_service_tick();
 
-    struct frame_data_probe_request preq = {
-        .bssid = mac_addr_broadcast,
+    struct mesh_probe_req_args_ preq = {
         .sta_address = s_mesh_own_addr,
-        .ssid = s_mesh_args.mesh_id,
-        .ssid_len = s_mesh_args.mesh_id_len,
-        .extra_ies = NULL,
-        .extra_ies_len = 0,
+        .mesh_id = s_mesh_args.mesh_id,
+        .mesh_id_len = s_mesh_args.mesh_id_len,
     };
-    struct mmpkt *probe = build_mgmt_frame(s_mesh_umacd, frame_probe_request_build, &preq);
+    struct mmpkt *probe = build_mgmt_frame(s_mesh_umacd, mesh_probe_req_build_, &preq);
     if (probe == NULL)
     {
         if (log_this) {
@@ -806,14 +853,11 @@ int umac_mesh_tx_broadcast_probe(void)
  * -- "ignoring probe req (no responder yet)" in umac_datapath_mesh.c. With no
  * response the peer never learns warthog exists, so no candidate and no plink.
  *
- * That path matters because warthog's chip does not currently beacon in mesh
- * mode at all (the beacon IRQ never fires; see AT+BCNSTAT?), so probe/response
- * is the only discovery mechanism available to us.
- *
  * addr3 is our own address: mac80211 uses vif->addr as the mesh BSSID, so a
- * Linux peer matches on that. The IEs carry Mesh ID + Mesh Configuration with
- * exactly the values our beacon would advertise, because mesh_matches_local()
- * compares them before accepting a candidate. */
+ * Linux peer matches on that. The IEs carry our beacon's Mesh ID and Mesh
+ * Configuration, which mesh_matches_local() compares before accepting a
+ * candidate, except that a node holding one of our slots is told accepting=1
+ * even when the beacon says 0. */
 int umac_mesh_tx_probe_response(const uint8_t *da)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL)
@@ -822,12 +866,18 @@ int umac_mesh_tx_probe_response(const uint8_t *da)
         return -1;
     }
 
-    uint8_t ies[UMAC_MESH_DISCOVERY_IES_MAXLEN];
-    uint16_t ies_len = umac_mesh_build_discovery_ies(ies, (uint16_t)sizeof(ies));
+    uint8_t ies[UMAC_MESH_PROBE_RESP_IES_MAXLEN];
+    uint16_t ies_len = umac_mesh_build_probe_resp_ies(ies, (uint16_t)sizeof(ies));
     if (ies_len == 0)
     {
         g_warthog_prsp_fail++;
         return -2;
+    }
+    /* A peer holding one of our slots is told we accept it even when full, or
+     * its mac80211 never raises us as a candidate (mesh_plink.c:549-563). */
+    if (umac_datapath_mesh_find_peer(da) != NULL)
+    {
+        (void)umac_mesh_ies_set_accepting(ies, ies_len, true);
     }
 
     /* Chip stamps the real TSF on TX; zero here is fine. */
@@ -871,14 +921,16 @@ int umac_mesh_tx_probe_response(const uint8_t *da)
     return ret;
 }
 
-/* Beaconless-peer discovery (Morse "dynamic peering").
+/* Beaconless-peer discovery (not Morse "dynamic peering", which is RSSI-based
+ * eviction when a node is full).
  *
  * A peer running mesh_beaconless_mode never beacons: it advertises itself
- * only by broadcasting a probe request for the Mesh ID (once ~5 s after its
- * mesh starts, then every ~60 s -- morse_driver mesh.c,
- * MESH_DISCOVERY_PROBE_PERIOD_S). Answering that probe (the caller does) is
- * not enough under SAE: nothing tells hostap a candidate exists, so neither
- * side ever initiates. Offer the requester as a candidate here.
+ * only by broadcasting a probe request for the Mesh ID (at mesh start, then
+ * every 5 s +/-20% until it has a station, then every 60 s +/-20% --
+ * morse_driver mm6108-2.0.1 mesh.c). Answering that probe (the caller does) is
+ * not enough under SAE: nothing tells our hostap a candidate exists, so it
+ * never initiates and drops the peer's Commit as unknown. Offer the requester
+ * as a candidate here.
  *
  * A probe request carries no Mesh Configuration element, which
  * umac_supp_mesh_new_peer() requires, so the offer substitutes our own
@@ -893,8 +945,39 @@ int umac_mesh_tx_probe_response(const uint8_t *da)
  * Only a request that names our mesh -- SSID(0) or Mesh ID(114) element
  * matching -- is offered. Wildcard probes are scanners, not peers, and
  * offering them would burn SAE attempts on every station in range. */
+static bool offer_synthetic_(const uint8_t *ta, int16_t rssi, bool named);
+static void offer_sae_(const uint8_t *addr, const uint8_t *ies, size_t ies_len, int16_t rssi,
+                       bool named);
+
+/* Does an SSID or Mesh ID element in [ies, ies + len) name our mesh? */
+static bool ies_name_our_mesh_(const uint8_t *ies, size_t len)
+{
+    if (!s_mesh_args_valid || ies == NULL)
+    {
+        return false;
+    }
+    size_t off = 0;
+    while (off + 2u <= len)
+    {
+        uint8_t eid = ies[off];
+        uint8_t elen = ies[off + 1];
+        if (off + 2u + elen > len)
+        {
+            return false;
+        }
+        if ((eid == 0u /* SSID */ || eid == 114u /* Mesh ID */) &&
+            elen == s_mesh_args.mesh_id_len &&
+            memcmp(&ies[off + 2], s_mesh_args.mesh_id, elen) == 0)
+        {
+            return true;
+        }
+        off += 2u + elen;
+    }
+    return false;
+}
+
 void umac_mesh_handle_probe_req_discovery(const uint8_t *ta, const uint8_t *ies,
-                                          uint32_t ies_len)
+                                          uint32_t ies_len, int16_t rssi)
 {
     extern volatile uint8_t g_warthog_prq_frame[96];
     extern volatile uint16_t g_warthog_prq_len;
@@ -907,44 +990,36 @@ void umac_mesh_handle_probe_req_discovery(const uint8_t *ta, const uint8_t *ies,
     g_warthog_prq_len = (uint16_t)ies_len;
     memcpy((void *)g_warthog_prq_ta, ta, 6);
 
-    if (!umac_mesh_sae_active() || !s_mesh_args_valid)
+    if (!ies_name_our_mesh_(ies, ies_len))
     {
         return;
     }
-
-    bool named = false;
-    uint32_t off = 0;
-    while (off + 2u <= ies_len)
-    {
-        uint8_t eid = ies[off];
-        uint8_t elen = ies[off + 1];
-        if (off + 2u + elen > ies_len)
-        {
-            break;
-        }
-        if ((eid == 0u /* SSID */ || eid == 114u /* Mesh ID */) &&
-            elen == s_mesh_args.mesh_id_len &&
-            memcmp(&ies[off + 2], s_mesh_args.mesh_id, elen) == 0)
-        {
-            named = true;
-            break;
-        }
-        off += 2u + elen;
-    }
-    if (!named)
-    {
-        return;
-    }
+    /* Counted on an open mesh too: the no-peers diagnosis reads it as audible. */
     g_warthog_prq_named++;
+    if (!umac_mesh_sae_active())
+    {
+        return;
+    }
+    if (offer_synthetic_(ta, rssi, true))
+    {
+        g_warthog_prq_offer++;
+    }
+}
 
+/* Offer @p ta with our own discovery IEs standing in for its advertisement,
+ * which it did not send; they must not report our own capacity. @p named: the
+ * frame that prompted it named our mesh (the IEs always do). */
+static bool offer_synthetic_(const uint8_t *ta, int16_t rssi, bool named)
+{
     uint8_t disc[UMAC_MESH_DISCOVERY_IES_MAXLEN];
     uint16_t disc_len = umac_mesh_build_discovery_ies(disc, (uint16_t)sizeof(disc));
     if (disc_len == 0)
     {
-        return;
+        return false;
     }
-    g_warthog_prq_offer++;
-    umac_supp_mesh_new_peer(ta, disc, disc_len);
+    (void)umac_mesh_ies_set_accepting(disc, disc_len, true);
+    offer_sae_(ta, disc, disc_len, rssi, named);
+    return true;
 }
 
 /* ---- Mesh Peering Management (MPM) ------------------------------------- *
@@ -1406,12 +1481,13 @@ static int mesh_tx_action_raw_(const uint8_t *da, const uint8_t *body, uint16_t 
 
 static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_len);
 
-/** Path lifetime we advertise, in TUs. 4882 TU ~= 5 s, which is what
- *  mac80211 uses for dot11MeshHWMPactivePathTimeout by default. */
+/** Path lifetime we advertise, in TUs. 4882 TU ~= 5 s, vanilla mac80211's
+ *  dot11MeshHWMPactivePathTimeout; OpenMANET's 999-0027 uses 50 s. */
 #define UMAC_MESH_HWMP_LIFETIME_TU 4882u
 
 /** How often we refresh our path at each peer. Must stay comfortably inside
- *  the peer's 5 s active-path timeout. */
+ *  UMAC_MESH_HWMP_LIFETIME_TU: a vanilla mac80211 peer keeps the path our PREQ
+ *  installs that long. */
 #define UMAC_MESH_HWMP_PREQ_PERIOD_MS 2000u
 #define MPM_IE_PEER_MGMT 117
 
@@ -1421,6 +1497,21 @@ static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_l
 /* Drop a link we have heard nothing from for this long. Peers probe every 2 s
  * and that probe refreshes the timer, so 30 s is ~15 missed probes. */
 #define MPM_PEER_TIMEOUT_MS 30000u
+/* A peer that answered our Open with Close(MESH_MAX_PEERS) is not opened toward
+ * again for this long; its own Open is still answered at once. */
+#ifndef MPM_REFUSED_HOLDOFF_MS
+#define MPM_REFUSED_HOLDOFF_MS 30000u
+#endif
+/* Full: how often an established peer is told directly that we accept it. */
+#ifndef MPM_FULL_REANNOUNCE_MS
+#define MPM_FULL_REANNOUNCE_MS 10000u
+#endif
+/* A neighbour SAE failed with is not offered again for this long; its own Commit
+ * ends it sooner. Longer delays a beaconless peer our probe request has not
+ * reached; shorter costs a slot and a chip re-registration per attempt. */
+#ifndef MPM_SAE_FAIL_HOLDOFF_MS
+#define MPM_SAE_FAIL_HOLDOFF_MS MPM_REFUSED_HOLDOFF_MS
+#endif
 
 static struct mpm_table s_mpm;
 
@@ -1633,7 +1724,176 @@ int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_le
     return mesh_tx_hwmp_(da, body, body_len);
 }
 
+extern volatile uint32_t g_warthog_hwmp_tx_prot, g_warthog_hwmp_tx_mmie, g_warthog_hwmp_tx_nommie;
+bool umac_mesh_tx_host_ccmp_mgmt(const uint8_t key[16], uint8_t key_id, uint64_t pn,
+                                 uint8_t *frame, uint32_t len);
+
+/* Apply @p k to a built HWMP frame whose body already reserves the CCMP or MMIE room. */
+static bool mesh_hwmp_protect_(struct mmpkt *frm, const struct umac_mesh_hwmp_txkey *k,
+                               struct mmdrv_tx_metadata *tx_md)
+{
+    struct mmpktview *v = mmpkt_open(frm);
+    uint8_t *f = mmpkt_get_data_start(v);
+    const uint32_t len = mmpkt_get_data_length(v);
+    bool ok = f != NULL && len > UMAC_MESH_BIP_HDR_LEN;
+    if (ok && k->how == UMAC_MESH_HWMP_PROT_CHIP)
+    {
+        /* As umac_datapath_tx_mgmt_frame protects a robust frame: the chip adds CCMP. */
+        f[1] |= 0x40u;
+        tx_md->flags |= MMDRV_TX_FLAG_HW_ENC;
+        tx_md->key_idx = k->key_id;
+    }
+    else if (ok && k->how == UMAC_MESH_HWMP_PROT_HOST)
+    {
+        ok = umac_mesh_tx_host_ccmp_mgmt(k->key, k->key_id, k->pn, f, len);
+    }
+    else if (ok && k->how == UMAC_MESH_HWMP_PROT_BIP)
+    {
+        const size_t body = len - UMAC_MESH_BIP_HDR_LEN;
+        ok = body >= UMAC_MESH_MMIE_LEN &&
+             umac_mesh_bip_protect(k->key, k->key_id, k->pn, f, f + UMAC_MESH_BIP_HDR_LEN,
+                                   body - UMAC_MESH_MMIE_LEN, body) == body;
+    }
+    mmpkt_close(&v);
+    return ok;
+}
+
+/* Group path selection is built and sent on the umac event loop only: that keeps
+ * mesh_tx_hwmp_now_'s 784 B frame, BIP and the driver off the 3.5 KB tcpip task, and
+ * one task draws IPNs in the order frames go out. */
+#define MESH_BIP_OUTBOX 4u
+static struct
+{
+    uint8_t da[6];
+    uint8_t len;
+    uint8_t body[HWMP_PREQ_BODY_LEN]; /* the largest group path-selection body we send */
+} s_bip_out[MESH_BIP_OUTBOX];
+static unsigned s_bip_out_head, s_bip_out_n;
+static bool s_bip_out_posted; /* an event is queued that will drain s_bip_out */
+extern volatile uint32_t g_warthog_hwmp_tx_qdrop, g_warthog_hwmp_tx_qfail;
+
+static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t body_len);
+
+static void mesh_bip_out_reset_(void)
+{
+    MMOSAL_TASK_ENTER_CRITICAL();
+    s_bip_out_head = 0;
+    s_bip_out_n = 0;
+    s_bip_out_posted = false;
+    MMOSAL_TASK_EXIT_CRITICAL();
+}
+
+/* A PREQ of ours queued off the loop drew its SN then; the loop may have sent a newer one
+ * since, and a peer drops an older SN as stale, so draw it again as it goes out. */
+static void mesh_bip_restamp_(uint8_t *body, uint8_t len)
+{
+    struct hwmp_preq q;
+    if (!umac_mesh_hwmp_parse_preq(body, len, &q) || memcmp(q.orig_addr, s_mesh_own_addr, 6) != 0)
+    {
+        return;
+    }
+    umac_mesh_fwd_glue_lock();
+    if (q.orig_sn != s_hwmp_sn)
+    {
+        const uint32_t sn = ++s_hwmp_sn;
+        body[17] = (uint8_t)sn;
+        body[18] = (uint8_t)(sn >> 8);
+        body[19] = (uint8_t)(sn >> 16);
+        body[20] = (uint8_t)(sn >> 24);
+    }
+    umac_mesh_fwd_glue_unlock();
+}
+
+static void mesh_bip_out_evt_(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    (void)umacd;
+    (void)evt;
+    for (;;)
+    {
+        uint8_t da[6], body[HWMP_PREQ_BODY_LEN];
+        uint8_t len = 0;
+        MMOSAL_TASK_ENTER_CRITICAL();
+        if (s_bip_out_n != 0u)
+        {
+            memcpy(da, s_bip_out[s_bip_out_head].da, sizeof(da));
+            len = s_bip_out[s_bip_out_head].len;
+            memcpy(body, s_bip_out[s_bip_out_head].body, len);
+            s_bip_out_head = (s_bip_out_head + 1u) % MESH_BIP_OUTBOX;
+            s_bip_out_n--;
+        }
+        else
+        {
+            s_bip_out_posted = false;
+        }
+        MMOSAL_TASK_EXIT_CRITICAL();
+        if (len == 0u)
+        {
+            return;
+        }
+        mesh_bip_restamp_(body, len);
+        if (mesh_tx_hwmp_now_(da, body, len) < 0)
+        {
+            g_warthog_hwmp_tx_qfail++;
+        }
+        else
+        {
+            umac_mesh_fwd_glue_deferred_sent(body, len);
+        }
+    }
+}
+
+/* Queue a group frame for mesh_bip_out_evt_: 1 once queued, not yet sent (the loop reports
+ * it to the glue when it is), negative (counted) if dropped. */
+static int mesh_bip_defer_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
+{
+    bool queued = false, post = false;
+    MMOSAL_TASK_ENTER_CRITICAL();
+    if (s_bip_out_n < MESH_BIP_OUTBOX && body_len <= HWMP_PREQ_BODY_LEN)
+    {
+        const unsigned i = (s_bip_out_head + s_bip_out_n) % MESH_BIP_OUTBOX;
+        memcpy(s_bip_out[i].da, da, sizeof(s_bip_out[i].da));
+        memcpy(s_bip_out[i].body, body, body_len);
+        s_bip_out[i].len = (uint8_t)body_len;
+        s_bip_out_n++;
+        queued = true;
+        post = !s_bip_out_posted;
+        s_bip_out_posted = true;
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+    if (!queued)
+    {
+        g_warthog_hwmp_tx_qdrop++;
+        return -5;
+    }
+    const struct umac_evt evt = UMAC_EVT_INIT(mesh_bip_out_evt_);
+    if (post && !umac_core_evt_queue(s_mesh_umacd, &evt))
+    {
+        /* Loop down or its queue full: nothing would send what waits, so drop it all. */
+        MMOSAL_TASK_ENTER_CRITICAL();
+        g_warthog_hwmp_tx_qdrop += s_bip_out_n;
+        s_bip_out_n = 0;
+        s_bip_out_posted = false;
+        MMOSAL_TASK_EXIT_CRITICAL();
+        return -5;
+    }
+    return 1;
+}
+
+/* 0: handed to the radio. 1: group path selection queued for the event loop. <0: dropped. */
 static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
+{
+    if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL || body == NULL || body_len == 0)
+    {
+        return -1;
+    }
+    if (body[0] == 13u && (da[0] & 0x01u) != 0u && !umac_core_evtloop_is_active(s_mesh_umacd))
+    {
+        return mesh_bip_defer_(da, body, body_len);
+    }
+    return mesh_tx_hwmp_now_(da, body, body_len);
+}
+
+static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL || body == NULL || body_len == 0)
     {
@@ -1652,21 +1912,42 @@ static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_l
      * with a HWMP_PREQ_BODY_LEN + caps budget (105 B) every one of them
      * fails the bounds check below and returns before reaching the radio --
      * SAE completes on both peers and peering silently never starts. */
-    uint8_t frame[UMAC_MESH_ACTION_BODY_MAX + sizeof(s1g_caps)];
-    if ((uint32_t)body_len + s1g_caps_len > sizeof(frame))
+    uint8_t frame[UMAC_CCMP_HDR_LEN + UMAC_MESH_ACTION_BODY_MAX + sizeof(s1g_caps) +
+                  UMAC_MESH_MMIE_LEN];
+    if ((uint32_t)body_len + s1g_caps_len > UMAC_MESH_ACTION_BODY_MAX + sizeof(s1g_caps))
     {
         g_warthog_mesh_act_oversize++;
         return -2;
     }
-    memcpy(frame, body, body_len);
-    memcpy(frame + body_len, s1g_caps, s1g_caps_len);
+    /* Under SAE a peer running MFP drops unprotected path selection (mac80211 rx.c). */
+    struct umac_mesh_hwmp_txkey k = { .how = UMAC_MESH_HWMP_PROT_NONE };
+    if (body[0] == 13u)
+    {
+        umac_datapath_mesh_hwmp_tx_key(da, &k);
+    }
+    /* Host CCMP fills a CCMP header and MIC in place; BIP appends a zero-MIC MMIE. */
+    uint16_t n = (k.how == UMAC_MESH_HWMP_PROT_HOST) ? UMAC_CCMP_HDR_LEN : 0u;
+    memset(frame, 0, n);
+    memcpy(frame + n, body, body_len);
+    memcpy(frame + n + body_len, s1g_caps, s1g_caps_len);
+    n = (uint16_t)(n + body_len + s1g_caps_len);
+    if (k.how == UMAC_MESH_HWMP_PROT_HOST)
+    {
+        memset(frame + n, 0, UMAC_CCMP_MIC_LEN);
+        n += UMAC_CCMP_MIC_LEN;
+    }
+    else if (k.how == UMAC_MESH_HWMP_PROT_BIP)
+    {
+        memset(frame + n, 0, UMAC_MESH_MMIE_LEN);
+        n += UMAC_MESH_MMIE_LEN;
+    }
 
     struct frame_data_action act = {
         .bssid = s_mesh_own_addr,
         .dst_address = da,
         .src_address = s_mesh_own_addr,
         .action_field = frame,
-        .action_field_len = (uint16_t)(body_len + s1g_caps_len),
+        .action_field_len = n,
     };
 
     struct mmpkt *frm = build_mgmt_frame(s_mesh_umacd, frame_action_build, &act);
@@ -1681,7 +1962,28 @@ static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_l
     tx_md->vif_id = s_mesh_vif_id;
     umac_rc_init_rate_table_mgmt(s_mesh_umacd, &tx_md->rc_data, false);
 
-    return mmdrv_tx_frame(frm, /*is_mgmt=*/true);
+    if (k.how != UMAC_MESH_HWMP_PROT_NONE && !mesh_hwmp_protect_(frm, &k, tx_md))
+    {
+        mmpkt_release(frm);
+        return -4;
+    }
+    int rc = mmdrv_tx_frame(frm, /*is_mgmt=*/true);
+    if (umac_mesh_sae_active() && body[0] == 13u && rc >= 0)
+    {
+        if (k.how == UMAC_MESH_HWMP_PROT_CHIP || k.how == UMAC_MESH_HWMP_PROT_HOST)
+        {
+            g_warthog_hwmp_tx_prot++;
+        }
+        else if (k.how == UMAC_MESH_HWMP_PROT_BIP)
+        {
+            g_warthog_hwmp_tx_mmie++;
+        }
+        else if ((da[0] & 0x01u) != 0u)
+        {
+            g_warthog_hwmp_tx_nommie++;
+        }
+    }
+    return rc;
 }
 
 /* Exposed for the forwarding glue; umac_mesh_tx_action() already exists above. */
@@ -1749,6 +2051,10 @@ void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta,
      * fact working. We do not act on it: mac80211 installs the path to us
      * from our own PREQ's originator block, which is the whole point of
      * emitting one. */
+    /* Neither mode acts on a RANN; a leaf ignores a PERR. Counted, not parse failures. */
+    uint8_t eid = umac_mesh_hwmp_element_id(body, len);
+    if (eid == HWMP_EID_RANN) { g_warthog_hwmp_rann_rx++; }
+    if (eid == HWMP_EID_PERR) { g_warthog_hwmp_perr_rx++; }
     /* Relay on: the forwarding engine owns PREQ, PREP and PERR. Off: the
      * original responder below, untouched. */
     extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge;
@@ -1765,6 +2071,10 @@ void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta,
     if (len >= 3u && body[2] == HWMP_EID_PREP)
     {
         g_warthog_hwmp_prep_rx++;
+        return;
+    }
+    if (eid == HWMP_EID_RANN || eid == HWMP_EID_PERR)
+    {
         return;
     }
     if (!umac_mesh_hwmp_parse_preq(body, len, &preq))
@@ -1815,8 +2125,12 @@ void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta,
  * warthog boards sat waiting for each other forever. mac80211 initiates from
  * mesh_neighbour_update when auto_open_plinks is set; this is the equivalent.
  * Driven off the peer's probe request (every 2 s), which doubles as the
- * retransmit timer -- MPM tolerates duplicate Opens. */
-void umac_mesh_maybe_initiate_mpm(const uint8_t *ta)
+ * retransmit timer -- MPM tolerates duplicate Opens.
+ * @p floored: a first Open needs @p rssi above the floor. Beacons pass true; a
+ * probe request passes false, so a weak warthog-only link still forms. */
+static bool rssi_admit_(int16_t rssi, bool named);
+
+void umac_mesh_maybe_initiate_mpm(const uint8_t *ta, int16_t rssi, bool floored)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid || ta == NULL)
     {
@@ -1826,9 +2140,11 @@ void umac_mesh_maybe_initiate_mpm(const uint8_t *ta)
     mpm_expire_stale_(now_ms);
     /* Keep a path to us alive at every established peer.
      *
-     * The peer's path expires after dot11MeshHWMPactivePathTimeout (5 s by
-     * default) and, once it has, the peer silently stops sending us unicast --
-     * broadcast keeps working, so the link looks up while nothing routes. Our
+     * The peer's path to us lapses when the lifetime in our last PREQ runs out
+     * (OpenMANET's 999-0027 gives a new path 10 s and extends a 1-hop path of
+     * metric <= 253 on each use) and, once it has, the peer silently stops
+     * sending us unicast -- broadcast keeps working, so the link looks up
+     * while nothing routes. Our
      * own PREQ refreshes it: a peer installs a path to any PREQ originator it
      * accepts, so this is what keeps warthog reachable without waiting to be
      * asked. Driven off the probe cadence, which is warthog's own clock, not
@@ -1850,10 +2166,18 @@ void umac_mesh_maybe_initiate_mpm(const uint8_t *ta)
         }
     }
 
+    /* Held off (it said full, or no entry could note another refusal), or a beacon
+     * heard only at the RSSI floor: start nothing. Its own Open still gets in. */
+    if (mpm_table_find(&s_mpm, ta) == NULL &&
+        (mpm_table_refused(&s_mpm, ta, now_ms, MPM_REFUSED_HOLDOFF_MS) ||
+         (floored && !rssi_admit_(rssi, true))))
+    {
+        return;
+    }
     struct mpm_link *l = mpm_table_get_or_create(&s_mpm, ta, mpm_mint_llid_(), (uint32_t)mmosal_get_time_ms());
     if (l == NULL)
     {
-        return; /* table full -- a real mesh would answer Close(MESH_MAX_PEERS) */
+        return; /* no room to initiate; its own Open may take a link nobody answered */
     }
     l->last_heard_ms = now_ms;
     if (l->estab)
@@ -1925,6 +2249,15 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
         {
             return;
         }
+        /* A neighbour that never answered our Opens (one naming another auth
+         * protocol, say) yields its link, so it cannot hold the last one. */
+        uint8_t idle[MPM_ADDR_LEN];
+        uint16_t idle_llid = 0;
+        if (mpm_table_make_room(&s_mpm, ta, idle, &idle_llid) &&
+            mesh_tx_mpm_(idle, MPM_ACTION_CLOSE, 0, idle_llid, MPM_REASON_PEER_CANCELED, 0) >= 0)
+        {
+            g_warthog_mpm_close_tx++;
+        }
         struct mpm_link *l = mpm_table_get_or_create(&s_mpm, ta, mpm_mint_llid_(), (uint32_t)mmosal_get_time_ms());
         if (l == NULL)
         {
@@ -1952,6 +2285,7 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
 
         l->plid = peer_llid;
         l->opens = 0; /* the peer answered: it is not holding a stale link */
+        mpm_table_unrefuse(&s_mpm, ta); /* an Open means it has room again */
 
         /* Open first, then Confirm. Confirm-first was tried on the theory that
          * the Confirm is the latency-critical frame; it measured worse (peer
@@ -2004,7 +2338,18 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
                     s_mesh_args.security_type == MMWLAN_SAE);
                 if (st != MMWLAN_SUCCESS)
                 {
+                    /* No station to carry the link: refuse it, citing both
+                     * link ids, rather than latch an ESTAB that black-holes. */
                     g_warthog_mesh_peer_add_fail++;
+                    uint16_t their = (peer_llid != 0) ? peer_llid : l->plid;
+                    if (mesh_tx_mpm_(ta, MPM_ACTION_CLOSE, l->llid, their,
+                                     UMAC_MESH_REASON_MAX_PEERS, 0) >= 0)
+                    {
+                        g_warthog_mpm_close_tx++;
+                    }
+                    mpm_table_release(&s_mpm, l);
+                    mpm_publish_(NULL);
+                    return;
                 }
             }
             l->estab = true;
@@ -2043,6 +2388,11 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
         if (umac_mesh_ies_get_close_reason(body, len, &reason))
         {
             g_warthog_mpm_close_reason = reason;
+            if (reason == UMAC_MESH_REASON_MAX_PEERS)
+            {
+                mpm_table_refuse(&s_mpm, ta, (uint32_t)mmosal_get_time_ms(),
+                                 MPM_REFUSED_HOLDOFF_MS);
+            }
         }
         /* Clear ESTAB too. umac_mesh_maybe_initiate_mpm() early-returns on it
          * and the Confirm retransmit is gated on !estab, so leaving it latched
@@ -2092,21 +2442,6 @@ bool umac_mesh_s1g_beacon_is_our_mesh(const uint8_t *frame, uint32_t len)
                                                 s_mesh_args.mesh_id_len);
 }
 
-/* First sight of this peer? Refreshes its liveness either way.
- *
- * A beacon must NOT be answered with a probe response every time. mac80211
- * raises NL80211_CMD_NEW_PEER_CANDIDATE for each probe response from a station
- * it has no plink for, and wpa_supplicant answers a candidate by starting a
- * FRESH peering -- tearing down the one already in progress with
- * Close(reason 52, MESH-PEER-CANCELED) and a new link id. Answering every
- * beacon therefore livelocks the handshake: captured on air as an endless
- * Open/Confirm/Close cycle where both ends' link ids changed every second and
- * the peer never left OPN_RCVD, with every individual frame verifiably
- * correct.
- *
- * Answer the first beacon, then stay quiet and let the ordinary MPM path
- * retransmit.
- */
 /* Forget every peer link, so the next beacon from each is treated as a first
  * sighting and the peering runs again from LISTEN.
  *
@@ -2147,6 +2482,27 @@ bool umac_mesh_sae_active(void)
     return s_mesh_args_valid && s_mesh_args.security_type == MMWLAN_SAE;
 }
 
+/* First sight of this peer? Refreshes its liveness either way.
+ *
+ * A beacon must NOT be answered with a probe response every time. mac80211
+ * raises NEW_PEER_CANDIDATE only for an address it has no station for, and
+ * wpa_supplicant ignores a candidate it already holds; a new link id plus
+ * Close(reason 52) comes from the peer freeing its station (its 400 ms holding
+ * timer, or its ~300 s inactivity timer). Answering every beacon starts a fresh
+ * peering right after each free and livelocks the handshake: captured on air
+ * as an endless Open/Confirm/Close cycle where both ends' link ids changed
+ * every second and the peer never left OPN_RCVD, with every individual frame
+ * verifiably correct.
+ *
+ * Answer the first beacon from each linked peer, then stay quiet and let the
+ * ordinary MPM path retransmit. A neighbour we will not open toward gets no
+ * link from its beacons; umac_mesh_unopenable_answer_due() rate-limits its
+ * answers instead. Its probe requests can still draw one, which another
+ * node's Open then takes.
+ * Under SAE s_mpm stays empty, so every beacon is a "first sight", and each one
+ * heard above the RSSI floor gets a probe response: that is how a full node's
+ * slot-holders hear they are accepted.
+ */
 bool umac_mesh_note_s1g_beacon(const uint8_t *sa)
 {
     if (sa == NULL)
@@ -2157,15 +2513,173 @@ bool umac_mesh_note_s1g_beacon(const uint8_t *sa)
     if (l != NULL)
     {
         l->last_heard_ms = (uint32_t)mmosal_get_time_ms();
-        return false; /* already known -- do not re-announce ourselves */
+        return false; /* already known: not a first sighting */
     }
     return true;
+}
+
+bool umac_mesh_reannounce_due(const uint8_t *sa)
+{
+    struct mpm_link *l = mpm_table_find(&s_mpm, sa);
+    if (l == NULL || !l->estab || umac_mesh_sae_active() || umac_datapath_mesh_has_free_slot())
+    {
+        return false;
+    }
+    uint32_t now = (uint32_t)mmosal_get_time_ms();
+    if (l->reannounce_ms != 0u && (uint32_t)(now - l->reannounce_ms) < MPM_FULL_REANNOUNCE_MS)
+    {
+        return false;
+    }
+    l->reannounce_ms = (now != 0u) ? now : 1u; /* 0 means never */
+    return true;
+}
+
+bool umac_mesh_unopenable_answer_due(const uint8_t *sa)
+{
+    return mpm_table_quiet_due(&s_mpm, sa, (uint32_t)mmosal_get_time_ms(), MPM_FULL_REANNOUNCE_MS);
+}
+
+/* At or below the candidate floor? 0 and -255 turn it off. The gate on
+ * OpenMANET's side is mesh_rssi_threshold (-80), measured at its receiver. */
+bool umac_mesh_rssi_below_floor(int16_t rssi)
+{
+    const int32_t floor_dbm = g_warthog_mesh_rssi_floor;
+    return floor_dbm < 0 && floor_dbm > -255 && (int32_t)rssi <= floor_dbm;
+}
+
+/* May a new peering start with a neighbour heard at @p rssi? Counted for the
+ * no-peers diagnosis only when the frame @p named our mesh. */
+static bool rssi_admit_(int16_t rssi, bool named)
+{
+    const bool below = umac_mesh_rssi_below_floor(rssi);
+    if (named && below)
+    {
+        g_warthog_mesh_rssi_skip++;
+    }
+    else if (named)
+    {
+        g_warthog_mesh_rssi_pass++;
+    }
+    return !below;
+}
+
+/* A new peer is not offered when weak, held off after a failed SAE, or with no
+ * slot free (hostap would build and free a station for it on every beacon). A
+ * peer already holding a slot passes: a no-op in hostap. */
+static void offer_sae_(const uint8_t *addr, const uint8_t *ies, size_t ies_len, int16_t rssi,
+                       bool named)
+{
+    if (addr == NULL)
+    {
+        return;
+    }
+    if (umac_datapath_mesh_find_peer(addr) == NULL)
+    {
+        if (!rssi_admit_(rssi, named))
+        {
+            return;
+        }
+        if (mpm_table_sae_held(&s_mpm, addr, (uint32_t)mmosal_get_time_ms(), MPM_SAE_FAIL_HOLDOFF_MS))
+        {
+            g_warthog_sae_offer_held++;
+            return;
+        }
+        if (!umac_datapath_mesh_has_free_slot())
+        {
+            g_warthog_sae_offer_full++;
+            return;
+        }
+    }
+    umac_supp_mesh_new_peer(addr, ies, ies_len);
+}
+
+void umac_mesh_offer_sae_candidate(const uint8_t *addr, const uint8_t *ies, size_t ies_len,
+                                   int16_t rssi)
+{
+    offer_sae_(addr, ies, ies_len, rssi, ies_name_our_mesh_(ies, ies_len));
+}
+
+/* Free @p addr's slot and hold it off, so a neighbour that never finishes
+ * holds a slot for one attempt at a time. */
+static void failed_hold_(const uint8_t *addr)
+{
+    umac_datapath_mesh_del_peer(addr);
+    mpm_table_sae_hold(&s_mpm, addr, (uint32_t)mmosal_get_time_ms(), MPM_SAE_FAIL_HOLDOFF_MS);
+}
+
+/* hostap's SAE with @p addr timed out: freed and held off at once rather than
+ * through retries and BLOCKED. */
+void umac_mesh_sae_failed(const uint8_t *addr)
+{
+    if (addr == NULL)
+    {
+        return;
+    }
+    g_warthog_sae_fail++;
+    failed_hold_(addr);
+}
+
+/* hostap's peering FSM with @p addr restarted before ESTAB: SAE finished, MPM or
+ * AMPE did not. Held off like a failed SAE, or the next beacon re-offers it. */
+void umac_mesh_plink_failed(const uint8_t *addr)
+{
+    if (addr == NULL)
+    {
+        return;
+    }
+    g_warthog_plink_fail++;
+    failed_hold_(addr);
+}
+
+/* hostap creates a station from an Open only on a cached PMKSA (mesh_mpm_action_rx), which
+ * skips offer_sae_: hold that Open to the same floor and hold-off. @p body: category onward. */
+bool umac_mesh_sae_open_refused(const uint8_t *ta, const uint8_t *body, uint32_t len, int16_t rssi)
+{
+    if (ta == NULL || body == NULL || len < 4u || !umac_mesh_sae_active() ||
+        umac_datapath_mesh_find_peer(ta) != NULL)
+    {
+        return false;
+    }
+    if (umac_mesh_rssi_below_floor(rssi))
+    {
+        if (ies_name_our_mesh_(body + 4u, len - 4u)) /* after category, action, capability */
+        {
+            g_warthog_mesh_rssi_skip++;
+        }
+        return true;
+    }
+    if (mpm_table_sae_held(&s_mpm, ta, (uint32_t)mmosal_get_time_ms(), MPM_SAE_FAIL_HOLDOFF_MS))
+    {
+        g_warthog_sae_offer_held++;
+        return true;
+    }
+    return false;
+}
+
+/* A held-off neighbour's own SAE Commit (@p body follows the MAC header) ends
+ * its hold-off, as an Open ends a Close(53) one. Offered before hostap sees the
+ * frame, so hostap knows the sender and does not drop it as unknown. */
+void umac_mesh_note_sae_auth(const uint8_t *ta, const uint8_t *body, uint32_t len, int16_t rssi)
+{
+    if (ta == NULL || body == NULL || len < 6u || !umac_mesh_sae_active())
+    {
+        return;
+    }
+    const uint16_t alg = (uint16_t)(body[0] | (body[1] << 8));
+    const uint16_t seq = (uint16_t)(body[2] | (body[3] << 8));
+    if (alg != 3u /* SAE */ || seq != 1u /* Commit */ ||
+        !mpm_table_sae_held(&s_mpm, ta, (uint32_t)mmosal_get_time_ms(), MPM_SAE_FAIL_HOLDOFF_MS))
+    {
+        return;
+    }
+    mpm_table_sae_release(&s_mpm, ta);
+    (void)offer_synthetic_(ta, rssi, false); /* a Commit names no mesh */
 }
 
 /* Is a peering with this peer still unfinished? Used to retransmit our Open.
  *
  * Announcing ourselves once is right for the PROBE RESPONSE -- repeating that
- * makes mac80211 raise NEW_PEER_CANDIDATE and restart the peering. It is wrong
+ * restarts the peering whenever the peer has just freed its station. It is wrong
  * for the Open: with no retransmission a single lost Open strands the link
  * forever, which is exactly what happened -- the peer reached ESTAB from an
  * earlier attempt while our side sat at plid=0 with nothing to drive it.

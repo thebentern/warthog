@@ -51,8 +51,8 @@ static int failures;
 
 /* ---- one node = one loaded copy of the whole simulator ----------------- */
 
-#define NODES 3
-enum { A = 0, W = 1, B = 2 };
+#define NODES 4
+enum { A = 0, W = 1, B = 2, R = 3 }; /* R joins only the four-node scenario */
 
 struct node {
     void *lib;
@@ -77,6 +77,11 @@ struct node {
     void (*host_rx_clear)(void);
     unsigned (*live_allocs)(void);
     int (*render_paths)(char *, uint32_t);
+    void (*advance_run)(uint32_t);
+    void (*set_time)(uint32_t);
+    int (*tx_probe)(void);
+    uint8_t (*peer_count)(void);
+    volatile uint32_t *hold, *hold_tx, *hold_drop, *perr_tx;
 };
 
 static struct node nd[NODES];
@@ -106,9 +111,10 @@ static const char *s_exedir = ".";
 
 static void open_nodes(void)
 {
-    static const char *names[NODES] = { "A", "W", "B" };
+    static const char *names[NODES] = { "A", "W", "B", "R" };
     static const uint8_t macs[NODES][6] = {
         { 0x02, 0, 0, 0, 0, 0x0a }, { 0x02, 0, 0, 0, 0, 0x0b }, { 0x02, 0, 0, 0, 0, 0x0c },
+        { 0x02, 0, 0, 0, 0, 0x0d },
     };
     for (int i = 0; i < NODES; i++)
     {
@@ -137,6 +143,14 @@ static void open_nodes(void)
         BIND(i, host_rx_clear, "simnode_host_rx_clear");
         BIND(i, live_allocs, "simnode_live_allocs");
         BIND(i, render_paths, "simnode_render_paths");
+        BIND(i, advance_run, "simnode_advance_run");
+        BIND(i, set_time, "simnode_set_time_ms");
+        BIND(i, tx_probe, "umac_mesh_tx_broadcast_probe");
+        BIND(i, peer_count, "umac_datapath_mesh_peer_count");
+        BIND(i, hold, "g_warthog_fwd_hold");
+        BIND(i, hold_tx, "g_warthog_fwd_hold_tx");
+        BIND(i, hold_drop, "g_warthog_fwd_hold_drop");
+        BIND(i, perr_tx, "g_warthog_fwd_perr_tx");
     }
     *(void **)(&fw_parse_frame) = need_sym(nd[A].lib, "umac_mesh_fwd_parse_frame");
     *(void **)(&hwmp_parse_preq) = need_sym(nd[A].lib, "umac_mesh_hwmp_parse_preq");
@@ -153,6 +167,8 @@ static void open_nodes(void)
  * and it means the shipping code's own addr1 check is under test too. */
 
 static bool in_range[NODES][NODES];
+/* What every receiver reads for every frame; scenarios that need a weak link set it. */
+static int16_t air_rssi = -60;
 
 struct airframe {
     int src;
@@ -193,7 +209,7 @@ static unsigned air_round(void)
         {
             if (j != batch[k].src && in_range[batch[k].src][j])
             {
-                nd[j].rx(batch[k].f.bytes, batch[k].f.len, -60);
+                nd[j].rx(batch[k].f.bytes, batch[k].f.len, air_rssi);
             }
         }
     }
@@ -213,6 +229,17 @@ static unsigned air_settle(void)
 }
 
 static void air_advance(uint32_t ms) { for (int i = 0; i < NODES; i++) { nd[i].advance(ms); } }
+
+/** Run every node's clock forward @p ms in 100 ms steps, firing each node's core
+ *  timeouts when they fall due and carrying what they send. */
+static void air_run(uint32_t ms)
+{
+    for (uint32_t t = 0; t < ms; t += 100u)
+    {
+        for (int i = 0; i < NODES; i++) { nd[i].advance_run(100u); }
+        (void)air_settle();
+    }
+}
 static void air_tick(void) { for (int i = 0; i < NODES; i++) { nd[i].tick(); } }
 
 /* ---- reading the log --------------------------------------------------- */
@@ -695,6 +722,231 @@ static void scenario_link_loss(void)
           "and the frame is held for that discovery, not dropped");
 }
 
+/**
+ * 5. A leaf answers a host behind a bridge it does not hear.
+ *
+ * Leaf A -- relay W -- bridge B, with laptop H3 on B's LAN. H3 talks to A;
+ * B discovers A, W relays. A's reply must reach H3 with A originating no
+ * discovery: mesh DA = B, AE 2 (H3, A), handed to W, which holds the path to
+ * B from B's own PREQ. When W has no path to B, a warthog relay (like
+ * OpenMANET's mac80211) holds the reply and discovers B itself, with no PERR;
+ * A still does not discover: that is the leaf contract.
+ */
+static void scenario_leaf_bridge_host(void)
+{
+    printf("--- 5: leaf A answers H3, a host behind bridge B it does not hear ---\n");
+    static const uint8_t H3[6] = { 0x02, 0, 0, 0, 0, 0x93 };
+    mesh_restart(/*fwd=*/false, false, false, false);
+    nd[W].gates(/*fwd=*/true, false, false, false);
+    nd[B].gates(false, /*bridge=*/true, false, false);
+    topo_link(A, W);
+    topo_link(W, B);
+    air_reset();
+
+    CHECK(nd[B].host_tx(nd[A].mac, H3, payload, sizeof(payload)), "H3, behind B, sends to A");
+    CHECK(air_settle() != 0, "B discovers A through W and the frame is relayed");
+    const struct simnode_hostrx *got = nd[A].host_rx_get(0);
+    CHECK(nd[A].host_rx_count() == 1 && got != NULL && memcmp(got->sa, H3, 6) == 0,
+          "A's host receives it from H3 (%u)", nd[A].host_rx_count());
+    char buf[768];
+    CHECK(nd[A].render_paths(buf, sizeof(buf)) > 0 &&
+          strstr(buf, "host=000093 behind=00000c relay=00000b uni\r\n") != NULL,
+          "A learned H3 behind B, through W");
+
+    air_reset();
+    static const uint8_t reply[12] = { 0x52, 0x45, 0x50, 0x4c, 0x59, 1, 2, 3, 4, 5, 6, 7 };
+    CHECK(nd[A].host_tx(H3, nd[A].mac, reply, sizeof(reply)), "A's host replies to H3");
+    CHECK(air_settle() != 0, "it settles");
+    CHECK(count_hwmp(A, HWMP_EID_PREQ) == 0, "A originates no PREQ (%u)", count_hwmp(A, HWMP_EID_PREQ));
+    const struct simnode_frame *f0 = find_data(A, 0);
+    struct umac_mesh_rx_frame p0;
+    memset(&p0, 0, sizeof(p0));
+    bool ok0 = f0 != NULL && fw_parse_frame(f0->bytes, f0->len, &p0) != 0;
+    CHECK(ok0 && count_data(A) == 1 && memcmp(p0.addr1, nd[W].mac, 6) == 0, "A hands it to W");
+    CHECK(ok0 && memcmp(p0.addr3, nd[B].mac, 6) == 0 && memcmp(p0.addr4, nd[A].mac, 6) == 0,
+          "mesh DA = B, mesh SA = A");
+    CHECK(ok0 && umac_mesh_ctrl_ae(&p0.mc) == UMAC_MESH_CTRL_AE_A5A6 &&
+          memcmp(p0.mc.eaddr1, H3, 6) == 0 && memcmp(p0.mc.eaddr2, nd[A].mac, 6) == 0,
+          "AE 2 carries H3 and A");
+    CHECK(count_data(W) == 1, "W relays it once (%u)", count_data(W));
+    got = nd[B].host_rx_get(0);
+    CHECK(nd[B].host_rx_count() == 1 && got != NULL && memcmp(got->da, H3, 6) == 0 &&
+          memcmp(got->sa, nd[A].mac, 6) == 0 && got->len == sizeof(reply) &&
+          memcmp(got->payload, reply, sizeof(reply)) == 0,
+          "B delivers it to H3, from A, byte for byte (%u)", nd[B].host_rx_count());
+
+    /* W loses B. A is not told by anything it trusts; W holds its next reply
+     * and asks for B itself, sends A no PERR, and gives the frame up when no
+     * PREP comes -- and A still does not discover. */
+    nd[W].del_peer(nd[B].mac);
+    nd[B].del_peer(nd[W].mac);
+    in_range[W][B] = in_range[B][W] = false;
+    air_reset();
+    const uint32_t hold0 = *nd[W].hold, drop0 = *nd[W].hold_drop, perr0 = *nd[W].perr_tx;
+    const unsigned w_allocs = nd[W].live_allocs();
+    (void)nd[A].host_tx(H3, nd[A].mac, reply, sizeof(reply));
+    CHECK(air_settle() != 0, "a later reply settles");
+    bool w_asks_b = false;
+    for (unsigned k = 0; find_hwmp(W, HWMP_EID_PREQ, k) != NULL; k++)
+    {
+        uint16_t blen = 0;
+        const uint8_t *qb = hwmp_body(find_hwmp(W, HWMP_EID_PREQ, k), &blen);
+        struct hwmp_preq q;
+        w_asks_b |= qb != NULL && hwmp_parse_preq(qb, blen, &q) &&
+                    memcmp(q.target_addr, nd[B].mac, 6) == 0 && memcmp(q.orig_addr, nd[W].mac, 6) == 0;
+    }
+    CHECK(*nd[W].hold - hold0 == 1 && w_asks_b,
+          "W has no path to B: it holds the reply and asks for B itself (hold +%u)",
+          *nd[W].hold - hold0);
+    CHECK(count_hwmp(W, HWMP_EID_PERR) == 0 && *nd[W].perr_tx == perr0,
+          "and sends A no PERR (%u)", count_hwmp(W, HWMP_EID_PERR));
+    air_run(7000u);
+    CHECK(count_hwmp(W, HWMP_EID_PREQ) == 5 && *nd[W].hold_drop - drop0 == 1 &&
+              nd[W].live_allocs() == w_allocs,
+          "unanswered: five PREQs, then W gives the reply up and its buffer back (%u PREQ, drop +%u)",
+          count_hwmp(W, HWMP_EID_PREQ), *nd[W].hold_drop - drop0);
+    CHECK(nd[B].host_rx_count() == 0, "the reply is lost (%u)", nd[B].host_rx_count());
+    CHECK(count_hwmp(A, HWMP_EID_PREQ) == 0, "and A still does not discover (%u PREQ)",
+          count_hwmp(A, HWMP_EID_PREQ));
+}
+
+/**
+ * 6. A mesh node is never a host behind itself.
+ *
+ * Leaf A -- relay W -- relay B. B broadcasts from its own address; W re-floods
+ * it to A as a replica whose AE 2 source is B, the mesh SA. A must not learn B
+ * as a host behind B: its unicast to B's own MAC stays the plain 4-address
+ * frame (mac80211 sends a node plain too), and B takes it as addressed to B.
+ */
+static void scenario_leaf_node_not_host(void)
+{
+    printf("--- 6: leaf A does not learn relay B as a host behind itself ---\n");
+    mesh_restart(/*fwd=*/false, false, false, false);
+    nd[W].gates(/*fwd=*/true, false, false, false);
+    nd[B].gates(/*fwd=*/true, false, false, false);
+    topo_link(A, W);
+    topo_link(W, B);
+    air_reset();
+
+    CHECK(nd[B].host_tx(BCAST, nd[B].mac, payload, sizeof(payload)), "B broadcasts from itself");
+    CHECK(air_settle() != 0, "it settles");
+    CHECK(nd[A].host_rx_count() == 1, "A's host receives it through W (%u)", nd[A].host_rx_count());
+    char buf[768];
+    CHECK(nd[A].render_paths(buf, sizeof(buf)) > 0 && strstr(buf, "proxies=0") != NULL,
+          "A learned nothing from W's replica of B's own broadcast");
+
+    air_reset();
+    static const uint8_t msg[8] = { 'L', 'E', 'A', 'F', 1, 2, 3, 4 };
+    CHECK(nd[A].host_tx(nd[B].mac, nd[A].mac, msg, sizeof(msg)), "A's host sends to B's own MAC");
+    CHECK(air_settle() != 0, "it settles");
+    const struct simnode_frame *f0 = find_data(A, 0);
+    CHECK(count_data(A) == 1 && f0 != NULL && f0->len == 46u + sizeof(msg) &&
+              memcmp(f0->bytes + 16, nd[B].mac, 6) == 0 && f0->bytes[32] == 0x00u,
+          "A's frame is plain: %u bytes, addr3 = B, no Address Extension",
+          f0 != NULL ? f0->len : 0u);
+    const struct simnode_hostrx *got = nd[B].host_rx_get(0);
+    CHECK(nd[B].host_rx_count() == 1 && got != NULL && memcmp(got->da, nd[B].mac, 6) == 0 &&
+              memcmp(got->sa, nd[A].mac, 6) == 0,
+          "B delivers it as addressed to B, from A (%u)", nd[B].host_rx_count());
+    CHECK(nd[B].render_paths(buf, sizeof(buf)) > 0 && strstr(buf, "host=00000a") == NULL,
+          "and B did not learn A as a host behind A");
+}
+
+/**
+ * 7. A relay with no path discovers the destination itself and delivers.
+ *
+ * A -- W -- R -- B, all relays. A's path to B through W is live, but W's own
+ * path to B has lapsed (W's clock alone runs past it, as when a relay's path
+ * was installed earlier than its upstream's). OpenMANET's mac80211 holds such
+ * a frame, originates its own PREQ and sends it on the PREP; W must do the
+ * same, carrying A's frame exactly as a forward would.
+ */
+static void scenario_relay_discovers(void)
+{
+    printf("--- 7: relay W holds A's frame, discovers B itself, and delivers it ---\n");
+    mesh_restart(/*fwd=*/true, false, false, false);
+    const uint32_t t = nd[A].now();
+    for (int i = 0; i < NODES; i++) { nd[i].set_time(t); }
+    topo_link(A, W);
+    topo_link(W, R);
+    topo_link(R, B);
+    air_reset();
+
+    CHECK(nd[A].host_tx(nd[B].mac, nd[A].mac, payload, sizeof(payload)), "A sends to B, three hops away");
+    CHECK(air_settle() != 0 && nd[B].host_rx_count() == 1, "A discovers B through W and R and B receives it (%u)",
+          nd[B].host_rx_count());
+    char buf[768];
+    const char *aline = path_line(A, nd[B].mac, buf, sizeof(buf));
+    CHECK(aline != NULL && strstr(aline, "via=00000b") != NULL && strstr(aline, "hops=3") != NULL,
+          "A's path to B runs through W, three hops");
+
+    nd[W].advance(6000u); /* past the 4882 TU W's path to B was installed with */
+    air_reset();
+    const uint32_t hold0 = *nd[W].hold, tx0 = *nd[W].hold_tx, perr0 = *nd[W].perr_tx;
+    const unsigned w_allocs = nd[W].live_allocs();
+    static const uint8_t body[16] = { 0x48, 0x4f, 0x4c, 0x44, 1, 2, 3, 4, 5, 6, 7, 8 };
+    CHECK(nd[A].host_tx(nd[B].mac, nd[A].mac, body, sizeof(body)), "A sends again on its live path");
+    CHECK(air_settle() != 0, "it settles");
+
+    CHECK(*nd[W].hold - hold0 == 1 && *nd[W].hold_tx - tx0 == 1,
+          "W held it and released it (hold +%u, sent +%u)", *nd[W].hold - hold0, *nd[W].hold_tx - tx0);
+    const struct simnode_frame *wq = find_hwmp(W, HWMP_EID_PREQ, 0);
+    struct hwmp_preq q;
+    uint16_t qlen = 0;
+    const uint8_t *qb = wq != NULL ? hwmp_body(wq, &qlen) : NULL;
+    bool q_ok = qb != NULL && hwmp_parse_preq(qb, qlen, &q);
+    CHECK(count_hwmp(W, HWMP_EID_PREQ) == 1 && q_ok && memcmp(q.orig_addr, nd[W].mac, 6) == 0 &&
+              memcmp(q.target_addr, nd[B].mac, 6) == 0,
+          "W originated one PREQ, its own, for B (%u)", count_hwmp(W, HWMP_EID_PREQ));
+    CHECK(count_hwmp(B, HWMP_EID_PREP) == 1 && count_hwmp(R, HWMP_EID_PREP) == 1,
+          "B answered and R carried the PREP back (%u, %u)", count_hwmp(B, HWMP_EID_PREP),
+          count_hwmp(R, HWMP_EID_PREP));
+    CHECK(count_hwmp(W, HWMP_EID_PERR) == 0 && *nd[W].perr_tx == perr0, "W sent no PERR (%u)",
+          count_hwmp(W, HWMP_EID_PERR));
+
+    struct umac_mesh_rx_frame fa, fw;
+    memset(&fa, 0, sizeof(fa));
+    memset(&fw, 0, sizeof(fw));
+    const struct simnode_frame *da = find_data(A, 0), *dw = find_data(W, 0);
+    bool a_ok = da != NULL && fw_parse_frame(da->bytes, da->len, &fa) != 0;
+    bool w_ok = dw != NULL && fw_parse_frame(dw->bytes, dw->len, &fw) != 0;
+    CHECK(count_data(W) == 1 && w_ok && memcmp(fw.addr1, nd[R].mac, 6) == 0 &&
+              memcmp(fw.addr3, nd[B].mac, 6) == 0 && memcmp(fw.addr4, nd[A].mac, 6) == 0,
+          "W's one data frame goes to R with mesh DA B and mesh SA A, not W");
+    CHECK(a_ok && w_ok && fw.mc.ttl == (uint8_t)(fa.mc.ttl - 1u) && fw.mc.seq == fa.mc.seq,
+          "one hop of TTL spent (%u -> %u) and A's sequence number kept (%lu)",
+          a_ok ? fa.mc.ttl : 0, w_ok ? fw.mc.ttl : 0, w_ok ? (unsigned long)fw.mc.seq : 0ul);
+    const struct simnode_hostrx *got = nd[B].host_rx_get(0);
+    CHECK(nd[B].host_rx_count() == 1 && got != NULL && memcmp(got->sa, nd[A].mac, 6) == 0 &&
+              got->len == sizeof(body) && memcmp(got->payload, body, sizeof(body)) == 0,
+          "B's host receives it once, from A, byte for byte (%u)", nd[B].host_rx_count());
+    CHECK(nd[W].live_allocs() == w_allocs, "W holds no buffer afterwards (%u -> %u)", w_allocs,
+          nd[W].live_allocs());
+    for (int i = 0; i < NODES; i++) { if (i != W) { nd[i].advance(6000u); } }
+}
+
+/**
+ * 8. Two warthogs that hear each other only below the RSSI floor (-85 dBm; the
+ * default floor is -80) still peer on an open mesh. Neither opens from a weak
+ * beacon, but each one's probe request draws the other's Open, and a
+ * neighbour's own Open is always answered. Nothing is pre-peered here.
+ */
+static void scenario_weak_link_peers(void)
+{
+    printf("--- 8: two warthogs at -85 dBm, below the floor, still peer through their probes ---\n");
+    mesh_restart(/*fwd=*/false, false, false, false);
+    in_range[A][W] = in_range[W][A] = true;
+    air_rssi = -85;
+    air_reset();
+    CHECK(nd[A].peer_count() == 0 && nd[W].peer_count() == 0, "A and W start with no peer");
+    CHECK(nd[W].tx_probe() >= 0, "W sends its periodic probe request");
+    CHECK(air_settle() != 0, "the exchange settles");
+    CHECK(nd[A].peer_count() == 1 && nd[W].peer_count() == 1,
+          "A opened on W's probe and both ends are established (%u / %u)",
+          (unsigned)nd[A].peer_count(), (unsigned)nd[W].peer_count());
+    air_rssi = -60;
+}
+
 int main(int argc, char **argv)
 {
     static char dir[512];
@@ -728,6 +980,10 @@ int main(int argc, char **argv)
     scenario_relay();
     scenario_flood();
     scenario_link_loss();
+    scenario_leaf_bridge_host();
+    scenario_leaf_node_not_host();
+    scenario_relay_discovers();
+    scenario_weak_link_peers();
 
     for (int i = 0; i < NODES; i++) { nd[i].stop(); }
 

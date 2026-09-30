@@ -28,6 +28,8 @@
 extern void warthog_sae_trace(unsigned int n);
 extern volatile unsigned int g_warthog_mpm_act_rx, g_warthog_mpm_plink, g_warthog_mpm_plink_seen;
 extern volatile unsigned int g_warthog_hostap_estab, g_warthog_mpm_fsm;
+/* umac_mesh.c: frees the station's datapath slot and holds the address off. */
+extern void umac_mesh_plink_failed(const u8 *addr);
 
 struct mesh_peer_mgmt_ie {
 	const u8 *proto_id; /* Mesh Peering Protocol Identifier (2 octets) */
@@ -320,7 +322,8 @@ static void mesh_mpm_send_plink_action(struct wpa_supplicant *wpa_s,
 		/* TODO: Add Connected to Mesh Gate/AS subfields */
 		wpabuf_put_u8(buf, info);
 		/* Set forwarding based on configuration and always accept
-		 * plinks for now */
+		 * plinks: warthog sends these only to stations that already
+		 * hold a datapath slot, and its own beacons carry capacity */
 		wpabuf_put_u8(buf, MESH_CAP_ACCEPT_ADDITIONAL_PEER |
 			      (conf->mesh_fwding ? MESH_CAP_FORWARDING : 0));
 	} else {	/* Peer closing frame */
@@ -491,6 +494,11 @@ static void mesh_mpm_fsm_restart(struct wpa_supplicant *wpa_s,
 
 	eloop_cancel_timeout(plink_timer, wpa_s, sta);
 
+	/* Warthog: never ESTAB (ASSOC is set only there), so its next beacon would re-offer
+	 * it at once; umac_mesh holds it off as a failed SAE. Its PMKSA stays, as upstream:
+	 * umac_mesh_sae_open_refused keeps its cached Open out while it is held. */
+	if (!(sta->flags & WLAN_STA_ASSOC))
+		umac_mesh_plink_failed(sta->addr);
 	ap_free_sta(hapd, sta);
 }
 

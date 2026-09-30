@@ -28,6 +28,7 @@
 #include "esp_netif_net_stack.h"
 #include "esp_system.h"               /* esp_restart() for 1200bps DL trick */
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "led.h"
 #include "soc/rtc_cntl_reg.h"         /* RTC_CNTL_OPTION1_REG */
@@ -61,28 +62,46 @@ static esp_netif_t *s_usb_netif = NULL;
 static volatile bool s_cdc_ready = false;
 static vprintf_like_t s_prev_log_fn = NULL;
 
-/* Non-blocking vprintf that mirrors logs to CDC ACM 0 if connected and also
- * chains to whatever logger was installed before us (USB-Serial-JTAG path
- * during early boot — writes to its FIFO are harmless even after USB-OTG
- * takes the pins). Drops CDC bytes when the TX buffer is full — never blocks
- * the caller. The built-in tinyusb_console_init uses freopen+VFS which
- * acquires a stdio mutex and deadlocks against re-entrant log calls during
- * boot — avoid it. */
+/* CDC ACM 0's writers share one lock (cdc_out.h). Created before the log
+ * mirror is installed and before the AT task exists. */
+static StaticSemaphore_t s_cdc_mtx_buf;
+static SemaphoreHandle_t s_cdc_mtx = NULL;
+
+static size_t cdc_port_queue_(const uint8_t *p, size_t n)
+{
+    size_t k = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, p, n);
+    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+    return k;
+}
+static size_t cdc_port_room_(void) { return tud_cdc_n_write_available(0); }
+static bool cdc_port_connected_(void) { return s_cdc_ready && tud_cdc_n_connected(0); }
+static void cdc_port_wait_(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
+/* Never taken from an ISR. A waiting writer gives up after CDC_OUT_IDLE_MS. */
+static bool cdc_port_lock_(bool wait)
+{
+    if (s_cdc_mtx == NULL || xPortInIsrContext()) {
+        return false;
+    }
+    return xSemaphoreTake(s_cdc_mtx, wait ? pdMS_TO_TICKS(CDC_OUT_IDLE_MS) : 0) == pdTRUE;
+}
+static void cdc_port_unlock_(void) { xSemaphoreGive(s_cdc_mtx); }
+
+/* The TX FIFO is 512 B and a queue call keeps only what fits: a reply waits for
+ * room under the lock, and every other line is written whole or dropped. */
+struct cdc_out g_warthog_cdc = {
+    .queue = cdc_port_queue_, .room = cdc_port_room_, .connected = cdc_port_connected_,
+    .wait_ms = cdc_port_wait_, .lock = cdc_port_lock_, .unlock = cdc_port_unlock_,
+};
+
+/* Mirrors log lines to CDC ACM 0 without ever waiting (cdc_out_vprintf_nowait)
+ * and chains to the logger installed before us. tinyusb_console_init's
+ * freopen+VFS deadlocks the stdio mutex against re-entrant boot logs. */
 static int cdc_vprintf(const char *fmt, va_list args)
 {
     va_list args_copy;
     va_copy(args_copy, args);
 
-    int n = 0;
-    if (s_cdc_ready && tud_cdc_n_connected(0)) {
-        char buf[256];
-        n = vsnprintf(buf, sizeof(buf), fmt, args);
-        if (n > 0) {
-            int len = n > (int)sizeof(buf) ? sizeof(buf) : n;
-            tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (const uint8_t *)buf, len);
-            tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
-        }
-    }
+    int n = (int)cdc_out_vprintf_nowait(&g_warthog_cdc, fmt, args);
 
     if (s_prev_log_fn) {
         n = s_prev_log_fn(fmt, args_copy);
@@ -496,6 +515,7 @@ static void l2_free_rx_buffer(void *h, void *buffer)
 
 esp_netif_t *warthog_usb_net_start(void)
 {
+    s_cdc_mtx = xSemaphoreCreateMutexStatic(&s_cdc_mtx_buf);
     ESP_LOGI(TAG, "init CDC+ECM");
 
     uint8_t mac[6];

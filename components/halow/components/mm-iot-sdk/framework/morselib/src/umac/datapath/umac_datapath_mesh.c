@@ -7,10 +7,9 @@
  *
  * The RX dispatch is the substantive part, and it owns two things the vendor
  * path cannot do:
- *   - PROBE_REQ is answered here. A peer in beaconless mode discovers by
- *     probing, and this chip never beacons in mesh mode, so probe/response is
- *     the only discovery path that works. Receiving a probe also triggers our
- *     own peering Open -- warthog<->warthog has no other initiator.
+ *   - PROBE_REQ is answered here: a peer in beaconless mode discovers by
+ *     probing. On an open mesh receiving a probe also triggers our own peering
+ *     Open, as a beacon does.
  *   - ACTION category 15 (SELF_PROTECTED, i.e. Mesh Peering) is handled
  *     directly rather than through umac_datapath_process_rx_action_frame's
  *     supplicant fan-out, which expects hostap's mesh_mpm_action_rx and is
@@ -45,6 +44,7 @@
 #include "common/morse_commands.h"  /* enum morse_sta_state */
 #include <string.h>
 #include "umac/mesh/umac_mesh.h"
+#include "umac/mesh/umac_mesh_bip.h"
 #include "umac/mesh/umac_mesh_ies.h"
 
 /* Data-plane counters (storage in main/at.c; AT+DATASTAT?). */
@@ -56,6 +56,7 @@ extern volatile uint32_t g_warthog_tx_data_hdr;
 extern volatile uint32_t g_warthog_mesh_chip_sta_fail;
 extern volatile uint32_t g_warthog_mesh_key_fail;
 extern volatile uint32_t g_warthog_ampe_mtk_installed, g_warthog_ampe_mgtk_installed;
+extern volatile uint32_t g_warthog_mgtk_reinst, g_warthog_mgtk_rsc_fail;
 extern volatile uint32_t g_warthog_mesh_secure;
 extern volatile uint8_t g_warthog_mesh_self_addr[6];
 extern volatile uint32_t g_warthog_peer_fp[4];
@@ -75,9 +76,9 @@ bool umac_mesh_peering_incomplete(const uint8_t *sa);
 extern volatile uint8_t g_warthog_s1g_bcn_sa[6];
 int umac_mesh_tx_probe_response(const uint8_t *da);
 void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len);
-void umac_mesh_maybe_initiate_mpm(const uint8_t *ta);
+void umac_mesh_maybe_initiate_mpm(const uint8_t *ta, int16_t rssi, bool floored);
 void umac_mesh_handle_probe_req_discovery(const uint8_t *ta, const uint8_t *ies,
-                                          uint32_t ies_len);
+                                          uint32_t ies_len, int16_t rssi);
 
 /* --- RX management frame dispatch ---------------------------------------- */
 
@@ -91,6 +92,8 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
     (void)stad;  /* the established peer the frame came from, or NULL */
     const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
     uint16_t frame_control_le = header->frame_control;
+    /* Under SAE every path that can start a peering applies the candidate RSSI floor. */
+    const int16_t rssi = mmdrv_get_rx_metadata(mmpkt_from_view(rxbufview))->rssi;
 
     uint16_t subtype = dot11_frame_control_get_subtype(frame_control_le);
 
@@ -146,6 +149,17 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
                                      frame_len - hdr_len);
                 break;
             }
+            if (frame[hdr_len] == DOT11_ACTION_CATEGORY_SELF_PROTECTED &&
+                frame[hdr_len + 1u] == UMAC_MESH_MPM_ACTION_OPEN &&
+                umac_mesh_sae_open_refused(dot11_get_ta(header), frame + hdr_len,
+                                           frame_len - hdr_len, rssi))
+            {
+                break;
+            }
+            if (frame[hdr_len] == 13u && !umac_datapath_mesh_hwmp_rx_ok(frame, frame_len))
+            {
+                break;
+            }
 
             umac_datapath_process_rx_action_frame(umacd, stad, rxbufview);
             break;
@@ -153,20 +167,18 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
 
         case DOT11_FC_SUBTYPE_PROBE_REQ:
         {
-            /* Answer it. A peer in beaconless mesh mode discovers us by probing,
-             * not by hearing a beacon -- and warthog's chip does not currently
-             * beacon in mesh mode at all (see AT+BCNSTAT?), so this is the only
-             * discovery path that can work. Dropping these was why a probing
-             * peer never learned warthog existed. */
+            /* Answer it: a peer in beaconless mesh mode discovers us by
+             * probing, and an unanswered probe tells it nothing. */
             const uint8_t *ta = dot11_get_ta(header);
             g_warthog_prsp_rx++;
             (void)umac_mesh_tx_probe_response(ta);
             /* Also OPEN toward them: warthog<->warthog has no other initiator.
              * Not under SAE -- there hostap's MPM owns the link, and two state
-             * machines opening the same peering race each other's link ids. */
+             * machines opening the same peering race each other's link ids.
+             * Not floored: a weak warthog-only link forms from these probes. */
             if (!umac_mesh_sae_active())
             {
-                umac_mesh_maybe_initiate_mpm(ta);
+                umac_mesh_maybe_initiate_mpm(ta, rssi, false);
             }
             /* Under SAE, a probe request naming our mesh is a beaconless
              * peer announcing itself (its only advertisement) -- offer it to
@@ -177,7 +189,7 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
                 const uint32_t phdr = sizeof(struct dot11_hdr);
                 if (plen > phdr)
                 {
-                    umac_mesh_handle_probe_req_discovery(ta, pframe + phdr, plen - phdr);
+                    umac_mesh_handle_probe_req_discovery(ta, pframe + phdr, plen - phdr, rssi);
                 }
             }
             break;
@@ -199,9 +211,12 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
             {
                 g_warthog_bcn_peer_rx++;
                 (void)umac_mesh_tx_probe_response(ta);
-                if (!umac_mesh_sae_active())
+                /* Open only toward a neighbour that says it would accept us
+                 * (the length check above covers the 12 fixed octets). */
+                if (!umac_mesh_sae_active() &&
+                    umac_mesh_ies_peer_openable(bframe + bhdr + 12u, blen - bhdr - 12u, false))
                 {
-                    umac_mesh_maybe_initiate_mpm(ta);
+                    umac_mesh_maybe_initiate_mpm(ta, rssi, true);
                 }
             }
             break;
@@ -209,7 +224,8 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
 
         case DOT11_FC_SUBTYPE_PROBE_RSP:
         {
-            /* Peer discovery for SAE happens HERE, not from beacons.
+            /* SAE peer discovery from probe responses, and from S1G beacons in
+             * umac_mesh_handle_s1g_beacon -- not from legacy beacons.
              *
              * The S1G beacon's address fields survive the chip's
              * S1G->legacy conversion badly (this file already warns that A2/A3
@@ -232,8 +248,8 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
                 const uint32_t ie_off = sizeof(struct dot11_hdr) + 12u;
                 if (pflen > ie_off)
                 {
-                    umac_supp_mesh_new_peer(dot11_get_ta(header), pf + ie_off,
-                                            (size_t)(pflen - ie_off));
+                    umac_mesh_offer_sae_candidate(dot11_get_ta(header), pf + ie_off,
+                                                  (size_t)(pflen - ie_off), rssi);
                 }
             }
             /* Forward to supplicant — bss.c uses these for IE caching. */
@@ -249,6 +265,13 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
             if (subtype == DOT11_FC_SUBTYPE_AUTH)
             {
                 g_warthog_rx_auth++;
+                const uint8_t *af = (const uint8_t *)mmpkt_get_data_start(rxbufview);
+                const uint32_t alen = mmpkt_get_data_length(rxbufview);
+                if (alen > sizeof(struct dot11_hdr))
+                {
+                    umac_mesh_note_sae_auth(dot11_get_ta(header), af + sizeof(struct dot11_hdr),
+                                            alen - sizeof(struct dot11_hdr), rssi);
+                }
             }
             MMLOG_ERR("mesh: rx mgmt subtype=%u (fc=0x%04x) -> supplicant fan-out\n",
                       subtype, frame_control_le);
@@ -269,15 +292,45 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
  *
  * Fixed-size: every established link takes a slot, so warthog's own MPM table
  * (MPM_MAX_LINKS) must not exceed it, and past MESH_MAX_PEERS add_peer returns
- * MMWLAN_UNAVAILABLE. The table is populated by umac_datapath_mesh_add_peer()
- * when a peering reaches ESTAB and emptied by umac_datapath_mesh_del_peer() on
- * Close.
+ * MMWLAN_UNAVAILABLE. umac_datapath_mesh_add_peer() fills a slot at ESTAB on an
+ * open mesh, and under SAE when hostap adds the station (.sta_add), before
+ * SAE/AMPE run; umac_datapath_mesh_del_peer() empties it on Close.
  */
-#define MESH_MAX_PEERS 4
+#define MESH_MAX_PEERS UMAC_DATAPATH_MESH_MAX_PEERS
 
 static struct umac_sta_data *s_peers[MESH_MAX_PEERS];
+/* Per slot: the link is established (open: from add; SAE: from the AMPE MTK). */
+static bool s_peer_estab[MESH_MAX_PEERS];
+/* Per slot: the peer runs MFP. Set by its IGTK (AMPE carries one only from a peer with
+ * ieee80211w != 0) or a protected unicast path-selection frame; cleared with the slot. */
+static bool s_peer_mfp[MESH_MAX_PEERS];
 static uint8_t s_own_addr[6];
 static uint16_t s_num_pkts_queued;
+
+bool umac_datapath_mesh_has_free_slot(void)
+{
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        if (s_peers[i] == NULL)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The Mesh Configuration's view of the table. Reads the slot array only, never
+ * a station: the beacon is built on the chip driver's task, not the evtloop. */
+static void mesh_capacity_(struct umac_mesh_ies_capacity *out)
+{
+    uint8_t estab = 0;
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        estab += (s_peers[i] != NULL && s_peer_estab[i]);
+    }
+    out->accepting = umac_datapath_mesh_has_free_slot();
+    out->peerings = estab;
+}
 
 static struct umac_sta_data *mesh_find_peer_(const uint8_t *addr)
 {
@@ -293,6 +346,54 @@ static struct umac_sta_data *mesh_find_peer_(const uint8_t *addr)
         }
     }
     return NULL;
+}
+
+static int mesh_slot_of_(const uint8_t *addr)
+{
+    for (int i = 0; addr != NULL && i < MESH_MAX_PEERS; i++)
+    {
+        if (s_peers[i] != NULL && umac_sta_data_matches_peer_addr(s_peers[i], addr))
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* ---- Management frame protection for path selection (SAE only) ---------- */
+
+extern volatile uint32_t g_warthog_mesh_pmf;
+extern volatile uint32_t g_warthog_hwmp_prot, g_warthog_hwmp_unprotected;
+extern volatile uint32_t g_warthog_hwmp_mmie, g_warthog_hwmp_nommie, g_warthog_hwmp_bipfail;
+extern volatile uint32_t g_warthog_hwmp_unestab;
+extern volatile uint32_t g_warthog_ampe_igtk_installed;
+/* Longest group body an MMIE is checked on: what our own TX would ever send. */
+#define UMAC_MESH_BIP_BODY_MAX 640u
+
+/* Our own TX IGTK, generated by hostap only with AT+MESHPMF=1. */
+static struct
+{
+    bool valid;
+    uint8_t id;
+    uint8_t key[UMAC_KEY_AES_128_LEN];
+    uint64_t ipn; /* last IPN used; the next frame takes ipn + 1 */
+} s_own_igtk;
+
+static bool mesh_slot_mfp_(int slot)
+{
+    struct umac_sta_data *stad = (slot >= 0) ? s_peers[slot] : NULL;
+    if (stad == NULL || !umac_mesh_sae_active() ||
+        umac_sta_data_get_security_type(stad) == MMWLAN_OPEN ||
+        umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE) < 0)
+    {
+        return false;
+    }
+    return g_warthog_mesh_pmf != 0u || s_peer_mfp[slot];
+}
+
+bool umac_datapath_mesh_peer_mfp(const uint8_t *addr)
+{
+    return mesh_slot_mfp_(mesh_slot_of_(addr));
 }
 
 /* Phase-1 shared keys for a keyed non-SAE mesh (AT+MESHSEC=1). Under SAE the
@@ -317,7 +418,7 @@ static const uint8_t k_mesh_p1_mtk[UMAC_KEY_AES_128_LEN] = {
 };
 /* The group key goes into the chip once, VIF-wide. */
 static bool s_group_key_in_chip;
-static uint32_t s_mesh_key_epoch; /* bumps the TX PN forward on every key install */
+static uint32_t s_mesh_key_epoch; /* written only by mesh_next_pn_base_ */
 
 /* Our own TX MGTK under SAE. hostap delivers it once, at mesh start and before
  * any peer exists, and this file only learns the mesh VIF from a peer -- so it
@@ -327,19 +428,93 @@ static struct
     bool valid;
     uint8_t id;
     uint8_t key[UMAC_KEY_AES_128_LEN];
+    uint16_t vif_id; /* VIF of the last successful chip install */
+#ifdef WARTHOG_MESH_MGTK_PN_BASE
+    /* Read and written only on the umac event loop; the critical sections are defensive. */
+    bool based;    /* base assigned: installed, or advertised before the first install */
+    uint64_t base; /* TX PN of the last install: every PN used under it is >= base */
+    uint64_t sent; /* frames queued at that install or handed to the chip since:
+                    * every PN used is <= base + sent */
+#endif
 } s_own_mgtk;
 
-static enum mmwlan_status mesh_install_own_mgtk_(uint16_t vif_id)
+#ifdef WARTHOG_MESH_MGTK_PN_BASE
+/* Group frames under our MGTK with no TX status yet. The chip draws each one's PN when
+ * it sends it, from whatever install is in the slot then; one never reported stays counted. */
+static uint64_t s_own_group_inflight;
+#endif
+
+/* The one TX PN allocator for every chip key install, pairwise and group alike:
+ * a fresh 2^20 epoch strictly above @p above and every earlier install. */
+static uint64_t mesh_next_pn_base_(uint64_t above)
 {
+    MMOSAL_TASK_ENTER_CRITICAL();
+    uint64_t e = (uint64_t)s_mesh_key_epoch + 1u;
+    if (e <= (above >> 20))
+    {
+        e = (above >> 20) + 1u;
+    }
+    s_mesh_key_epoch = (uint32_t)e;
+    MMOSAL_TASK_EXIT_CRITICAL();
+    return e << 20;
+}
+
+/* The highest PN our own MGTK can have used, or 0 when it has no base. */
+static uint64_t mesh_own_group_pn_top_(void)
+{
+    uint64_t top = 0;
+#ifdef WARTHOG_MESH_MGTK_PN_BASE
+    MMOSAL_TASK_ENTER_CRITICAL();
+    if (s_own_mgtk.based)
+    {
+        top = s_own_mgtk.base + s_own_mgtk.sent;
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+#endif
+    return top;
+}
+
+#ifdef WARTHOG_MESH_MGTK_PN_BASE
+static void mesh_own_pn_store_(uint64_t base)
+{
+    MMOSAL_TASK_ENTER_CRITICAL();
+    s_own_mgtk.based = true;
+    s_own_mgtk.base = base;
+    s_own_mgtk.sent = s_own_group_inflight; /* still queued: they draw from this base */
+    MMOSAL_TASK_EXIT_CRITICAL();
+}
+#endif
+
+/* Our own MGTK into the chip's group slot: at TX PN 0, or with WARTHOG_MESH_MGTK_PN_BASE
+ * at a fresh base above every earlier install and every PN our MGTK has used. */
+static enum mmwlan_status mesh_put_own_mgtk_(uint16_t vif_id)
+{
+    uint64_t pn = 0;
+#ifdef WARTHOG_MESH_MGTK_PN_BASE
+    pn = mesh_next_pn_base_(mesh_own_group_pn_top_());
+#endif
     struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = s_own_mgtk.id,
-                                 .length = UMAC_KEY_AES_128_LEN, .tx_pn = 0 };
+                                 .length = UMAC_KEY_AES_128_LEN, .tx_pn = pn };
     memcpy(kc.key, s_own_mgtk.key, sizeof(s_own_mgtk.key));
     if (mmdrv_install_key(vif_id, 0, &kc) != 0)
     {
         MMLOG_WRN("mesh: own MGTK chip install failed\n");
         return MMWLAN_ERROR;
     }
+#ifdef WARTHOG_MESH_MGTK_PN_BASE
+    mesh_own_pn_store_(pn);
+#endif
+    s_own_mgtk.vif_id = vif_id;
     s_group_key_in_chip = true;
+    return MMWLAN_SUCCESS;
+}
+
+static enum mmwlan_status mesh_install_own_mgtk_(uint16_t vif_id)
+{
+    if (mesh_put_own_mgtk_(vif_id) != MMWLAN_SUCCESS)
+    {
+        return MMWLAN_ERROR;
+    }
     g_warthog_ampe_mgtk_installed++;
     MMLOG_INF("mesh: own TX MGTK installed in chip group slot (key_id %u)\n",
               (unsigned)s_own_mgtk.id);
@@ -351,12 +526,90 @@ int umac_datapath_mesh_own_group_key_id(void)
     return s_own_mgtk.valid ? (int)s_own_mgtk.id : -1;
 }
 
+void umac_datapath_mesh_own_group_tx_note(void)
+{
+#ifdef WARTHOG_MESH_MGTK_PN_BASE
+    MMOSAL_TASK_ENTER_CRITICAL();
+    s_own_mgtk.sent++;
+    s_own_group_inflight++;
+    MMOSAL_TASK_EXIT_CRITICAL();
+#endif
+}
+
+void umac_datapath_mesh_own_group_tx_done(void)
+{
+#ifdef WARTHOG_MESH_MGTK_PN_BASE
+    MMOSAL_TASK_ENTER_CRITICAL();
+    if (s_own_group_inflight != 0)
+    {
+        s_own_group_inflight--;
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+#endif
+}
+
+/* The Key RSC AMPE advertises for our own MGTK: one below the chip's next PN. The chip's PN
+ * cannot be read, so if a frame may have drawn one since the last install it is re-installed
+ * at a fresh base; if that fails, the old base still lies below every PN it will use. */
+enum mmwlan_status umac_datapath_mesh_own_group_rsc(uint8_t key_id, uint8_t rsc[6])
+{
+    if (rsc == NULL)
+    {
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+    memset(rsc, 0, 6);
+    {
+        MMOSAL_TASK_ENTER_CRITICAL();
+        const bool igtk = s_own_igtk.valid && key_id == s_own_igtk.id;
+        const uint64_t ipn = s_own_igtk.ipn;
+        MMOSAL_TASK_EXIT_CRITICAL();
+        if (igtk)
+        {
+            for (int i = 0; i < 6; i++)
+            {
+                rsc[i] = (uint8_t)(ipn >> (8 * i));
+            }
+            return MMWLAN_SUCCESS;
+        }
+    }
+#ifdef WARTHOG_MESH_MGTK_PN_BASE
+    if (!s_own_mgtk.valid || key_id != s_own_mgtk.id)
+    {
+        return MMWLAN_SUCCESS; /* never installed, never used: 0 is exact */
+    }
+    if (!s_own_mgtk.based)
+    {
+        mesh_own_pn_store_(mesh_next_pn_base_(0)); /* not in the chip yet: installs go above */
+    }
+    else if (s_group_key_in_chip && s_own_mgtk.sent != 0)
+    {
+        if (mesh_put_own_mgtk_(s_own_mgtk.vif_id) == MMWLAN_SUCCESS)
+        {
+            g_warthog_mgtk_reinst++;
+        }
+        else
+        {
+            g_warthog_mgtk_rsc_fail++;
+        }
+    }
+    uint64_t v = s_own_mgtk.base - 1u;
+    for (int i = 0; i < 6; i++)
+    {
+        rsc[i] = (uint8_t)(v >> (8 * i));
+    }
+#else
+    (void)key_id;
+#endif
+    return MMWLAN_SUCCESS;
+}
+
 static const uint8_t k_mesh_p1_mgtk[UMAC_KEY_AES_128_LEN] = {
     0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78,
     0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0
 };
 
-/* Every peer shares ONE pairwise key, because the chip holds exactly one.
+/* Every peer shares ONE pairwise key, because this chip firmware's mesh
+ * interface (mm6108.mbin rel_1_17_6) holds exactly one.
  *
  * Settled by experiment, not inference. Built with WARTHOG_MESH_PERLINK_MTK so
  * each link had its own key -- verified genuinely distinct and symmetric via
@@ -378,10 +631,11 @@ static const uint8_t k_mesh_p1_mgtk[UMAC_KEY_AES_128_LEN] = {
  * establishes the single-slot behavior.)
  *
  * The consequence is the important part: AMPE derives a DISTINCT MTK per link,
- * so SAE/AMPE -- and therefore OpenMANET interop -- cannot use chip crypto as
- * this SDK drives it. Host software CCMP is not an optimisation for that path,
- * it is the prerequisite. mesh_derive_mtk_() below stays behind the flag as
- * the seam where a real per-link key lands once that exists.
+ * so SAE/AMPE -- and therefore OpenMANET interop -- cannot use chip crypto with
+ * more than one peer as this SDK drives it. Host software CCMP is not an
+ * optimisation for that path, it is the prerequisite. mesh_derive_mtk_() below
+ * stays behind the flag as the seam where a real per-link key lands once that
+ * exists.
  */
 /* Walk a station up to AUTHORIZED in the chip. Same sequence umac_ap_update_sta()
  * uses; AID is 1-based (0 means "no station" to the chip). */
@@ -443,9 +697,8 @@ static enum mmwlan_status umac_datapath_mesh_install_peer_keys(struct umac_sta_d
      * Starting each install a wide margin above the last satisfies both: the
      * key is always present, and no receiver ever sees the PN go backwards.
      * 2^20 per epoch is far more frames than a link will carry between two
-     * peer changes, and 48-bit CCMP PN space allows ~2.7e11 epochs. */
-    s_mesh_key_epoch++;
-    mtk.tx_seq = (uint64_t)s_mesh_key_epoch << 20;
+     * peer changes, and 48-bit CCMP PN space allows 2^28 (~2.7e8) epochs. */
+    mtk.tx_seq = mesh_next_pn_base_(mesh_own_group_pn_top_());
 
     /* Publish peer -> key fingerprint. A per-link key must derive IDENTICALLY
      * on both ends; comparing the two boards' fingerprints for the same link
@@ -503,7 +756,8 @@ static enum mmwlan_status umac_datapath_mesh_install_peer_keys(struct umac_sta_d
     }
 #endif
 
-    /* The GROUP key is a per-VIF resource on this chip, not a per-STA one.
+    /* On this firmware a second GROUP key install on the mesh interface breaks
+     * group decryption; the Linux order (own MGTK at aid 0 first) is untested.
      *
      * umac_keys_install_key() pushes to the chip at the stad's AID, so
      * installing the MGTK on every peer stad handed the chip the same group
@@ -553,9 +807,9 @@ static bool mesh_restore_peer_key_(struct umac_sta_data *stad, uint16_t vif_id)
         int kid = umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE);
         if (kid >= 0)
         {
-            s_mesh_key_epoch++;
             return umac_keys_reinstall_key(stad, vif_id, (uint8_t)kid,
-                                           (uint64_t)s_mesh_key_epoch << 20) == MMWLAN_SUCCESS;
+                                           mesh_next_pn_base_(mesh_own_group_pn_top_())) ==
+                   MMWLAN_SUCCESS;
         }
 #endif
         return false;
@@ -685,6 +939,8 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
         (void)mesh_install_own_mgtk_(vif_id);
     }
 
+    s_peer_estab[slot] = !sae;
+    s_peer_mfp[slot] = false;
     s_peers[slot] = stad;
     MMLOG_INF("mesh: peer " MM_MAC_ADDR_FMT " added (slot %d)\n", MM_MAC_ADDR_VAL(peer_addr), slot);
     return MMWLAN_SUCCESS;
@@ -694,19 +950,23 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
  * supplicant shim's .set_key driver op.
  *
  * This is the same install the hardcoded path does, with the same two
- * constraints, which are properties of the chip rather than of the key:
+ * constraints, which are properties of this chip firmware rather than of the key:
  *
  *  - the pairwise TX packet number must only ever move FORWARD across
  *    installs, or existing peers reject our frames as replays; and
- *  - the chip has one VIF-wide group slot (aid 0). It holds our own TX MGTK;
- *    each peer's MGTK stays in that peer's host keychain.
+ *  - one group key goes into the chip, at aid 0 (a second install broke group
+ *    RX on this firmware). It is our own TX MGTK; each peer's MGTK stays in
+ *    that peer's host keychain.
  *
  * @param peer_addr  the peer the key belongs to, or the broadcast address for
  *                   our own TX MGTK.
  * @param pairwise   true for the MTK, false for the MGTK.
+ * @param rsc        a peer MGTK's Key RSC from AMPE (little-endian, @p rsc_len
+ *                   octets), or NULL. Ignored for every other key.
  */
 enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, const uint8_t *key,
-                                                   uint8_t key_len, uint8_t key_id, bool pairwise)
+                                                   uint8_t key_len, uint8_t key_id, bool pairwise,
+                                                   const uint8_t *rsc, size_t rsc_len)
 {
     if (peer_addr == NULL || key == NULL || key_len != UMAC_KEY_AES_128_LEN)
     {
@@ -719,6 +979,15 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
         s_own_mgtk.valid = true;
         s_own_mgtk.id = key_id;
         memcpy(s_own_mgtk.key, key, key_len);
+#ifdef WARTHOG_MESH_MGTK_PN_BASE
+        /* hostap may deliver the same key again: move the allocator past every PN the
+         * last install used, or the next install could reuse them under that key. */
+        (void)mesh_next_pn_base_(mesh_own_group_pn_top_());
+        MMOSAL_TASK_ENTER_CRITICAL();
+        s_own_mgtk.based = false; /* its next install takes a fresh base */
+        s_own_mgtk.sent = 0;
+        MMOSAL_TASK_EXIT_CRITICAL();
+#endif
         s_group_key_in_chip = false;
         for (int i = 0; i < MESH_MAX_PEERS; i++)
         {
@@ -747,8 +1016,7 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
 
     if (pairwise)
     {
-        s_mesh_key_epoch++;
-        k.tx_seq = (uint64_t)s_mesh_key_epoch << 20;
+        k.tx_seq = mesh_next_pn_base_(mesh_own_group_pn_top_());
 #ifdef WARTHOG_MESH_AMPE_NO_CHIP_KEY
         /* Same feasibility probe as WARTHOG_MESH_NO_CHIP_KEY above, on the
          * path that actually matters: AMPE. Keep the MTK in the host keychain
@@ -776,13 +1044,51 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
         /* Now -- and only now -- the link is keyed, so the TX path may set
          * Protected and the RX path may insist on it. */
         umac_sta_data_set_security(stad, MMWLAN_SAE, MMWLAN_PMF_DISABLED);
+        uint16_t aid = umac_sta_data_get_aid(stad);
+        if (aid >= 1u && aid <= MESH_MAX_PEERS)
+        {
+            s_peer_estab[aid - 1u] = true; /* AMPE done: counts in Formation Info */
+        }
         g_warthog_ampe_mtk_installed++;
         MMLOG_INF("mesh: AMPE MTK installed for " MM_MAC_ADDR_FMT "\n",
                   MM_MAC_ADDR_VAL(peer_addr));
         return MMWLAN_SUCCESS;
     }
 
-    if (!connection_keys_install_key(&umac_sta_data_get_keys(stad)->keys, &k))
+    /* Replay floor: the peer's advertised RSC, little-endian as mac80211 reads it.
+     * The same key installed again on a live link keeps the counter it has. */
+    uint64_t floor = 0;
+    if (rsc != NULL)
+    {
+        for (size_t i = (rsc_len < 6u) ? rsc_len : 6u; i > 0; i--)
+        {
+            floor = (floor << 8) | rsc[i - 1];
+        }
+    }
+    struct connection_keys_data *kd = &umac_sta_data_get_keys(stad)->keys;
+    for (int i = 0; i < UMAC_KEY_RX_COUNTER_NUM; i++)
+    {
+        k.rx_seq[i] = floor;
+    }
+    if (key_id < UMAC_KEYS_NUM_KEY_IDS)
+    {
+        MMOSAL_TASK_ENTER_CRITICAL();
+        const struct umac_key *old = kd->keys[key_id];
+        if (old != NULL && old->key_type == UMAC_KEY_TYPE_GROUP && old->key_len == key_len &&
+            memcmp(old->key_data, key, key_len) == 0)
+        {
+            for (int i = 0; i < UMAC_KEY_RX_COUNTER_NUM; i++)
+            {
+                if (old->rx_seq[i] > k.rx_seq[i])
+                {
+                    k.rx_seq[i] = old->rx_seq[i];
+                }
+            }
+        }
+        MMOSAL_TASK_EXIT_CRITICAL();
+    }
+
+    if (!connection_keys_install_key(kd, &k))
     {
         MMLOG_WRN("mesh: AMPE MGTK keychain install failed\n");
         return MMWLAN_ERROR;
@@ -791,8 +1097,241 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
      * has one VIF-wide slot, and that slot belongs to our TX key. */
     (void)vif_id;
     g_warthog_ampe_mgtk_installed++;
-    MMLOG_INF("mesh: AMPE MGTK installed (key_id %u)\n", (unsigned)k.key_id);
+    MMLOG_INF("mesh: AMPE MGTK installed (key_id %u, rx floor 0x%08lx)\n", (unsigned)k.key_id,
+              (unsigned long)(k.rx_seq[UMAC_KEY_RX_COUNTER_SPACE_DEFAULT] & 0xffffffffu));
     return MMWLAN_SUCCESS;
+}
+
+enum mmwlan_status umac_datapath_mesh_set_igtk(const uint8_t *addr, const uint8_t *key,
+                                               uint8_t key_len, uint16_t key_id,
+                                               const uint8_t *rsc, size_t rsc_len)
+{
+    if (addr == NULL || key_id < UMAC_MESH_IGTK_ID_MIN || key_id > UMAC_MESH_IGTK_ID_MAX ||
+        (key != NULL && key_len != UMAC_KEY_AES_128_LEN))
+    {
+        return MMWLAN_INVALID_ARGUMENT;
+    }
+    if ((addr[0] & 0x01) != 0)
+    {
+        /* The same key delivered again keeps its IPN; a new one starts from 0. */
+        MMOSAL_TASK_ENTER_CRITICAL();
+        if (key == NULL)
+        {
+            s_own_igtk.valid = false;
+        }
+        else
+        {
+            if (!s_own_igtk.valid || s_own_igtk.id != key_id ||
+                memcmp(s_own_igtk.key, key, UMAC_KEY_AES_128_LEN) != 0)
+            {
+                s_own_igtk.ipn = 0;
+            }
+            s_own_igtk.id = (uint8_t)key_id;
+            memcpy(s_own_igtk.key, key, UMAC_KEY_AES_128_LEN);
+            s_own_igtk.valid = true;
+        }
+        MMOSAL_TASK_EXIT_CRITICAL();
+        return MMWLAN_SUCCESS;
+    }
+    struct umac_sta_data *stad = mesh_find_peer_(addr);
+    if (key == NULL || stad == NULL)
+    {
+        return MMWLAN_ERROR;
+    }
+    struct umac_key k = { .key_id = (uint8_t)key_id, .key_type = UMAC_KEY_TYPE_IGTK,
+                          .key_len = UMAC_KEY_AES_128_LEN };
+    memcpy(k.key_data, key, UMAC_KEY_AES_128_LEN);
+    uint64_t floor = 0;
+    for (size_t i = (rsc != NULL) ? ((rsc_len < 6u) ? rsc_len : 6u) : 0u; i > 0; i--)
+    {
+        floor = (floor << 8) | rsc[i - 1];
+    }
+    struct connection_keys_data *kd = &umac_sta_data_get_keys(stad)->keys;
+    MMOSAL_TASK_ENTER_CRITICAL();
+    const struct umac_key *old = kd->keys[key_id];
+    if (old != NULL && old->key_type == UMAC_KEY_TYPE_IGTK &&
+        memcmp(old->key_data, key, UMAC_KEY_AES_128_LEN) == 0 &&
+        old->rx_seq[UMAC_KEY_RX_COUNTER_SPACE_DEFAULT] > floor)
+    {
+        floor = old->rx_seq[UMAC_KEY_RX_COUNTER_SPACE_DEFAULT];
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+    for (int i = 0; i < UMAC_KEY_RX_COUNTER_NUM; i++)
+    {
+        k.rx_seq[i] = floor;
+    }
+    if (!connection_keys_install_key(kd, &k))
+    {
+        return MMWLAN_ERROR;
+    }
+    /* Authenticated by AMPE, and sent exactly when hostap marks all its peers MFP. */
+    const int slot = mesh_slot_of_(addr);
+    if (slot >= 0)
+    {
+        s_peer_mfp[slot] = true;
+    }
+    g_warthog_ampe_igtk_installed++;
+    return MMWLAN_SUCCESS;
+}
+
+uint64_t umac_datapath_mesh_take_tx_pn(struct umac_sta_data *stad, uint8_t key_id)
+{
+    uint64_t pn = 0;
+    if (stad == NULL || key_id >= UMAC_KEYS_NUM_KEY_IDS)
+    {
+        return 0;
+    }
+    struct connection_keys_data *kd = &umac_sta_data_get_keys(stad)->keys;
+    MMOSAL_TASK_ENTER_CRITICAL();
+    if (kd->keys[key_id] != NULL)
+    {
+        pn = kd->keys[key_id]->tx_seq++;
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+    return pn;
+}
+
+void umac_datapath_mesh_hwmp_tx_key(const uint8_t *da, struct umac_mesh_hwmp_txkey *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (da == NULL || !umac_mesh_sae_active())
+    {
+        return;
+    }
+    if ((da[0] & 0x01) != 0)
+    {
+        MMOSAL_TASK_ENTER_CRITICAL();
+        if (s_own_igtk.valid)
+        {
+            out->how = UMAC_MESH_HWMP_PROT_BIP;
+            out->key_id = s_own_igtk.id;
+            memcpy(out->key, s_own_igtk.key, UMAC_KEY_AES_128_LEN);
+            out->pn = ++s_own_igtk.ipn;
+        }
+        MMOSAL_TASK_EXIT_CRITICAL();
+        return;
+    }
+    const int slot = mesh_slot_of_(da);
+    if (!mesh_slot_mfp_(slot))
+    {
+        return;
+    }
+    struct umac_sta_data *stad = s_peers[slot];
+    const int kid = umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE);
+    if (kid < 0)
+    {
+        return;
+    }
+    out->key_id = (uint8_t)kid;
+#ifdef WARTHOG_MESH_HOST_CCMP
+    /* The data path's choice: host CCMP when armed and the key is here, else the chip. */
+    extern volatile uint32_t g_warthog_host_ccmp_on;
+    const uint8_t *key = umac_keys_get_key_data(stad, (uint8_t)kid);
+    if (g_warthog_host_ccmp_on && key != NULL &&
+        umac_keys_get_key_len(stad, (uint8_t)kid) == UMAC_KEY_AES_128_LEN)
+    {
+        memcpy(out->key, key, UMAC_KEY_AES_128_LEN);
+        out->pn = umac_datapath_mesh_take_tx_pn(stad, (uint8_t)kid);
+        out->how = UMAC_MESH_HWMP_PROT_HOST;
+        return;
+    }
+#endif
+    umac_keys_increment_tx_seq(stad, (uint8_t)kid);
+    out->how = UMAC_MESH_HWMP_PROT_CHIP;
+}
+
+/* Verify an MMIE with this peer's IGTK, then (only then) move its replay floor. */
+static bool mesh_bip_ok_(int slot, const uint8_t *hdr, const uint8_t *body, uint32_t len,
+                         uint16_t kid, uint64_t ipn)
+{
+    if (slot < 0 || kid < UMAC_MESH_IGTK_ID_MIN || kid > UMAC_MESH_IGTK_ID_MAX ||
+        len > UMAC_MESH_BIP_BODY_MAX)
+    {
+        return false;
+    }
+    struct umac_sta_data *stad = s_peers[slot];
+    struct connection_keys_data *kd = &umac_sta_data_get_keys(stad)->keys;
+    uint8_t key[UMAC_KEY_AES_128_LEN];
+    bool have = false;
+    MMOSAL_TASK_ENTER_CRITICAL();
+    const struct umac_key *k = kd->keys[kid];
+    if (k != NULL && k->key_type == UMAC_KEY_TYPE_IGTK && k->key_len == UMAC_KEY_AES_128_LEN)
+    {
+        memcpy(key, k->key_data, sizeof(key));
+        have = true;
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+    return have && umac_mesh_bip_verify(key, hdr, body, len) &&
+           umac_keys_check_and_update_rx_replay(stad, (uint8_t)kid, ipn,
+                                                UMAC_KEY_RX_COUNTER_SPACE_DEFAULT) ==
+               MMWLAN_SUCCESS;
+}
+
+/* mac80211 parity: only from an ESTAB peer (mesh_rx_path_sel_frame); from one that runs
+ * MFP, unicast must be protected and group must carry an MMIE (rx.c
+ * ieee80211_drop_unencrypted_mgmt); an MMIE is checked always. */
+bool umac_datapath_mesh_hwmp_rx_ok(const uint8_t *frame, uint32_t len)
+{
+    if (frame == NULL || len < UMAC_MESH_BIP_HDR_LEN || !umac_mesh_sae_active())
+    {
+        return true;
+    }
+    const bool group = (frame[4] & 0x01u) != 0u;
+    const bool prot = (frame[1] & 0x40u) != 0u;
+    const int slot = mesh_slot_of_(frame + 10);
+    if (slot < 0 || !s_peer_estab[slot])
+    {
+        g_warthog_hwmp_unestab++;
+        return false;
+    }
+    const bool mfp = mesh_slot_mfp_(slot);
+    const uint8_t *body = frame + UMAC_MESH_BIP_HDR_LEN;
+    const uint32_t blen = len - UMAC_MESH_BIP_HDR_LEN;
+
+    if (!group)
+    {
+        if (!prot)
+        {
+            if (mfp)
+            {
+                g_warthog_hwmp_unprotected++;
+                return false;
+            }
+            return true;
+        }
+        /* Decrypted and replay-checked on the way here: this peer runs MFP. */
+        g_warthog_hwmp_prot++;
+        if (slot >= 0)
+        {
+            s_peer_mfp[slot] = true;
+        }
+        return true;
+    }
+    uint16_t kid = 0;
+    uint64_t ipn = 0;
+    if (prot)
+    {
+        /* Group path selection is never CCMP-protected; only our own MGTK could open it. */
+        g_warthog_hwmp_bipfail++;
+        return false;
+    }
+    if (!umac_mesh_bip_parse(body, blen, &kid, &ipn))
+    {
+        g_warthog_hwmp_nommie++;
+        if (mfp)
+        {
+            g_warthog_hwmp_unprotected++;
+            return false;
+        }
+        return true;
+    }
+    g_warthog_hwmp_mmie++;
+    if (!mesh_bip_ok_(slot, frame, body, blen, kid, ipn))
+    {
+        g_warthog_hwmp_bipfail++;
+        return false;
+    }
+    return true; /* verified under its IGTK, whose install already marked it MFP */
 }
 
 struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr)
@@ -800,16 +1339,23 @@ struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr)
     return addr != NULL ? mesh_find_peer_(addr) : NULL;
 }
 
+bool umac_datapath_mesh_peer_estab(const uint8_t *addr)
+{
+    const int slot = mesh_slot_of_(addr);
+    return slot >= 0 && s_peer_estab[slot];
+}
+
 /* Any established peer other than @p excl, for the original copy of a relayed
- * group frame; NULL when the sender is our only neighbour. */
+ * group frame; NULL when the sender is our only neighbour. Under SAE, keyed only. */
 struct umac_sta_data *umac_datapath_mesh_first_peer_except(const uint8_t *excl)
 {
     for (int i = 0; i < MESH_MAX_PEERS; i++)
     {
-        if (s_peers[i] != NULL &&
-            (excl == NULL || !umac_sta_data_matches_peer_addr(s_peers[i], excl)))
+        struct umac_sta_data *p = s_peers[i];
+        if (p != NULL && s_peer_estab[i] &&
+            (excl == NULL || !umac_sta_data_matches_peer_addr(p, excl)))
         {
-            return s_peers[i];
+            return p;
         }
     }
     return NULL;
@@ -833,6 +1379,7 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
                 }
             }
             s_peers[i] = NULL;
+            s_peer_mfp[i] = false;
             /* Tell the chip the station is gone, then drain the queue. */
             (void)mmdrv_update_sta_state(umac_sta_data_get_vif_id(stad),
                                          umac_sta_data_get_aid(stad),
@@ -899,8 +1446,9 @@ static struct umac_sta_data *mesh_lookup_stad_by_peer_addr(struct umac_data *uma
  *
  * Unicast to a known peer: that peer. With AT+MESHFWD or AT+MESHBRIDGE on, any
  * other unicast takes its HWMP path's next hop, or is dropped until one exists.
- * In leaf mode a host learned behind a peer (Address Extension) goes to that
- * peer. Group frames, and a leaf's other unicast, go to the FIRST peer;
+ * In leaf mode a learned host (Address Extension) goes to its node if that is
+ * a peer, else to the peer it was learned through. Group frames, and a leaf's
+ * other unicast, go to the FIRST established peer;
  * mesh_enqueue_tx_frame decides how a group frame reaches the rest. */
 static struct umac_sta_data *mesh_lookup_stad_by_tx_dest_addr(struct umac_data *umacd,
                                                               const uint8_t *dest_addr)
@@ -912,8 +1460,8 @@ static struct umac_sta_data *mesh_lookup_stad_by_tx_dest_addr(struct umac_data *
         return stad;
     }
     /* Relay or bridge on: a destination that is not a neighbour goes to the
-     * path's next hop. No path yet: a PREQ goes out and this frame is dropped
-     * for the upper layer to retry, as it does for an unanswered ARP. */
+     * path's next hop. No path yet: a PREQ goes out and the caller holds the
+     * frame for the PREP (umac_mesh_fwd_glue_tx_pending). */
     {
         extern volatile uint32_t g_warthog_mesh_fwd, g_warthog_mesh_bridge;
         extern bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6]);
@@ -932,19 +1480,27 @@ static struct umac_sta_data *mesh_lookup_stad_by_tx_dest_addr(struct umac_data *
         }
         else
         {
-            /* Leaf mode: a learned host behind a peer goes to that peer. */
+            /* Leaf mode: a learned host goes to its node if that is a peer, else
+             * to the peer its traffic arrived through; failing both, the first. */
             uint8_t via[6];
             if (umac_mesh_fwd_glue_proxy_via_peer(dest_addr, via))
             {
-                return mesh_find_peer_(via);
+                stad = mesh_find_peer_(via);
+                if (stad != NULL)
+                {
+                    return stad;
+                }
             }
         }
     }
+    /* The first established peer: under SAE one AMPE has keyed, since a frame
+     * queued to a candidate could only be dropped at TX. */
     for (int i = 0; i < MESH_MAX_PEERS; i++)
     {
-        if (s_peers[i] != NULL)
+        struct umac_sta_data *p = s_peers[i];
+        if (p != NULL && s_peer_estab[i])
         {
-            return s_peers[i];
+            return p;
         }
     }
     return NULL;
@@ -1080,16 +1636,19 @@ static void mesh_enqueue_tx_frame(struct umac_data *umacd,
     {
         /* Copy to every peer except the one we were handed, which takes the
          * original. A failed copy drops that peer's replica only. A relayed
-         * group frame also skips the neighbour it came from. */
+         * group frame also skips the neighbour it came from.
+         * Under SAE an unkeyed candidate gets none: TX would drop it, and a failed
+         * SAE frees such a slot. This narrows del_peer racing this walk; the race remains. */
         const struct mmdrv_tx_metadata *md0 = mmdrv_get_tx_metadata(txbuf);
         for (int i = 0; i < MESH_MAX_PEERS; i++)
         {
-            if (s_peers[i] == NULL || s_peers[i] == stad)
+            struct umac_sta_data *p = s_peers[i];
+            if (p == NULL || p == stad || !s_peer_estab[i])
             {
                 continue;
             }
             if (md0->mesh.exclude_valid &&
-                umac_sta_data_matches_peer_addr(s_peers[i], md0->mesh.exclude_ta))
+                umac_sta_data_matches_peer_addr(p, md0->mesh.exclude_ta))
             {
                 continue;
             }
@@ -1100,7 +1659,7 @@ static void mesh_enqueue_tx_frame(struct umac_data *umacd,
                 continue;
             }
             g_warthog_tx_bcast_dup++;
-            mesh_queue_one_(umacd, s_peers[i], dup);
+            mesh_queue_one_(umacd, p, dup);
         }
     }
 
@@ -1277,6 +1836,7 @@ void umac_datapath_configure_mesh_mode(struct umac_data *umacd)
 {
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
     data->ops = &datapath_ops_mesh;
+    umac_mesh_ies_capacity_fn = mesh_capacity_;
     MMLOG_INF("Datapath configured for mesh mode\n");
 }
 
@@ -1285,11 +1845,11 @@ void umac_datapath_configure_mesh_mode(struct umac_data *umacd)
  * whichever link the chip decrypts afterwards follows the last install. */
 void umac_datapath_mesh_service_rekey(void)
 {
-    /* Serviced from the probe path rather than called from main: morselib is a
-     * static archive and the linker will not extract an object to satisfy a
-     * call from main -- the same reason every warthog counter is defined in
-     * main/at.c and extern'd here. AT+REKEY=<n> sets the request; this runs
-     * within one probe interval (~2 s). */
+    /* Run on the umac event loop, posted from the mesh-probe tick, rather than called
+     * from main: morselib is a static archive and the linker will not extract an object
+     * to satisfy a call from main -- the same reason every warthog counter is defined in
+     * main/at.c and extern'd here. AT+REKEY=<n> sets the request; this runs within one
+     * probe interval (~2 s). */
     if (g_warthog_mesh_repeer_req)
     {
         /* Tear every link down, host and chip, and re-arm the peering. Used to
@@ -1352,16 +1912,31 @@ void umac_mesh_handle_s1g_beacon(struct mmpktview *rxbufview)
     }
     g_warthog_s1g_bcn_ours++;
     memcpy((void *)g_warthog_s1g_bcn_sa, sa, MMWLAN_MAC_ADDR_LEN);
+    const int16_t rssi = mmdrv_get_rx_metadata(mmpkt_from_view(rxbufview))->rssi;
 
-    /* Announce ourselves ONCE per peer. Answering every beacon makes mac80211
-     * raise NEW_PEER_CANDIDATE repeatedly, and wpa_supplicant restarts the
-     * peering each time -- see umac_mesh_note_s1g_beacon(). */
+    /* Announce ourselves once per peer link. Answering every beacon restarts
+     * the peering each time the peer frees its station -- see
+     * umac_mesh_note_s1g_beacon(). */
     if (umac_mesh_note_s1g_beacon(sa))
     {
+        const bool sae = umac_mesh_sae_active();
+        const uint32_t boff = umac_mesh_ies_s1g_beacon_ie_offset(
+            (uint16_t)(f[0] | ((uint16_t)f[1] << 8)));
+        /* Open only toward a neighbour whose Mesh Configuration would accept
+         * us, as mac80211 does (mesh_plink.c:635-640), heard above the floor. */
+        const bool accepts =
+            sae || flen <= boff || umac_mesh_ies_peer_openable(f + boff, flen - boff, false);
+        const bool openable = accepts && !umac_mesh_rssi_below_floor(rssi);
+        /* One we will not open toward gets no link, so each of its beacons is
+         * a first sighting: answer it at most once per re-announce period. */
+        if (!openable && !umac_mesh_unopenable_answer_due(sa))
+        {
+            return;
+        }
         /* First sight: announce ourselves so the peer learns we exist. */
         g_warthog_s1g_bcn_new++;
         (void)umac_mesh_tx_probe_response(sa);
-        if (umac_mesh_sae_active())
+        if (sae)
         {
             /* Under SAE, beacons are the discovery path for mac80211-style
              * peers (OpenMANET): they beacon and never probe, so the
@@ -1371,23 +1946,27 @@ void umac_mesh_handle_s1g_beacon(struct mmpktview *rxbufview)
              * gate, so an open node sharing the Mesh ID is not SAE'd at.
              * Warthog peers are discovered by the probe-response path; both
              * feed the same gate. */
-            uint32_t boff = umac_mesh_ies_s1g_beacon_ie_offset(
-                (uint16_t)(f[0] | ((uint16_t)f[1] << 8)));
             if (flen > boff)
             {
-                umac_supp_mesh_new_peer(sa, f + boff, (size_t)(flen - boff));
+                umac_mesh_offer_sae_candidate(sa, f + boff, (size_t)(flen - boff), rssi);
             }
         }
-        else
+        else if (accepts)
         {
-            umac_mesh_maybe_initiate_mpm(sa);
+            umac_mesh_maybe_initiate_mpm(sa, rssi, true); /* refuses, and counts, a weak one */
         }
+    }
+    else if (umac_mesh_reannounce_due(sa))
+    {
+        /* Full: our beacon says "not accepting", so tell this established
+         * peer directly that we accept IT, in case it lost its half. */
+        (void)umac_mesh_tx_probe_response(sa);
     }
     else if (!umac_mesh_sae_active() && umac_mesh_peering_incomplete(sa))
     {
         /* Known peer, handshake unfinished: retransmit the Open only. NOT the
          * probe response -- that is what restarts the peer's FSM. */
         g_warthog_s1g_bcn_retry++;
-        umac_mesh_maybe_initiate_mpm(sa);
+        umac_mesh_maybe_initiate_mpm(sa, rssi, true);
     }
 }

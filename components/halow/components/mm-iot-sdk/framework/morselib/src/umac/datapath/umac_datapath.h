@@ -39,10 +39,14 @@ void umac_datapath_configure_ap_mode(struct umac_data *umacd);
  * chip-side ADD_INTERFACE(MESH) + MESH_CONFIG(START) sequence succeeds. */
 void umac_datapath_configure_mesh_mode(struct umac_data *umacd);
 
+/** Mesh peer slots. AIDs are slot + 1; MPM_MAX_LINKS must not exceed it. */
+#define UMAC_DATAPATH_MESH_MAX_PEERS 4
+
 /**
- * Mesh peer table. Add a peer once its peering reaches ESTAB; from then on the
- * generic datapath carries 4-address data frames to and from it. Remove it on
- * Close. own_addr is stamped as addr2/TA on every frame we send.
+ * Mesh peer table. Add a peer at ESTAB (open mesh) or when hostap adds its
+ * station (SAE, before the handshake); from then on the generic datapath
+ * carries 4-address data frames to and from it. Remove it on Close. own_addr
+ * is stamped as addr2/TA on every frame we send.
  */
 enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t vif_id,
                                                const uint8_t *own_addr,
@@ -56,10 +60,62 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr);
  * @param pairwise  true installs the per-link MTK on that peer; false installs
  *                  the group MGTK, which is a VIF-wide chip resource written
  *                  once and mirrored into each peer's host keychain.
+ * @param rsc       a peer MGTK's Key RSC (@p rsc_len octets, little-endian): its
+ *                  replay floor. NULL for none.
  */
 enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, const uint8_t *key,
-                                                   uint8_t key_len, uint8_t key_id, bool pairwise);
+                                                   uint8_t key_len, uint8_t key_id, bool pairwise,
+                                                   const uint8_t *rsc, size_t rsc_len);
+/** The Key RSC (6 octets, little-endian) AMPE advertises for our own group key @p key_id,
+ *  or for our own IGTK its last IPN. */
+enum mmwlan_status umac_datapath_mesh_own_group_rsc(uint8_t key_id, uint8_t rsc[6]);
+
+/**
+ * Install a BIP-CMAC-128 IGTK (key id 4 or 5) host-side: ours when @p addr is the
+ * broadcast address (NULL @p key removes it), else that peer's, with @p rsc (its
+ * IPN, little-endian) as the replay floor, which also marks the peer MFP. The chip
+ * never holds an IGTK.
+ */
+enum mmwlan_status umac_datapath_mesh_set_igtk(const uint8_t *addr, const uint8_t *key,
+                                               uint8_t key_len, uint16_t key_id,
+                                               const uint8_t *rsc, size_t rsc_len);
+
+/** True for a keyed SAE peer that runs MFP (it sent an IGTK, or protected path
+ *  selection, or AT+MESHPMF=1): it drops our unprotected robust frames, and an
+ *  unprotected one claiming to be from it is refused. */
+bool umac_datapath_mesh_peer_mfp(const uint8_t *addr);
+
+/** How mesh_tx_hwmp_ protects one path-selection frame under SAE. */
+enum umac_mesh_hwmp_prot
+{
+    UMAC_MESH_HWMP_PROT_NONE, /* as before: plaintext, no MMIE */
+    UMAC_MESH_HWMP_PROT_CHIP, /* unicast: Protected + HW_ENC under the link's key */
+    UMAC_MESH_HWMP_PROT_HOST, /* unicast: host CCMP under the link's key, at pn */
+    UMAC_MESH_HWMP_PROT_BIP,  /* group: MMIE under our IGTK, at pn (the IPN) */
+};
+struct umac_mesh_hwmp_txkey
+{
+    enum umac_mesh_hwmp_prot how;
+    uint8_t key_id;
+    uint8_t key[16];
+    uint64_t pn;
+};
+/** Choose the protection for an HWMP frame to @p da and reserve its PN or IPN. */
+void umac_datapath_mesh_hwmp_tx_key(const uint8_t *da, struct umac_mesh_hwmp_txkey *out);
+
+/**
+ * The SAE path-selection RX policy, on a whole Mesh Action frame (24-byte header
+ * first): an established peer's only. Protected unicast arrives here decrypted and
+ * replay-checked. False = drop.
+ */
+bool umac_datapath_mesh_hwmp_rx_ok(const uint8_t *frame, uint32_t len);
+
+/** Reserve the next TX PN of @p stad's key @p key_id: one read-and-increment, so a
+ *  host-CCMP frame from any task never shares a PN with another. */
+uint64_t umac_datapath_mesh_take_tx_pn(struct umac_sta_data *stad, uint8_t key_id);
 uint8_t umac_datapath_mesh_peer_count(void);
+/** True while the mesh peer table has room for one more peer. */
+bool umac_datapath_mesh_has_free_slot(void);
 
 
 void umac_datapath_configure_scan_mode(struct umac_data *umacd);

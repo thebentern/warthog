@@ -202,7 +202,10 @@ bool umac_mesh_tx_host_ccmp(struct umac_sta_data *stad, uint8_t key_id,
 
     uint8_t *body = (uint8_t *)mmpkt_get_data_start(txbufview);
     uint32_t body_len = mmpkt_get_data_length(txbufview);
-    if (body == NULL || body_len == 0u)
+    /* Checked before encrypting in place: a frame refused here is still plaintext. */
+    if (body == NULL || body_len == 0u ||
+        mmpkt_available_space_at_end(txbufview) < SWCCMP_MIC_LEN ||
+        mmpkt_available_space_at_start(txbufview) < UMAC_CCMP_HDR_LEN)
     {
         g_warthog_swccmp_tx_fail++;
         return false;
@@ -233,6 +236,40 @@ bool umac_mesh_tx_host_ccmp(struct umac_sta_data *stad, uint8_t key_id,
     mmpkt_append_data(txbufview, mic, sizeof(mic));
     mmpkt_prepend_data(txbufview, ccmp_hdr, sizeof(ccmp_hdr));
 
+    g_warthog_swccmp_tx_ok++;
+    return true;
+}
+
+/* Protect a built management frame in place: 24-byte header, UMAC_CCMP_HDR_LEN
+ * reserved, the plaintext body, SWCCMP_MIC_LEN reserved. @p pn must be this key's
+ * next unused PN (umac_datapath_mesh_take_tx_pn), shared with the data path. */
+bool umac_mesh_tx_host_ccmp_mgmt(const uint8_t key[16], uint8_t key_id, uint64_t pn64,
+                                 uint8_t *frame, uint32_t len)
+{
+    const uint32_t hdr = 24u;
+    if (key == NULL || frame == NULL || key_id >= UMAC_KEYS_NUM_KEY_IDS ||
+        len <= hdr + UMAC_CCMP_HDR_LEN + SWCCMP_MIC_LEN)
+    {
+        g_warthog_swccmp_tx_fail++;
+        return false;
+    }
+    const uint8_t pn[6] = { (uint8_t)(pn64 >> 40), (uint8_t)(pn64 >> 32), (uint8_t)(pn64 >> 24),
+                            (uint8_t)(pn64 >> 16), (uint8_t)(pn64 >> 8),  (uint8_t)pn64 };
+    frame[1] |= 0x40u; /* Protected: the AAD forces it on anyway */
+    umac_ccmp_write_header(frame + hdr, pn, key_id);
+
+    uint8_t aad[UMAC_CCMP_AAD_MAXLEN];
+    uint8_t nonce[13];
+    uint32_t aad_len = umac_ccmp_build_aad(frame, aad);
+    umac_ccmp_build_nonce(frame, pn, nonce);
+    uint8_t *plain = frame + hdr + UMAC_CCMP_HDR_LEN;
+    const uint32_t plain_len = len - hdr - UMAC_CCMP_HDR_LEN - SWCCMP_MIC_LEN;
+    if (warthog_ccm_ae(key, nonce, SWCCMP_MIC_LEN, aad, aad_len, plain, plain_len,
+                       plain + plain_len) != 0)
+    {
+        g_warthog_swccmp_tx_fail++;
+        return false;
+    }
     g_warthog_swccmp_tx_ok++;
     return true;
 }

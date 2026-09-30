@@ -16,10 +16,31 @@
  *      kills the only working discovery path)
  *  (B) MPM CONFIRM/OPEN bodies: exact bytes plus field-level checks so a
  *      failure names the field rather than just "52 bytes differ"
+ *  (C) the capacity octets of the Mesh Configuration: with no table reader
+ *      the golden frames above hold (0 peerings, accepting); with one,
+ *      Formation Info is min(peerings, 63) << 1 as mac80211 writes it
+ *      (net/mac80211/mesh.c, v6.6) and a full table clears capability bit 0
+ *      and nothing else; set_accepting rewrites that one bit in a built blob
+ *      and refuses a blob with no (or a truncated) Mesh Configuration
+ *  (D) peer_openable: a neighbour's Mesh Configuration that clears its
+ *      accepting bit or names another auth protocol is not opened toward; an
+ *      absent or truncated element does not block (the peer can still Close)
+ *  (E) probe-response IEs: under SAE, hostap's RSN element verbatim between
+ *      Supported Rates and Mesh ID; on an open mesh, or with no usable RSN
+ *      bytes, exactly the discovery blob -- a mac80211 peer drops a beacon or
+ *      probe response whose RSN presence disagrees with its own mesh security
+ *  (F) probe-request IEs: a zero-length SSID then the Mesh ID element, the only
+ *      shape mac80211 (mesh.c, ieee80211_mesh_rx_probe_req) answers
+ *  (G) the RSN hand-over check: an RSN element first, lengths inside the
+ *      buffer, at most UMAC_MESH_IES_RSN_MAXLEN
+ *  Both: a Mesh Configuration shorter than its 7 octets is skipped, never
+ *  read or written past. The blob sits in an exactly-sized heap buffer, so
+ *  `make SAN=1` turns an overrun into an ASan abort, not a silent pass.
  */
 #include "umac_mesh_ies.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures;
@@ -296,12 +317,314 @@ static void test_extra_ies(void)
     CHECK(fence_ok, "...and nothing was written to the caller's buffer");
 }
 
+static bool s_cap_accepting;
+static uint8_t s_cap_peerings;
+static void fake_capacity(struct umac_mesh_ies_capacity *out)
+{
+    out->accepting = s_cap_accepting;
+    out->peerings = s_cap_peerings;
+}
+
+static void test_capacity_octets(void)
+{
+    printf("\n=== (C) capacity octets: Formation Info and the accepting bit ===\n");
+    uint8_t cfg[2 + UMAC_MESH_CFG_IE_LEN];
+
+    CHECK(umac_mesh_ies_capacity_fn == NULL, "no table reader is installed by default");
+    CHECK(umac_mesh_ies_build_mesh_config(cfg, sizeof(cfg), false) == 9 && cfg[7] == 0x00 &&
+          cfg[8] == 0x01, "without one: 0 peerings, accepting -- the golden frames above");
+
+    umac_mesh_ies_capacity_fn = fake_capacity;
+    umac_mesh_ies_cap_forwarding = 1;
+    s_cap_accepting = false;
+    s_cap_peerings = 4;
+    static const uint8_t FULL4[] = { 0x71, 0x07, 0x01, 0x01, 0x00, 0x01, 0x00, 0x08, 0x08 };
+    CHECK(umac_mesh_ies_build_mesh_config(cfg, sizeof(cfg), false) == sizeof(FULL4) &&
+          memcmp(cfg, FULL4, sizeof(FULL4)) == 0,
+          "4 peers, full, forwarding: Formation 0x08, capability 0x08 (got %02x %02x)",
+          cfg[7], cfg[8]);
+    s_cap_accepting = true;
+    s_cap_peerings = 3;
+    (void)umac_mesh_ies_build_mesh_config(cfg, sizeof(cfg), false);
+    CHECK(cfg[7] == 0x06 && cfg[8] == 0x09, "3 peers, room: 0x06 / 0x09 (got %02x %02x)", cfg[7], cfg[8]);
+    s_cap_peerings = 63;
+    (void)umac_mesh_ies_build_mesh_config(cfg, sizeof(cfg), false);
+    CHECK(cfg[7] == 0x7e, "63 peerings: 0x7e (got %02x)", cfg[7]);
+    s_cap_peerings = 200;
+    (void)umac_mesh_ies_build_mesh_config(cfg, sizeof(cfg), false);
+    CHECK(cfg[7] == 0x7e, "capped at 63, never into the Connected-to-AS bit (got %02x)", cfg[7]);
+
+    /* set_accepting on a built discovery blob, as the probe response uses it. */
+    uint8_t on[UMAC_MESH_DISCOVERY_IES_MAXLEN], off[UMAC_MESH_DISCOVERY_IES_MAXLEN];
+    s_cap_peerings = 4;
+    s_cap_accepting = true;
+    uint16_t non = umac_mesh_ies_build_discovery(on, sizeof(on), MESH_ID, MESH_ID_LEN, false);
+    s_cap_accepting = false;
+    uint16_t noff = umac_mesh_ies_build_discovery(off, sizeof(off), MESH_ID, MESH_ID_LEN, false);
+    umac_mesh_ies_capacity_fn = NULL;
+    umac_mesh_ies_cap_forwarding = 0;
+    CHECK(non == noff && non > 0 && memcmp(on, off, non - 1u) == 0 && on[non - 1u] == 0x09 &&
+          off[noff - 1u] == 0x08, "full changes the capability octet's bit 0 only");
+    CHECK(umac_mesh_ies_set_accepting(off, noff, true) && memcmp(on, off, non) == 0,
+          "set_accepting(true) restores the accepting blob byte for byte");
+    CHECK(umac_mesh_ies_set_accepting(off, noff, false) && off[noff - 1u] == 0x08 &&
+          memcmp(on, off, non - 1u) == 0, "set_accepting(false) clears it again, nothing else");
+    CHECK(!umac_mesh_ies_set_accepting(off, (uint16_t)(noff - 9u), true),
+          "no Mesh Configuration in the blob: false");
+    uint8_t trunc[] = { 0x72, 0x09, 'x', 0x71, 0x07 };
+    uint8_t trunc0[sizeof(trunc)];
+    memcpy(trunc0, trunc, sizeof(trunc));
+    CHECK(!umac_mesh_ies_set_accepting(trunc, sizeof(trunc), true) &&
+          memcmp(trunc, trunc0, sizeof(trunc)) == 0, "truncated element: false, nothing written");
+    CHECK(!umac_mesh_ies_set_accepting(NULL, 0, true), "NULL blob: false");
+
+    /* A 3-octet Mesh Configuration ends the blob: its capability octet would be 3 past the end. */
+    static const uint8_t shortcfg[] = { 0x72, 0x02, 's', 'n', 0x71, 0x03, 0x01, 0x01, 0x00 };
+    uint8_t *h = malloc(sizeof(shortcfg));
+    if (h != NULL)
+    {
+        memcpy(h, shortcfg, sizeof(shortcfg));
+        CHECK(!umac_mesh_ies_set_accepting(h, sizeof(shortcfg), false) &&
+              memcmp(h, shortcfg, sizeof(shortcfg)) == 0, "short Mesh Configuration: false, nothing written");
+        free(h);
+    }
+    /* A short one, then a full one: only the full one's capability octet moves. */
+    uint8_t two[] = { 0x71, 0x03, 0x01, 0x01, 0x00, 0x71, 0x07, 0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01 };
+    CHECK(umac_mesh_ies_set_accepting(two, sizeof(two), false) && two[13] == 0x00 && two[4] == 0x00 &&
+          two[2] == 0x01, "short element skipped: the full one after it is rewritten");
+}
+
+static void test_peer_openable(void)
+{
+    printf("\n=== (D) peer_openable: the neighbour's own Mesh Configuration ===\n");
+    uint8_t c[] = { 0x71, 0x07, 0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01 };
+    CHECK(umac_mesh_ies_peer_openable(c, sizeof(c), false), "open, accepting: openable");
+    c[8] = 0x08;
+    CHECK(!umac_mesh_ies_peer_openable(c, sizeof(c), false), "forwarding but not accepting: not");
+    c[8] = 0x00;
+    CHECK(!umac_mesh_ies_peer_openable(c, sizeof(c), false), "not accepting: not");
+    c[8] = 0x19;
+    c[6] = 0x01;
+    CHECK(!umac_mesh_ies_peer_openable(c, sizeof(c), false), "SAE neighbour, we are open: not");
+    CHECK(umac_mesh_ies_peer_openable(c, sizeof(c), true), "SAE neighbour, we are SAE: openable");
+    c[6] = 0x00;
+    CHECK(!umac_mesh_ies_peer_openable(c, sizeof(c), true), "open neighbour, we are SAE: not");
+
+    uint8_t blob[UMAC_MESH_DISCOVERY_IES_MAXLEN];
+    uint16_t n = umac_mesh_ies_build_discovery(blob, sizeof(blob), MESH_ID, MESH_ID_LEN, false);
+    blob[n - 1u] = 0x00;
+    CHECK(!umac_mesh_ies_peer_openable(blob, n, false), "found after Supported Rates and Mesh ID");
+    CHECK(umac_mesh_ies_peer_openable(blob, (uint16_t)(n - 9u), false),
+          "no Mesh Configuration: openable (its Close still refuses us)");
+    uint8_t trunc[] = { 0x72, 0x09, 'x' };
+    CHECK(umac_mesh_ies_peer_openable(trunc, sizeof(trunc), false), "truncated: openable");
+    CHECK(umac_mesh_ies_peer_openable(NULL, 0, false), "NULL: openable");
+
+    static const uint8_t shortcfg[] = { 0x72, 0x02, 's', 'n', 0x71, 0x03, 0x01, 0x01, 0x00 };
+    uint8_t *h = malloc(sizeof(shortcfg));
+    if (h != NULL)
+    {
+        memcpy(h, shortcfg, sizeof(shortcfg));
+        CHECK(umac_mesh_ies_peer_openable(h, sizeof(shortcfg), false),
+              "short Mesh Configuration at the end: treated as absent, not read past");
+        free(h);
+    }
+    uint8_t two[] = { 0x71, 0x03, 0x01, 0x01, 0x00, 0x71, 0x07, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    CHECK(umac_mesh_ies_peer_openable(two, sizeof(two), false),
+          "short element skipped: the full one after it is read (open, accepting)");
+}
+
+/* hostap's wpa_write_rsn_ie() output for warthog's mesh config (mesh_rsn.c):
+ * RSN v1, group CCMP-128, one pairwise CCMP-128, one AKM SAE 00-0F-AC:8,
+ * capabilities 0 (AT+MESHPMF=0). */
+static const uint8_t HOSTAP_MESH_RSN[] = {
+    0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f,
+    0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x08, 0x00, 0x00,
+};
+
+/* The SAE probe response's IEs for "warthog-mesh-test": rates, RSN, Mesh ID, config. */
+static const uint8_t GOLDEN_PRSP_SAE[] = {
+    0x01, 0x08, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c,
+    0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f,
+    0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x08, 0x00, 0x00,
+    0x72, 0x11, 0x77, 0x61, 0x72, 0x74, 0x68, 0x6f, 0x67, 0x2d, 0x6d, 0x65,
+    0x73, 0x68, 0x2d, 0x74, 0x65, 0x73, 0x74,
+    0x71, 0x07, 0x01, 0x01, 0x00, 0x01, 0x01, 0x00, 0x01,
+};
+
+/* The probe request's IEs for "warthog-mesh-test": SSID(0), then Mesh ID. */
+static const uint8_t GOLDEN_PREQ[] = {
+    0x00, 0x00,
+    0x72, 0x11, 0x77, 0x61, 0x72, 0x74, 0x68, 0x6f, 0x67, 0x2d, 0x6d, 0x65,
+    0x73, 0x68, 0x2d, 0x74, 0x65, 0x73, 0x74,
+};
+
+/* Does an element walk over [p, p+n) meet element @p eid? */
+static bool has_eid(const uint8_t *p, uint16_t n, uint8_t eid)
+{
+    uint16_t off = 0;
+    while (off + 2u <= n && off + 2u + p[off + 1] <= n)
+    {
+        if (p[off] == eid) { return true; }
+        off = (uint16_t)(off + 2u + p[off + 1]);
+    }
+    return false;
+}
+
+static void test_probe_resp_ies(void)
+{
+    printf("\n=== (E) probe-response IEs: RSN under SAE only ===\n");
+    uint8_t buf[UMAC_MESH_PROBE_RESP_IES_MAXLEN];
+    uint8_t ref[UMAC_MESH_DISCOVERY_IES_MAXLEN];
+
+    uint16_t n = umac_mesh_ies_build_probe_resp(buf, sizeof(buf), MESH_ID, MESH_ID_LEN, true,
+                                                HOSTAP_MESH_RSN, sizeof(HOSTAP_MESH_RSN));
+    if (n == sizeof(GOLDEN_PRSP_SAE) && memcmp(buf, GOLDEN_PRSP_SAE, n) != 0) {
+        hexdiff(buf, GOLDEN_PRSP_SAE, n);
+    }
+    CHECK(n == sizeof(GOLDEN_PRSP_SAE) && memcmp(buf, GOLDEN_PRSP_SAE, n) == 0,
+          "SAE: rates, hostap's RSN verbatim, Mesh ID, Mesh Config (auth 1) -- %u bytes", n);
+    CHECK(umac_mesh_ies_set_accepting(buf, n, false) && buf[n - 1u] == 0x00 &&
+          !umac_mesh_ies_peer_openable(buf, n, true),
+          "SAE: the Mesh Configuration is still found past the RSN element");
+
+    uint16_t rn = umac_mesh_ies_build_discovery(ref, sizeof(ref), MESH_ID, MESH_ID_LEN, false);
+    n = umac_mesh_ies_build_probe_resp(buf, sizeof(buf), MESH_ID, MESH_ID_LEN, false,
+                                       HOSTAP_MESH_RSN, sizeof(HOSTAP_MESH_RSN));
+    CHECK(n == rn && n > 0 && memcmp(buf, ref, n) == 0 && !has_eid(buf, n, UMAC_MESH_EID_RSN),
+          "open: RSN bytes supplied, none emitted -- the discovery blob byte for byte");
+
+    rn = umac_mesh_ies_build_discovery(ref, sizeof(ref), MESH_ID, MESH_ID_LEN, true);
+    n = umac_mesh_ies_build_probe_resp(buf, sizeof(buf), MESH_ID, MESH_ID_LEN, true, NULL, 0);
+    CHECK(n == rn && n > 0 && memcmp(buf, ref, n) == 0,
+          "SAE before hostap's RSN exists: the SAE discovery blob, no RSN element");
+    uint8_t bad[sizeof(HOSTAP_MESH_RSN)];
+    memcpy(bad, HOSTAP_MESH_RSN, sizeof(bad));
+    bad[1] = 0x30; /* runs past the buffer */
+    n = umac_mesh_ies_build_probe_resp(buf, sizeof(buf), MESH_ID, MESH_ID_LEN, true, bad, sizeof(bad));
+    CHECK(n == rn && memcmp(buf, ref, n) == 0, "SAE with a truncated RSN element: left out, not sent");
+
+    printf("--- sizing sweep ---\n");
+    uint8_t maxid[UMAC_MESH_IES_MESH_ID_MAXLEN];
+    memset(maxid, 'z', sizeof(maxid));
+    uint8_t maxrsn[UMAC_MESH_IES_RSN_MAXLEN];
+    memset(maxrsn, 0xee, sizeof(maxrsn));
+    maxrsn[0] = UMAC_MESH_EID_RSN;
+    maxrsn[1] = (uint8_t)(sizeof(maxrsn) - 2u);
+    n = umac_mesh_ies_build_probe_resp(buf, sizeof(buf), maxid, sizeof(maxid), true, maxrsn,
+                                       sizeof(maxrsn));
+    CHECK(n == UMAC_MESH_PROBE_RESP_IES_MAXLEN,
+          "the longest Mesh ID and RSN fill exactly UMAC_MESH_PROBE_RESP_IES_MAXLEN (%u)",
+          (unsigned)UMAC_MESH_PROBE_RESP_IES_MAXLEN);
+    int wrong_rc = 0, leaked = 0;
+    for (uint16_t cap = 0; cap < sizeof(GOLDEN_PRSP_SAE); cap++) {
+        uint8_t probe[sizeof(GOLDEN_PRSP_SAE)];
+        memset(probe, 0xA5, sizeof(probe));
+        if (umac_mesh_ies_build_probe_resp(probe, cap, MESH_ID, MESH_ID_LEN, true, HOSTAP_MESH_RSN,
+                                           sizeof(HOSTAP_MESH_RSN)) != 0) wrong_rc++;
+        for (uint16_t i = 0; i < sizeof(probe); i++) {
+            if (probe[i] != 0xA5) { leaked = 1; break; }
+        }
+    }
+    CHECK(wrong_rc == 0 && leaked == 0,
+          "every out_len below %u returns 0 and writes nothing", (unsigned)sizeof(GOLDEN_PRSP_SAE));
+    CHECK(umac_mesh_ies_build_probe_resp(NULL, 64, MESH_ID, MESH_ID_LEN, true, NULL, 0) == 0 &&
+          umac_mesh_ies_build_probe_resp(buf, sizeof(buf), NULL, MESH_ID_LEN, true, NULL, 0) == 0 &&
+          umac_mesh_ies_build_probe_resp(buf, sizeof(buf), MESH_ID, 0, true, NULL, 0) == 0 &&
+          umac_mesh_ies_build_probe_resp(buf, sizeof(buf), maxid,
+                                         UMAC_MESH_IES_MESH_ID_MAXLEN + 1, true, NULL, 0) == 0,
+          "NULL buffer, NULL / empty / over-long Mesh ID: refused");
+}
+
+static void test_probe_req_ies(void)
+{
+    printf("\n=== (F) probe-request IEs: wildcard SSID, then Mesh ID ===\n");
+    uint8_t buf[UMAC_MESH_PROBE_REQ_IES_MAXLEN];
+    uint16_t n = umac_mesh_ies_build_probe_req(buf, sizeof(buf), MESH_ID, MESH_ID_LEN);
+    CHECK(n == sizeof(GOLDEN_PREQ) && memcmp(buf, GOLDEN_PREQ, n) == 0,
+          "SSID(0) then Mesh ID \"warthog-mesh-test\" -- %u bytes", n);
+
+    uint8_t maxid[UMAC_MESH_IES_MESH_ID_MAXLEN];
+    memset(maxid, 'z', sizeof(maxid));
+    CHECK(umac_mesh_ies_build_probe_req(buf, sizeof(buf), maxid, sizeof(maxid)) ==
+          UMAC_MESH_PROBE_REQ_IES_MAXLEN, "a 32-byte Mesh ID fills UMAC_MESH_PROBE_REQ_IES_MAXLEN");
+    int wrong_rc = 0, leaked = 0;
+    for (uint16_t cap = 0; cap < sizeof(GOLDEN_PREQ); cap++) {
+        uint8_t probe[sizeof(GOLDEN_PREQ)];
+        memset(probe, 0xA5, sizeof(probe));
+        if (umac_mesh_ies_build_probe_req(probe, cap, MESH_ID, MESH_ID_LEN) != 0) wrong_rc++;
+        for (uint16_t i = 0; i < sizeof(probe); i++) {
+            if (probe[i] != 0xA5) { leaked = 1; break; }
+        }
+    }
+    CHECK(wrong_rc == 0 && leaked == 0,
+          "every out_len below %u returns 0 and writes nothing", (unsigned)sizeof(GOLDEN_PREQ));
+    CHECK(umac_mesh_ies_build_probe_req(NULL, 64, MESH_ID, MESH_ID_LEN) == 0 &&
+          umac_mesh_ies_build_probe_req(buf, sizeof(buf), NULL, MESH_ID_LEN) == 0 &&
+          umac_mesh_ies_build_probe_req(buf, sizeof(buf), MESH_ID, 0) == 0 &&
+          umac_mesh_ies_build_probe_req(buf, sizeof(buf), maxid, UMAC_MESH_IES_MESH_ID_MAXLEN + 1) == 0,
+          "NULL buffer, NULL / empty / over-long Mesh ID: refused");
+    uint8_t roomy[2 * UMAC_MESH_PROBE_REQ_IES_MAXLEN];
+    uint8_t longid[UMAC_MESH_IES_MESH_ID_MAXLEN + 1];
+    memset(longid, 'z', sizeof(longid));
+    CHECK(umac_mesh_ies_build_probe_req(roomy, sizeof(roomy), longid, sizeof(longid)) == 0,
+          "a 33-byte Mesh ID is refused even when the buffer has room for it");
+}
+
+static void test_rsn_valid(void)
+{
+    printf("\n=== (G) which bytes count as our RSN element ===\n");
+    CHECK(umac_mesh_ies_rsn_valid(HOSTAP_MESH_RSN, sizeof(HOSTAP_MESH_RSN)),
+          "hostap's mesh RSN element: accepted");
+    uint8_t two[sizeof(HOSTAP_MESH_RSN) + 3];
+    memcpy(two, HOSTAP_MESH_RSN, sizeof(HOSTAP_MESH_RSN));
+    two[sizeof(HOSTAP_MESH_RSN)] = 0xf4; /* RSNX, as hostap appends when it has capabilities */
+    two[sizeof(HOSTAP_MESH_RSN) + 1] = 0x01;
+    two[sizeof(HOSTAP_MESH_RSN) + 2] = 0x20;
+    CHECK(umac_mesh_ies_rsn_valid(two, sizeof(two)), "RSN followed by RSNX: accepted whole");
+
+    uint8_t b[UMAC_MESH_IES_RSN_MAXLEN + 1];
+    memset(b, 0, sizeof(b));
+    b[0] = UMAC_MESH_EID_RSN;
+    b[1] = (uint8_t)(sizeof(b) - 2u);
+    CHECK(!umac_mesh_ies_rsn_valid(b, sizeof(b)), "longer than UMAC_MESH_IES_RSN_MAXLEN: refused");
+    CHECK(!umac_mesh_ies_rsn_valid(NULL, sizeof(HOSTAP_MESH_RSN)), "NULL: refused");
+    CHECK(!umac_mesh_ies_rsn_valid(HOSTAP_MESH_RSN, 0), "empty: refused");
+    memcpy(b, HOSTAP_MESH_RSN, sizeof(HOSTAP_MESH_RSN));
+    b[0] = 0x31;
+    CHECK(!umac_mesh_ies_rsn_valid(b, sizeof(HOSTAP_MESH_RSN)), "first element not RSN (49): refused");
+    memcpy(b, HOSTAP_MESH_RSN, sizeof(HOSTAP_MESH_RSN));
+    CHECK(!umac_mesh_ies_rsn_valid(b, sizeof(HOSTAP_MESH_RSN) - 1u), "one octet short: refused");
+    CHECK(!umac_mesh_ies_rsn_valid(b, sizeof(HOSTAP_MESH_RSN) + 1u), "a stray trailing octet: refused");
+    static const uint8_t tiny[] = { 0x30, 0x01, 0x01 };
+    static const uint8_t empty_rsn[] = { 0x30, 0x00 };
+    CHECK(!umac_mesh_ies_rsn_valid(tiny, sizeof(tiny)) && !umac_mesh_ies_rsn_valid(empty_rsn, 2),
+          "an RSN element too short for its version: refused");
+    /* 802.11 makes every RSNE field after Version optional; hostap's parser takes this one. */
+    static const uint8_t version_only[] = { 0x30, 0x02, 0x01, 0x00 };
+    CHECK(umac_mesh_ies_rsn_valid(version_only, sizeof(version_only)),
+          "a version-only RSN element: accepted");
+    /* One octet on the heap: reading a length octet past it is an ASan abort under SAN=1. */
+    uint8_t *lone = malloc(1);
+    if (lone != NULL)
+    {
+        lone[0] = UMAC_MESH_EID_RSN;
+        CHECK(!umac_mesh_ies_rsn_valid(lone, 1), "a lone element id: refused, its length never read");
+        free(lone);
+    }
+}
+
 int main(void)
 {
     printf("=== mesh IE / MPM golden-byte tests ===\n");
     test_discovery_ies();
     test_mpm_bodies();
     test_extra_ies();
+    test_capacity_octets();
+    test_peer_openable();
+    test_probe_resp_ies();
+    test_probe_req_ies();
+    test_rsn_valid();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
 }

@@ -28,8 +28,10 @@ extern "C" {
 #define UMAC_MESH_IES_MESH_ID_MAXLEN 32
 
 /* Element IDs (IEEE 802.11-2020). Mirrored from dot11.h, which is not
- * includable here; umac_mesh_beacon.c static-asserts they agree. */
+ * includable here; umac_mesh_beacon.c static-asserts they agree (dot11.h has no RSN). */
+#define UMAC_MESH_EID_SSID 0
 #define UMAC_MESH_EID_SUPPORTED_RATES 1
+#define UMAC_MESH_EID_RSN 48
 #define UMAC_MESH_EID_MESH_CONFIG 113
 #define UMAC_MESH_EID_MESH_ID 114
 #define UMAC_MESH_EID_PEER_MGMT 117
@@ -74,6 +76,30 @@ extern "C" {
 uint16_t umac_mesh_ies_build_discovery(uint8_t *out, uint16_t out_len, const uint8_t *mesh_id,
                                        uint8_t mesh_id_len, bool sae);
 
+/** Longest RSN element sequence (hostap's mesh rsn_ie) we carry in discovery frames. */
+#define UMAC_MESH_IES_RSN_MAXLEN 64
+
+/** Worst-case probe-response IEs: the discovery blob plus the RSN element. */
+#define UMAC_MESH_PROBE_RESP_IES_MAXLEN (UMAC_MESH_DISCOVERY_IES_MAXLEN + UMAC_MESH_IES_RSN_MAXLEN)
+
+/** Worst-case mesh probe-request IEs: wildcard SSID and Mesh ID. */
+#define UMAC_MESH_PROBE_REQ_IES_MAXLEN (2 + 2 + UMAC_MESH_IES_MESH_ID_MAXLEN)
+
+/** True if @p rsn starts with an RSN element holding at least its Version, every element
+ *  fits inside @p len, and @p len <= UMAC_MESH_IES_RSN_MAXLEN. */
+bool umac_mesh_ies_rsn_valid(const uint8_t *rsn, uint16_t len);
+
+/** Probe-response IEs: Supported Rates, RSN (only if @p sae and it is valid), Mesh ID, Mesh
+ *  Configuration. Returns 0 and writes nothing on bad arguments or a short buffer. */
+uint16_t umac_mesh_ies_build_probe_resp(uint8_t *out, uint16_t out_len, const uint8_t *mesh_id,
+                                        uint8_t mesh_id_len, bool sae, const uint8_t *rsn,
+                                        uint16_t rsn_len);
+
+/** Mesh probe-request IEs: zero-length SSID then Mesh ID, the only shape mac80211 answers.
+ *  Returns 0 and writes nothing on bad arguments or a short buffer. */
+uint16_t umac_mesh_ies_build_probe_req(uint8_t *out, uint16_t out_len, const uint8_t *mesh_id,
+                                       uint8_t mesh_id_len);
+
 /**
  * Build the Mesh Configuration IE alone (element ID + length + 7 payload
  * octets), so the beacon path and the discovery blob cannot drift apart.
@@ -86,6 +112,36 @@ uint16_t umac_mesh_ies_build_mesh_config(uint8_t *out, uint16_t out_len, bool sa
 
 /** Set to 1 when this node forwards; the Mesh Configuration capability follows it. */
 extern uint8_t umac_mesh_ies_cap_forwarding;
+
+/** The peer table as the Mesh Configuration element reports it. */
+struct umac_mesh_ies_capacity
+{
+    bool accepting;   /**< Accepting Additional Mesh Peerings (capability bit 0) */
+    uint8_t peerings; /**< established peers: Formation Info Number of Peerings */
+};
+
+/**
+ * Called on every Mesh Configuration build, so beacons, probe responses and
+ * MPM frames report the table as it is now. NULL builds "accepting, 0 peerings".
+ * Set by the mesh datapath when it is installed.
+ */
+extern void (*umac_mesh_ies_capacity_fn)(struct umac_mesh_ies_capacity *out);
+
+/**
+ * Rewrite the Accepting Additional Mesh Peerings bit of the Mesh Configuration
+ * element in a built IE blob, leaving every other octet alone.
+ *
+ * @returns false when the blob has no Mesh Configuration or is truncated.
+ */
+bool umac_mesh_ies_set_accepting(uint8_t *ies, uint16_t len, bool accepting);
+
+/**
+ * Would a neighbour advertising these IEs accept an Open from us? False when
+ * its Mesh Configuration names another auth protocol than ours (@p sae) or
+ * clears Accepting Additional Mesh Peerings; true when the element is absent
+ * or the IEs are truncated.
+ */
+bool umac_mesh_ies_peer_openable(const uint8_t *ies, uint32_t len, bool sae);
 
 /**
  * Build a Mesh Peering action-frame body (everything after the 802.11 header).

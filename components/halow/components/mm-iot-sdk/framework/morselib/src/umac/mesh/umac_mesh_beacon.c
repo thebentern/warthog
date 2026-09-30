@@ -6,8 +6,8 @@
  *
  * Two consumers, deliberately sharing their IE values:
  *   - umac_mesh_get_beacon(), the template the chip asks the host for
- *   - umac_mesh_build_discovery_ies(), the flat IE blob used by mesh probe
- *     responses and by every Mesh Peering (MPM) action frame
+ *   - umac_mesh_build_probe_resp_ies() / umac_mesh_build_discovery_ies(), the
+ *     flat IE blobs used by mesh probe responses and Mesh Peering (MPM) frames
  * They must agree: a peer runs mac80211's mesh_matches_local() over the Mesh
  * ID and Mesh Configuration in whichever frame it sees first, and disagreement
  * between our beacon and our peering frames would make peering succeed or fail
@@ -22,9 +22,10 @@
  *
  * S1G short beacon layout (IEEE 802.11-2020 s9.3.4), 15-byte fixed header:
  *   frame_control(2) duration(2) sa(6) timestamp(4) change_seq(1)
- * then SSID(0, empty for mesh), Mesh ID(114), Mesh Configuration(113),
- * S1G Beacon Compatibility(213), S1G Capabilities(217), S1G Operation(232),
- * S1G Short Beacon Interval(214). Supported Rates / DS Params / ERP / HT / VHT
+ * then SSID(0, empty for mesh), RSN(48, SAE only), Mesh ID(114), Mesh
+ * Configuration(113), S1G Beacon Compatibility(213), S1G Capabilities(217),
+ * S1G Operation(232), S1G Short Beacon Interval(214). Supported Rates / DS
+ * Params / ERP / HT / VHT
  * are masked for S1G -- but note the discovery IE blob DOES carry Supported
  * Rates, because mesh_matches_local() compares the basic rate set.
  */
@@ -47,6 +48,7 @@
 #include "dot11/dot11.h"
 #include "dot11/dot11_ies.h"
 #include "mmdrv.h"
+#include "mmosal.h"
 
 #include <string.h>
 
@@ -55,6 +57,7 @@
  * file sees both headers, which makes it the one place the two can be pinned
  * together. If the SDK ever renumbers these, fail the build here rather than
  * on air, where the symptom is a peer silently declining to peer. */
+MM_STATIC_ASSERT(UMAC_MESH_EID_SSID == DOT11_IE_SSID, "mesh IE id drift");
 MM_STATIC_ASSERT(UMAC_MESH_EID_MESH_ID == DOT11_IE_MESH_ID, "mesh IE id drift");
 MM_STATIC_ASSERT(UMAC_MESH_EID_MESH_CONFIG == DOT11_IE_MESH_CONFIGURATION, "mesh IE id drift");
 MM_STATIC_ASSERT(UMAC_MESH_IES_MESH_ID_MAXLEN == MMWLAN_MESH_ID_MAXLEN, "mesh id maxlen drift");
@@ -66,6 +69,9 @@ static uint8_t s_own_addr[6];
 /* Beacon change sequence — increments when IEs change. For now we never
  * change IEs during a mesh session, so it stays 0. */
 static uint8_t s_change_seq = 0;
+/* hostap's RSN element(s), set from the supplicant task; read under the critical section. */
+static uint8_t s_rsn[UMAC_MESH_IES_RSN_MAXLEN];
+static uint16_t s_rsn_len;
 
 /* ---------------------------------------------------------------------------
  * Frame Control for S1G beacon
@@ -81,34 +87,21 @@ static uint8_t s_change_seq = 0;
 /* S1G short-beacon frame control: version 0, type EXT(3), subtype
  * S1G_BEACON(1) => low byte 0x1C, high byte 0x00.
  *
- * UNTESTED on air: this chip does not beacon in mesh mode at all (the beacon
- * IRQ fires once at startup and never again -- see AT+BCNSTAT?), so no value
- * here has ever been transmitted. 0x00 matches the in-tree hostap S1G builder,
- * which emits bss_bw=0 at both 1 and 2 MHz on the AP path that does work.
+ * 0x00 matches the in-tree hostap S1G builder, which emits bss_bw=0 at both
+ * 1 and 2 MHz on the AP path that does work.
  * Note the upper octet is the BSS-BW subfield (bits 11-13), NOT an
  * optional-field presence flag -- the presence bits are 0x0100/0x0200/0x0400. */
 #define MESH_S1G_BEACON_FC_LO 0x1C
 #define MESH_S1G_BEACON_FC_HI 0x00
+/* Security Supported (B14), set with an RSN element as hostap and the Morse driver do. */
+#define MESH_S1G_BEACON_FC_HI_SECURITY 0x40
 
 /* Mesh Configuration IE — see field layout in S1G beacon header above and
  * IEEE 802.11-2020 §9.4.2.97. 7 bytes fixed payload. */
 #define MESH_CFG_IE_LEN 7
-/* 0x01/0x01 is correct FOR THIS PEER. Measured, not reasoned.
- *
- * The kernel's generic constants say otherwise -- Linux include/linux/ieee80211.h
- * has IEEE80211_PATH_PROTOCOL_HWMP = 0 and IEEE80211_PATH_METRIC_AIRTIME = 0,
- * and mac80211's mesh_matches_local() rejects a candidate whose meshconf_psel /
- * meshconf_pmetric differ from ifmsh->mesh_pp_id / mesh_pm_id. That argues for
- * 0x00/0x00, and it was tried on hardware. Result:
- *
- *   0x01/0x01 -> peer creates a candidate, sends Open, reaches OPN_RCVD
- *   0x00/0x00 -> AT+PRSPSTAT? req_rx=16 rsp_tx=16 but AT+MPMSTAT? rx=0:
- *                the peer probes us repeatedly and NEVER initiates peering
- *
- * So the morse driver runs with mesh_pp_id / mesh_pm_id = 1, not the kernel
- * defaults, and 0x00 is what fails mesh_matches_local() here. Do not "correct"
- * these to 0 on the strength of the kernel headers alone -- verify against the
- * peer. Set WARTHOG_MESH_PATHSEL_ZERO to re-test 0x00/0x00. */
+/* Unused: the beacon takes its Mesh Configuration from umac_mesh_ies_build_mesh_config,
+ * so WARTHOG_MESH_PATHSEL_ZERO changes nothing. 1/1 are the 802.11 HWMP and airtime IDs
+ * (Linux IEEE80211_PATH_PROTOCOL_HWMP = IEEE80211_PATH_METRIC_AIRTIME = 1). */
 #ifdef WARTHOG_MESH_PATHSEL_ZERO
 #define MESH_PATH_PROTO_ID  0x00
 #define MESH_PATH_METRIC_ID 0x00
@@ -132,6 +125,7 @@ void umac_mesh_beacon_init(const struct mmwlan_mesh_args *args, const uint8_t ow
     memcpy(&s_args, args, sizeof(s_args));
     memcpy(s_own_addr, own_addr, 6);
     s_change_seq = 0;
+    umac_mesh_beacon_set_rsn(NULL, 0); /* a previous session's RSN must not leak into this one */
     s_initialized = true;
     MMLOG_INF("mesh beacon: init OK (S1G fmt) mesh_id_len=%u "
               "own_addr=%02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -143,6 +137,37 @@ void umac_mesh_beacon_init(const struct mmwlan_mesh_args *args, const uint8_t ow
 bool umac_mesh_beacon_is_active(void)
 {
     return s_initialized;
+}
+
+void umac_mesh_beacon_set_rsn(const uint8_t *rsn, uint16_t len)
+{
+    const bool ok = umac_mesh_ies_rsn_valid(rsn, len);
+    if (rsn != NULL && !ok)
+    {
+        MMLOG_ERR("mesh beacon: RSN element rejected (len %u)\n", (unsigned)len);
+    }
+    MMOSAL_TASK_ENTER_CRITICAL();
+    if (ok)
+    {
+        memcpy(s_rsn, rsn, len);
+    }
+    s_rsn_len = ok ? len : 0u;
+    MMOSAL_TASK_EXIT_CRITICAL();
+}
+
+/* The RSN bytes one frame carries: none on an open mesh. Copied once per frame,
+ * so both passes of build_mgmt_frame() see the same length. */
+static uint16_t rsn_snapshot_(uint8_t out[UMAC_MESH_IES_RSN_MAXLEN])
+{
+    if (s_args.security_type != MMWLAN_SAE)
+    {
+        return 0;
+    }
+    MMOSAL_TASK_ENTER_CRITICAL();
+    uint16_t n = s_rsn_len;
+    memcpy(out, s_rsn, n);
+    MMOSAL_TASK_EXIT_CRITICAL();
+    return n;
 }
 
 /* ---------------------------------------------------------------------------
@@ -196,6 +221,18 @@ uint16_t umac_mesh_build_discovery_ies(uint8_t *out, uint16_t out_len)
     }
     return umac_mesh_ies_build_discovery(out, out_len, s_args.mesh_id, s_args.mesh_id_len,
                                          s_args.security_type == MMWLAN_SAE);
+}
+
+uint16_t umac_mesh_build_probe_resp_ies(uint8_t *out, uint16_t out_len)
+{
+    if (!s_initialized)
+    {
+        return 0;
+    }
+    uint8_t rsn[UMAC_MESH_IES_RSN_MAXLEN];
+    uint16_t rsn_len = rsn_snapshot_(rsn);
+    return umac_mesh_ies_build_probe_resp(out, out_len, s_args.mesh_id, s_args.mesh_id_len,
+                                          s_args.security_type == MMWLAN_SAE, rsn, rsn_len);
 }
 
 /* S1G Beacon Compatibility IE (213, 8B payload).
@@ -309,9 +346,16 @@ static void append_s1g_short_bcn_int_ie_(struct consbuf *buf)
  * Top-level beacon builder — called twice by build_mgmt_frame (size pass,
  * then fill pass). consbuf_append in size-pass-mode only tracks offset.
  * --------------------------------------------------------------------------- */
+/* What one beacon carries that can change under it: the RSN snapshot. */
+struct mesh_beacon_params_
+{
+    uint8_t rsn[UMAC_MESH_IES_RSN_MAXLEN];
+    uint16_t rsn_len;
+};
+
 static void umac_mesh_build_beacon_(struct umac_data *umacd, struct consbuf *buf, void *params)
 {
-    MM_UNUSED(params);
+    const struct mesh_beacon_params_ *p = (const struct mesh_beacon_params_ *)params;
 
     /* --- S1G beacon fixed header (15 bytes) ---
      *   frame_control (2)   = 0x001C  (FTYPE_EXT | STYPE_S1G_BEACON)
@@ -328,10 +372,17 @@ static void umac_mesh_build_beacon_(struct umac_data *umacd, struct consbuf *buf
     };
     memcpy(&header[4], s_own_addr, 6);
     header[14] = s_change_seq;
+    if (p->rsn_len != 0u)
+    {
+        header[1] |= MESH_S1G_BEACON_FC_HI_SECURITY;
+    }
     consbuf_append(buf, header, sizeof(header));
 
     /* --- IEs --- */
     append_ssid_ie_empty_(buf);
+    /* A secured mac80211 mesh drops a beacon without RSN (mesh.c, rx_bcn_presp).
+     * SSID, RSN, Mesh ID, Mesh Configuration is their relative 802.11 order. */
+    consbuf_append(buf, p->rsn, p->rsn_len);
     append_mesh_id_ie_(buf);
     append_mesh_config_ie_(buf);
     append_s1g_bcn_compat_ie_(buf);
@@ -351,7 +402,9 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
         return NULL;
     }
 
-    struct mmpkt *beacon = build_mgmt_frame(umacd, umac_mesh_build_beacon_, NULL);
+    struct mesh_beacon_params_ params;
+    params.rsn_len = rsn_snapshot_(params.rsn);
+    struct mmpkt *beacon = build_mgmt_frame(umacd, umac_mesh_build_beacon_, &params);
     if (beacon == NULL)
     {
         MMLOG_ERR("mesh beacon: alloc failed\n");
@@ -369,8 +422,9 @@ struct mmpkt *umac_mesh_get_beacon(struct umac_data *umacd)
      * chip doesn't know what S1G-MCS rate to use for this beacon. */
     umac_rc_init_rate_table_mgmt(umacd, &tx_metadata->rc_data, false);
 
-    MMLOG_INF("mesh beacon: S1G fmt built (FC 0x%02x%02x) — len-tagged for chip TX\n",
-              MESH_S1G_BEACON_FC_HI, MESH_S1G_BEACON_FC_LO);
+    MMLOG_INF("mesh beacon: S1G fmt built (FC 0x%02x%02x, rsn %u) — len-tagged for chip TX\n",
+              MESH_S1G_BEACON_FC_HI | (params.rsn_len ? MESH_S1G_BEACON_FC_HI_SECURITY : 0),
+              MESH_S1G_BEACON_FC_LO, (unsigned)params.rsn_len);
     {
         extern volatile uint8_t g_warthog_bcn_own[160];
         extern volatile uint16_t g_warthog_bcn_own_len;

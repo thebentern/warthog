@@ -357,7 +357,8 @@ static void t_tx_proxied_destination(void)
 
     char paths[512] = { 0 };
     (void)simnode_render_paths(paths, sizeof(paths));
-    CHECK(strstr(paths, "host=000088 behind=00000a") != NULL,
+    /* Anchored: a relay-learned entry prints no relay= and no uni. */
+    CHECK(strstr(paths, "host=000088 behind=00000a\r\n") != NULL,
           "the proxy table learned H2 behind A%s", strstr(paths, "host=") ? "" : " (no host= line)");
 
     simnode_outbox_clear();
@@ -501,6 +502,25 @@ static void t_rx_forward_eapol(void)
               "[44] the ethertype is still EAPOL (got %02x%02x)", f->bytes[44], f->bytes[45]);
         CHECK(memcmp(&f->bytes[46], PAY, sizeof(PAY)) == 0, "[46] the payload is untouched");
     }
+
+    /* The same for one held while we discover its mesh DA: carried, not judged. */
+    simnode_outbox_clear();
+    mc.seq = 403;
+    n = umac_mesh_ies_build_data_hdr4(frame, W, A, E, A);
+    frame[n++] = 0x00;
+    frame[n++] = 0x01;
+    n = (uint16_t)(n + umac_mesh_ctrl_build(&frame[n], 18u, &mc));
+    memcpy(&frame[n], SNAP_EAPOL, sizeof(SNAP_EAPOL));
+    n = (uint16_t)(n + sizeof(SNAP_EAPOL));
+    memcpy(&frame[n], PAY, sizeof(PAY));
+    n = (uint16_t)(n + sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    const struct simnode_frame *q = simnode_outbox_get(0);
+    CHECK(g_warthog_rxdrop_reason == 100u + UMAC_MESH_FWD_DROP_NO_PATH && simnode_outbox_count() == 1 &&
+              q != NULL && q->is_mgmt && q->len >= 27u && q->bytes[26] == HWMP_EID_PREQ &&
+              simnode_host_rx_count() == 0,
+          "an EAPOL frame for unroutable E is held and asked for, not refused as ours "
+          "(reason %lu, %u out)", (unsigned long)g_warthog_rxdrop_reason, simnode_outbox_count());
 
     /* The gate itself stays: 4-address EAPOL addressed to US is still refused. */
     fresh(/*fwd=*/true, /*bridge=*/false, /*grp_std=*/false);
@@ -740,25 +760,6 @@ static void t_leaf_proxied_host(void)
               d->bytes[32] == 0x00u,
           "an AE frame naming peer C as a host behind A does not redirect traffic for C");
 
-    /* Only a host behind a DIRECT peer is learned. One behind a non-neighbour M
-     * can never be answered by a leaf, and would hold a table slot for nothing. */
-    {
-        static const uint8_t M[6]  = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x4d };
-        static const uint8_t H3[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x93 };
-        fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
-        (void)simnode_add_peer(A);
-        struct umac_mesh_ctrl m3 = { .flags = UMAC_MESH_CTRL_AE_A5A6, .ttl = 30, .seq = 6002 };
-        memcpy(m3.eaddr1, W, 6);
-        memcpy(m3.eaddr2, H3, 6);
-        n = mk_uni(frame, W, A, W, M, &m3, PAY, sizeof(PAY));
-        (void)simnode_rx(frame, n, -60);
-        CHECK(simnode_host_rx_count() == 1, "A relays a frame from H3, behind non-neighbour M: "
-                                            "delivered (%u)", simnode_host_rx_count());
-        char paths[512];
-        (void)simnode_render_paths(paths, sizeof(paths));
-        CHECK(strstr(paths, "proxies=0") != NULL, "H3 is not learned: M is no peer of ours");
-    }
-
     /* The TX gate and classify are separate lock sections. If the proxy's peer
      * goes between them, a leaf still must not originate a PREQ. */
     {
@@ -783,6 +784,186 @@ static void t_leaf_proxied_host(void)
               "A gone before classify: no PREQ (%u sent, %u frames)",
               (unsigned)(g_warthog_fwd_preq_tx - preq0), simnode_outbox_count());
     }
+}
+
+/* ---- 7e. leaf mode: a host behind a node we do not hear ------------------
+ *
+ * Leaf W hears only A (and C where stated). Laptop H3 sits on bridge M's LAN;
+ * A relays H3's frames to W. W's answer must be the shape mac80211 itself
+ * emits from its own stack to a proxied host (tx.c ieee80211_build_hdr, the
+ * DS -> MBSS branch): mesh DA = M, mesh SA = W, QoS Mesh Control Present, AE 2
+ * carrying H3 and W, handed to A -- the peer that carried H3's traffic -- and
+ * never a PREQ, because a leaf does not discover.
+ *
+ * Also pinned, through the shipping datapath: a flood alone teaches; the
+ * unicast's relay is held against another relay's flood for
+ * UMAC_MESH_LEAF_VIA_HOLD_MS and yields when it goes; the second copy of a
+ * flood through another relay does not move the reply; a host behind a direct
+ * peer goes to that peer although a relay carried its flood; a frame for a
+ * third party (reason 93) teaches nothing; a peer named as a host redirects
+ * nothing. AT+MESHPATH? shows each leaf entry's relay and its unicast pin. */
+
+static const uint8_t M[6]  = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x4d }; /* bridge, not a peer */
+static const uint8_t H3[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x93 }; /* host behind M */
+static const uint8_t H4[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x94 }; /* another host behind M */
+static const uint8_t H5[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x95 }; /* host behind peer C */
+static const uint8_t H9[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x99 }; /* host in a third party's frame */
+
+/* A unicast from @p host behind M, relayed to us by @p ta. */
+static uint16_t mk_from_m_(uint8_t *f, const uint8_t *ta, const uint8_t *host, uint32_t seq)
+{
+    struct umac_mesh_ctrl mc = { .flags = UMAC_MESH_CTRL_AE_A5A6, .ttl = 30, .seq = seq };
+    memcpy(mc.eaddr1, W, 6);
+    memcpy(mc.eaddr2, host, 6);
+    return mk_uni(f, W, ta, W, M, &mc, PAY, sizeof(PAY));
+}
+
+/* A broadcast from @p host behind @p node (an ARP request, say), re-flooded to us by @p ta. */
+static uint16_t mk_flood_(uint8_t *f, const uint8_t *ta, const uint8_t *node, const uint8_t *host,
+                          uint32_t seq, uint8_t ttl)
+{
+    struct umac_mesh_ctrl mc = { .flags = UMAC_MESH_CTRL_AE_A4, .ttl = ttl, .seq = seq };
+    memcpy(mc.eaddr1, host, 6);
+    return mk_grp(f, BC, ta, node, &mc, PAY, sizeof(PAY));
+}
+
+static uint16_t mk_flood_from_m_(uint8_t *f, const uint8_t *ta, const uint8_t *host, uint32_t seq)
+{
+    return mk_flood_(f, ta, M, host, seq, 30);
+}
+
+/* The one data frame our host's reply to @p host produced, checked byte for byte:
+ * mesh DA @p node, handed to @p ra. */
+static void expect_reply_to_(const uint8_t *host, const uint8_t *node, const uint8_t *ra, const char *what)
+{
+    extern volatile uint32_t g_warthog_fwd_preq_tx;
+    uint32_t preq0 = g_warthog_fwd_preq_tx;
+    simnode_outbox_clear();
+    (void)simnode_host_tx(host, W, PAY, sizeof(PAY));
+    const struct simnode_frame *f = simnode_outbox_get(0);
+    bool one = simnode_outbox_count() == 1u && f != NULL && !f->is_mgmt;
+    CHECK(one && f->len == 58u + sizeof(PAY), "%s: one data frame with an 18-octet Mesh Control "
+          "(%u frames, %u bytes)", what, simnode_outbox_count(), f ? f->len : 0u);
+    if (!one || f->len != 58u + sizeof(PAY)) { if (f) { hexdump("reply", f->bytes, f->len); } return; }
+    CHECK(MAC_EQ(&f->bytes[4], ra), "  [4]  addr1 = %02x, the peer it is handed to", ra[5]);
+    CHECK(MAC_EQ(&f->bytes[10], W), "  [10] addr2 = us");
+    CHECK(MAC_EQ(&f->bytes[16], node), "  [16] addr3 = %02x, the node it sits behind -- not the host",
+          node[5]);
+    CHECK(MAC_EQ(&f->bytes[24], W), "  [24] addr4 = us");
+    CHECK(f->bytes[30] == 0x00 && f->bytes[31] == 0x01,
+          "  [30..31] QoS Control = TID 0 with Mesh Control Present (got %02x%02x)",
+          f->bytes[31], f->bytes[30]);
+    CHECK(f->bytes[32] == UMAC_MESH_CTRL_AE_A5A6, "  [32] AE mode 2 (got %02x)", f->bytes[32]);
+    CHECK(MAC_EQ(&f->bytes[38], host), "  [38] AE address 1 = the host");
+    CHECK(MAC_EQ(&f->bytes[44], W), "  [44] AE address 2 = us");
+    CHECK(g_warthog_fwd_preq_tx == preq0, "  and no PREQ: a leaf never discovers (%u sent)",
+          (unsigned)(g_warthog_fwd_preq_tx - preq0));
+}
+
+static void expect_reply_(const uint8_t *host, const uint8_t *ra, const char *what)
+{
+    expect_reply_to_(host, M, ra, what);
+}
+
+static void t_leaf_nonneighbour_host(void)
+{
+    printf("--- leaf mode: a reply to a host behind a non-neighbour goes through the relay ---\n");
+    uint8_t frame[256];
+    uint16_t n;
+    char paths[512];
+
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    n = mk_from_m_(frame, A, H3, 7000);
+    (void)simnode_rx(frame, n, -60);
+    const struct simnode_hostrx *r = simnode_host_rx_get(0);
+    CHECK(simnode_host_rx_count() == 1u && r != NULL && MAC_EQ(r->sa, H3),
+          "A relays a frame from H3, behind non-neighbour M: delivered as from H3");
+    (void)simnode_render_paths(paths, sizeof(paths));
+    CHECK(strstr(paths, "host=000093 behind=00004d relay=00000a uni\r\n") != NULL,
+          "H3 is learned behind M, through relay A, from a unicast to us");
+    expect_reply_(H3, A, "reply to H3");
+
+    /* An ARP request arrives as a flood before any unicast: it must be enough. */
+    n = mk_flood_from_m_(frame, A, H4, 7001);
+    (void)simnode_rx(frame, n, -60);
+    (void)simnode_render_paths(paths, sizeof(paths));
+    CHECK(strstr(paths, "host=000094 behind=00004d relay=00000a\r\n") != NULL,
+          "H4 is learned from a flood alone, without unicast evidence");
+    expect_reply_(H4, A, "ARP reply to H4");
+
+    /* Two relays. A carried H3's unicast; C re-floods H3's broadcast. A holds a
+     * path to M, C need not: C must not take over while A's path can be live. */
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    n = mk_from_m_(frame, A, H3, 7002);
+    (void)simnode_rx(frame, n, -60);
+    n = mk_flood_from_m_(frame, C, H3, 7003);
+    (void)simnode_rx(frame, n, -60);
+    expect_reply_(H3, A, "unicast evidence outranks a flood's transmitter");
+    simnode_advance_ms(UMAC_MESH_LEAF_VIA_HOLD_MS);
+    n = mk_flood_from_m_(frame, C, H3, 7004);
+    (void)simnode_rx(frame, n, -60);
+    expect_reply_(H3, C, "once A's path to M may have lapsed, the flood's relay");
+
+    /* The relay goes: the host is still answered in its proper shape, via the
+     * only peer left, and still without discovery. */
+    simnode_del_peer(C);
+    expect_reply_(H3, A, "with C gone, the remaining peer (A)");
+
+    /* One flood, heard through both relays: the first copy decides. */
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    n = mk_flood_(frame, A, M, H4, 7010, 30);
+    (void)simnode_rx(frame, n, -60);
+    n = mk_flood_(frame, C, M, H4, 7010, 29);
+    (void)simnode_rx(frame, n, -60);
+    (void)simnode_render_paths(paths, sizeof(paths));
+    CHECK(strstr(paths, "host=000094 behind=00004d relay=00000a\r\n") != NULL,
+          "the same flood (M, seq 7010) again through C is a duplicate: H4 stays with A");
+    expect_reply_(H4, A, "reply to H4 after the duplicate");
+
+    /* H5 sits behind peer C; A re-floods its broadcast. C is the node: the reply
+     * goes straight to C, whoever carried the flood. */
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    n = mk_flood_(frame, A, C, H5, 7011, 30);
+    (void)simnode_rx(frame, n, -60);
+    expect_reply_to_(H5, C, C, "a host behind direct peer C, flooded by A, goes to C");
+
+    /* A frame for a third party is dropped at the reason-93 gate, before
+     * anything is learned from its Address Extension. */
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    {
+        struct umac_mesh_ctrl mt = { .flags = UMAC_MESH_CTRL_AE_A5A6, .ttl = 30, .seq = 7012 };
+        memcpy(mt.eaddr1, E, 6);
+        memcpy(mt.eaddr2, H9, 6);
+        n = mk_uni(frame, W, A, E, M, &mt, PAY, sizeof(PAY));
+    }
+    (void)simnode_rx(frame, n, -60);
+    (void)simnode_render_paths(paths, sizeof(paths));
+    CHECK(g_warthog_rxdrop_reason == 93u && simnode_host_rx_count() == 0u &&
+              strstr(paths, "proxies=0") != NULL,
+          "a frame for third party E is dropped (reason %lu) and teaches nothing",
+          (unsigned long)g_warthog_rxdrop_reason);
+
+    /* Refusals. A peer, ourselves and a group address are never hosts. */
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    n = mk_from_m_(frame, A, C, 7005);
+    (void)simnode_rx(frame, n, -60);
+    simnode_outbox_clear();
+    (void)simnode_host_tx(C, W, PAY, sizeof(PAY));
+    const struct simnode_frame *d = simnode_outbox_get(0);
+    CHECK(d != NULL && MAC_EQ(&d->bytes[4], C) && MAC_EQ(&d->bytes[16], C) && d->bytes[32] == 0u,
+          "a claim that peer C sits behind M does not redirect traffic for C");
+    (void)simnode_render_paths(paths, sizeof(paths));
+    CHECK(strstr(paths, "proxies=0") != NULL, "and nothing was learned");
 }
 
 /* ---- 8. receive: group frame delivered AND re-flooded ------------------- */
@@ -922,8 +1103,8 @@ static void t_rx_proxied_endpoints(void)
 
     char paths[512] = { 0 };
     (void)simnode_render_paths(paths, sizeof(paths));
-    CHECK(strstr(paths, "host=000088 behind=00000a") != NULL,
-          "and H2 was learned as a host behind A");
+    CHECK(strstr(paths, "host=000088 behind=00000a\r\n") != NULL,
+          "and H2 was learned as a host behind A, as a relay entry");
 }
 
 /* ---- 11. receive: the drop verdicts ------------------------------------- */
@@ -1004,7 +1185,8 @@ static void t_rx_drops(void)
                     frame, mk_uni(frame, W, A, C, A, &mc, PAY, sizeof(PAY)),
                     UMAC_MESH_FWD_DROP_NO_FWD);
 
-    /* No peer and no path to the mesh DA: mac80211 answers with a PERR. */
+    /* No peer and no path to the mesh DA: held while we PREQ for it, as
+     * OpenMANET's mac80211 (999-0027) does; the receive buffer itself is done. */
     fresh(/*fwd=*/true, /*bridge=*/false, /*grp_std=*/false);
     (void)simnode_add_peer(A);
     memset(&mc, 0, sizeof(mc)); mc.ttl = 31; mc.seq = 606;
@@ -1014,14 +1196,14 @@ static void t_rx_drops(void)
     (void)simnode_rx(frame, n, -60);
     CHECK(g_warthog_rxdrop_count > before &&
           g_warthog_rxdrop_reason == 100u + UMAC_MESH_FWD_DROP_NO_PATH,
-          "a relay frame for an unreachable node -> dropped, reason %u (got %lu)",
+          "a relay frame for an unreachable node -> its RX buffer done, reason %u (got %lu)",
           100u + (unsigned)UMAC_MESH_FWD_DROP_NO_PATH, (unsigned long)g_warthog_rxdrop_reason);
-    const struct simnode_frame *perr = simnode_outbox_get(0);
-    CHECK(perr != NULL && perr->is_mgmt,
-          "and a PERR goes back as a management frame (%u frames out)",
+    const struct simnode_frame *preq = simnode_outbox_get(0);
+    CHECK(simnode_outbox_count() == 1 && preq != NULL && preq->is_mgmt && preq->len >= 27u &&
+              preq->bytes[4] == 0xff && preq->bytes[26] == HWMP_EID_PREQ,
+          "and the one frame out is a broadcast PREQ, not a PERR to the sender (%u frames out)",
           simnode_outbox_count());
-    CHECK(perr != NULL && perr->len >= 16u && MAC_EQ(&perr->bytes[4], A),
-          "addressed to the transmitter that handed it to us");
+    CHECK(simnode_host_rx_count() == 0, "nothing reached our own host (%u)", simnode_host_rx_count());
 
     /* A LEAF must not hand a third party's traffic to its own IP stack.
      * With both gates off the forwarding engine never runs, so nothing else
@@ -1101,6 +1283,34 @@ static void t_rx_drops(void)
           simnode_host_rx_count());
 }
 
+/* ---- leaf mode: the service tick frees lapsed proxy entries ------------ */
+
+static void t_leaf_proxy_sweep(void)
+{
+    printf("--- leaf mode: a lapsed proxy entry is freed by the tick, and stays gone past 2^31 ms ---\n");
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    uint8_t frame[256];
+    struct umac_mesh_ctrl mc = { .flags = UMAC_MESH_CTRL_AE_A5A6, .ttl = 31, .seq = 6500 };
+    memcpy(mc.eaddr1, W, 6);
+    memcpy(mc.eaddr2, H2, 6);
+    uint16_t n = mk_uni(frame, W, A, W, A, &mc, PAY, sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    uint8_t via[6];
+    CHECK(umac_mesh_fwd_glue_proxy_via_peer(H2, via) && MAC_EQ(via, A), "H2 learned behind A");
+
+    const uint32_t t0 = mmosal_get_time_ms();
+    simnode_set_time_ms(t0 + UMAC_MESH_PROXY_LIFETIME_MS + UMAC_MESH_PATH_EXPIRE_MS + 10u);
+    simnode_tick();
+    simnode_pump();
+    char paths[512];
+    (void)simnode_render_paths(paths, sizeof(paths));
+    CHECK(strstr(paths, "proxies=0") != NULL, "600 s past its expiry, the leaf's tick freed it");
+    simnode_set_time_ms(t0 + UMAC_MESH_PROXY_LIFETIME_MS + 0x80000000u + 10u);
+    CHECK(!umac_mesh_fwd_glue_proxy_via_peer(H2, via),
+          "2^31 ms after its expiry, H2 does not come back behind A");
+}
+
 int main(void)
 {
     printf("=== simnode datapath: the real TX and RX path, header construction "
@@ -1116,6 +1326,8 @@ int main(void)
     t_rx_forward_eapol();
     t_rx_forward_keyed();
     t_leaf_proxied_host();
+    t_leaf_nonneighbour_host();
+    t_leaf_proxy_sweep();
     t_rx_group_deliver_and_forward();
     t_rx_replica_normalise();
     t_rx_proxied_endpoints();

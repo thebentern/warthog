@@ -54,6 +54,7 @@ void umac_mesh_beacon_init(const struct mmwlan_mesh_args *args, const uint8_t ow
  *   Fixed fields (12 B): timestamp=0, beacon_interval, capability_info
  *   IEs:
  *     SSID (0)              — empty (mesh STAs identify by Mesh ID IE)
+ *     RSN (48)              — SAE only: hostap's bytes (umac_mesh_beacon_set_rsn)
  *     Mesh ID (114)         — the mesh_id bytes
  *     Mesh Configuration (113, 7 B) — path/metric/sync/auth ids + caps
  *     S1G Capabilities (217)
@@ -83,6 +84,14 @@ bool umac_mesh_beacon_is_active(void);
  * @returns bytes written, or 0 if mesh is inactive or @p out is too small.
  */
 uint16_t umac_mesh_build_discovery_ies(uint8_t *out, uint16_t out_len);
+
+/** Store hostap's mesh rsn_ie for beacons and probe responses, which carry it under SAE only.
+ *  Safe from any task; invalid input and umac_mesh_beacon_init() clear it. */
+void umac_mesh_beacon_set_rsn(const uint8_t *rsn, uint16_t len);
+
+/** umac_mesh_build_discovery_ies() plus, under SAE, the stored RSN element. Size @p out from
+ *  UMAC_MESH_PROBE_RESP_IES_MAXLEN; returns 0 if mesh is inactive or @p out is too small. */
+uint16_t umac_mesh_build_probe_resp_ies(uint8_t *out, uint16_t out_len);
 
 /** Worst-case size of umac_mesh_build_discovery_ies() output:
  *  Supported Rates (2+8) + Mesh ID (2+MMWLAN_MESH_ID_MAXLEN) + Mesh Config (2+7).

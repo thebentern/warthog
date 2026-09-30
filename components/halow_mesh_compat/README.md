@@ -11,13 +11,16 @@ The firmware prerequisite this port waited on turned out to be already met.
 The MM6108's shipping fullmac firmware accepts
 `MORSE_CMD_INTERFACE_TYPE_MESH`, and Warthog runs 802.11s mesh point mode on
 it directly — see `components/halow/.../umac/mesh/`, `../../docs/mesh-openmanet.md`
-and `../../wiki/Mesh-Mode.md`. SAE/AMPE peering against stock OpenMANET is
-working; the remaining gap is the group-key (MGTK) path, not the driver model.
+and `../../wiki/Mesh-Mode.md`. SAE/AMPE peering against an SAE-configured
+OpenMANET node is working; the remaining gaps are the group-key (MGTK) path and
+batman-adv, not the driver model.
 
 Only the host-side test harness under `test/` is live: it builds and runs on
-the host (`cd test && make`) and covers the mesh data header, CCMP header,
-AES-CCM and a cross-check of the shipping cipher against hostap's reference.
-Nothing else here is compiled into any firmware image.
+the host (`cd test && make`) and tests the shipping mesh code, both as
+freestanding units and through `simnode`, which links the real umac mesh and
+datapath and replaces the chip, the RTOS, the rest of the radio stack (the
+supplicant included) and the app. Nothing else here is compiled into any
+firmware image.
 
 The text below is kept for the history of how the softmac route was scoped.
 

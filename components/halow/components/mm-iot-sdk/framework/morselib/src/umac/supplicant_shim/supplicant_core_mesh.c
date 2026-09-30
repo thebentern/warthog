@@ -29,6 +29,7 @@
 #include "umac/datapath/umac_datapath.h"
 #include "umac/mesh/umac_mesh_ies.h"
 #include "umac/mesh/umac_mesh.h"
+#include "umac/mesh/umac_mesh_beacon.h"
 
 /* passive ifmsh init — pull the hostap mesh internals so we can
  * allocate the bss / mconf / ifmsh directly without going through
@@ -41,7 +42,7 @@
 #include "hostap/wpa_supplicant/config_ssid.h"
 #include "hostap/wpa_supplicant/mesh_rsn.h"
 
-/* 0 = open mesh, 1 = SAE authenticator up, 2 = SAE requested but init failed. */
+/* 0 = open mesh, 1 = SAE authenticator up, 2 = SAE requested but not running. */
 extern volatile uint32_t g_warthog_sae_init;
 extern volatile uint32_t g_warthog_sae_peer_offers, g_warthog_sae_peer_parse_fail;
 extern volatile uint32_t g_warthog_sae_rates_synth;
@@ -187,23 +188,25 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
     bss->conf->mesh = MESH_ENABLED;
     bss->conf->ap_max_inactivity = wpa_s->conf->mesh_max_inactivity;
     bss->conf->mesh_fwding = wpa_s->conf->mesh_fwding;
-
-    /* SAE group list. Upstream wpa_supplicant_mesh_init() copies
-     * wpa_s->conf->sae_groups into the bss conf (mesh.c); this passive init
-     * never did, and mesh_rsn_sae_group() indexes the array without a NULL
-     * check -- the first SAE authentication dereferences NULL at groups[0],
-     * inside mesh_rsn_sae_group(). Group 19 (NIST P-256) is the SAE default used by
-     * wpa_supplicant, hostapd and OpenMANET alike. Static storage: this conf
-     * is torn down by hostapd_config_free(), which would os_free() a heap
-     * pointer -- but bss->conf here is a *copy* of conf->bss[0] (line above),
-     * freed through conf, whose own sae_groups stays NULL, so the static is
-     * never freed. */
-    {
-        static int mesh_sae_groups[] = { 19, -1 };
-        bss->conf->sae_groups = mesh_sae_groups;
-    }
     bss->iconf = conf;
     ifmsh->conf = conf;
+
+    /* SAE groups: a commit we start uses index 0, a peer's is accepted in any listed group.
+     * mesh_rsn_sae_group() indexes this without a NULL check. Heap: bss->conf IS
+     * conf->bss[0], and hostapd_config_free_bss() os_free()s sae_groups. */
+    static const int k_mesh_sae_groups[] = { 19, 20, 21, -1 };
+    bss->conf->sae_groups = os_memdup(k_mesh_sae_groups, sizeof(k_mesh_sae_groups));
+    if (bss->conf->sae_groups == NULL)
+    {
+        /* mesh_config_create()'s test for SAE: asked for, but it will not run. */
+        if (ssid->key_mgmt & WPA_KEY_MGMT_SAE)
+        {
+            g_warthog_sae_init = 2;
+        }
+        MMLOG_ERR("mesh: out of memory for the SAE group list\n");
+        return -1;
+    }
+    /* Never binds: .sta_add fails once the datapath's slots are full. */
     ifmsh->bss[0]->max_plinks = wpa_s->conf->max_peer_links;
     ifmsh->bss[0]->dot11RSNASAERetransPeriod =
         wpa_s->conf->dot11RSNASAERetransPeriod;
@@ -250,6 +253,13 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
     extern volatile uint32_t g_warthog_mesh_pmf;
     mconf->ieee80211w = g_warthog_mesh_pmf ? MGMT_FRAME_PROTECTION_REQUIRED
                                            : NO_MGMT_FRAME_PROTECTION;
+    /* mesh_config_create left this 0 (get_capa reports no BIP): with PMF on, wpa_init
+     * then rejects the RSN element; with it off, a peer's AMPE IGTK is parsed at 0 bytes.
+     * Our own Opens change only when PMF is on (mesh_rsn.c sends an IGTK only then). */
+    if (mconf->security & MESH_CONF_SEC_AMPE)
+    {
+        mconf->mgmt_group_cipher = WPA_CIPHER_AES_128_CMAC;
+    }
 
     /* Bring up mesh RSN when the config asked for SAE.
      *
@@ -312,6 +322,9 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
         {
             g_warthog_sae_init = 1;
             MMLOG_INF("mesh: SAE/AMPE authenticator up (rsn=%p)\n", wpa_s->mesh_rsn);
+            /* The RSN our Open/Confirm carry goes in beacons and probe responses
+             * too: a secured mac80211 mesh drops either without one. */
+            umac_mesh_beacon_set_rsn(mconf->rsn_ie, (uint16_t)mconf->rsn_ie_len);
         }
     }
     else

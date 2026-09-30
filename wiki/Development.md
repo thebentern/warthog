@@ -84,10 +84,12 @@ every other one.
 
 ## Diagnostics
 
-Warthog's log output is physically unreachable after early boot — the app moves
-the shared USB PHY to USB-OTG for the AT console. Counters read back over AT are
-the only visibility into the receive path, which is why there are so many of
-them. See [AT Command Reference](AT-Command-Reference).
+The USB-Serial-JTAG console goes dark after early boot — the app moves the
+shared USB PHY to USB-OTG for the AT console, which mirrors INFO-and-above log
+lines but drops any that arrive while the port is full or busy with another
+line. Counters read back over AT are the dependable visibility into the
+receive path, which is why there are so many of them. See
+[AT Command Reference](AT-Command-Reference).
 
 When adding one, make sure it is incremented on the path the shipping build
 actually takes. A counter that silently reads zero is worse than no counter — it

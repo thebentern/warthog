@@ -82,7 +82,7 @@ This applies to the umac sources we'd want to extend. The Apache-2.0 on the regi
 - `MORSE_CMD_ID_BSS_BEACON_CONFIG = 0x003D`
 - `MORSE_CMD_ID_SET_OFFSET_TSF = 0x003A`
 
-The chip firmware blob shipping in the registry component accepts these commands — that's a property of the firmware, not the host driver. Same `mm6108.mbin` is used by the Linux driver in mesh mode and by morselib in STA/AP mode.
+The chip firmware blob shipping in the registry component accepts these commands — that's a property of the firmware, not the host driver. The Linux driver does not use this blob: it loads morse-firmware's `mm6108.bin` (an ELF; OpenMANET 1.8.0 ships the mm6108-2.0.1 build, 468,304 bytes), a different build from morselib's `mm6108.mbin` (1.17.6).
 
 ## What still works from the original scope
 

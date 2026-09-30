@@ -14,3 +14,7 @@
  * WARTHOG_MESH_SMOKE is defined (the warthog-mesh-smoke PlatformIO env).
  */
 void warthog_mesh_smoke_test(void);
+
+struct warthog_mesh_diag_in;
+/* The no-peers diagnosis inputs over the peering watchdog's window (mesh_diag.h). */
+void warthog_mesh_diag_windowed(struct warthog_mesh_diag_in *in);

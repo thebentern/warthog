@@ -149,7 +149,8 @@ static struct umac_mesh_hwmp_ctx hctx(int i)
 {
     struct umac_mesh_hwmp_ctx c = { .own_addr = S.n[i].addr, .tbl = &S.n[i].tbl,
                                     .forwarding = S.n[i].forwarding, .link_metric = 100,
-                                    .path_lifetime_ms = 5120, .now_ms = S.now, .own_sn = &S.n[i].own_sn };
+                                    .max_lifetime_ms = UMAC_MESH_PATH_LIFETIME_MAX_MS, .now_ms = S.now,
+                                    .own_sn = &S.n[i].own_sn };
     return c;
 }
 
@@ -273,7 +274,7 @@ static void receive(int me, const struct frame *f)
             if (sent) n->fwd_data++;
         }
     }
-    if (r.send_perr) { n->perr_sent++; queue_action(me, r.perr_to, r.perr_body, r.perr_len); }
+    /* HOLD: the glue's relay store and PREQ ladder, driven in test_simnode_glue. */
 }
 
 /* Drain the air. Returns false on a storm: the run cap hit or the queue overflowed. */
@@ -694,7 +695,7 @@ int main(void)
         if (!run()) { printf("FAIL storm\n"); failures++; }
         if (delivered(2, 17000 + k, S.n[2].addr, S.n[0].addr) != 1) lost++;
     }
-    CHECK(lost == 0, "10 frames over 10 s, %d lost (path lifetime %u ms)", lost, 5120u);
+    CHECK(lost == 0, "10 frames over 10 s, %d lost (path lifetime %u ms: 4882 TU)", lost, 4999u);
     CHECK(S.n[0].preq_sent >= 2 && S.n[0].preq_sent <= 4, "A refreshed the path before it lapsed: %u PREQs", S.n[0].preq_sent);
     CHECK(S.n[1].fwd_data == 10, "every frame went through W");
 

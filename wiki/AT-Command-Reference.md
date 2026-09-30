@@ -7,9 +7,23 @@ the baud rate.
 Commands ending `=` set, ending `?` query. Every command answers `OK` or
 `ERROR`, with any data on preceding `+VERB:` lines.
 
-Warthog's log output is unreachable after early boot — the app hands the shared
-USB PHY to USB-OTG for this console — so the diagnostic counters below are the
-only visibility into the receive path. That is why there are so many.
+A reply of any length arrives whole, with its `OK`, while the host keeps
+reading. If the host reads nothing for 500 ms, the rest of that reply is
+dropped, and until the host reads again, output that does not fit in the
+512-byte transmit buffer is dropped without waiting.
+
+The port also carries log lines (INFO and above), the lines other tasks print
+(`+MPING:` per reply, `+MCAST: rx`) and the echo of typed characters. None of
+these waits: each goes in whole, or is dropped whole if the transmit buffer
+lacks room for it or another line is being written — a reply line included,
+which holds the port while it waits for room. They can fall between the lines
+of a reply, never inside one, so match reply lines by their `+VERB:` prefix. A
+log line longer than 255 bytes is cut to 255, ending in a newline.
+
+The USB-Serial-JTAG console goes dark after early boot — the app hands the
+shared USB PHY to USB-OTG for this console — and the mirrored log drops lines
+under load, so the diagnostic counters below are the dependable view of the
+receive path. That is why there are so many.
 
 > **Three commands need a mesh build.** `AT+MESHSTAT?`, `AT+RXHEAD?` and
 > `AT+FCRING?` report a per-frame capture that only `warthog-mesh-smoke` and
@@ -66,15 +80,15 @@ Everything here persists in NVS and outranks the build-time default.
 | `AT+MESHEN=<0\|1>` | [op] | Start the mesh instead of associating as a station. Persisted; takes effect on the next boot. Works on any build, including the region envs — this is how a stock image joins a mesh. |
 | `AT+MESHCHAN=<chan>,<freq_hz>,<gclass>,<sclass>,<bw>` | [op] | Pin the S1G channel as a set — class and bandwidth belong to the channel, so they move together. Persisted; applied on next boot. `AT+MESHCHAN=default` clears it. |
 | `AT+MESHCHAN?` | [op] | Stored set, **and whether it actually applied**. `applied=NO` means the regulatory table refused it and the radio is on its default — the usual cause of "peers with nothing, looks like range". On a region build the stored channel is matched against the country's regulatory row, so duty cycle, EIRP and airtime stay the regulator's; a channel that is not in the table is discarded rather than forced. |
-| `AT+MESHFWD=<0\|1>` | [op] | 802.11s forwarding: relay other nodes' data and path selection through this node, and advertise the Forwarding capability so mac80211 peers will route through it. Default 0: a leaf, which relays nothing but learns hosts behind a peer from Address Extension and sends to such a host through that peer (AE mode 2, not measured on air). Persisted; next boot. **Compiled and simulated, not measured on air** — see [Mesh Mode](Mesh-Mode#forwarding). |
+| `AT+MESHFWD=<0\|1>` | [op] | 802.11s forwarding: relay other nodes' data and path selection through this node, and advertise the Forwarding capability so mac80211 peers will route through it. Default 0: a leaf, which relays nothing and starts no path discovery (on an open mesh its only PREQs are the per-peer keepalive), but learns hosts behind any mesh node from Address Extension and sends to such a host addressed to its node (AE mode 2), through that node if it is a peer, else through the peer that carried the host's traffic (not measured on air). A relay without a path to that node: vanilla mac80211 drops the reply with a PERR; a warthog relay, and OpenMANET's patched mac80211 with forwarding on (from its source), hold it and discover the node. Not measured. Persisted; next boot. **Compiled and simulated, not measured on air** — see [Mesh Mode](Mesh-Mode#forwarding). |
 | `AT+MESHFWD?` | [op] | Current setting. |
-| `AT+MESHPATH?` | [op] | The path table and proxy table: each destination with its next hop, HWMP sequence number, metric, hop count, active/dead and time to expiry; each host known to sit behind a mesh node; live duplicate-cache entries, cache evictions, and frames waiting for discovery. Empty on a leaf that has heard no path selection and no Address Extension frame. |
-| `AT+MESHFWDSTAT?` | [op] | Relay counters: frames forwarded (unicast, group), allocation failures, and every drop by cause — own frame echoed, duplicate, TTL, no path, forwarding off, malformed, next hop's queue full — plus PERRs originated and suppressed by the rate limit, PREQs originated, PREQ/PREP/PERR relayed, frames held for discovery then sent or dropped, and path-selection frames seen protected, refused as plaintext from a peer that protects, and (group-addressed, keyed mesh) with or without an MMIE. `nopath` climbing with `perr_tx` alongside is a node asking us to relay somewhere we have no route. |
+| `AT+MESHPATH?` | [op] | The path table and proxy table: each destination with its next hop, HWMP sequence number, metric, hop count, active/dead and time to expiry (a path is dropped 600 s after its expiry); each host known to sit behind a mesh node (`host= behind=`), on a leaf also `relay=`, the peer its traffic arrived through, and `uni` when a unicast to this node pinned the entry against eviction (cleared if the host is next heard behind another node); live duplicate-cache entries, cache evictions, and frames waiting for discovery: our own (`pending`) and relayed ones (`relay_held`). A listing longer than the 4096-byte reply buffer ends with `+MESHPATH: (truncated)`. Empty on a leaf that has heard no path selection and no Address Extension frame. |
+| `AT+MESHFWDSTAT?` | [op] | Relay counters: frames forwarded (unicast, group), allocation failures, and every drop by cause — own frame echoed, duplicate, TTL, no path, forwarding off, malformed, next hop's queue full, path table full (`tblfull`: path selection naming a destination we hold no path for (a PREQ's originator or a PREP's target, including the answer to our own discovery) while every path slot is live) — plus PERRs originated (for lost neighbours only), PREQs originated, PREQ/PREP/PERR relayed, our own frames held for discovery then sent or dropped (`pend`), relayed frames held while we discover their destination then sent or lost (`hold n`/`tx`/`drop`: given up after 6.8 s, evicted, refused while the transmit pool is paused, or the next hop's queue full), and path selection: `hwmp prot` arrived protected (decrypted, replay-checked), `unprotected` refused as plaintext from a peer that protects (under SAE: runs MFP; on a relay also after it once protected), `unestab` refused under SAE, in every mode, because the sender's link is not established (a station the supplicant added before SAE and AMPE finished; mac80211 takes path selection only from an ESTAB peer), `mmie`/`nommie` group-addressed with or without an MMIE (under SAE in every mode, else on a keyed relay only), `bipfail` an MMIE refused (no IGTK for its key id, bad MIC, replayed IPN) or a Protected group frame; `hwmp tx prot` sent CCMP-protected, `tx mmie`/`tx nommie` group path selection sent under SAE with and without an MMIE (without: we hold no IGTK, `AT+MESHPMF=0`), `tx qdrop` group path selection another task sent (the event loop builds and sends it all) dropped because it could not be queued to the loop (four already waiting, or the loop's event queue full), `tx qfail` queued group path selection the loop then could not build or send (no transmit buffer; not counted in `preq_tx`, which counts PREQs handed to the radio); `mgmt prot chip`/`host`/`nodec` protected management frames on an SAE mesh opened by the chip, by host CCMP, or by neither (dropped), `grpkey` protected unicast ones refused because their key id is not the link's pairwise key; `igtk` peer IGTKs installed. `hold drop` climbing is a node asking us to relay to a destination nobody answers for. |
 | `AT+MESHGRP=<0\|1>` | [op] | How group frames leave the radio. `0` (default, measured): one unicast per peer; with `AT+MESHFWD=1` or `AT+MESHBRIDGE=1` the group address rides in Address Extension, and a leaf sends the copies without it. Works under SAE, but a mac80211 node that receives one delivers it locally and does not re-flood it, so a warthog's broadcasts stop at the first Linux relay; with Address Extension it also learns a proxy entry that is not one — the sending warthog as a host behind itself, or a relayed frame's originator as a host behind the relay — which costs that node its path state every time the path ages out. Both are reasons to prefer `1` wherever a Linux node is in the mesh. `1`: standard 3-address 802.11s broadcasts, what mac80211 sends and re-floods. Under SAE they are keyed with this node's own group key (MGTK), which every peer receives in AMPE; a warthog's chip holds only its own MGTK, so a warthog decrypts other nodes' group frames only with host CCMP (`AT+SWCCMP`). Neither is measured on air. This is the bench A/B, not a fix. Persisted; next boot. |
 | `AT+MESHGRP?` | [op] | Current setting. |
-| `AT+MESHPMF=<0\|1>` | [op] | Management frame protection on the mesh. `0` (default): off — the measured-working value, both warthog-to-warthog and against an OpenMANET peer, which reported `MFP: yes` for a link to a warthog that had it off. `1`: MFP required in the peering negotiation only; the mesh key path installs CCMP keys and drops the rest, so no IGTK is installed and nothing enforces protection. A peer advertising `ieee80211w=2` is **not** by itself a reason to set this; the AMPE framing follows our own RSN element, and off and required are each self-consistent. Only these two values exist here: "optional" is the setting where the two ends size the AMPE payload differently and a peer slices the frame short, taking the MIC and Peer Management elements with it, so it is deliberately unreachable. Read once while the mesh config is built, so unlike `AT+MESHSEC=` it cannot be flipped under a live mesh. Persisted; next boot. **Not measured on air** — it exists for a peer that truly refuses unprotected peering, and as a one-command A/B when SAE fails for an unpinned reason. |
+| `AT+MESHPMF=<0\|1>` | [op] | Management frame protection on the mesh. `0` (default): off in our own peering — measured working warthog-to-warthog, and for peering only against an OpenMANET peer, which reported `MFP: yes` for a link to a warthog that had it off. Path selection still follows each peer: a keyed SAE peer that sent an IGTK in its AMPE (hostap does exactly when it runs `ieee80211w` 1 or 2; the OpenMANET wizard sets 2), or that sent us protected path selection, gets its unicast PREQ/PREP/PERR CCMP-protected under the link key (the chip, or host CCMP on swccmp builds), and its own unprotected unicast path selection, or group path selection without a valid MMIE, is refused. `1`: MFP required — our RSN element asks for it, hostap generates our IGTK and sends it in AMPE, the IGTK is kept host-side, every keyed peer is treated as MFP, and our group path selection (a relay's broadcast PREQs and PERRs, a bridge's broadcast PREQs) carries a BIP-CMAC-128 MMIE. A relay or bridge needs `1` against an MFP peer, which drops group path selection without an MMIE; a leaf does not. A peer running MFP off drops group frames carrying that MMIE unless it parsed our IGTK. Only these two values exist here: "optional" is the setting where the two ends size the AMPE payload differently and a peer slices the frame short, taking the MIC and Peer Management elements with it, so it is deliberately unreachable. Read once while the mesh config is built, so unlike `AT+MESHSEC=` it cannot be flipped under a live mesh. Persisted; next boot. **Not measured on air**, neither setting's path selection protection. |
 | `AT+MESHPMF?` | [op] | Current setting. |
-| `AT+MESHBRIDGE=<0\|1>` | [op] | L2 bridge mode: USB, the Wi-Fi AP and the mesh become ports of one lwIP bridge, so tethered hosts sit on the mesh segment with their own MACs and take addresses from the mesh's DHCP server — the fix for CoT and mDNS, whose payload addresses alias under NAT. NAT and the multicast repeater are off in this mode. Default 0 — NAT is the proven path. Persisted; next boot. **Compiled, not measured on air**; see [Mesh Mode](Mesh-Mode#bridge-mode). |
+| `AT+MESHBRIDGE=<0\|1>` | [op] | L2 bridge mode: USB, the Wi-Fi AP and the mesh become ports of one lwIP bridge, so tethered hosts sit on the mesh segment with their own MACs and take addresses from the mesh's DHCP server — the fix for CoT and mDNS, whose payload addresses alias under NAT, against a peer whose mesh interface is a bridge port. It does not reach a node set up by OpenMANET's mesh wizard, whose DHCP server and applications sit on `br-ahwlan` behind `bat0`. NAT and the multicast repeater are off in this mode. Default 0 — NAT is the proven path. Persisted; next boot. **Compiled, not measured on air**; see [Mesh Mode](Mesh-Mode#bridge-mode). |
 | `AT+MESHBRIDGE?` | [op] | Current setting. |
 | `AT+MESHDHCP=<0\|1>` | [op] | Take a DHCP lease on the mesh if one is offered (default 1), else go straight to the static `10.77.x.y`. A peer that keeps its mesh interface bridged runs a DHCP server on that bridge. |
 | `AT+MESHEN?` | [op] | Whether mesh mode is on. The capability envs always report 1. |
@@ -82,17 +96,18 @@ Everything here persists in NVS and outranks the build-time default.
 | `AT+MESHID?` | [op] | Current mesh ID. |
 | `AT+MESHPASS=<pass>` | [op] | SAE passphrase, 1–63 chars. Persisted; next boot. Must match every peer. |
 | `AT+MESHPASS?` | [op] | Length only, never the value — this console mirrors the logs. |
-| `AT+MPMPEERS?` | [op] | Peer links and handshake state. The first thing to read on a mesh. |
-| `AT+MESHRSSI?` | [op] | Per-neighbour signal: last, min, max, noise, SNR, the bandwidth that neighbour transmitted at, and a frame count. Min/max matter more than last — a link that averages fine but dips to −90 is the one that drops under load. A `bw=` that differs from your own is a configuration mismatch, not a weak link. **No MCS:** this driver's RX metadata (`struct mmdrv_rx_metadata`) carries RSSI, noise, frequency and bandwidth and no rate, so per-peer MCS is not reportable. |
+| `AT+MPMPEERS?` | [op] | Peer links and handshake state. The first thing to read on a mesh. `ampe_mtk`/`ampe_mgtk`: AMPE keys installed (our own MGTK counts once, at its first install). `mgtk_reinst`: re-installs of our own MGTK at a fresh TX PN base, made when an AMPE Open follows group frames sent under it or still queued in the chip at its last install, so the Key RSC in that Open lies above every PN already used. `mgtk_rsc_fail`: such re-installs the chip refused; that Open advertises one below the previous base. Both stay 0 except on `warthog-mesh-sae-swccmp` and `-swccmp-on`, the only builds with `WARTHOG_MESH_MGTK_PN_BASE`; every other build installs our MGTK at PN 0 and advertises RSC 0. |
+| `AT+MESHRSSI=<dBm>` | [op] | Candidate RSSI floor, `-255`..`0`. A neighbour heard at or below it is not offered to the SAE supplicant, and under SAE its Mesh Peering Open is refused unless it already holds a slot (the supplicant would otherwise take it on the key cached from an earlier SAE); on an open mesh no peering is started toward it from its beacons; its S1G beacons are answered at most once per 10 s. On an open mesh its probe requests still draw an Open, its own Open is still answered, and a peering already under way continues, so a link below the floor forms only when the other side initiates; two Warthogs, which probe every 2 s, still peer. Under SAE it forms only with the floor lowered on both ends, except toward OpenMANET, whose threshold does not apply to an Open: while both ends still cache the key of an earlier SAE (up to 12 h, until either reboots), Warthog's PMKSA-cached Open, sent only toward a node Warthog hears above its own floor, re-peers a link OpenMANET hears below its threshold. `0` or `-255` turns it off. Default `-80`, the `mesh_rssi_threshold` a fresh OpenMANET 1.8.0 node applies to Warthog's beacons and probe responses at its own receiver, so this approximates that gate from Warthog's side. Persisted; applies at once. |
+| `AT+MESHRSSI?` | [op] | First line: the floor (`off` when disabled), `skipped` (new peerings it refused) and `passed` (ones it let through), counting only frames that name our mesh, since boot. Then per-neighbour signal: last, min, max, noise, SNR, the bandwidth that neighbour transmitted at, and a frame count. Min/max matter more than last — a link that averages fine but dips to −90 is the one that drops under load. A `bw=` that differs from your own is a configuration mismatch, not a weak link. **No MCS:** this driver's RX metadata (`struct mmdrv_rx_metadata`) carries RSSI, noise, frequency and bandwidth and no rate, so per-peer MCS is not reportable. |
 | `AT+MESHSEC=<0\|1>` | [op] | Data plane open (0) or keyed (1). Re-peers within ~2 s. Persisted in NVS. |
 | `AT+MESHSEC?` | [op] | Current setting. No effect on the SAE build (keys come from AMPE). |
 | `AT+SAERX?` | [diag] | SAE/AMPE conversation state on the encrypted build: auth frames in/out, SAE FSM state, peering FSM, `ESTAB` count, which peer is being offered. |
 | `AT+SAESTAGE?` | [diag] | Last step the SAE path reached, stored in RTC — survives a panic reboot. `AT+SAESTAGE=0` clears it. |
-| `AT+SAEBRIDGE=<0\|1\|2>` | [diag] | Gate on offering discovered peers to the SAE supplicant. Defaults 1; `0` makes the node deaf to candidates (a debugging state); `2` also offers peers whose Mesh Configuration advertises a different auth protocol — needed toward OpenMANET, whose kernel MPM advertises 0 while running SAE. |
+| `AT+SAEBRIDGE=<0\|1\|2>` | [diag] | Gate on offering discovered peers to the SAE supplicant. Defaults 1; `0` makes the node deaf to candidates (a debugging state); `2` also offers peers whose Mesh Configuration advertises a different auth protocol, for an SAE peer that advertises 0: OpenMANET probe responses were seen doing so on the bench, though its source advertises 1 under SAE and the verified OpenMANET run peered without it. Not persisted; 1 again after a reboot. |
 | `AT+COREDUMP?` | [diag] | Task, PC and backtrace of the last panic, read from the flash core-dump partition. Feed the addresses to `addr2line`. |
 | `AT+MPING=<ipv4>[,<count>]` | [op] | ICMP echo from the node itself. Count 1–20, default 4; out-of-range is silently clamped to 4, not rejected. Blocks the AT console for the duration. |
 | `AT+PEERS?` | [diag] | Datapath peer count and registration failures. |
-| `AT+HWMPSTAT?` | [diag] | Path-selection counters. |
+| `AT+HWMPSTAT?` | [diag] | Path-selection counters. `rann_rx`/`perr_rx`: root announcements (never acted on) and path errors received; neither is a parse failure. |
 | `AT+HWMPDUMP?` | [dev] | Hex of the last path-selection frame received. |
 | `AT+MPMSTAT?` | [diag] | Peering frame counters and last close reason. |
 | `AT+MPMDUMP?` | [dev] | Hex of the last peering frame body. |
@@ -107,13 +122,18 @@ AT+MPMPEERS?
 OK
 
 AT+HWMPSTAT?
-+HWMPSTAT: rx=234 preq_rx=75 preq_tx=142 prep_rx=159 prep_tx=75 parse_fail=0 not_ours=0
++HWMPSTAT: rx=234 preq_rx=75 preq_tx=142 prep_rx=159 prep_tx=75 parse_fail=0 not_ours=0 rann_rx=0 perr_rx=0
 OK
 ```
 
 Reading `AT+MPMPEERS?`: `estab=1` with a non-zero `plid` is a complete two-way
 handshake. `plid=0` with `opens` climbing means the node is sending Opens nobody
-answers — Warthog sends a Close and restarts after 8.
+answers — Warthog sends a Close and restarts after 8. `offer_full` counts SAE
+candidates not offered to the supplicant because all 4 peer slots were taken.
+`sae_fail` counts SAE handshakes that timed out and `plink_fail` peerings that
+failed after SAE completed, each freeing its slot; `held` counts offers and
+Mesh Peering Opens refused while such a neighbour is held off (see
+[Peer capacity](Mesh-Mode#peer-capacity)).
 
 ## Datapath diagnostics
 
@@ -161,8 +181,9 @@ not a loss counter by itself; `reason` is the most recent cause:
 | 93 | Leaf: a mesh frame for another node, dropped because forwarding and bridge are both off |
 | 94 | A 4-address frame for another node **without** Mesh Control — never relayable, dropped in every mode |
 | 95 | SAE: a group frame the chip decrypted. Its one group key is this node's own TX MGTK, which no peer sends under, so the frame is forged in the transmitter's name |
+| 96 | SAE: a unicast frame the chip decrypted under a key id other than the link's pairwise key. The key it was opened with (this node's own MGTK, the chip's one group key) is held by every peer, so any of them could have sent it in the transmitter's name. On the `-nochipkey` and `-swccmp` builds, whose chip holds no pairwise key, every unicast the chip decrypted |
 | 99 | Forwarded to the next hop — **not a loss** |
-| 100 + N | Forwarding engine: 101 own frame echoed, 102 duplicate, 103 not for us, 104 would forward but `AT+MESHFWD=0`, 105 TTL, 106 no path (a PERR goes back), 107 bad Address Extension, 108 arrived with TTL 0 |
+| 100 + N | Forwarding engine: 101 own frame echoed, 102 duplicate, 103 not for us, 104 would forward but `AT+MESHFWD=0`, 105 TTL, 106 no path: held while we discover its destination, see `AT+MESHFWDSTAT?` `hold` — not a loss by itself, unless its mesh destination is a group address, which is dropped (`nopath`), 107 bad Address Extension, 108 arrived with TTL 0 |
 
 93 and 104 are configuration, not failure: they mean the node is a leaf, or
 bridge-only, by setting.
@@ -206,9 +227,9 @@ AT+MESHPASS=<passphrase>         SAE builds only; must match the peer
 AT+RESET                         the three above take effect on boot
 AT+MESHSEC=0                     match an unencrypted peer
 AT+MPMPEERS?                     confirm estab=1 and a non-zero plid
-AT+HWMPSTAT?                     confirm preq_tx climbing, parse_fail=0
+AT+HWMPSTAT?                     confirm preq_tx climbing (open mesh), parse_fail=0
 AT+MPING=10.77.191.116,8         confirm data
 ```
 
-If step 2 shows `estab=1` but step 4 fails, the peer has no *path* to us —
+If `AT+MPMPEERS?` shows `estab=1` but `AT+MPING` fails, the peer has no *path* to us —
 see [Mesh Mode](Mesh-Mode#how-paths-work-and-why-it-matters).

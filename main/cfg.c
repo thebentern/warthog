@@ -490,6 +490,38 @@ esp_err_t warthog_cfg_set_mesh_pmf(uint8_t on)
     return err;
 }
 
+int16_t warthog_cfg_get_mesh_rssi(void)
+{
+    nvs_handle_t h;
+    int16_t dbm = -80; /* OpenMANET's mesh_rssi_threshold */
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        int16_t v;
+        if (nvs_get_i16(h, "mesh_rssi", &v) == ESP_OK && v >= -255 && v <= 0) {
+            dbm = v;
+        }
+        nvs_close(h);
+    }
+    return dbm;
+}
+
+esp_err_t warthog_cfg_set_mesh_rssi(int16_t dbm)
+{
+    if (dbm < -255 || dbm > 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_i16(h, "mesh_rssi", dbm);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
 uint8_t warthog_cfg_get_mesh_secure(void)
 {
     nvs_handle_t h;

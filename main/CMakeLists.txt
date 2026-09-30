@@ -10,6 +10,7 @@ idf_component_register(
         "nat.c"
         "mudp.c"
         "mudp_classify.c"
+        "cdc_out.c"
         "led.c"
         "cfg.c"
         "at.c"

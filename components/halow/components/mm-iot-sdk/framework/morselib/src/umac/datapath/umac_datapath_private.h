@@ -88,6 +88,13 @@ struct mmdrv_tx_metadata;
 void umac_datapath_mesh_set_cur_tx_md(const struct mmdrv_tx_metadata *md);
 const struct mmdrv_tx_metadata *umac_datapath_mesh_cur_tx_md(void);
 struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr);
+/** @p addr's link is established: from add on an open or constant-key mesh, from its
+ *  AMPE MTK under SAE. A slot hostap added before SAE finished is not. */
+bool umac_datapath_mesh_peer_estab(const uint8_t *addr);
 /** Key id of our own TX MGTK once hostap has delivered it, else -1. */
 int umac_datapath_mesh_own_group_key_id(void);
+/** One frame went to the chip for encryption under our own TX MGTK. */
+void umac_datapath_mesh_own_group_tx_note(void);
+/** The chip reported TX status for a frame counted by tx_note: it draws no further PN. */
+void umac_datapath_mesh_own_group_tx_done(void);
 struct umac_sta_data *umac_datapath_mesh_first_peer_except(const uint8_t *excl);

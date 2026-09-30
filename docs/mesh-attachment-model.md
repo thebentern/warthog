@@ -64,11 +64,14 @@ batman's job, and no Warthog has been measured against such a node.
 
 1. **Batman-adv is broadcast-first, and encrypted broadcast is Warthog's
    least-proven path.** OGMs flood; the translation table floods.
-   `AT+MESHGRP=1` sends standard 802.11s group frames, but the chip has one
-   group-key slot, so under SAE a peer's group frames decrypt only through
-   host CCMP, which has not run on air (see *Prerequisite: group-addressed
-   frames*). HWMP's control plane rides the management path instead, which
-   does not use the data-plane group key.
+   `AT+MESHGRP=1` sends standard 802.11s group frames, but Warthog puts only
+   its own MGTK in the chip, so under SAE a peer's group frames decrypt only
+   through host CCMP, which has not run on air (see *Prerequisite:
+   group-addressed frames*). HWMP's control plane rides the management path
+   instead, which does not use the data-plane group key; toward a peer running
+   MFP (the wizard's `ieee80211w=2`) it must itself be protected (CCMP unicast;
+   BIP group, which Warthog's own group frames carry only with `AT+MESHPMF=1`),
+   which is implemented and not measured.
 2. **HWMP is already half-present.** The mesh port answers path requests
    aimed at it today. Forwarding is the missing branch, not a new subsystem.
 > **Update.** The forwarding layer described below as future work now exists
@@ -95,16 +98,20 @@ OpenMANET 24.10 Pi image, `/www/luci-static/resources/tools/morse/`:
 when `mesh_gate_announcements=1`, else `client`), then
 `setupBatmanInterfaceOnDevice()`. In `uci.js:58-65` these create `bat0`
 (`proto=batadv`, `routing_algo=BATMAN_V`, `fragmentation=1`,
-`multicast_mode=1`), attach the HaLow wifi-iface to `batmesh0`
-(`proto=batadv_hardif master=bat0`), add `bat0` to the `br-ahwlan` bridge, and
-set mesh11sd `mesh_fwding='0'` and `nolearn='1'`. `kmod-batman-adv`, `alfred`
+`multicast_mode=1`, which `openmanetd` rewrites to `0` on every start), attach
+the HaLow wifi-iface to `batmesh0` (`proto=batadv_hardif master=bat0`), add
+`bat0` to the `br-ahwlan` bridge, and set mesh11sd `mesh_fwding='0'` and
+`nolearn='1'`. Nothing reads `nolearn` on 1.8.0, so `mesh_nolearn` stays `0`;
+1.8.1-dev writes `mesh_nolearn='1'`. `kmod-batman-adv`, `alfred`
 and `morse_mesh11sd` ship in the image, and its tooling keys off `bat0`:
 `alfred` runs with `-b bat0`, and `openmanetd` reads batman originators and
 restarts when `bat0` comes up.
 
-**A node that has not been through that wizard is bare bridged 802.11s.**
+**A fresh image has no mesh**: its HaLow radio is an SAE access point in
+`br-lan`. **A node switched to `mode='mesh'` by hand, without the wizard, is
+bare bridged 802.11s.**
 Measured 2026-09-21 on two Pi 4 / MM6108 nodes running OpenMANET 24.10
-(`r28739-d9340319c6`), configured with mesh credentials only:
+(`r28739-d9340319c6`), switched to mesh by hand:
 
 ```
 # ip -br link show type batadv   -> (nothing)
@@ -116,10 +123,13 @@ Measured 2026-09-21 on two Pi 4 / MM6108 nodes running OpenMANET 24.10
 
 Here `wlh0` is a **direct member of `br-lan`** alongside `eth0` and the 5 GHz
 AP. batman-adv is built and loaded but holds no devices and is not in the data
-path; `network.bat0` is an un-instantiated stub the image ships.
+path; `network.bat0` is a stub `openmanetd` writes on every start, not a
+configured interface.
 
 So the fabric mismatch is a property of the peer's configuration, not of
-OpenMANET as such. Against a wizard-configured node it is real and Warthog is
+OpenMANET as such. A hand-converted node also keeps the stock
+`mesh_fwding '1'` and relays 802.11s frames; a wizard node does not.
+Against a wizard-configured node it is real and Warthog is
 off the fabric. Against a node like these two there is nothing to dismantle and
 Warthog's documented setup costs the operator nothing. **Check which one you
 have with `ip addr show bat0` before believing either story** — that one
@@ -151,7 +161,9 @@ Two ways out, and they are genuinely different products:
 For the drone-relay goal between bare or bridged 802.11s nodes, forwarding is
 the answer; inside a `bat0` fabric it is unproven. For "Warthog appears in
 `batctl originators` and ATAK discovery works end to end", only the subset
-does.
+does, and it is not enough alone: OpenMANET's CoT is IPv4 multicast to
+`239.2.3.1:6969` on `br-ahwlan`, which a NATed Warthog must also repeat to its
+tethered client (`main/mudp.c` repeats only Meshtastic's group).
 
 ## The bridged-peer blocker is Address Extension, not addressing
 
@@ -172,12 +184,18 @@ reaching us.
 **Transmit** depends on the mode:
 
 - **Leaf (default: `AT+MESHFWD=0`, `AT+MESHBRIDGE=0`).** Warthog learns, from
-  received AE, each host behind a direct peer, and sends a unicast for that
-  host to that peer with AE mode 2. Broadcasts go out as one plain replica per peer
-  without AE, or as a standard group frame with `AT+MESHGRP=1`. A unicast to
-  an unknown destination goes to the first peer, and a leaf sends no path
-  request for it. The tethered client is NATed (`main/nat.c`), so every frame
-  a leaf originates is its own.
+  AE on frames a keyed peer carried, each host behind any mesh node, and the
+  peer that carried it (its relay). A unicast for that host is addressed to its
+  node with AE mode 2 and handed to the node if it is a peer, else to the
+  relay; a leaf sends no path request for it. A vanilla mac80211 relay with no
+  path to the node drops the reply with a PERR, so first contact from a far
+  host on an idle mesh can fail. A warthog relay, and OpenMANET's patched
+  mac80211 with forwarding on (from its source), hold it and discover the
+  node, giving up after 6.8 s. Not measured.
+  Broadcasts go out as one plain replica per peer without AE, or as a standard
+  group frame with `AT+MESHGRP=1`. A unicast to an unknown destination goes to
+  the first peer, and a leaf sends no path request for it. The tethered client
+  is NATed (`main/nat.c`), so every frame a leaf originates is its own.
 - **`AT+MESHFWD=1` or `AT+MESHBRIDGE=1`.** The forwarding engine shapes every
   frame: AE mode 2 on group replicas and on unicast to or from a proxied host,
   AE mode 1 on a standard group frame from a proxied source, and a PREQ for an
@@ -194,15 +212,20 @@ setup in `docs/mesh-openmanet.md` takes the interface out of the bridge.
 
 ## Prerequisite: group-addressed frames
 
-The chip holds one VIF-wide MGTK while every 802.11s peer generates its own.
-Under SAE that slot holds Warthog's own TX MGTK: hostap delivers it at mesh
-start, it is stored, and it goes into the chip with the first peer, so
+Warthog puts one MGTK in the chip, at AID 0, while every 802.11s peer
+generates its own. Under SAE that is Warthog's own TX MGTK: hostap delivers it
+at mesh start, it is stored, and it goes into the chip with the first peer, so
 standard group frames (`AT+MESHGRP=1`) go out under Warthog's own key id.
-Peers' MGTKs stay in the host keychain only. That chip limit is not fixable in
-the chip — it is why the host software CCMP path exists, and that path (RX
-*and* TX, compiled only into the `warthog-mesh-sae-swccmp` builds) is
-implemented and keeps a per-transmitter key for every peer. Host CCMP refuses
-a unicast frame keyed with a group key (`grpkey=` on `AT+SWCCMP?`).
+Peers' MGTKs stay in the host keychain only. On Warthog's chip firmware
+(MM-IoT-SDK 2.10.4, `mm6108.mbin` 1.17.6) group RX from more than one peer
+failed both with the key installed at each peer's AID and with it once at
+AID 0. Linux (`morse_driver`) installs each peer's MGTK at that peer's AID
+alongside its own at AID 0; that sequence has not been tried here, so this is
+a measured limit of Warthog's firmware and key sequence, not a proven chip
+limit. It is why the host software CCMP path exists, and that path (RX *and*
+TX, compiled only into the `warthog-mesh-sae-swccmp` builds) is implemented
+and keeps a per-transmitter key for every peer. Host CCMP refuses a unicast
+frame keyed with a group key (`grpkey=` on `AT+SWCCMP?`).
 
 What remains is **measurement**: no run has yet shown `AT+SWCCMP?` reporting
 `ok > 0` on live traffic, and the 3-address group-frame AAD path has never
@@ -215,11 +238,12 @@ that risk, while HWMP's control plane on the management path does not.
 Full 802.11s forwarding is the right answer, but two narrower relays are far
 closer than it and may cover a specific need:
 
-- **Meshtastic-only relay: one guard.** `main/mudp.c:122` refuses to re-send a
+- **Meshtastic-only relay: one guard.** `main/mudp.c:137` refuses to re-send a
   datagram out the interface it arrived on (`if (out == skip ...) continue;`).
   Relaxing that for the mesh netif would relay Meshtastic's multicast between
   two peers that cannot hear each other. Application-layer, one group, but it
-  is nearly free.
+  is nearly free. No OpenMANET node sends or listens on that group
+  (`239.0.0.69:4403`), so it helps only Meshtastic devices on warthogs.
 - **Mesh-to-mesh IP forwarding: one lwIP define.** `IP_FORWARD_ALLOW_TX_ON_RX_NETIF`
   would let routed IP traffic cross between mesh peers. This forwards at L3,
   so it does not extend the *mesh* (no 802.11s path selection, no batman
@@ -321,9 +345,11 @@ today, so it needs one added.
 
 ## Current on-air posture
 
-The Mesh Capability octet advertises `0x01` — "accepting additional mesh
-peerings" — and adds the forwarding bit (0x08) only while `AT+MESHFWD=1`, in
+The Mesh Capability octet sets "accepting additional mesh peerings" (0x01)
+while one of the 4 peer slots is free (and in a probe response to a node that
+holds one), and adds the forwarding bit (0x08) only while `AT+MESHFWD=1`, in
 beacons, probe responses and peering frames (`umac_mesh_ies.c`; under SAE,
-hostap's `mesh_fwding` is set from the same gate in `supplicant_core_mesh.c`).
+hostap's `mesh_fwding` is set from the same gate in `supplicant_core_mesh.c`,
+and hostap's own peering frames always set 0x01).
 The gate is read at mesh start. A leaf relays no PREQ for another node, so no
 peer discovers a path through it (`umac_mesh.c`, `umac_mesh_hwmp_relay.c`).

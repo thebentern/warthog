@@ -29,14 +29,12 @@ void umac_mesh_fwd_glue_rx(struct umac_data *umacd, struct umac_sta_data *stad,
                            const struct umac_mesh_ctrl *mc,
                            struct umac_mesh_fwd_rx_result *out);
 
-/** Queue a copy of @p body (LLC already stripped) toward the decided next hop. */
+/** Queue a copy of @p body (LLC already stripped) toward the decided next hop,
+ *  or, on HOLD, keep it until a PREQ we originate finds one. */
 void umac_mesh_fwd_glue_forward(struct umac_data *umacd, struct mmpktview *body,
                                 uint16_t ethertype, const struct dot11_hdr *hdr,
                                 const struct dot11_data_hdr *dhdr,
                                 const struct umac_mesh_fwd_rx_result *r);
-
-/** Send the PERR a NO_PATH decision asked for. */
-void umac_mesh_fwd_glue_send_perr(const struct umac_mesh_fwd_rx_result *r);
 
 /** Locally originated frame: fill the sidecar for proxying, kick discovery. */
 void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, const uint8_t *sa);
@@ -46,8 +44,13 @@ void umac_mesh_fwd_glue_tx_classify(struct mmpkt *txbuf, const uint8_t *da, cons
  *  if held; the caller must then not release it. */
 bool umac_mesh_fwd_glue_tx_pending(struct umac_data *umacd, struct mmpkt *txbuf, const uint8_t *dest);
 
-/** Periodic (2 s): release held frames whose discovery never answered. */
+/** Periodic (2 s), on the umac event loop: free paths 600 s past their expiry,
+ *  and release held frames whose discovery never answered. */
 void umac_mesh_fwd_glue_tick(void);
+
+/** Group path selection another task queued has now gone to the radio from the
+ *  event loop: a PREQ we originated is counted and marked sent here. */
+void umac_mesh_fwd_glue_deferred_sent(const uint8_t *body, uint16_t len);
 
 /** The glue's table lock, for the one HWMP sequence-number writer outside
  *  this file (the keepalive PREQ in umac_mesh.c). */
@@ -61,9 +64,12 @@ uint32_t umac_mesh_fwd_glue_next_seq(void);
 /** Next hop for a non-neighbour destination into @p out; false = none (a PREQ was sent). */
 bool umac_mesh_fwd_glue_next_hop(const uint8_t *dest, uint8_t out[6]);
 
-/** Leaf mode: learn a host behind a peer, and find the peer a learned host is
- *  behind. Neither path-selects nor relays; see umac_mesh_fwd_learn_proxy. */
-void umac_mesh_fwd_glue_learn_proxy(const uint8_t *ext, const uint8_t *mesh_sa);
+/** Leaf mode: learn a proxied host from a received frame's Address Extension,
+ *  test whether a destination is one, and find the peer it is sent through.
+ *  None path-selects or relays; see umac_mesh_fwd_leaf_learn. */
+void umac_mesh_fwd_glue_leaf_learn(const struct dot11_hdr *hdr, const struct dot11_data_hdr *dhdr,
+                                   const struct umac_mesh_ctrl *mc);
+bool umac_mesh_fwd_glue_leaf_proxied(const uint8_t *da);
 bool umac_mesh_fwd_glue_proxy_via_peer(const uint8_t *da, uint8_t out[6]);
 
 /** HWMP action body received; carries out what the relay engine decides. */

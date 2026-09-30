@@ -51,6 +51,7 @@ enum umac_mesh_hwmp_drop {
     UMAC_MESH_HWMP_DROP_NO_FWD,     /* forwarding disabled */
     UMAC_MESH_HWMP_DROP_NO_PATH,    /* PREP: no route back to its originator */
     UMAC_MESH_HWMP_DROP_UNCHANGED,  /* PERR: we held no such path */
+    UMAC_MESH_HWMP_DROP_TABLE_FULL, /* no free path slot for a new destination */
 };
 
 struct umac_mesh_hwmp_ctx {
@@ -58,7 +59,7 @@ struct umac_mesh_hwmp_ctx {
     struct umac_mesh_pathtbl *tbl;
     bool     forwarding;      /* AT+MESHFWD */
     uint32_t link_metric;     /* cost of the hop the frame arrived over */
-    uint32_t path_lifetime_ms;
+    uint32_t max_lifetime_ms; /* ceiling on the element's Lifetime; <= UINT32_MAX / 1024 */
     uint32_t now_ms;
     /* Our HWMP sequence number; advanced by the PREP reply rule. */
     uint32_t *own_sn;

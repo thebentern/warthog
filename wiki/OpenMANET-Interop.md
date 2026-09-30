@@ -4,7 +4,8 @@ Warthog meshes with Linux `mac80211` 802.11s peers. Verified against OpenMANET
 1.8.0 on a Raspberry Pi 4 with a Seeed HaLow HAT, meshing with two Warthog nodes
 at once.
 
-Measured with the peer in its stock configuration:
+Measured with the peer hand-configured for an open mesh (`encryption='none'`);
+a stock image runs no mesh (see below):
 
 | Direction | Result |
 |---|---|
@@ -18,18 +19,24 @@ Warthog and OpenMANET must agree on mesh security. Two working combinations:
 
 | Mesh | Warthog build | OpenMANET config |
 |---|---|---|
-| **Encrypted (SAE/AMPE)** | `warthog-mesh-sae` | `wpa_supplicant` mesh SAE (below) |
-| Open | `warthog-mesh-smoke` + `AT+MESHSEC=0` | stock `encryption='none'` |
+| **Encrypted (SAE/AMPE)** | `warthog-mesh-sae` | mesh wizard default, or `uci` (below) |
+| Open | `warthog-mesh-smoke` + `AT+MESHSEC=0` | `encryption='none'`, set by the operator |
+
+A fresh OpenMANET image runs no mesh: its HaLow radio is an SAE access point in
+`br-lan`. The LuCI mesh wizard writes an SAE mesh (mesh ID `openmanet`,
+passphrase `changeme123` unless changed); openmanetd's setup wizard defaults to
+SAE and also offers none. An open mesh is always an operator's choice.
 
 Mismatched modes fail cleanly rather than half-working: a SAE Warthog does not
 offer peering to an open node at all (the Mesh Configuration's Authentication
-Protocol Identifier must match), and an open Warthog peers with a SAE node but
-no keys exist so no data crosses.
+Protocol Identifier must match), and an SAE node ignores an open Warthog (per
+source, OpenMANET drops its beacons for lacking an RSN element, and hostap
+drops an Open from a peer that has not completed SAE).
 
 ## Warthog side — open
 
-Build for mesh and set the data plane to match the peer. Stock OpenMANET runs
-`encryption='none'`, so:
+Only for a peer an operator has set to `encryption='none'` (wizard nodes run
+SAE by default). Build for mesh and set the data plane to match the peer:
 
 ```bash
 pio run -e warthog-mesh-smoke -t upload
@@ -57,9 +64,10 @@ boot). The node then authenticates (SAE, group 19), exchanges per-link keys
 (AMPE) and peers on its own. Verify with `AT+SAERX?` (`ESTAB=1`) and
 `AT+MPMPEERS?` (`ampe_mtk=1 ampe_mgtk=2` with one peer).
 
-OpenMANET side — use `uci`. This is the idiomatic path and the one verified on
-hardware; a hand-run `wpa_supplicant` fights netifd and loses its config on the
-next `wifi` event.
+OpenMANET side — against a node set up by the mesh wizard, set Warthog's
+`AT+MESHID`/`AT+MESHPASS` to the node's values. To set a node up by hand, use
+`uci`. This is the idiomatic path and the one verified on hardware; a hand-run
+`wpa_supplicant` fights netifd and loses its config on the next `wifi` event.
 
 ```sh
 uci set wireless.radio1.disabled='0'
@@ -67,11 +75,9 @@ uci set wireless.default_radio1.mode='mesh'
 uci set wireless.default_radio1.mesh_id='halowmesh'      # must match Warthog
 uci set wireless.default_radio1.encryption='sae'
 uci set wireless.default_radio1.key='warthog-mesh'       # must match Warthog
-uci set wireless.default_radio1.sae_pwe='2'              # see below
 uci commit wireless
 
-uci set mesh11sd.mesh_beaconless.mesh_beacon_less_mode='1'
-uci set mesh11sd.mesh_dynamic_peering.enabled='1'
+uci set mesh11sd.mesh_beaconless.mesh_beacon_less_mode='1'   # stock 0; optional, see trap 2
 uci commit mesh11sd
 
 wifi down radio1 && wifi up radio1                       # NOT `wifi reload`
@@ -83,9 +89,16 @@ Three traps, all of which cost real bench time:
    regenerates `/var/run/wpa_supplicant-wlh0.conf` when the *wireless* config
    changes. Check the file's mtime — a stale one means your change never
    applied. Cycle the radio instead.
-2. **Beaconless mode is not optional on the MM6108.** With beaconing on, the
-   chip firmware faults on the mesh-beacon path: two `HW has stopped` events
-   and `wlh0` goes down. Beaconless gives 0 crashes over a 6-minute soak.
+2. **Beaconless mode is not needed for discovery** (per source; not measured
+   on air). A secured mac80211 mesh drops a beacon or probe response without
+   an RSN element, and answers only a probe request that carries a Mesh ID
+   element. Warthog's SAE beacons and probe responses carry the RSN element its
+   peering frames carry, and its probe requests carry the Mesh ID element, so a
+   beaconing OpenMANET node (the wizard default) can take Warthog as a
+   candidate. One bench run with beaconing on saw the MM6108 chip firmware
+   fault (two `HW has stopped` events, `wlh0` down) where beaconless ran
+   6 minutes with 0 crashes; the chip firmware version was not recorded and
+   source cannot explain it, so if you see that fault, keep beaconless on.
    Note the uci name (`mesh_beacon_less_mode`) differs from the supplicant
    name it becomes (`mesh_beaconless_mode`).
 3. **After a chip fault, only a reboot recovers it.** The driver leaks its
@@ -113,46 +126,57 @@ every link, with the Warthog installing two distinct AMPE pairwise keys
 **The encrypted data plane does not yet pass traffic cross-vendor.** In that
 run ICMP was 0/30 and every undecryptable frame was group-addressed
 (`AT+RXCHAN?` showed `nodec grp` climbing 1:1 with pings while `uni` stayed
-0). The chip has one group key slot, while every 802.11s peer generates its
-own MGTK, and one pairwise slot, where the last install wins. The group slot
-now holds Warthog's own TX MGTK, installed with the first peer, so standard
-group frames (`AT+MESHGRP=1`) go out under Warthog's own key; each peer's MGTK
-stays in the host keychain. Under SAE, receiving any peer's group frames,
+0). Measured on Warthog's chip firmware (`mm6108.mbin` 1.17.6) on the mesh
+interface: one pairwise key, where the last install wins, and a second
+group-key install breaks group decryption, while every 802.11s peer generates
+its own MGTK. (A Linux node installs each peer's keys at that peer's AID; that
+order is untested on this firmware.) The only group key in the chip is now
+Warthog's own TX MGTK, installed with the first peer, so standard group frames
+(`AT+MESHGRP=1`) go out under Warthog's own key; each peer's MGTK stays in the
+host keychain. Under SAE, receiving any peer's group frames,
 and any unicast with more than one peer, therefore needs host CCMP
 (`warthog-mesh-sae-swccmp`, armed with `AT+SWCCMP=1`), which has not been
 measured on air. **For cross-vendor data today, use the unencrypted mesh
 above.**
 
-Earlier bench findings, still relevant:
+Earlier findings, still relevant:
 
-- **OpenMANET's kernel-MPM mesh advertises Authentication Protocol 0 even
-  when running SAE** (`wpa_supplicant_s1g` with `key_mgmt=SAE`; observed in
-  its probe responses). Warthog's candidate gate therefore refuses to
-  initiate toward it. `AT+SAEBRIDGE=2` overrides the gate for exactly this
-  case. **Note (2026-09-20): the verified three-node run peered
-  without setting it.** Either the gate no longer trips against current
-  OpenMANET, or the beacon path now satisfies discovery. Try without it first.
-  Also be aware `AT+SAEBRIDGE` is RAM-only — it resets to 1 on every boot, so
-  anything depending on it is unusable on an unattended node.
-- `sae_pwe=1` (H2E-only) is OpenMANET's shipped default; Warthog sends
-  hunt-and-peck Commits, so set `sae_pwe=0` or `2` on the Linux side.
+- **OpenMANET probe responses were observed advertising Authentication
+  Protocol 0 while running SAE.** Source predicts 1: OpenMANET peers in
+  userspace (`wpa_supplicant_s1g`, not kernel MPM), which sets the SAE
+  protocol for the beacons and probe responses its kernel sends; the reading
+  is unexplained. Warthog's candidate gate refuses a peer whose protocol
+  differs from its own, and `AT+SAEBRIDGE=2` overrides the gate. The verified
+  three-node run (2026-09-20) peered without it, so try without it first.
+  `AT+SAEBRIDGE` is RAM-only — it resets to 1 on every boot, so anything
+  depending on it is unusable on an unattended node.
+- OpenMANET writes `sae_pwe=1` (H2E-only) into its generated supplicant
+  config, but mesh SAE never reads it: both sides use hunt-and-peck on a mesh.
+  No `sae_pwe` setting is needed on either side.
 - The Morse supplicant rejects `MESH_PEER_ADD` even with `user_mpm=1` +
-  `no_auto_peer=1`, so the Linux side cannot be told to initiate; and Warthog
-  does not beacon in mesh mode, so kernel-MPM candidate discovery never sees
-  it. The Warthog must initiate — hence the `AT+SAEBRIDGE=2` override.
-- OpenMANET's kernel-MPM stack only engages SAE with peers it discovered from
-  *beacons*, not from unsolicited Commits. Warthog now beacons (see below), so
-  the discovery path exists in both directions: Warthog discovers OpenMANET
-  from probe responses (with `AT+SAEBRIDGE=2`), and OpenMANET can discover
-  Warthog from its beacons.
+  `no_auto_peer=1`, so the Linux side cannot be told to initiate toward a peer
+  it has not discovered.
+- OpenMANET's supplicant only starts SAE with a peer its kernel raised as a
+  candidate from a beacon, or from a probe response addressed to it; with
+  beaconing on, a Commit from an unknown peer is dropped (a beaconless node's
+  driver turns it into a candidate instead). The frame must match the node's
+  Mesh ID and Mesh Configuration, carry an RSN element on an SAE mesh, and
+  arrive above `mesh_rssi_threshold` (-80 dBm; -85 on 1.6.5–1.7.x or nodes
+  upgraded from them). Warthog now beacons (see below), and under SAE its
+  beacons and probe responses carry RSN, so OpenMANET can discover it (per
+  source; not measured). Warthog discovers OpenMANET from its beacons and
+  probe responses.
 
 **Warthog mesh beaconing.** The MM6108 firmware fires its beacon TBTT once and
 never re-arms it, so early builds did not beacon and were invisible to a
 beacon-driven peer. A host beacon timer now re-drives the beacon at the
 interval; `AT+BCNSTAT?` shows `served`/`txcomp` climbing together (~1.15/s),
 i.e. the chip transmits every beacon. Warthog↔Warthog SAE is fully verified;
-the Warthog↔OpenMANET SAE handshake over these beacons has since completed on
-hardware (see the status note above).
+the Warthog↔OpenMANET SAE handshake has since completed on hardware (see the
+status note above), presumably against a peer set up with the beaconless recipe
+above, whose driver takes Warthog's Commit as first contact (the peer's setting
+was not recorded). Discovery of Warthog from its beacons by a beaconing SAE peer
+is not measured.
 
 `AT+SAERX?` on the Warthog shows the SAE conversation state and which peer it
 is talking to.
@@ -181,7 +205,8 @@ Each produces a total failure with no error message.
 
 ### The mesh interface must not be bridged
 
-OpenWrt puts `wlh0` in `br-lan`. A bridged mesh interface cannot hold its own
+A stock HaLow interface switched to `mode='mesh'` by hand keeps `network='lan'`,
+so `wlh0` is in `br-lan`. A bridged mesh interface cannot hold its own
 address, and traffic entering the mesh from a bridge is *proxied* traffic, which
 802.11s handles through a different mechanism than locally-originated frames.
 
@@ -207,11 +232,13 @@ This applies to a node whose `wlh0` is a `br-lan` port. Check first with
 `ip addr show bat0` (`tools/bench/openmanet_interop.py` prints the same). On a
 node configured by OpenMANET's mesh wizard, `bat0` exists, `wlh0` is a
 batman-adv hard interface of it (BATMAN_V), and mesh11sd runs with
-`mesh_fwding='0'` and `nolearn='1'`. Warthog does not implement batman-adv, and
-a batman hard interface hands only batman's own ethertype (0x4305) to `bat0`,
-so a Warthog peers with such a node at 802.11s but gets no DHCP lease and no
-IP path to it. `nomaster` on a wizard node removes `wlh0` from `bat0` and takes
-that node off its own batman fabric. Nothing involving `bat0` has been
+`mesh_fwding='0'` (the 1.8.0 LuCI wizard also writes `nolearn='1'`, a key
+nothing reads, so the effective `mesh_nolearn` is 0; 1.8.1-dev writes
+`mesh_nolearn='1'`). Warthog does not implement batman-adv, and a batman hard
+interface hands only batman's own ethertype (0x4305) to `bat0`, so a Warthog
+peers with such a node at 802.11s but gets no DHCP lease and no IP path to it.
+`nomaster` on a wizard node removes `wlh0` from `bat0` and takes that node off
+its own batman fabric. Nothing involving `bat0` has been
 measured.
 
 ```sh
@@ -237,10 +264,12 @@ For anything permanent, assign the interface to a zone in
 
 ## Do not use mesh_nolearn
 
-`mesh_nolearn=1` bypasses path discovery for established peers. It makes a
-broken link start passing traffic, which makes it look like the fix. It is not:
-OpenWrt resets it to `0` every ~10 seconds, so the link works in bursts and
-fails in between. Warthog answers path discovery properly and does not need it.
+`mesh_nolearn=1` bypasses path discovery for established peers. Set with `iw`,
+it makes a broken link start passing traffic, which makes it look like the fix.
+It is not: mesh11sd re-applies `/etc/config/mesh11sd` every 10 s (`0` as
+shipped and on 1.8.0 wizard nodes), so the link works in bursts and fails in
+between. 1.8.1-dev wizard nodes hold it at `1`. Warthog answers path discovery
+properly and does not need it.
 
 ## Verifying
 
@@ -272,8 +301,8 @@ AT+MPING=10.77.191.116,8
 A mismatched node beacons happily and alone. Nothing about the radio looks
 wrong, so this reads as a range problem and gets chased as one. Warthog says so
 instead: about 20 seconds after the mesh starts, and every minute after that
-while it has no peers, it logs every value a peer matches on and which of the
-two causes it is. The same thing is available on demand:
+while it has no peers, it logs every value a peer matches on and the likely
+cause. The same thing is available on demand:
 
 ```
 AT+MESHCFG?
@@ -298,26 +327,52 @@ reading first:
 |---|---|---|
 | `applied chan=NONE` | The radio has the whole country list; its operating channel is neither chosen nor observable | Region builds ship unpinned. Set `AT+MESHCHAN=<chan>,<freq_hz>,<gclass>,<sclass>,<bw>` to match the peer and reboot. An unpinned radio meeting a mesh is luck, not configuration. |
 | `set_channel_list` non-zero | The channel was refused; the radio is **not** on the channel printed above | The channel must exist in the country's regulatory table. `AT+MESHCHAN=default` restores the build-time pin. |
-| `beacons_heard=0` | Nothing is audible | Channel, bandwidth, or range. Compare `applied chan`/`bw` against `uci get wireless.radio1.channel` on the peer — `radio1` is the HaLow device and `channel` lives on the device, not the iface; `radio0` is the 5 GHz radio and `default_radio0.channel` is unset. Fix this before looking at anything else. |
-| `beacons_heard>0`, `peers=0` | The mesh is audible and Warthog will not join it | Mesh ID (exact match, case included), operating class, or security mode. An open Warthog will not peer with an SAE mesh, and vice versa. Management frame protection is **not** on this list — interop is measured working with it off; see the PMF note below before chasing it. |
+| `beacons_heard=0` | Nothing is audible | Channel, bandwidth, or range. Compare `applied chan`/`bw` against `uci get wireless.radio1.channel` on the peer — `radio1` is the HaLow device and `channel` lives on the device, not the iface; `radio0` is the 5 GHz radio and `default_radio0.channel` is unset. Fix this before looking at anything else. A peer in beaconless mode sends no beacons at all; when its probe requests name our mesh, the diagnosis line says so. |
+| `beacons_heard>0`, `peers=0` | The mesh is audible and Warthog will not join it | Mesh ID (exact match, case included), operating class, or security mode. An open Warthog will not peer with an SAE mesh, and vice versa. Signal: an OpenMANET node takes no candidate it hears at or below its `mesh_rssi_threshold` (-80 dBm), and Warthog starts no peering at or below its own floor (`AT+MESHRSSI`, also -80), which the diagnosis line reports. Management frame protection is **not** on this list — peering is measured working with it off; it governs path selection (see the PMF note below). |
 | `peers>0` but no traffic | Peered; this is a data-plane question | `AT+RXCHAN?` and `AT+MPING=<peer>,8`. |
 
-### Management frame protection: `MFP: yes` on the peer is not a demand on us
+### Management frame protection: peering does not need it, path selection does
 
 An OpenMANET node configures MFP required — `ieee80211w=2` in its generated
-supplicant config — and once peered its station dump reads `MFP: yes`. Neither
-means a Warthog has to match it. Warthog peered with exactly such a node while
-running MFP **off**, and that peer reported `mesh plink: ESTAB`,
+supplicant config — and once peered its station dump reads `MFP: yes`. For the
+*peering* that is not a demand on us. Warthog peered with exactly such a node
+while running MFP **off**, and that peer reported `mesh plink: ESTAB`,
 `authenticated: yes` and `MFP: yes` for the link at the same time. The AMPE
 framing follows what our RSN element advertises, and off and required are each
 self-consistent; only "optional" desyncs the two ends, which is why no setting
-here can select it.
+here can select it. Do not read `MFP: yes` as the reason a peering fails.
 
-So do not read `MFP: yes` on a peer as the reason a link is failing — that
-reasoning has already produced one wrong diagnosis. `AT+MESHPMF=1` (then
-`AT+RESET`) exists for a peer that genuinely refuses to peer unprotected, and
-as a one-command A/B when SAE is failing for reasons not yet pinned down. It
-has not been run on air, and off is the measured-working default.
+It does govern path selection. hostap mesh negotiates no MFP: the node marks
+every SAE peer MFP, and its mac80211 then drops unprotected unicast Mesh Action
+frames (PREQ, PREP, PERR) and group ones without a BIP MMIE. A 1.8.0 node runs
+HWMP even to a one-hop peer (its effective `mesh_nolearn` is 0), so without
+protection it never holds a path to Warthog. So Warthog, on the SAE build:
+
+- sends unicast path selection to a peer whose AMPE carried an IGTK (the node
+  sends one because it runs MFP) CCMP-protected under that link's key, by the
+  same route as its data;
+- refuses that peer's unprotected unicast path selection, and its group path
+  selection unless the MMIE verifies under the IGTK the node sent in its AMPE
+  Open (kept host-side) with a fresh IPN.
+
+A leaf needs nothing set: it answers with unicast PREPs. A relay
+(`AT+MESHFWD=1`) broadcasts PREQs and PERRs, and a bridge (`AT+MESHBRIDGE=1`)
+PREQs, which the node drops without an MMIE: set `AT+MESHPMF=1` (then
+`AT+RESET`) on either, so hostap
+generates our IGTK, sends it in AMPE, and our group path selection carries a
+BIP-CMAC-128 MMIE. The alternative is `ieee80211w='0'` on the node's mesh
+interface, which also turns MFP off between OpenMANET nodes. Use one or the
+other, not both: a node with `ieee80211w='0'` never installs our IGTK and drops
+our MMIE frames, and with `AT+MESHPMF=1` Warthog refuses its plaintext path
+selection.
+
+**Not measured on air.** On the bench: `iw dev wlh0 mpath dump` on the node
+should show Warthog `ACTIVE`; on Warthog, `AT+MESHFWDSTAT?` `hwmp tx prot`
+counts protected frames sent, `mgmt prot chip` (or `host` on swccmp-on)
+protected ones opened, `mgmt prot nodec` protected ones the chip handed up
+unopened (then only host CCMP can read them), `mmie` with `bipfail` 0 the
+node's group frames verified, and `igtk` whether its IGTK was installed (the
+node counts as running MFP from that install).
 `AT+MESHCFG?` prints `pmf=` so the two sides can be compared directly.
 
 **A station entry is not a peering.** `iw dev wlh0 station dump` lists blocked
@@ -336,8 +391,9 @@ They have held `ESTAB` for long stretches, and they have also gone 70 minutes
 (210 samples) without it. The failing state is a loop: four
 `MESH-SAE-AUTH-FAILURE`, then `MESH-SAE-AUTH-BLOCKED duration=300`, then again.
 
-What the log lines mean, from the supplicant and the Morse driver source (which
-driver release these nodes run is not established):
+What the log lines mean, from the supplicant and the Morse driver source (an
+OpenMANET 1.8.0 image runs morse_driver mm6108-2.0.1 and hostap
+mm8108-2.0.0):
 
 - `process_mesh_rx_mgmt_beaconless: Rx of Mesh Auth from unknown peer` is the
   driver's **first-contact path, not the failure**. It drops the Auth and
@@ -345,8 +401,10 @@ driver release these nodes run is not established):
   sender at once and starts its own SAE. On these nodes it fires once per
   cycle, about 45 s before each `BLOCKED`.
 - `MESH-SAE-AUTH-FAILURE` is a **timeout**: SAE did not reach ACCEPTED within
-  10 s. It is not a password or crypto rejection. After four, the peer is
-  blocked for `mesh_max_inactivity` (300 s by default).
+  10–19 s (10 s plus a random 0–9 s). It is not a password or crypto
+  rejection. After four, the peer is blocked until the inactivity timer frees
+  the station, `mesh_max_inactivity` (300 s by default) after it was created;
+  `duration=300` prints that setting.
 
 So both sides know each other and SAE still times out. Why is open, and the
 stuck state could not be produced on demand. From a healthy start, with debug
@@ -422,7 +480,27 @@ the sender's address in the payload — CoT, mDNS/SD — would therefore be
 repeated into a contact the receiver cannot reach, or worse, one that aliases
 itself. Widening the repeater would make discovery look like it works. The fix
 is one L2 segment with unique host addresses, which is bridge mode; see
-`docs/mesh-attachment-model.md`.
+`docs/mesh-attachment-model.md`. OpenMANET's own CoT (`239.2.3.1:6969`)
+carries no tethered-host address, so repeating it from mesh to tether would not
+alias, but it never reaches a Warthog (next section).
+
+## Reaching OpenMANET applications
+
+OpenMANET ships nothing for Meshtastic; no OpenMANET service uses
+`239.0.0.69:4403`. Its own applications — CoT on `239.2.3.1:6969`,
+push-to-talk RTP on `239.192.41.1`, mDNS and alfred — run on `br-ahwlan`, which
+the mesh wizard creates with `bat0` as its mesh port; a node without the wizard
+has no `br-ahwlan` and does not run them. A Warthog peers with a wizard node at
+802.11s but gets no IP path into `bat0` (see
+[above](#the-mesh-interface-must-not-be-bridged)), so its tethered host reaches
+none of them. Two ways in, neither measured:
+
+- **A batman-adv (BATMAN_V) member in Warthog.** Not implemented.
+- **Warthog as a HaLow station on an OpenMANET HaLow AP bound to `ahwlan`.**
+  The operator creates the AP by hand, a `meshap_<radio>` wifi-iface with
+  `mode='ap'`, `network='ahwlan'` and their own encryption and key; no wizard
+  exposes it. Warthog joins it in station mode (`AT+HALOW=<ssid>,<pass>`).
+  Whether the node's chip runs the AP and the mesh together is unmeasured.
 
 ## Turning on the relay: the on-air experiment, in order
 
@@ -452,8 +530,9 @@ and each step is a counter read rather than an argument:
    climbing. If paths never form, `parse_fail`/`not_ours` on `AT+HWMPSTAT?`
    say whether the frames were even understood.
 3. **Data through the warthog.** Ping node to node. `AT+MESHFWDSTAT?`
-   `fwd uni` counts each relayed frame; `drop nopath` with `perr_tx` beside it
-   means a node asked us to relay somewhere we have no route. Then a
+   `fwd uni` counts each relayed frame; `hold n` means a node asked us to
+   relay to a destination we had no path to, `hold tx` those we then found and
+   sent, `hold drop` those we gave up on after 6.8 s. Then a
    broadcast (ARP will do): `fwd grp` should count once per frame, `drop dup`
    should catch the echo.
 4. **Hosts across the relay.** A laptop behind each node; ping laptop to
@@ -462,6 +541,9 @@ and each step is a counter read rather than an argument:
    should get a lease from the OpenMANET node's dnsmasq (or nothing, on a
    warthog-only mesh — that is the documented cost), and mDNS/CoT discovery
    between the laptop and a node's host is the thing this mode exists for.
+   This needs a node without `bat0`; OpenMANET's own services are not
+   reachable this way (see
+   [Reaching OpenMANET applications](#reaching-openmanet-applications)).
 
 `tools/bench/openmanet_interop.py --fwd` sets step 2 up and reads steps 2–4;
 `--bridge` adds step 5. Both report; neither asserts, because none of it has

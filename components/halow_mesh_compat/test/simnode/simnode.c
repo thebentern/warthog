@@ -14,11 +14,17 @@
 #include "umac/data/umac_data.h"
 #include "umac/datapath/umac_datapath.h"
 #include "umac/datapath/umac_datapath_private.h"
+#include "umac/datapath/umac_datapath_data.h"
 #include "umac/mesh/umac_mesh.h"
 #include "umac/mesh/umac_mesh_fwd_glue.h"
 #include "umac/mesh/umac_mesh_ies.h"
 
 void simnode_set_identity(const uint8_t mac[6], uint16_t vif_id);
+bool simnode_evt_dispatch_one(struct umac_data *umacd); /* fake_app.c */
+unsigned simnode_fire_timeouts(void);                   /* fake_app.c */
+bool simnode_timeout_next_due(uint32_t *due);           /* fake_app.c */
+void simnode_loop_enter(void);                          /* fake_app.c */
+void simnode_loop_leave(void);                          /* fake_app.c */
 
 /* Not in a header: umac_mesh.c exports it for the probe task. */
 void umac_mesh_service_tick(void);
@@ -66,36 +72,77 @@ static void simnode_netif_rx_(uint8_t *header, unsigned header_len,
     e->len = (uint16_t)payload_len;
 }
 
-static bool simnode_start_(const uint8_t mac[6], bool sae);
+static bool simnode_start_(const uint8_t mac[6], bool sae, uint16_t vif_id);
 
 bool simnode_start(const uint8_t mac[6])
 {
-    return simnode_start_(mac, false);
+    return simnode_start_(mac, false, 0);
 }
 
 bool simnode_start_sae(const uint8_t mac[6])
 {
-    return simnode_start_(mac, true);
+    return simnode_start_(mac, true, 0);
+}
+
+bool simnode_start_sae_vif(const uint8_t mac[6], uint16_t vif_id)
+{
+    return simnode_start_(mac, true, vif_id);
 }
 
 int simnode_set_key(const uint8_t addr[6], const uint8_t key[16], uint8_t key_id, bool pairwise)
 {
-    return (int)umac_datapath_mesh_set_peer_key(addr, key, 16, key_id, pairwise);
+    return simnode_set_key_rsc(addr, key, key_id, pairwise, NULL);
 }
 
-static bool simnode_start_(const uint8_t mac[6], bool sae)
+/* hostap's driver ops run on the umac event loop. */
+int simnode_set_key_rsc(const uint8_t addr[6], const uint8_t key[16], uint8_t key_id,
+                        bool pairwise, const uint8_t rsc[6])
+{
+    simnode_loop_enter();
+    int st = (int)umac_datapath_mesh_set_peer_key(addr, key, 16, key_id, pairwise, rsc,
+                                                  rsc != NULL ? 6u : 0u);
+    simnode_loop_leave();
+    return st;
+}
+
+int simnode_own_group_rsc(uint8_t key_id, uint8_t rsc[6])
+{
+    return (int)umac_datapath_mesh_own_group_rsc(key_id, rsc);
+}
+
+int simnode_set_igtk(const uint8_t addr[6], const uint8_t key[16], uint16_t key_id,
+                     const uint8_t rsc[6])
+{
+    simnode_loop_enter();
+    int st = (int)umac_datapath_mesh_set_igtk(addr, key, key != NULL ? 16u : 0u, key_id, rsc,
+                                              rsc != NULL ? 6u : 0u);
+    simnode_loop_leave();
+    return st;
+}
+
+static uint8_t s_mesh_id[MMWLAN_MESH_ID_MAXLEN] = "simnode";
+static uint8_t s_mesh_id_len = 7;
+
+void simnode_set_mesh_id(const uint8_t *id, uint8_t len)
+{
+    const bool ok = id != NULL && len != 0 && len <= sizeof(s_mesh_id);
+    memcpy(s_mesh_id, ok ? id : (const uint8_t *)"simnode", ok ? len : 7u);
+    s_mesh_id_len = ok ? len : 7u;
+}
+
+static bool simnode_start_(const uint8_t mac[6], bool sae, uint16_t vif_id)
 {
     if (s_up) { simnode_stop(); }
     memcpy(s_mac, mac, 6);
-    simnode_set_identity(mac, 0);
+    simnode_set_identity(mac, vif_id);
     umac_data_init();
     s_umacd = umac_data_get_umacd();
     if (s_umacd == NULL) { return false; }
 
     struct mmwlan_mesh_args args;
     memset(&args, 0, sizeof(args));
-    memcpy(args.mesh_id, "simnode", 7);
-    args.mesh_id_len = 7;
+    memcpy(args.mesh_id, s_mesh_id, s_mesh_id_len);
+    args.mesh_id_len = s_mesh_id_len;
     args.security_type = sae ? MMWLAN_SAE : MMWLAN_OPEN;
     if (sae)
     {
@@ -143,18 +190,39 @@ void simnode_set_gates(bool fwd, bool bridge, bool grp_std, bool secure)
     umac_mesh_ies_cap_forwarding = fwd ? 1u : 0u;
 }
 
+/* Peers come and go on the umac event loop: hostap's sta_add/sta_remove and the MPM. */
 bool simnode_add_peer(const uint8_t mac[6])
 {
-    return umac_mesh_add_datapath_peer(mac) == MMWLAN_SUCCESS;
+    simnode_loop_enter();
+    bool ok = umac_mesh_add_datapath_peer(mac) == MMWLAN_SUCCESS;
+    simnode_loop_leave();
+    return ok;
 }
 
 void simnode_del_peer(const uint8_t mac[6])
 {
+    simnode_loop_enter();
     umac_datapath_mesh_del_peer(mac);
+    simnode_loop_leave();
 }
+
+static bool simnode_host_tx_(const uint8_t da[6], const uint8_t sa[6],
+                             const uint8_t *payload, uint16_t payload_len, bool pump);
 
 bool simnode_host_tx(const uint8_t da[6], const uint8_t sa[6],
                      const uint8_t *payload, uint16_t payload_len)
+{
+    return simnode_host_tx_(da, sa, payload, payload_len, true);
+}
+
+bool simnode_host_tx_nopump(const uint8_t da[6], const uint8_t sa[6],
+                            const uint8_t *payload, uint16_t payload_len)
+{
+    return simnode_host_tx_(da, sa, payload, payload_len, false);
+}
+
+static bool simnode_host_tx_(const uint8_t da[6], const uint8_t sa[6],
+                             const uint8_t *payload, uint16_t payload_len, bool pump)
 {
     if (!s_up) { return false; }
     /* An 802.3 frame, the shape the netif hands down. */
@@ -173,7 +241,10 @@ bool simnode_host_tx(const uint8_t da[6], const uint8_t sa[6],
     {
         return false;
     }
-    simnode_pump(); /* the frame is queued; the event loop is what sends it */
+    if (pump)
+    {
+        simnode_pump(); /* the frame is queued; the event loop is what sends it */
+    }
     return true;
 }
 
@@ -208,14 +279,44 @@ void simnode_tick(void)
 
 void simnode_pump(void)
 {
-    /* The event loop's datapath work. On the firmware the umac core task runs
-     * this whenever umac_core_evt_wake() fires; here the test drives it, which
-     * is what keeps a run deterministic. Bounded so a firmware bug that never
-     * drains cannot hang the suite. */
+    /* The event loop: datapath work, then queued events, as evtloop_iteration
+     * runs them. On the firmware the umac core task runs this whenever
+     * umac_core_evt_wake() fires; here the test drives it, which is what keeps
+     * a run deterministic. Bounded so a firmware bug that never drains cannot
+     * hang the suite. */
     if (s_umacd == NULL) { return; }
-    for (unsigned i = 0; i < 64u && umac_datapath_process(s_umacd); i++)
+    struct umac_datapath_data *dp = umac_data_get_datapath(s_umacd);
+    simnode_loop_enter();
+    for (unsigned i = 0; i < 64u; i++)
     {
+        bool more = umac_datapath_process(s_umacd);
+        /* A frame sent in this pass reports its TX status for the next one to take. */
+        more = !mmpkt_list_is_empty(&dp->tx_status_q) || more;
+        if (!simnode_evt_dispatch_one(s_umacd) && !more) { break; }
     }
+    simnode_loop_leave();
+}
+
+unsigned simnode_run_timeouts(void)
+{
+    unsigned n = simnode_fire_timeouts();
+    simnode_pump();
+    return n;
+}
+
+void simnode_advance_run(uint32_t ms)
+{
+    const uint32_t end = mmosal_get_time_ms() + ms;
+    (void)simnode_run_timeouts();
+    for (unsigned guard = 0; guard < 100000u; guard++) /* a timeout that re-arms at 0 must not hang the suite */
+    {
+        uint32_t due;
+        if (!simnode_timeout_next_due(&due) || (int32_t)(due - end) > 0) { break; }
+        if ((int32_t)(due - mmosal_get_time_ms()) > 0) { simnode_set_time_ms(due); }
+        if (simnode_run_timeouts() == 0) { break; } /* nothing due after all: no spin */
+    }
+    simnode_set_time_ms(end);
+    (void)simnode_run_timeouts();
 }
 
 int simnode_render_paths(char *buf, uint32_t len)

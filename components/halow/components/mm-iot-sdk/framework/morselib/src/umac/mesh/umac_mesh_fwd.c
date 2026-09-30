@@ -32,33 +32,87 @@ static bool proxy_ok_(const struct umac_mesh_fwd_ctx *c, const uint8_t *ext)
     return umac_mesh_path_lookup(c->tbl, ext, c->now_ms) == NULL;
 }
 
-bool umac_mesh_fwd_learn_proxy(const struct umac_mesh_fwd_ctx *c, const uint8_t *ext,
-                               const uint8_t *mesh_sa)
+bool umac_mesh_fwd_leaf_learn(const struct umac_mesh_fwd_ctx *c, const struct umac_mesh_rx_frame *f)
 {
-    /* Only behind a direct peer: nothing else can be answered, and it would hold a slot. */
-    if (c == NULL || c->tbl == NULL || c->own_addr == NULL || c->is_peer == NULL ||
-        ext == NULL || mesh_sa == NULL || !c->is_peer(mesh_sa, c->is_peer_arg) ||
-        !proxy_ok_(c, ext))
+    /* mac80211 drops ttl 0 before it learns anything from the frame. */
+    if (c == NULL || f == NULL || c->tbl == NULL || c->own_addr == NULL || c->is_peer == NULL ||
+        f->mc.ttl == 0u)
     {
         return false;
     }
-    return umac_mesh_proxy_learn(c->tbl, ext, mesh_sa, c->now_ms);
+    uint8_t ae = umac_mesh_ctrl_ae(&f->mc);
+    const uint8_t *ext, *mesh_sa;
+    bool uni, flood;
+    /* The shapes umac_mesh_fwd_rx accepts: AE 1 on a group frame, AE 2 on a
+     * unicast. A warthog replica is AE 2 with a group e1: a flood, so not uni. */
+    if (f->group)
+    {
+        if (ae != UMAC_MESH_CTRL_AE_A4) { return false; }
+        ext = f->mc.eaddr1;
+        mesh_sa = f->addr3;
+        uni = false;
+        flood = true;
+    }
+    else
+    {
+        if (ae != UMAC_MESH_CTRL_AE_A5A6) { return false; }
+        ext = f->mc.eaddr2;
+        mesh_sa = f->addr4;
+        uni = eq_(f->mc.eaddr1, c->own_addr);
+        flood = is_group_(f->mc.eaddr1);
+    }
+    /* A node is never a host behind itself: mac80211 sends to it plain. */
+    if (!c->is_peer(f->addr2, c->is_peer_arg) || is_group_(mesh_sa) || eq_(mesh_sa, c->own_addr) ||
+        eq_(ext, mesh_sa) || !proxy_ok_(c, ext))
+    {
+        return false;
+    }
+    /* A flood's second copy, through another relay, must not rewrite via:
+     * mac80211 drops it in the RMC before learning, so the first copy wins. */
+    if (flood && c->rmc != NULL && umac_mesh_rmc_check(c->rmc, mesh_sa, f->mc.seq, c->now_ms))
+    {
+        return false;
+    }
+    /* A relay that carried this host's unicast to us held a path to its node; a
+     * flood's transmitter need not. Keep the former while that path can be live.
+     * The age is unsigned (2^31 ms is not fresh); the sweep keeps it below 2^32. */
+    uint8_t via[6];
+    memcpy(via, f->addr2, 6);
+    const struct umac_mesh_proxy *x = umac_mesh_proxy_entry(c->tbl, ext, c->now_ms);
+    if (!uni && x != NULL && x->leaf && x->uni && eq_(x->mesh_sta, mesh_sa) &&
+        (uint32_t)(c->now_ms - x->uni_ms) < UMAC_MESH_LEAF_VIA_HOLD_MS &&
+        c->is_peer(x->via, c->is_peer_arg))
+    {
+        memcpy(via, x->via, 6);
+    }
+    return umac_mesh_proxy_learn_leaf(c->tbl, ext, mesh_sa, via, uni, c->now_ms);
+}
+
+bool umac_mesh_fwd_leaf_proxied(const struct umac_mesh_fwd_ctx *c, const uint8_t *da)
+{
+    if (c == NULL || c->tbl == NULL || c->is_peer == NULL || da == NULL || is_group_(da) ||
+        c->is_peer(da, c->is_peer_arg))
+    {
+        return false;
+    }
+    const struct umac_mesh_proxy *x = umac_mesh_proxy_entry(c->tbl, da, c->now_ms);
+    return x != NULL && x->leaf;
 }
 
 bool umac_mesh_fwd_proxy_via_peer(const struct umac_mesh_fwd_ctx *c, const uint8_t *da,
                                   uint8_t out[6])
 {
-    if (c == NULL || c->tbl == NULL || c->is_peer == NULL || da == NULL || out == NULL ||
-        is_group_(da) || c->is_peer(da, c->is_peer_arg))
+    if (out == NULL || !umac_mesh_fwd_leaf_proxied(c, da))
     {
         return false;
     }
-    const uint8_t *proxy = umac_mesh_proxy_lookup(c->tbl, da, c->now_ms);
-    if (proxy == NULL || !c->is_peer(proxy, c->is_peer_arg))
+    struct umac_mesh_fwd_tx_result t;
+    umac_mesh_fwd_tx(c, da, c->own_addr, 0, &t);
+    if (!t.ok || t.shape != UMAC_MESH_TX_UNICAST_4ADDR)
     {
         return false;
     }
-    memcpy(out, proxy, 6);
+    memcpy(out, t.ra, 6);
     return true;
 }
 
@@ -171,24 +225,22 @@ void umac_mesh_fwd_rx(const struct umac_mesh_fwd_ctx *c, const struct umac_mesh_
     {
         next = mesh_da;
     }
+    r->fwd_mc = f->mc;
+    r->fwd_mc.ttl = (uint8_t)(f->mc.ttl - 1u);
     if (next == NULL)
     {
-        /* mac80211: PERR back to the transmitter, sn 0, reason no-forward. */
-        drop_(r, UMAC_MESH_FWD_DROP_NO_PATH);
-        r->perr_len = umac_mesh_hwmp_build_perr(r->perr_body, sizeof(r->perr_body),
-                                                c->element_ttl, mesh_da, 0u,
-                                                HWMP_REASON_MESH_PATH_ERROR_NO_FORWARDING);
-        if (r->perr_len != 0)
+        if (is_group_(mesh_da))
         {
-            r->send_perr = true;
-            memcpy(r->perr_to, f->addr2, 6);
+            drop_(r, UMAC_MESH_FWD_DROP_NO_PATH); /* mac80211 never discovers a group address */
+            return;
         }
+        /* OpenMANET's mac80211 (999-0027): queue it and discover; no PERR. */
+        r->verdict = UMAC_MESH_FWD_HOLD;
+        r->drop = UMAC_MESH_FWD_DROP_NO_PATH;
         return;
     }
     r->verdict = UMAC_MESH_FWD_FORWARD;
     memcpy(r->fwd_ra, next, 6);
-    r->fwd_mc = f->mc;
-    r->fwd_mc.ttl = (uint8_t)(f->mc.ttl - 1u);
 }
 
 void umac_mesh_fwd_tx(const struct umac_mesh_fwd_ctx *c, const uint8_t *da, const uint8_t *sa,
@@ -262,6 +314,17 @@ void umac_mesh_fwd_tx(const struct umac_mesh_fwd_ctx *c, const uint8_t *da, cons
         memcpy(r->ra, mesh_da, 6);
         r->ok = true;
         return;
+    }
+    /* Leaf: no path selection; the peer that carried this host's traffic to us. */
+    if (proxy != NULL)
+    {
+        const struct umac_mesh_proxy *x = umac_mesh_proxy_entry(c->tbl, da, c->now_ms);
+        if (x != NULL && x->leaf && c->is_peer != NULL && c->is_peer(x->via, c->is_peer_arg))
+        {
+            memcpy(r->ra, x->via, 6);
+            r->ok = true;
+            return;
+        }
     }
     r->ok = false;
     r->need_path = true;
@@ -445,11 +508,46 @@ bool umac_mesh_preq_gate_allow(struct umac_mesh_preq_gate *g, const uint8_t *tar
     {
         slot = oldest;
     }
+    if (!g->t[slot].used || memcmp(g->t[slot].target, target, 6) != 0)
+    {
+        g->t[slot].sent = false; /* a reused slot must not lend its old target's send */
+    }
     memcpy(g->t[slot].target, target, 6);
     g->t[slot].last_ms = now_ms;
     g->t[slot].used = true;
     g->any_ms = now_ms;
     g->any_used = true;
+    return true;
+}
+
+static int gate_find_(const struct umac_mesh_preq_gate *g, const uint8_t *target)
+{
+    for (uint32_t i = 0; g != NULL && target != NULL && i < UMAC_MESH_PREQ_TARGETS; i++)
+    {
+        if (g->t[i].used && memcmp(g->t[i].target, target, 6) == 0) { return (int)i; }
+    }
+    return -1;
+}
+
+void umac_mesh_preq_gate_sent(struct umac_mesh_preq_gate *g, const uint8_t *target, uint32_t sent_ms)
+{
+    int i = gate_find_(g, target);
+    if (i >= 0)
+    {
+        g->t[i].sent_ms = sent_ms;
+        g->t[i].sent = true;
+    }
+}
+
+bool umac_mesh_preq_gate_last(const struct umac_mesh_preq_gate *g, const uint8_t *target,
+                              uint32_t *sent_ms)
+{
+    int i = gate_find_(g, target);
+    if (i < 0 || !g->t[i].sent || sent_ms == NULL)
+    {
+        return false;
+    }
+    *sent_ms = g->t[i].sent_ms;
     return true;
 }
 
@@ -511,15 +609,32 @@ void umac_mesh_pending_init(struct umac_mesh_pending *p)
 
 static bool pend_past_(uint32_t now, uint32_t exp) { return (int32_t)(now - exp) >= 0; }
 
-void *umac_mesh_pending_push(struct umac_mesh_pending *p, const uint8_t *target, void *handle, uint32_t now_ms)
+static bool pend_live_(const struct umac_mesh_pending *p, uint32_t i, uint32_t now)
 {
-    if (p == NULL || target == NULL || handle == NULL) { return handle; }
+    return p->e[i].used && !pend_past_(now, p->e[i].exp_ms);
+}
+
+uint32_t umac_mesh_relay_ask_ms(uint32_t k)
+{
+    uint32_t t = 0, d = UMAC_MESH_RELAY_DISC_FIRST_MS;
+    for (uint32_t i = 0; i < k && i <= UMAC_MESH_RELAY_PREQ_RETRIES; i++)
+    {
+        t += d;
+        d = (d * 2u > UMAC_MESH_RELAY_DISC_CAP_MS) ? UMAC_MESH_RELAY_DISC_CAP_MS : d * 2u;
+    }
+    return t;
+}
+
+/* Own frames live in [0, PENDING_MAX), relayed ones after: each kind reuses and
+ * evicts only its own slots. */
+static void *pend_put_(struct umac_mesh_pending *p, uint32_t lo, uint32_t hi, const uint8_t *target,
+                       void *handle, uint32_t now_ms, uint32_t *slot)
+{
     uint32_t same = 0;
     int oldest_same = -1, freeslot = -1, oldest = -1;
-    for (uint32_t i = 0; i < UMAC_MESH_PENDING_MAX; i++)
+    for (uint32_t i = lo; i < hi; i++)
     {
-        const struct umac_mesh_pending *pp = p; (void)pp;
-        if (!p->e[i].used || pend_past_(now_ms, p->e[i].exp_ms))
+        if (!pend_live_(p, i, now_ms))
         {
             if (freeslot < 0) { freeslot = (int)i; }
             continue;
@@ -538,9 +653,49 @@ void *umac_mesh_pending_push(struct umac_mesh_pending *p, const uint8_t *target,
     void *evicted = p->e[v].used ? p->e[v].handle : NULL;
     memcpy(p->e[v].target, target, 6);
     p->e[v].handle = handle;
-    p->e[v].exp_ms = now_ms + UMAC_MESH_PENDING_MS;
     p->e[v].order = ++p->order;
     p->e[v].used = true;
+    *slot = (uint32_t)v;
+    return evicted;
+}
+
+void *umac_mesh_pending_push(struct umac_mesh_pending *p, const uint8_t *target, void *handle, uint32_t now_ms)
+{
+    if (p == NULL || target == NULL || handle == NULL) { return handle; }
+    uint32_t v;
+    void *evicted = pend_put_(p, 0, UMAC_MESH_PENDING_MAX, target, handle, now_ms, &v);
+    p->e[v].exp_ms = now_ms + UMAC_MESH_PENDING_MS;
+    p->e[v].start_ms = now_ms;
+    p->e[v].asks = 0;
+    p->e[v].relayed = false;
+    return evicted;
+}
+
+void *umac_mesh_pending_push_relayed(struct umac_mesh_pending *p, const uint8_t *target,
+                                     void *handle, uint32_t now_ms)
+{
+    if (p == NULL || target == NULL || handle == NULL) { return handle; }
+    /* mac80211 queues onto a path already resolving: same ladder, same give-up. */
+    uint32_t start = now_ms, asked = now_ms;
+    uint8_t asks = 0;
+    for (uint32_t i = UMAC_MESH_PENDING_MAX; i < UMAC_MESH_PENDING_SLOTS; i++)
+    {
+        if (pend_live_(p, i, now_ms) && eq_(p->e[i].target, target))
+        {
+            start = p->e[i].start_ms;
+            asks = p->e[i].asks;
+            asked = p->e[i].asked_ms;
+            break;
+        }
+    }
+    uint32_t v;
+    void *evicted = pend_put_(p, UMAC_MESH_PENDING_MAX, UMAC_MESH_PENDING_SLOTS, target, handle,
+                              now_ms, &v);
+    p->e[v].start_ms = start;
+    p->e[v].asks = asks;
+    p->e[v].asked_ms = asked;
+    p->e[v].exp_ms = start + umac_mesh_relay_ask_ms(UMAC_MESH_RELAY_PREQ_RETRIES + 1u);
+    p->e[v].relayed = true;
     return evicted;
 }
 
@@ -548,30 +703,47 @@ uint32_t umac_mesh_pending_take(struct umac_mesh_pending *p, const struct umac_m
                                 struct umac_mesh_pending_out *out, uint32_t max)
 {
     if (p == NULL || c == NULL || out == NULL) { return 0; }
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < UMAC_MESH_PENDING_MAX && n < max; i++)
+    /* Oldest first, as mac80211 sends a path's queue: slot reuse must not reorder a flow. */
+    uint32_t idx[UMAC_MESH_PENDING_SLOTS], m = 0;
+    for (uint32_t i = 0; i < UMAC_MESH_PENDING_SLOTS; i++)
     {
         if (!p->e[i].used) { continue; }
+        uint32_t k = m++;
+        while (k > 0 && (int32_t)(p->e[i].order - p->e[idx[k - 1]].order) < 0) { idx[k] = idx[k - 1]; k--; }
+        idx[k] = i;
+    }
+    uint32_t n = 0;
+    for (uint32_t j = 0; j < m && n < max; j++)
+    {
+        uint32_t i = idx[j];
+        const uint8_t *ra = NULL;
+        struct umac_mesh_fwd_tx_result t;
         if (pend_past_(c->now_ms, p->e[i].exp_ms))
         {
-            out[n].handle = p->e[i].handle;
-            memcpy(out[n].target, p->e[i].target, 6);
-            out[n].ok = false;
-            n++;
-            p->e[i].used = false;
-            continue;
+            /* expired: handed back with ok=false */
         }
-        struct umac_mesh_fwd_tx_result t;
-        umac_mesh_fwd_tx(c, p->e[i].target, c->own_addr, 0, &t);
-        if (t.ok && t.shape == UMAC_MESH_TX_UNICAST_4ADDR)
+        else if (p->e[i].relayed)
         {
-            out[n].handle = p->e[i].handle;
-            memcpy(out[n].target, p->e[i].target, 6);
-            memcpy(out[n].ra, t.ra, 6);
-            out[n].ok = true;
-            n++;
-            p->e[i].used = false;
+            /* The copy already carries its mesh DA, SA, AE and TTL: it needs a next hop only. */
+            const struct umac_mesh_path *pa =
+                (c->tbl != NULL) ? umac_mesh_path_lookup(c->tbl, p->e[i].target, c->now_ms) : NULL;
+            if (pa != NULL) { ra = pa->next_hop; }
+            else if (c->is_peer != NULL && c->is_peer(p->e[i].target, c->is_peer_arg)) { ra = p->e[i].target; }
+            else { continue; }
         }
+        else
+        {
+            umac_mesh_fwd_tx(c, p->e[i].target, c->own_addr, 0, &t);
+            if (!t.ok || t.shape != UMAC_MESH_TX_UNICAST_4ADDR) { continue; }
+            ra = t.ra;
+        }
+        out[n].handle = p->e[i].handle;
+        memcpy(out[n].target, p->e[i].target, 6);
+        out[n].ok = (ra != NULL);
+        if (ra != NULL) { memcpy(out[n].ra, ra, 6); }
+        out[n].relayed = p->e[i].relayed;
+        n++;
+        p->e[i].used = false;
     }
     return n;
 }
@@ -581,9 +753,9 @@ uint32_t umac_mesh_pending_targets(const struct umac_mesh_pending *p, uint32_t n
 {
     uint32_t n = 0;
     if (p == NULL || out == NULL) { return 0; }
-    for (uint32_t i = 0; i < UMAC_MESH_PENDING_MAX && n < max; i++)
+    for (uint32_t i = 0; i < UMAC_MESH_PENDING_SLOTS && n < max; i++)
     {
-        if (!p->e[i].used || pend_past_(now_ms, p->e[i].exp_ms)) { continue; }
+        if (!pend_live_(p, i, now_ms) || p->e[i].relayed) { continue; }
         bool dup = false;
         for (uint32_t k = 0; k < n; k++)
         {
@@ -594,10 +766,79 @@ uint32_t umac_mesh_pending_targets(const struct umac_mesh_pending *p, uint32_t n
     return n;
 }
 
+uint32_t umac_mesh_pending_ask_due(const struct umac_mesh_pending *p, uint32_t now_ms,
+                                   uint8_t (*out)[6], uint32_t max)
+{
+    uint32_t n = 0;
+    if (p == NULL || out == NULL) { return 0; }
+    for (uint32_t i = 0; i < UMAC_MESH_PENDING_SLOTS && n < max; i++)
+    {
+        if (!pend_live_(p, i, now_ms) || !p->e[i].relayed || p->e[i].asks > UMAC_MESH_RELAY_PREQ_RETRIES ||
+            (uint32_t)(now_ms - p->e[i].start_ms) < umac_mesh_relay_ask_ms(p->e[i].asks))
+        {
+            continue;
+        }
+        bool dup = false;
+        for (uint32_t k = 0; k < n; k++)
+        {
+            if (eq_(out[k], p->e[i].target)) { dup = true; break; }
+        }
+        if (!dup) { memcpy(out[n++], p->e[i].target, 6); }
+    }
+    return n;
+}
+
+void umac_mesh_pending_asked(struct umac_mesh_pending *p, const uint8_t *target, uint32_t sent_ms)
+{
+    if (p == NULL || target == NULL) { return; }
+    for (uint32_t i = 0; i < UMAC_MESH_PENDING_SLOTS; i++)
+    {
+        /* A step takes a PREQ sent at or after it fell due, and each PREQ one step. */
+        uint32_t due = p->e[i].start_ms + umac_mesh_relay_ask_ms(p->e[i].asks);
+        if (pend_live_(p, i, sent_ms) && p->e[i].relayed && eq_(p->e[i].target, target) &&
+            p->e[i].asks <= UMAC_MESH_RELAY_PREQ_RETRIES && (int32_t)(sent_ms - due) >= 0 &&
+            (p->e[i].asks == 0 || (int32_t)(sent_ms - p->e[i].asked_ms) > 0))
+        {
+            p->e[i].asks++;
+            p->e[i].asked_ms = sent_ms;
+        }
+    }
+}
+
+bool umac_mesh_pending_next_ms(const struct umac_mesh_pending *p, uint32_t now_ms, uint32_t *delta_ms)
+{
+    bool any = false;
+    uint32_t best = UINT32_MAX;
+    if (p == NULL) { return false; }
+    for (uint32_t i = 0; i < UMAC_MESH_PENDING_SLOTS; i++)
+    {
+        if (!p->e[i].used || !p->e[i].relayed) { continue; }
+        any = true;
+        uint32_t d = pend_past_(now_ms, p->e[i].exp_ms) ? 0u : p->e[i].exp_ms - now_ms;
+        if (d != 0u && p->e[i].asks <= UMAC_MESH_RELAY_PREQ_RETRIES)
+        {
+            uint32_t due = p->e[i].start_ms + umac_mesh_relay_ask_ms(p->e[i].asks);
+            uint32_t dd = ((int32_t)(due - now_ms) > 0) ? due - now_ms : 0u;
+            if (dd < d) { d = dd; }
+        }
+        if (d < best) { best = d; }
+    }
+    if (any && delta_ms != NULL) { *delta_ms = best; }
+    return any;
+}
+
 uint32_t umac_mesh_pending_count(const struct umac_mesh_pending *p)
 {
     uint32_t n = 0;
     if (p == NULL) { return 0; }
-    for (uint32_t i = 0; i < UMAC_MESH_PENDING_MAX; i++) { n += p->e[i].used ? 1u : 0u; }
+    for (uint32_t i = 0; i < UMAC_MESH_PENDING_SLOTS; i++) { n += p->e[i].used ? 1u : 0u; }
+    return n;
+}
+
+uint32_t umac_mesh_pending_count_relayed(const struct umac_mesh_pending *p)
+{
+    uint32_t n = 0;
+    if (p == NULL) { return 0; }
+    for (uint32_t i = 0; i < UMAC_MESH_PENDING_SLOTS; i++) { n += (p->e[i].used && p->e[i].relayed) ? 1u : 0u; }
     return n;
 }

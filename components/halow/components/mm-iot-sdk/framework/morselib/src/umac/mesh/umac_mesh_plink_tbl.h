@@ -33,9 +33,10 @@ extern "C" {
 /**
  * Peers we can hold links to at once.
  *
- * Must not exceed the datapath's MESH_MAX_PEERS -- every established link
- * allocates a station there. A real mesh answers an Open it has no room for
- * with Close(MESH_MAX_PEERS); we currently just refuse and count it.
+ * Must not exceed UMAC_DATAPATH_MESH_MAX_PEERS -- every established link
+ * allocates a station there; umac_mesh.c static-asserts it. An Open with no
+ * room, even after mpm_table_make_room(), is answered Close(MESH_MAX_PEERS)
+ * and counted in @c no_slot.
  */
 #ifndef MPM_MAX_LINKS
 #define MPM_MAX_LINKS 4
@@ -49,12 +50,37 @@ struct mpm_link {
     uint16_t plid;          /**< theirs, from the Open/Confirm we received */
     uint32_t last_heard_ms; /**< refreshed by any frame from this peer */
     uint16_t opens;         /**< Opens sent since this link last changed state */
+    uint32_t reannounce_ms; /**< last "we accept you" sent while full; 0 = never */
     bool used;
     bool estab;
 };
 
+/** Neighbours we answer without a link. With every entry live, a newcomer
+ *  waits for one to lapse: none is evicted. */
+#ifndef MPM_MAX_QUIET
+#define MPM_MAX_QUIET 8
+#endif
+
+/** SAE neighbours held off after a failed handshake. More than the peer table
+ *  holds, so a table's worth of failures is remembered with room to spare. */
+#ifndef MPM_MAX_SAE_HELD
+#define MPM_MAX_SAE_HELD 8
+#endif
+
+/** A per-address time stamp: a Close(MESH_MAX_PEERS) refusal, or a beacon
+ *  answered from a neighbour we hold no link to. */
+struct mpm_stamp {
+    uint8_t addr[MPM_ADDR_LEN];
+    uint32_t since_ms;
+    bool used;
+};
+
 struct mpm_table {
     struct mpm_link links[MPM_MAX_LINKS];
+    struct mpm_stamp refused[MPM_MAX_LINKS];
+    struct mpm_stamp refused_over; /**< last refusal no entry could hold; addr unused */
+    struct mpm_stamp quiet[MPM_MAX_QUIET];
+    struct mpm_stamp sae_held[MPM_MAX_SAE_HELD];
     uint32_t no_slot; /**< Opens refused because the table was full */
     uint32_t expired; /**< links dropped for inactivity */
 };
@@ -81,6 +107,15 @@ struct mpm_link *mpm_table_get_or_create(struct mpm_table *t, const uint8_t *add
 /** Drop a link. @p l may be NULL. */
 void mpm_table_release(struct mpm_table *t, struct mpm_link *l);
 
+/**
+ * Make room for an Open from @p addr, which holds no link: with none free, release
+ * the unanswered link (not ESTAB, plid 0) that sent the most Opens, copying its
+ * address and llid out for the caller's Close (either output may be NULL).
+ * @returns true if a link was released.
+ */
+bool mpm_table_make_room(struct mpm_table *t, const uint8_t *addr,
+                         uint8_t out_addr[MPM_ADDR_LEN], uint16_t *out_llid);
+
 /** Number of links that have reached ESTAB. */
 uint8_t mpm_table_estab_count(const struct mpm_table *t);
 
@@ -100,6 +135,48 @@ uint8_t mpm_table_estab_count(const struct mpm_table *t);
  */
 int mpm_table_expire(struct mpm_table *t, uint32_t now_ms, uint32_t timeout_ms,
                      uint8_t out_addrs[][MPM_ADDR_LEN], int max_out);
+
+/**
+ * Hold off opening toward @p addr for @p holdoff_ms from @p now_ms: it answered
+ * our Open with Close(MESH_MAX_PEERS). Nothing is evicted: with every entry
+ * live for another address, every address without an entry is held off instead.
+ */
+void mpm_table_refuse(struct mpm_table *t, const uint8_t *addr, uint32_t now_ms,
+                      uint32_t holdoff_ms);
+
+/** Drop @p addr's hold-off: its own Open shows it has room again. */
+void mpm_table_unrefuse(struct mpm_table *t, const uint8_t *addr);
+
+/**
+ * Is @p addr held off at @p now_ms? By its own entry, or for any address while
+ * every entry is live or within @p holdoff_ms of a refusal none could hold.
+ * Unsigned elapsed time, so a wrapped clock is safe; lapsed entries are freed.
+ */
+bool mpm_table_refused(struct mpm_table *t, const uint8_t *addr, uint32_t now_ms,
+                       uint32_t holdoff_ms);
+
+/**
+ * May a beacon from @p addr, a neighbour we hold no link to, be answered (and
+ * restamped) at @p now_ms? Only if unanswered for @p period_ms and an entry is
+ * free: none is evicted, so at most MPM_MAX_QUIET answers fall in any period.
+ */
+bool mpm_table_quiet_due(struct mpm_table *t, const uint8_t *addr, uint32_t now_ms,
+                         uint32_t period_ms);
+
+/**
+ * Hold @p addr off for @p hold_ms from @p now_ms: SAE with it failed. With every
+ * entry live for another address, the oldest is replaced: holding off everyone
+ * instead would keep a working neighbour out.
+ */
+void mpm_table_sae_hold(struct mpm_table *t, const uint8_t *addr, uint32_t now_ms,
+                        uint32_t hold_ms);
+
+/** Is @p addr held off at @p now_ms? Unsigned elapsed time; lapsed entries are freed. */
+bool mpm_table_sae_held(struct mpm_table *t, const uint8_t *addr, uint32_t now_ms,
+                        uint32_t hold_ms);
+
+/** Drop @p addr's SAE hold-off: its own Commit shows it knows us and has room. */
+void mpm_table_sae_release(struct mpm_table *t, const uint8_t *addr);
 
 /**
  * Render the table as "aabbcc llid=N plid=N estab=N; " per link, for

@@ -16,6 +16,9 @@
 #include "cfg.h"
 #include "region.h"
 #include "mesh_diag.h"
+#include "mesh.h"
+#include "cdc_out.h"
+#include "usb_net.h"
 
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -53,13 +56,16 @@ static const char *TAG = "warthog.at";
 #define WARTHOG_VERSION "0.0.0"
 #endif
 
+/* Replies, on the AT task only: waits while the FIFO is full (cdc_out.h). */
 static void cdc_write(const char *s)
 {
-    if (!s || !tud_cdc_n_connected(0)) {
-        return;
-    }
-    tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (const uint8_t *)s, strlen(s));
-    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+    (void)cdc_out_write(&g_warthog_cdc, s);
+}
+
+/* Other tasks and the echo: never waits, drops the whole line when it cannot go in. */
+static void cdc_write_nowait(const char *s)
+{
+    (void)cdc_out_write_nowait(&g_warthog_cdc, s);
 }
 
 static void reply_ok(void)
@@ -91,6 +97,21 @@ static char *trim(char *s)
         *end-- = '\0';
     }
     return s;
+}
+
+/* AT+MESHRSSI=<dBm>: the whole argument, -255..0. The glue guard runs it. */
+static bool meshrssi_parse_(const char *a, int32_t *out)
+{
+    char *end = NULL;
+    if (a == NULL || out == NULL || a[0] == '\0') {
+        return false;
+    }
+    long v = strtol(a, &end, 10);
+    if (end == a || *end != '\0' || v < -255 || v > 0) {
+        return false;
+    }
+    *out = (int32_t)v;
+    return true;
 }
 
 /* Case-insensitive prefix check. */
@@ -463,12 +484,13 @@ volatile uint32_t g_warthog_mesh_key_fail = 0;
 /* Mesh data-plane protection. 1 (default) = register peers as secured and
  * install the static MTK/MGTK; 0 = leave them OPEN.
  *
- * A keyed mesh cannot carry data to a peer running an OPEN mesh, which is what
- * stock OpenMANET ships (encryption='none'). The keying was introduced because
- * an OPEN mesh measured acked-but-never-delivered -- but the chip STA
- * registration that also fixes delivery landed in the same change, so which of
- * the two actually opened the gate was never isolated. AT+MESHSEC= flips this
- * at runtime and re-peers, so the two can be told apart on hardware. */
+ * A keyed mesh cannot carry data to a peer running an OPEN mesh (an OpenMANET
+ * node only if set to encryption='none'; its mesh wizard writes SAE). The
+ * keying was introduced because an OPEN mesh measured acked-but-never-delivered
+ * -- but the chip STA registration that also fixes delivery landed in the same
+ * change, so which of the two actually opened the gate was never isolated.
+ * AT+MESHSEC= flips this at runtime and re-peers, so the two can be told apart
+ * on hardware. */
 volatile uint32_t g_warthog_mesh_secure = 1;
 /* Forwarding and bridge gates, seeded from NVS in mesh.c before the mesh starts. */
 volatile uint32_t g_warthog_mesh_fwd = 0, g_warthog_mesh_bridge = 0, g_warthog_mesh_grp = 0;
@@ -480,9 +502,26 @@ volatile uint32_t g_warthog_fwd_drop_own = 0, g_warthog_fwd_drop_dup = 0, g_wart
 volatile uint32_t g_warthog_fwd_drop_nopath = 0, g_warthog_fwd_drop_nofwd = 0, g_warthog_fwd_drop_bad = 0;
 volatile uint32_t g_warthog_fwd_perr_tx = 0, g_warthog_fwd_preq_tx = 0;
 volatile uint32_t g_warthog_hwmp_relay_preq = 0, g_warthog_hwmp_relay_prep = 0, g_warthog_hwmp_relay_perr = 0;
-volatile uint32_t g_warthog_fwd_perr_suppressed = 0, g_warthog_fwd_drop_full = 0;
+volatile uint32_t g_warthog_fwd_drop_full = 0;
+/* Relayed unicast held while we discover its mesh DA: held, sent on PREP, lost. */
+volatile uint32_t g_warthog_fwd_hold = 0, g_warthog_fwd_hold_tx = 0, g_warthog_fwd_hold_drop = 0;
+volatile uint32_t g_warthog_fwd_drop_tblfull = 0; /* path table: no slot for a new destination */
 volatile uint32_t g_warthog_fwd_pend_tx = 0, g_warthog_fwd_pend_drop = 0, g_warthog_hwmp_prot = 0;
 volatile uint32_t g_warthog_hwmp_unprotected = 0, g_warthog_hwmp_mmie = 0, g_warthog_hwmp_nommie = 0;
+/* SAE path-selection MFP: MMIEs refused; frames sent protected, with and without an MMIE;
+ * group frames for BIP that could not be queued to the event loop. */
+volatile uint32_t g_warthog_hwmp_bipfail = 0, g_warthog_hwmp_tx_prot = 0;
+volatile uint32_t g_warthog_hwmp_tx_mmie = 0, g_warthog_hwmp_tx_nommie = 0;
+volatile uint32_t g_warthog_hwmp_tx_qdrop = 0;
+/* Group path selection queued for the umac event loop that it then failed to build or send. */
+volatile uint32_t g_warthog_hwmp_tx_qfail = 0;
+/* SAE: path selection refused from a station whose link is not established (unkeyed). */
+volatile uint32_t g_warthog_hwmp_unestab = 0;
+/* Protected management frames on an SAE mesh: opened by the chip, by host CCMP, by neither;
+ * unicast ones refused for a key id other than the link's pairwise key. */
+volatile uint32_t g_warthog_mgmt_prot_chip = 0, g_warthog_mgmt_prot_host = 0;
+volatile uint32_t g_warthog_mgmt_prot_nodec = 0, g_warthog_ampe_igtk_installed = 0;
+volatile uint32_t g_warthog_mgmt_prot_grpkey = 0;
 
 /* Data-plane counters (AT+DATASTAT?). rxtap_data = data frames the chip
  * delivered; stad_hit/miss = whether the peer table resolved the sender;
@@ -646,23 +685,36 @@ volatile uint32_t g_warthog_filt_reason = 0, g_warthog_filt_drop = 0;
 volatile uint32_t g_warthog_filt_hist[9] = { 0 };
 
 /* HWMP path selection. A mac80211 peer will not send a unicast data frame to a
- * neighbour it has no PATH to, and peering ESTAB does not create one -- so
+ * neighbour it has no PATH to (unless mesh_nolearn is on, as on OpenMANET
+ * 1.8.1-dev wizard nodes), and peering ESTAB does not create one -- so
  * before this, warthog was reachable by broadcast and unreachable by anything
  * else. preq_tx is what makes us routable (a peer installs a path to any PREQ
  * originator it accepts); prep_tx is what answers a peer's discovery. */
 volatile uint32_t g_warthog_hwmp_rx = 0, g_warthog_hwmp_preq_rx = 0, g_warthog_hwmp_preq_tx = 0;
 volatile uint32_t g_warthog_hwmp_prep_tx = 0, g_warthog_hwmp_parse_fail = 0;
 volatile uint32_t g_warthog_hwmp_not_ours = 0;
-volatile uint32_t g_warthog_hwmp_prep_rx = 0;
+volatile uint32_t g_warthog_hwmp_prep_rx = 0, g_warthog_hwmp_rann_rx = 0, g_warthog_hwmp_perr_rx = 0;
 
 /* AMPE key installs. Non-zero means SAE/AMPE actually derived a key and it
  * reached the chip -- the difference between real mesh security and the
  * hardcoded constant. */
 volatile uint32_t g_warthog_ampe_mtk_installed = 0, g_warthog_ampe_mgtk_installed = 0;
+/* Re-installs of our own MGTK at a fresh TX PN base for an AMPE Key RSC, and
+ * failed ones (WARTHOG_MESH_MGTK_PN_BASE builds; ampe_mgtk counts first installs). */
+volatile uint32_t g_warthog_mgtk_reinst = 0, g_warthog_mgtk_rsc_fail = 0;
 /* 0 = open mesh, 1 = SAE authenticator initialised, 2 = SAE asked for but
  * mesh_rsn_auth_init() failed (mesh still runs, unsecured). */
 volatile uint32_t g_warthog_sae_init = 0;
 volatile uint32_t g_warthog_sae_peer_offers = 0, g_warthog_sae_peer_parse_fail = 0;
+/* SAE candidates not offered to hostap: new peers while the peer table is full. */
+volatile uint32_t g_warthog_sae_offer_full = 0;
+/* SAE handshakes that timed out, peerings that failed after SAE (each: slot
+ * freed, address held off), and offers refused during such a hold-off. */
+volatile uint32_t g_warthog_sae_fail = 0, g_warthog_sae_offer_held = 0, g_warthog_plink_fail = 0;
+/* Candidate RSSI floor in dBm (AT+MESHRSSI=, seeded from NVS in mesh.c); 0 or
+ * -255 is off. New peerings refused at or below it, and those it let through. */
+volatile int32_t g_warthog_mesh_rssi_floor = -80;
+volatile uint32_t g_warthog_mesh_rssi_skip = 0, g_warthog_mesh_rssi_pass = 0;
 volatile uint32_t g_warthog_sae_mlme_tx = 0, g_warthog_sae_mlme_auth_tx = 0;
 volatile unsigned int g_warthog_sae_addpeer_null = 0, g_warthog_sae_addpeer_ok = 0;
 volatile unsigned int g_warthog_sae_authsta_fail = 0, g_warthog_sae_authsta_ok = 0;
@@ -854,7 +906,7 @@ static void mping_on_success(esp_ping_handle_t h, void *args)
     c->recv++; c->last_rtt_ms = rtt;
     snprintf(c->line, sizeof(c->line), "+MPING: reply from %s seq=%u time=%lums\r\n",
              ipaddr_ntoa(&target), (unsigned)seq, (unsigned long)rtt);
-    cdc_write(c->line);
+    cdc_write_nowait(c->line); /* esp_ping task: a wait would delay the next ping */
 }
 
 static void mping_on_timeout(esp_ping_handle_t h, void *args)
@@ -863,7 +915,7 @@ static void mping_on_timeout(esp_ping_handle_t h, void *args)
     uint16_t seq = 0;
     esp_ping_get_profile(h, ESP_PING_PROF_SEQNO, &seq, sizeof(seq));
     snprintf(c->line, sizeof(c->line), "+MPING: seq=%u timeout\r\n", (unsigned)seq);
-    cdc_write(c->line);
+    cdc_write_nowait(c->line);
 }
 
 static void mping_on_end(esp_ping_handle_t h, void *args)
@@ -979,6 +1031,7 @@ static void cmd_meshcfg(void)
             .applied_chan    = g_warthog_applied_chan,
             .beacons_heard   = g_warthog_rxchan_beacon,
         };
+        warthog_mesh_diag_windowed(&in);
         snprintf(line, sizeof(line), "+MESHCFG: %s\r\n",
                  warthog_mesh_diag_text(warthog_mesh_diagnose(&in)));
         cdc_write(line);
@@ -1063,14 +1116,15 @@ static void cmd_hwmpdump(void)
 }
 static void cmd_hwmpstat(void)
 {
-    char buf[190];
+    char buf[240];
     snprintf(buf, sizeof(buf),
              "+HWMPSTAT: rx=%lu preq_rx=%lu preq_tx=%lu prep_rx=%lu prep_tx=%lu "
-             "parse_fail=%lu not_ours=%lu\r\n",
+             "parse_fail=%lu not_ours=%lu rann_rx=%lu perr_rx=%lu\r\n",
              (unsigned long)g_warthog_hwmp_rx, (unsigned long)g_warthog_hwmp_preq_rx,
              (unsigned long)g_warthog_hwmp_preq_tx, (unsigned long)g_warthog_hwmp_prep_rx,
              (unsigned long)g_warthog_hwmp_prep_tx,
-             (unsigned long)g_warthog_hwmp_parse_fail, (unsigned long)g_warthog_hwmp_not_ours);
+             (unsigned long)g_warthog_hwmp_parse_fail, (unsigned long)g_warthog_hwmp_not_ours,
+             (unsigned long)g_warthog_hwmp_rann_rx, (unsigned long)g_warthog_hwmp_perr_rx);
     cdc_write(buf);
     reply_ok();
 }
@@ -1216,7 +1270,7 @@ static void mcast_rx_task(void *arg)
             char line[110];
             snprintf(line, sizeof(line), "+MCAST: rx %d bytes from %s (#%lu)\r\n", n,
                      s_mc_last_from, (unsigned long)g_mc_rx);
-            cdc_write(line);
+            cdc_write_nowait(line);
         }
     }
     close(s_mc_sock);   /* also drops the IGMP membership */
@@ -1551,12 +1605,15 @@ static void cmd_keyfp(void)
 
 static void cmd_mpmpeers(void)
 {
-    char buf[400];
-    snprintf(buf, sizeof(buf), "+MPMPEERS: self=%02x%02x%02x %ssae=%lu offers=%lu pfail=%lu mlme=%lu auth_tx=%lu addp=%lu/%lu authsta=%lu/%lu rates=%lu apx=%lu/%lu rej=c%lu/e%lu/a%lu/r%lu stadd=%lu/%lu rxauth=%lu/%lu/%lu ampe_mtk=%lu ampe_mgtk=%lu no_slot=%lu expired=%lu bcn_peer=%lu close_tx=%lu s1g_bcn=%lu/%lu new=%lu retry=%lu sa=%02x%02x%02x\r\n",
+    static char buf[1024]; /* static: AT commands run one at a time; glue guard checks the fit */
+    snprintf(buf, sizeof(buf), "+MPMPEERS: self=%02x%02x%02x %ssae=%lu offers=%lu offer_full=%lu sae_fail=%lu plink_fail=%lu held=%lu pfail=%lu mlme=%lu auth_tx=%lu addp=%lu/%lu authsta=%lu/%lu rates=%lu apx=%lu/%lu rej=c%lu/e%lu/a%lu/r%lu stadd=%lu/%lu rxauth=%lu/%lu/%lu ampe_mtk=%lu ampe_mgtk=%lu mgtk_reinst=%lu mgtk_rsc_fail=%lu no_slot=%lu expired=%lu bcn_peer=%lu close_tx=%lu s1g_bcn=%lu/%lu new=%lu retry=%lu sa=%02x%02x%02x\r\n",
              g_warthog_mesh_self_addr[3], g_warthog_mesh_self_addr[4], g_warthog_mesh_self_addr[5],
              (const char *)g_warthog_mpm_links,
              (unsigned long)g_warthog_sae_init,
              (unsigned long)g_warthog_sae_peer_offers,
+             (unsigned long)g_warthog_sae_offer_full,
+             (unsigned long)g_warthog_sae_fail, (unsigned long)g_warthog_plink_fail,
+             (unsigned long)g_warthog_sae_offer_held,
              (unsigned long)g_warthog_sae_peer_parse_fail,
              (unsigned long)g_warthog_sae_mlme_tx,
              (unsigned long)g_warthog_sae_mlme_auth_tx,
@@ -1578,6 +1635,7 @@ static void cmd_mpmpeers(void)
              (unsigned long)g_warthog_rx_auth_other,
              (unsigned long)g_warthog_ampe_mtk_installed,
              (unsigned long)g_warthog_ampe_mgtk_installed,
+             (unsigned long)g_warthog_mgtk_reinst, (unsigned long)g_warthog_mgtk_rsc_fail,
              (unsigned long)g_warthog_mpm_no_slot, (unsigned long)g_warthog_mpm_expired,
              (unsigned long)g_warthog_bcn_peer_rx, (unsigned long)g_warthog_mpm_close_tx,
              (unsigned long)g_warthog_s1g_bcn_ours, (unsigned long)g_warthog_s1g_bcn_rx,
@@ -1801,9 +1859,31 @@ static void dispatch(char *line)
         } else {
             reply_error("usage: AT+MESHEN=<0|1>");
         }
+    } else if (strcasecmp(verb, "MESHRSSI") == 0 && terminator == '=') {
+        int32_t v = 0;
+        if (!meshrssi_parse_(trim(args), &v)) {
+            reply_error("usage: AT+MESHRSSI=<dBm -255..0>; 0 or -255 is off");
+        } else if (warthog_cfg_set_mesh_rssi((int16_t)v) != ESP_OK) {
+            reply_error("nvs write failed");
+        } else {
+            g_warthog_mesh_rssi_floor = v; /* live: read per candidate */
+            char line[80];
+            snprintf(line, sizeof(line), "+MESHRSSI: floor=%ld, stored, applies now\r\n", (long)v);
+            cdc_write(line);
+            reply_ok();
+        }
     } else if (strcasecmp(verb, "MESHRSSI") == 0 && terminator == '?') {
         char line[128];
         int shown = 0;
+        const int32_t fl = g_warthog_mesh_rssi_floor;
+        if (fl < 0 && fl > -255) {
+            snprintf(line, sizeof(line), "+MESHRSSI: floor=%ld skipped=%lu passed=%lu\r\n", (long)fl,
+                     (unsigned long)g_warthog_mesh_rssi_skip, (unsigned long)g_warthog_mesh_rssi_pass);
+        } else {
+            snprintf(line, sizeof(line), "+MESHRSSI: floor=off skipped=%lu passed=%lu\r\n",
+                     (unsigned long)g_warthog_mesh_rssi_skip, (unsigned long)g_warthog_mesh_rssi_pass);
+        }
+        cdc_write(line);
         for (int i = 0; i < WARTHOG_RSSI_PEERS; i++) {
             if (!s_peer_rssi[i].used) { continue; }
             snprintf(line, sizeof(line),
@@ -1880,29 +1960,40 @@ static void dispatch(char *line)
             reply_ok();
         } else { reply_error("usage: AT+MESHFWD=<0|1>"); }
     } else if (strcasecmp(verb, "MESHPATH") == 0 && terminator == '?') {
-        static char big[1400];
+        static char big[4096];
         int w = mmwlan_mesh_fwd_render(big, sizeof(big));
         if (w <= 0) { cdc_write("+MESHPATH: (empty)\r\n"); } else { cdc_write(big); }
         reply_ok();
     } else if (strcasecmp(verb, "MESHFWDSTAT") == 0 && terminator == '?') {
-        char line[480];
+        static char line[768]; /* AT task only; kept off its 4 KB stack */
         snprintf(line, sizeof(line),
                  "+MESHFWDSTAT: on=%lu fwd uni=%lu grp=%lu nomem=%lu | drop own=%lu dup=%lu ttl=%lu "
-                 "nopath=%lu nofwd=%lu bad=%lu full=%lu | perr_tx=%lu perr_supp=%lu preq_tx=%lu | relay preq=%lu prep=%lu perr=%lu "
-                 "| pend tx=%lu drop=%lu | hwmp prot=%lu unprotected=%lu mmie=%lu nommie=%lu\r\n",
+                 "nopath=%lu nofwd=%lu bad=%lu full=%lu tblfull=%lu | perr_tx=%lu preq_tx=%lu | relay preq=%lu prep=%lu perr=%lu "
+                 "| pend tx=%lu drop=%lu | hold n=%lu tx=%lu drop=%lu "
+                 "| hwmp prot=%lu unprotected=%lu unestab=%lu mmie=%lu nommie=%lu bipfail=%lu "
+                 "| hwmp tx prot=%lu mmie=%lu nommie=%lu qdrop=%lu qfail=%lu "
+                 "| mgmt prot chip=%lu host=%lu nodec=%lu grpkey=%lu | igtk=%lu\r\n",
                  (unsigned long)g_warthog_mesh_fwd, (unsigned long)g_warthog_fwd_uni,
                  (unsigned long)g_warthog_fwd_grp, (unsigned long)g_warthog_fwd_nomem,
                  (unsigned long)g_warthog_fwd_drop_own, (unsigned long)g_warthog_fwd_drop_dup,
                  (unsigned long)g_warthog_fwd_drop_ttl, (unsigned long)g_warthog_fwd_drop_nopath,
                  (unsigned long)g_warthog_fwd_drop_nofwd, (unsigned long)g_warthog_fwd_drop_bad,
-                 (unsigned long)g_warthog_fwd_drop_full,
-                 (unsigned long)g_warthog_fwd_perr_tx, (unsigned long)g_warthog_fwd_perr_suppressed,
-                 (unsigned long)g_warthog_fwd_preq_tx,
+                 (unsigned long)g_warthog_fwd_drop_full, (unsigned long)g_warthog_fwd_drop_tblfull,
+                 (unsigned long)g_warthog_fwd_perr_tx, (unsigned long)g_warthog_fwd_preq_tx,
                  (unsigned long)g_warthog_hwmp_relay_preq, (unsigned long)g_warthog_hwmp_relay_prep,
                  (unsigned long)g_warthog_hwmp_relay_perr,
                  (unsigned long)g_warthog_fwd_pend_tx, (unsigned long)g_warthog_fwd_pend_drop,
+                 (unsigned long)g_warthog_fwd_hold, (unsigned long)g_warthog_fwd_hold_tx,
+                 (unsigned long)g_warthog_fwd_hold_drop,
                  (unsigned long)g_warthog_hwmp_prot, (unsigned long)g_warthog_hwmp_unprotected,
-                 (unsigned long)g_warthog_hwmp_mmie, (unsigned long)g_warthog_hwmp_nommie);
+                 (unsigned long)g_warthog_hwmp_unestab,
+                 (unsigned long)g_warthog_hwmp_mmie, (unsigned long)g_warthog_hwmp_nommie,
+                 (unsigned long)g_warthog_hwmp_bipfail, (unsigned long)g_warthog_hwmp_tx_prot,
+                 (unsigned long)g_warthog_hwmp_tx_mmie, (unsigned long)g_warthog_hwmp_tx_nommie,
+                 (unsigned long)g_warthog_hwmp_tx_qdrop, (unsigned long)g_warthog_hwmp_tx_qfail,
+                 (unsigned long)g_warthog_mgmt_prot_chip, (unsigned long)g_warthog_mgmt_prot_host,
+                 (unsigned long)g_warthog_mgmt_prot_nodec, (unsigned long)g_warthog_mgmt_prot_grpkey,
+                 (unsigned long)g_warthog_ampe_igtk_installed);
         cdc_write(line);
         reply_ok();
     } else if (strcasecmp(verb, "MESHFWD") == 0 && terminator == '?') {
@@ -2138,6 +2229,7 @@ static void at_task(void *arg)
     while (1) {
         bool connected = tud_cdc_n_connected(0);
         if (connected && !was_connected) {
+            g_warthog_cdc.stalled = false; /* a new session: wait for this host */
             cdc_write("\r\n+READY: warthog AT interface\r\n");
             cdc_write("OK\r\n");
             len = 0;
@@ -2166,10 +2258,10 @@ static void at_task(void *arg)
             if (c == 0x7F || c == 0x08) {
                 if (len > 0) {
                     len--;
-                    cdc_write("\b \b");
+                    cdc_write_nowait("\b \b");
                 }
             } else if (c == '\r' || c == '\n') {
-                cdc_write("\r\n");
+                cdc_write_nowait("\r\n");
                 if (discarding) {
                     /* Tail of a line we already rejected. */
                     discarding = false;
@@ -2184,7 +2276,7 @@ static void at_task(void *arg)
             } else if (len + 1 < sizeof(line)) {
                 line[len++] = (char)c;
                 char echo[2] = {(char)c, '\0'};
-                cdc_write(echo);
+                cdc_write_nowait(echo);
             } else {
                 /* Overflow. Reject the line AND everything up to the next
                  * terminator: without the discard state the bytes past the
@@ -2193,7 +2285,7 @@ static void at_task(void *arg)
                  * error and then ran whatever happened to trail it. */
                 discarding = true;
                 len = 0;
-                cdc_write("\r\n");
+                cdc_write_nowait("\r\n");
                 reply_error("line too long");
             }
         }

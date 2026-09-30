@@ -16,9 +16,9 @@
 #include "mesh_diag.h"
 #include "mesh_bridge.h"
 
-/* 802.11s security. Default OFF: stock OpenMANET ships encryption='none', and
- * an open mesh is what it must be matched with. The warthog-mesh-sae env turns
- * it on. The passphrase must be identical on every node in the mesh. */
+/* 802.11s security. Default OFF, which matches only a peer set to encryption='none':
+ * OpenMANET's mesh wizard writes SAE. The warthog-mesh-sae env turns it on. The
+ * passphrase must be identical on every node in the mesh. */
 #ifndef WARTHOG_MESH_SAE
 #define WARTHOG_MESH_SAE 0
 #endif
@@ -70,6 +70,37 @@ static const char *TAG = "warthog.mesh";
 static char s_mesh_id_active[WARTHOG_CFG_MESH_ID_MAXLEN + 1];
 static uint16_t s_mesh_beacon_tu;
 
+/* Rolled or reset by the watchdog (probe task), read by AT+MESHCFG? (AT task). */
+static struct warthog_mesh_diag_window s_diag_win;
+static portMUX_TYPE s_diag_mux = portMUX_INITIALIZER_UNLOCKED;
+
+enum diag_win_op { DIAG_WIN_FILL, DIAG_WIN_ROLL, DIAG_WIN_RESET };
+
+/* One window operation on the totals as they stand, both under the lock. */
+static void diag_win_(enum diag_win_op op, struct warthog_mesh_diag_in *in)
+{
+    extern volatile uint32_t g_warthog_prq_named, g_warthog_mesh_rssi_skip, g_warthog_mesh_rssi_pass;
+    portENTER_CRITICAL(&s_diag_mux);
+    const struct warthog_mesh_diag_counts now = {
+        .mesh_probes  = g_warthog_prq_named,
+        .floor_skips  = g_warthog_mesh_rssi_skip,
+        .floor_passes = g_warthog_mesh_rssi_pass,
+    };
+    if (op == DIAG_WIN_FILL) {
+        warthog_mesh_diag_window_fill(&s_diag_win, &now, in);
+    } else if (op == DIAG_WIN_ROLL) {
+        warthog_mesh_diag_window_roll(&s_diag_win, &now);
+    } else {
+        warthog_mesh_diag_window_reset(&s_diag_win, &now);
+    }
+    portEXIT_CRITICAL(&s_diag_mux);
+}
+
+void warthog_mesh_diag_windowed(struct warthog_mesh_diag_in *in)
+{
+    diag_win_(DIAG_WIN_FILL, in);
+}
+
 static void mesh_report_unpeered(unsigned int peers)
 {
     extern volatile uint32_t g_warthog_rxchan_beacon;
@@ -85,6 +116,7 @@ static void mesh_report_unpeered(unsigned int peers)
         .applied_chan    = g_warthog_applied_chan,
         .beacons_heard   = g_warthog_rxchan_beacon,
     };
+    warthog_mesh_diag_windowed(&in);
     enum warthog_mesh_diag d = warthog_mesh_diagnose(&in);
 
     ESP_LOGE(TAG, "NOT PEERED. Every value below must match the rest of the mesh:");
@@ -204,10 +236,12 @@ static void mesh_probe_burst_task(void *arg)
                     complained = false;
                 }
                 unpeered = 0;
+                diag_win_(DIAG_WIN_RESET, NULL);
             } else if (++unpeered == MESH_PEER_GRACE_TICKS ||
                        (unpeered > MESH_PEER_GRACE_TICKS &&
                         ((unpeered - MESH_PEER_GRACE_TICKS) % MESH_PEER_NAG_TICKS) == 0)) {
                 mesh_report_unpeered(0);
+                diag_win_(DIAG_WIN_ROLL, NULL);
                 complained = true;
             }
         }
@@ -380,6 +414,9 @@ void warthog_mesh_smoke_test(void)
     g_warthog_mesh_grp = warthog_cfg_get_mesh_grp();
     /* Must precede the supplicant's mesh_config_create(), which reads it once. */
     g_warthog_mesh_pmf = warthog_cfg_get_mesh_pmf();
+    /* Before the first beacon is heard; AT+MESHRSSI= also sets it live. */
+    extern volatile int32_t g_warthog_mesh_rssi_floor;
+    g_warthog_mesh_rssi_floor = warthog_cfg_get_mesh_rssi();
 #if WARTHOG_MESH_SAE && !defined(WARTHOG_MESH_HOST_CCMP)
     if (g_warthog_mesh_grp) {
         ESP_LOGE(TAG, "mesh: standard group frames under SAE with chip crypto: sent under our "
@@ -444,7 +481,8 @@ void warthog_mesh_smoke_test(void)
      * that differs from the peer's is a plausible sync failure -- Morse and
      * OpenMANET both use 1000 TU where the conventional default is 100.
      *
-     * OpenMANET parity (see the channel notes in platformio.ini):
+     * Parity with the hand-configured bench OpenMANET nodes (see platformio.ini;
+     * the mesh wizard's default ID is 'openmanet'):
      *   -DWARTHOG_MESH_ID='"halowmesh"'  -DWARTHOG_MESH_BEACON_TU=1000
      */
 #ifndef WARTHOG_MESH_ID
@@ -475,8 +513,8 @@ void warthog_mesh_smoke_test(void)
      * implements and what a mac80211 peer speaks, so it is the only mode that
      * can interoperate with a secured OpenMANET mesh.
      *
-     * MMWLAN_OPEN leaves the mesh unauthenticated and unencrypted, which is
-     * what stock OpenMANET ships and what the data plane must match.
+     * MMWLAN_OPEN leaves the mesh unauthenticated and unencrypted; it matches
+     * only a peer set to encryption='none' (OpenMANET's mesh wizard writes SAE).
      *
      * The passphrase must be identical on every node, exactly as it must be
      * for any 802.11s SAE mesh. */

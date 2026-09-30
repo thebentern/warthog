@@ -1326,19 +1326,15 @@ int mmdrv_tx_frame(struct mmpkt *mmpkt, bool is_mgmt)
         return -ENODEV;
     }
 
-    /* Diagnostic: count every chip TX. After step 23 the
-     * chip only ever asks for the beacon template once (mmdrv_host_get_beacon
-     * count stays at 1) and never reports TX_STATUS. This counts mgmt vs data
-     * vs beacon frames going TO the chip — so we can tell whether mesh is
-     * trying to TX anything beyond the one beacon (probe reqs, action
-     * frames, etc.) or genuinely silent. ERR level surfaces at default. */
+    /* Diagnostic: count every chip TX, mgmt vs data. DBG only: every task that transmits
+     * runs this, and printf's frames on top of a sender's overflow the 3.5 KB tcpip task. */
     static uint32_t s_tx_total = 0;
     static uint32_t s_tx_mgmt = 0;
     s_tx_total++;
     if (is_mgmt) s_tx_mgmt++;
     if (s_tx_total <= 16 || (s_tx_total % 50) == 0)
     {
-        MMLOG_ERR("mmdrv_tx_frame#%lu: is_mgmt=%d tid=%u (total mgmt=%lu)\n",
+        MMLOG_DBG("mmdrv_tx_frame#%lu: is_mgmt=%d tid=%u (total mgmt=%lu)\n",
                   (unsigned long)s_tx_total, (int)is_mgmt,
                   (unsigned)tx_metadata->tid, (unsigned long)s_tx_mgmt);
     }

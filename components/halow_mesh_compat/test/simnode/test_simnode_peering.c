@@ -18,10 +18,11 @@
  *     SAE-mode assertion would be asserting on a stub.
  *   - mmosal_get_time_ms() is the simulator's virtual clock, so the 30 s
  *     peering timeout is crossed by advancing it, not by waiting.
- *   - mpm_expire_stale_() is called from umac_mesh_maybe_initiate_mpm(), NOT
- *     from umac_mesh_service_tick(). simnode_tick() therefore does NOT run the
- *     watchdog; a received probe request does. That is what prod_() below is
- *     for, and it is the real firmware path, not a back door.
+ *   - mpm_expire_stale_() runs from umac_mesh_maybe_initiate_mpm() on every
+ *     received probe request (prod_() below), and from the service tick --
+ *     which only POSTS it to the umac event loop, where the RX path that
+ *     dereferences the stations it frees also runs. simnode_tick() pumps that
+ *     loop; section 5c calls the bare tick to show the post is all it does.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -453,6 +454,58 @@ int main(void)
         CHECK(g_warthog_mpm_expired > expired_before,
               "and it is counted as an expiry (%lu -> %lu)",
               (unsigned long)expired_before, (unsigned long)g_warthog_mpm_expired);
+    }
+
+    /* ---- 5c. The tick frees no station itself ---------------------------
+     *
+     * The tick runs on the mesh-probe task, but stations are dereferenced by
+     * the RX path on the umac event loop, so freeing one from the tick is a
+     * cross-task use-after-free. The tick must only post the work: nothing is
+     * torn down until the event loop runs, for expiry and for AT+MESHRELINK. */
+    reset_node();
+    {
+        extern volatile uint32_t g_warthog_mesh_repeer_req;
+        void umac_mesh_service_tick(void);
+
+        uint16_t ours = peer_up(A, 0x7a7a);
+        CHECK(ours != 0 && umac_datapath_mesh_peer_count() == 1, "A is established");
+        uint32_t expired_before = g_warthog_mpm_expired;
+        simnode_advance_ms(40000);
+        umac_mesh_service_tick();
+        CHECK(umac_datapath_mesh_peer_count() == 1 && g_warthog_mpm_expired == expired_before,
+              "40 s of silence: the bare tick leaves A's station alone (count=%u)",
+              umac_datapath_mesh_peer_count());
+        CHECK(simnode_evt_pending() == 1u, "it posted one event to the loop (%u)", simnode_evt_pending());
+        umac_mesh_service_tick();
+        CHECK(simnode_evt_pending() == 1u, "a second tick while it is queued posts no more (%u)",
+              simnode_evt_pending());
+        simnode_pump();
+        CHECK(umac_datapath_mesh_peer_count() == 0 && g_warthog_mpm_expired > expired_before,
+              "the event loop runs it and A expires (count=%u)", umac_datapath_mesh_peer_count());
+        CHECK(strstr((const char *)g_warthog_mpm_links, "00000a") == NULL,
+              "and its link is gone from AT+MPMPEERS? (%s)", (const char *)g_warthog_mpm_links);
+
+        CHECK(peer_up(B, 0x7b7b) != 0 && umac_datapath_mesh_peer_count() == 1, "B is established");
+        g_warthog_mesh_repeer_req = 1;
+        umac_mesh_service_tick();
+        CHECK(umac_datapath_mesh_peer_count() == 1 && g_warthog_mesh_repeer_req == 1,
+              "AT+MESHRELINK: the bare tick leaves B's station alone");
+        simnode_pump();
+        CHECK(umac_datapath_mesh_peer_count() == 0 && g_warthog_mesh_repeer_req == 0,
+              "the event loop tears B down (count=%u)", umac_datapath_mesh_peer_count());
+        umac_mesh_service_tick();
+        CHECK(simnode_evt_pending() == 1u, "once the event has run, the next tick posts again (%u)",
+              simnode_evt_pending());
+        simnode_pump();
+
+        /* A full event pool refuses the post; the tick must not wait on it forever. */
+        CHECK(simnode_evt_fill() > 0u, "event queue filled");
+        umac_mesh_service_tick();
+        simnode_pump();
+        umac_mesh_service_tick();
+        CHECK(simnode_evt_pending() == 1u, "a tick refused by a full queue is posted by the next (%u)",
+              simnode_evt_pending());
+        simnode_pump();
     }
 
     /* ---- 6. An Open with a NEW llid means the peer restarted ------------ */

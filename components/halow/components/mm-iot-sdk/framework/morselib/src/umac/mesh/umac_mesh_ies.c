@@ -13,32 +13,26 @@
 
 /* Mesh Configuration IE payload values.
  *
- * Path selection protocol / metric are 0x01/0x01. This is MEASURED, not
- * reasoned, and it contradicts the kernel headers -- Linux has
- * IEEE80211_PATH_PROTOCOL_HWMP = 0 and IEEE80211_PATH_METRIC_AIRTIME = 0, and
- * mesh_matches_local() compares these fields against ifmsh->mesh_pp_id /
- * mesh_pm_id. 0x00 was tried on hardware and is wrong for this peer:
- *
- *   0x01/0x01 -> peer creates a candidate, sends an Open, reaches OPN_RCVD
- *   0x00/0x00 -> peer probes us forever and never initiates
- *                (AT+PRSPSTAT? req_rx=16 rsp_tx=16 while AT+MPMSTAT? rx=0)
- *
- * The morse driver runs mesh_pp_id / mesh_pm_id = 1. Do NOT "correct" these to
- * the header constants without re-testing on air. */
-#define MESH_PATH_PROTO_ID 0x01  /* HWMP, as this peer identifies it */
-#define MESH_PATH_METRIC_ID 0x01 /* Airtime, as this peer identifies it */
+ * Path selection protocol / metric 0x01/0x01 are the 802.11 HWMP and airtime
+ * IDs (Linux IEEE80211_PATH_PROTOCOL_HWMP = IEEE80211_PATH_METRIC_AIRTIME = 1).
+ * mesh_matches_local() rejects other values: with 0x00/0x00 the peer never initiated. */
+#define MESH_PATH_PROTO_ID 0x01  /* HWMP */
+#define MESH_PATH_METRIC_ID 0x01 /* Airtime */
 #define MESH_CONGESTION_NONE 0x00
 #define MESH_SYNC_NEIGHBOR 0x01
 #define MESH_AUTH_NONE 0x00
 #define MESH_AUTH_SAE 0x01
-#define MESH_FORMATION_INFO 0x00
-/* Accepting Additional Mesh Peerings (bit 0), plus Forwarding (bit 3) only
- * when the relay is on. Advertising forwarding invites a mac80211 peer to
- * route through us; with the relay off that is a blackhole, so the bit
- * follows the runtime gate exactly. */
-#define MESH_CAPABILITY 0x01
+/* Formation Info carries Number of Peerings in bits 1..6, capped at 63 as
+ * mac80211 does; Connected to Gate/AS stay 0. */
+#define MESH_FORMATION_PEERINGS_MAX 63u
+/* Accepting Additional Mesh Peerings (bit 0) while the peer table has room,
+ * plus Forwarding (bit 3) only when the relay is on. Advertising forwarding
+ * invites a mac80211 peer to route through us; with the relay off that is a
+ * blackhole, so the bit follows the runtime gate exactly. */
+#define MESH_CAPABILITY_ACCEPTING 0x01
 #define MESH_CAPABILITY_FORWARDING 0x08
 uint8_t umac_mesh_ies_cap_forwarding = 0;
+void (*umac_mesh_ies_capacity_fn)(struct umac_mesh_ies_capacity *out) = NULL;
 
 /* Supported Rates, mandatory 5 GHz OFDM set. dot11ah presents S1G as 5 GHz, so
  * this is the set a peer expects. Units are 500 kbps; the MSB marks a rate
@@ -79,8 +73,16 @@ uint16_t umac_mesh_ies_build_mesh_config(uint8_t *out, uint16_t out_len, bool sa
     out[n++] = MESH_CONGESTION_NONE;
     out[n++] = MESH_SYNC_NEIGHBOR;
     out[n++] = sae ? MESH_AUTH_SAE : MESH_AUTH_NONE;
-    out[n++] = MESH_FORMATION_INFO;
-    out[n++] = (uint8_t)(MESH_CAPABILITY |
+
+    struct umac_mesh_ies_capacity cap = { .accepting = true, .peerings = 0 };
+    if (umac_mesh_ies_capacity_fn != NULL)
+    {
+        umac_mesh_ies_capacity_fn(&cap);
+    }
+    uint8_t peerings = (cap.peerings > MESH_FORMATION_PEERINGS_MAX) ? MESH_FORMATION_PEERINGS_MAX
+                                                                    : cap.peerings;
+    out[n++] = (uint8_t)(peerings << 1);
+    out[n++] = (uint8_t)((cap.accepting ? MESH_CAPABILITY_ACCEPTING : 0u) |
                          (umac_mesh_ies_cap_forwarding ? MESH_CAPABILITY_FORWARDING : 0u));
     return n;
 }
@@ -116,6 +118,71 @@ uint16_t umac_mesh_ies_build_discovery(uint8_t *out, uint16_t out_len, const uin
 
     n = (uint16_t)(n + umac_mesh_ies_build_mesh_config(&out[n], (uint16_t)(out_len - n), sae));
     return n;
+}
+
+bool umac_mesh_ies_rsn_valid(const uint8_t *rsn, uint16_t len)
+{
+    /* At least the 2-octet Version: 802.11 makes every later RSNE field optional. */
+    if (rsn == NULL || len < 2u || len > UMAC_MESH_IES_RSN_MAXLEN || rsn[0] != UMAC_MESH_EID_RSN ||
+        rsn[1] < 2u)
+    {
+        return false;
+    }
+    uint32_t off = 0;
+    while (off < len)
+    {
+        if (off + 2u > len || off + 2u + rsn[off + 1] > len)
+        {
+            return false;
+        }
+        off += 2u + rsn[off + 1];
+    }
+    return true;
+}
+
+uint16_t umac_mesh_ies_build_probe_resp(uint8_t *out, uint16_t out_len, const uint8_t *mesh_id,
+                                        uint8_t mesh_id_len, bool sae, const uint8_t *rsn,
+                                        uint16_t rsn_len)
+{
+    if (out == NULL || mesh_id == NULL || mesh_id_len == 0 ||
+        mesh_id_len > UMAC_MESH_IES_MESH_ID_MAXLEN)
+    {
+        return 0;
+    }
+    const uint16_t rsn_n = (sae && umac_mesh_ies_rsn_valid(rsn, rsn_len)) ? rsn_len : 0u;
+    const uint32_t need = 2u + sizeof(k_supported_rates) + rsn_n + 2u + mesh_id_len + 2u +
+                          UMAC_MESH_CFG_IE_LEN;
+    if (need > out_len)
+    {
+        return 0;
+    }
+
+    uint16_t n = umac_mesh_ies_build_discovery(out, out_len, mesh_id, mesh_id_len, sae);
+    if (n != 0u && rsn_n != 0u)
+    {
+        /* The standard probe-response order: Supported Rates, RSN, ..., Mesh ID. */
+        const uint16_t at = (uint16_t)(2u + sizeof(k_supported_rates));
+        memmove(&out[at + rsn_n], &out[at], (size_t)(n - at));
+        memcpy(&out[at], rsn, rsn_n);
+        n = (uint16_t)(n + rsn_n);
+    }
+    return n;
+}
+
+uint16_t umac_mesh_ies_build_probe_req(uint8_t *out, uint16_t out_len, const uint8_t *mesh_id,
+                                       uint8_t mesh_id_len)
+{
+    if (out == NULL || mesh_id == NULL || mesh_id_len == 0 ||
+        mesh_id_len > UMAC_MESH_IES_MESH_ID_MAXLEN || 4u + (uint32_t)mesh_id_len > out_len)
+    {
+        return 0;
+    }
+    out[0] = UMAC_MESH_EID_SSID;
+    out[1] = 0; /* wildcard: a mesh STA identifies its MBSS by Mesh ID */
+    out[2] = UMAC_MESH_EID_MESH_ID;
+    out[3] = mesh_id_len;
+    memcpy(&out[4], mesh_id, mesh_id_len);
+    return (uint16_t)(4u + mesh_id_len);
 }
 
 uint16_t umac_mesh_ies_build_mpm_body(uint8_t *out, uint16_t out_len, uint8_t action,
@@ -468,4 +535,49 @@ bool umac_mesh_ies_s1g_beacon_has_mesh_id(const uint8_t *frame, uint32_t len,
         return false;
     }
     return mesh_id_in_elements_(frame, len, off, mesh_id, mesh_id_len);
+}
+
+/* The Mesh Configuration payload in an element walk; NULL when it is absent
+ * or a length octet runs past the buffer first. */
+static const uint8_t *mesh_config_in_(const uint8_t *ies, uint32_t len)
+{
+    uint32_t off = 0;
+    while (ies != NULL && off + 2u <= len)
+    {
+        uint8_t eid = ies[off];
+        uint8_t elen = ies[off + 1];
+        if (off + 2u + (uint32_t)elen > len)
+        {
+            return NULL;
+        }
+        if (eid == UMAC_MESH_EID_MESH_CONFIG && elen >= UMAC_MESH_CFG_IE_LEN)
+        {
+            return &ies[off + 2u];
+        }
+        off += 2u + (uint32_t)elen;
+    }
+    return NULL;
+}
+
+bool umac_mesh_ies_set_accepting(uint8_t *ies, uint16_t len, bool accepting)
+{
+    uint8_t *cfg = (uint8_t *)mesh_config_in_(ies, len);
+    if (cfg == NULL)
+    {
+        return false;
+    }
+    cfg[6] = (uint8_t)(accepting ? (cfg[6] | MESH_CAPABILITY_ACCEPTING)
+                                 : (cfg[6] & (uint8_t)~MESH_CAPABILITY_ACCEPTING));
+    return true;
+}
+
+bool umac_mesh_ies_peer_openable(const uint8_t *ies, uint32_t len, bool sae)
+{
+    const uint8_t *cfg = mesh_config_in_(ies, len);
+    if (cfg == NULL)
+    {
+        return true; /* absent or unparseable: the peer's Close still refuses us */
+    }
+    return cfg[4] == (sae ? MESH_AUTH_SAE : MESH_AUTH_NONE) &&
+           (cfg[6] & MESH_CAPABILITY_ACCEPTING) != 0u;
 }

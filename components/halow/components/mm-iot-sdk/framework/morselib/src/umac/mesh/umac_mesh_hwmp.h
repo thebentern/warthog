@@ -40,6 +40,8 @@ extern "C" {
 /** Element IDs. 130/131 -- NOT 113/114, which are Mesh Config and Mesh ID. */
 #define HWMP_EID_PREQ 130
 #define HWMP_EID_PREP 131
+/** Root announcement: counted, not acted on. */
+#define HWMP_EID_RANN 126
 
 /** Element length octets. mac80211 has historically required these EXACTLY
  *  (preq_len != 37 / prep_len != 31 -> drop), so always emit them. */

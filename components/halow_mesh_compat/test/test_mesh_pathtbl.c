@@ -6,7 +6,10 @@
  * sequence-number comparison backwards and a relay adopts every stale
  * advertisement; forget the hysteresis and two equal routes flap on every
  * PREQ; refresh expiry on a rejected update and a dead path never dies;
- * honour an older PERR and a delayed error kills a path that was rebuilt.
+ * honour an older PERR and a delayed error kills a path that was rebuilt;
+ * start a new slot's expiry at 0 and a path made after 2^31 ms of uptime
+ * never expires; never free a lapsed slot and 2^31 ms later it is live again;
+ * never bound a leaf pin's age and 2^32 ms later its via hold is back.
  * Each of those is a known-answer case here.
  */
 #include "umac_mesh_pathtbl.h"
@@ -26,7 +29,7 @@ static const uint8_t H2[6] = { 0x02, 0, 0, 0, 0, 0x22 }; /* next hop 2 */
 static const uint8_t X[6]  = { 0x00, 0xe0, 0x4f, 0x71, 0x99, 0xa5 }; /* a host behind a node */
 
 static struct umac_mesh_pathtbl T;
-#define LT UMAC_MESH_PATH_LIFETIME_MS
+#define LT 5120u /* any lifetime; the relay derives the real one from the PREQ/PREP */
 
 int main(void)
 {
@@ -184,14 +187,296 @@ int main(void)
     CHECK(umac_mesh_proxy_lookup(&T, X, now + UMAC_MESH_PROXY_LIFETIME_MS + 2) == NULL, "a touch does not resurrect a lapsed host entry");
     _Static_assert(UMAC_MESH_PROXY_LIFETIME_MS == 600000u, "proxy lifetime is mac80211's 600 s");
 
+    /* ---- a path made late in uptime still expires --------------------------- */
+    /* The only-extend rule compares against the slot's old expiry. A new slot
+     * must start at now (mac80211 mesh_path_new), not 0: from 2^31 ms of
+     * uptime, 0 is in the future and the path would never lapse. */
+    {
+        const uint32_t late[2] = { 0x80000000u + 1000u, 0xfffff000u };
+        const uint32_t life[2] = { LT, 1000u }; /* the second expires just short of the wrap */
+        for (unsigned k = 0; k < 2u; k++)
+        {
+            umac_mesh_pathtbl_init(&T);
+            umac_mesh_path_update(&T, D, H1, 10, 500, 1, life[k], late[k]);
+            CHECK(T.p[0].exp_ms == late[k] + life[k], "uptime 0x%08lx: expiry is now + %lu ms (got 0x%08lx)",
+                  (unsigned long)late[k], (unsigned long)life[k], (unsigned long)T.p[0].exp_ms);
+            CHECK(umac_mesh_path_lookup(&T, D, late[k] + life[k] + 1u) == NULL,
+                  "uptime 0x%08lx: and the path lapses then", (unsigned long)late[k]);
+        }
+    }
+
+    /* ---- the sweep: a path 600 s past its expiry is freed ------------------
+     *
+     * Every expiry test is signed 32-bit, so a slot left 2^31 ms (24.9 days)
+     * after its expiry reads as unexpired again: a lapsed ACTIVE path comes
+     * back, and a dead slot re-learned then keeps its old expiry and never
+     * lapses. umac_mesh_path_expire(), run from the glue's tick, frees both
+     * UMAC_MESH_PATH_EXPIRE_MS after their expiry, as mac80211's
+     * mesh_path_expire() does. Pinned: the bound (600 s, to the ms), that dead
+     * and lapsed-active slots go and a live one stays, and that after a sweep
+     * both wrap cases behave. Separately, without any sweep, an update still
+     * restarts a slot that lapsed just under 2^31 ms ago.
+     */
+    {
+        _Static_assert(UMAC_MESH_PATH_EXPIRE_MS == 600000u, "mac80211 MESH_PATH_EXPIRE is 600 s");
+        const uint8_t D2[6] = { 0x02, 0, 0, 0, 0, 0xd2 }, D3[6] = { 0x02, 0, 0, 0, 0, 0xd3 };
+        const uint32_t t = 1000;
+        const uint32_t edge = t + LT + UMAC_MESH_PATH_EXPIRE_MS;
+        umac_mesh_pathtbl_init(&T);
+        umac_mesh_path_update(&T, D, H1, 10, 500, 1, LT, t);       /* lapses, still ACTIVE */
+        umac_mesh_path_update(&T, D2, H1, 10, 500, 1, LT, t);      /* a PERR kills it... */
+        CHECK(umac_mesh_path_invalidate(&T, D2, 11, H1, t + 10), "sweep: D2 dead with time left");
+        umac_mesh_path_update(&T, D3, H1, 10, 500, 1, LT, edge - 1000u); /* live at the edge */
+        CHECK(umac_mesh_path_expire(&T, edge - 1u) == 0 && T.p[0].used && T.p[1].used,
+              "sweep: 600 s - 1 ms after their expiry, lapsed and dead paths are kept");
+        CHECK(umac_mesh_path_expire(&T, edge) == 2 && !T.p[0].used && !T.p[1].used,
+              "sweep: 600 s after it, both are freed");
+        CHECK(T.p[2].used && umac_mesh_path_lookup(&T, D3, edge) != NULL,
+              "sweep: a live path is not");
+        CHECK(umac_mesh_path_expire(&T, edge) == 0, "sweep: a second pass frees nothing");
+
+        const uint32_t wrap = t + LT + 0x80000000u + 10u;
+        CHECK(umac_mesh_path_lookup(&T, D, wrap) == NULL,
+              "sweep: 2^31 ms after its expiry, the lapsed path does not come back");
+        CHECK(umac_mesh_path_update(&T, D2, H1, 12, 500, 1, LT, wrap), "sweep: D2 re-learned then");
+        p = umac_mesh_path_lookup(&T, D2, wrap);
+        CHECK(p != NULL && p->exp_ms == wrap + LT,
+              "sweep: with expiry now + %u ms (got 0x%08lx want 0x%08lx)", (unsigned)LT,
+              p != NULL ? (unsigned long)p->exp_ms : 0ul, (unsigned long)(wrap + LT));
+        CHECK(umac_mesh_path_lookup(&T, D2, wrap + LT) == NULL &&
+                  umac_mesh_path_lookup(&T, D2, wrap + 86400000u) == NULL,
+              "sweep: and it lapses then, not a day later");
+        CHECK(umac_mesh_path_expire(NULL, edge) == 0, "sweep: NULL table");
+
+        /* Proxy entries: the same rule, or one learned and left 2^31 ms reads live again. */
+        umac_mesh_pathtbl_init(&T);
+        const uint8_t HX[6] = { 0x00, 0x77, 0, 0, 0, 0x5a };
+        CHECK(umac_mesh_proxy_learn(&T, HX, H1, t), "sweep: a proxy entry learned");
+        const uint32_t pedge = t + UMAC_MESH_PROXY_LIFETIME_MS + UMAC_MESH_PATH_EXPIRE_MS;
+        CHECK(umac_mesh_path_expire(&T, pedge - 1u) == 0 && T.x[0].used,
+              "sweep: a proxy entry 600 s - 1 ms past its expiry is kept");
+        CHECK(umac_mesh_path_expire(&T, pedge) == 1 && !T.x[0].used,
+              "sweep: and freed at 600 s past it");
+        const uint32_t pwrap = t + UMAC_MESH_PROXY_LIFETIME_MS + 0x80000000u + 10u;
+        CHECK(umac_mesh_proxy_lookup(&T, HX, pwrap) == NULL,
+              "sweep: 2^31 ms after its expiry, the proxy entry does not come back");
+
+        /* No sweep: update alone still restarts a slot stale by just under 2^31 ms. */
+        umac_mesh_pathtbl_init(&T);
+        umac_mesh_path_update(&T, D, H1, 10, 500, 1, LT, t);
+        (void)umac_mesh_path_invalidate(&T, D, 11, H1, t + 10);
+        const uint32_t stale = t + LT + 0x80000000u - LT / 2u;
+        CHECK(umac_mesh_path_update(&T, D, H1, 12, 500, 1, LT, stale), "unswept: re-learned");
+        p = umac_mesh_path_lookup(&T, D, stale);
+        CHECK(p != NULL && p->exp_ms == stale + LT,
+              "unswept: a slot %lu ms past its expiry restarts at now + %u ms (got %ld)",
+              (unsigned long)(stale - t - LT), (unsigned)LT,
+              p != NULL ? (long)(int32_t)(p->exp_ms - stale) : -1L);
+    }
+
+    /* ---- leaf entries: hints from floods may be evicted, conversations not ----
+     *
+     * Pinned: a full table of flood hints gives up exactly its least recently
+     * refreshed one; a node at its bound rotates only its own hints; unicast
+     * evidence pins (and is recorded with its time); relay-learned entries are
+     * never evicted and a relay re-learn clears leaf state; a reused slot starts
+     * clean; the entry accessor honours expiry. */
+    {
+        static const uint8_t VIA[6] = { 0x02, 0, 0, 0, 0, 0xaa };
+        uint32_t t0 = 200000;
+        /* Four nodes, eight flood-learned hosts each: the table is full. */
+        umac_mesh_pathtbl_init(&T);
+        for (uint32_t n = 0; n < 4; n++) for (uint32_t i = 0; i < UMAC_MESH_PROXY_PER_NODE; i++)
+        {
+            uint8_t node[6] = { 0x02, 0, 0, 0, 0, (uint8_t)(0x10 + n) }, h[6] = { 0x00, 0x55, 0, 0, (uint8_t)n, (uint8_t)i };
+            (void)umac_mesh_proxy_learn_leaf(&T, h, node, VIA, false, t0 + n * 100u + i);
+        }
+        CHECK(umac_mesh_proxy_count(&T, t0 + 1000) == UMAC_MESH_PROXY_MAX, "leaf: table full of flood-learned hints");
+        uint8_t fresh5[6] = { 0x00, 0x66, 0, 0, 0, 1 }, node5[6] = { 0x02, 0, 0, 0, 0, 0x50 };
+        uint8_t oldest[6] = { 0x00, 0x55, 0, 0, 0, 0 }, second[6] = { 0x00, 0x55, 0, 0, 0, 1 };
+        CHECK(umac_mesh_proxy_learn_leaf(&T, fresh5, node5, VIA, false, t0 + 1000),
+              "leaf: a newcomer behind another node takes a slot from a flood hint");
+        CHECK(umac_mesh_proxy_lookup(&T, oldest, t0 + 1000) == NULL &&
+              umac_mesh_proxy_lookup(&T, second, t0 + 1000) != NULL,
+              "leaf: the victim is the least recently refreshed hint, and only it");
+        CHECK(umac_mesh_proxy_count(&T, t0 + 1000) == UMAC_MESH_PROXY_MAX, "leaf: still exactly full");
+
+        /* A node at its bound rotates its own hints, even with slots free and
+         * another node's hint older: one node's flood cannot unlearn others. */
+        umac_mesh_pathtbl_init(&T);
+        uint8_t node0[6] = { 0x02, 0, 0, 0, 0, 0x10 }, node1[6] = { 0x02, 0, 0, 0, 0, 0x11 };
+        for (uint32_t i = 0; i < UMAC_MESH_PROXY_PER_NODE; i++)
+        {
+            uint8_t h1[6] = { 0x00, 0x55, 0, 0, 1, (uint8_t)i }, h0[6] = { 0x00, 0x55, 0, 0, 0, (uint8_t)i };
+            (void)umac_mesh_proxy_learn_leaf(&T, h1, node1, VIA, false, t0 + i);
+            (void)umac_mesh_proxy_learn_leaf(&T, h0, node0, VIA, false, t0 + 500u + i);
+        }
+        uint8_t n0h9[6] = { 0x00, 0x55, 0, 0, 0, 9 }, n0h0[6] = { 0x00, 0x55, 0, 0, 0, 0 };
+        uint8_t n1h0[6] = { 0x00, 0x55, 0, 0, 1, 0 };
+        CHECK(umac_mesh_proxy_learn_leaf(&T, n0h9, node0, VIA, false, t0 + 1000),
+              "leaf: a ninth host behind a node at its bound replaces that node's oldest hint");
+        CHECK(umac_mesh_proxy_lookup(&T, n0h0, t0 + 1000) == NULL &&
+              umac_mesh_proxy_lookup(&T, n1h0, t0 + 1000) != NULL &&
+              umac_mesh_proxy_count(&T, t0 + 1000) == 2u * UMAC_MESH_PROXY_PER_NODE,
+              "leaf: ...not another node's, though older, and not a free slot");
+
+        /* Unicast evidence pins an entry; a table of pinned entries refuses. */
+        umac_mesh_pathtbl_init(&T);
+        for (uint32_t n = 0; n < 4; n++) for (uint32_t i = 0; i < UMAC_MESH_PROXY_PER_NODE; i++)
+        {
+            uint8_t node[6] = { 0x02, 0, 0, 0, 0, (uint8_t)(0x10 + n) }, h[6] = { 0x00, 0x55, 0, 0, (uint8_t)n, (uint8_t)i };
+            (void)umac_mesh_proxy_learn_leaf(&T, h, node, VIA, false, t0);
+            (void)umac_mesh_proxy_learn_leaf(&T, h, node, VIA, true, t0 + 1);
+        }
+        CHECK(!umac_mesh_proxy_learn_leaf(&T, fresh5, node5, VIA, false, t0 + 1000),
+              "leaf: nothing evicts a host we have had a unicast from");
+        const struct umac_mesh_proxy *e = umac_mesh_proxy_entry(&T, oldest, t0 + 1000);
+        CHECK(e != NULL && e->uni && e->uni_ms == t0 + 1 && e->leaf, "leaf: the entry records it");
+        CHECK(!umac_mesh_proxy_learn_leaf(&T, n0h9, node0, VIA, false, t0 + 1000),
+              "leaf: nor, for a node at its bound, one of that node's own");
+
+        /* Relay-learned entries are never evicted by a leaf learn either. */
+        umac_mesh_pathtbl_init(&T);
+        for (uint32_t n = 0; n < 4; n++) for (uint32_t i = 0; i < UMAC_MESH_PROXY_PER_NODE; i++)
+        {
+            uint8_t node[6] = { 0x02, 0, 0, 0, 0, (uint8_t)(0x10 + n) }, h[6] = { 0x00, 0x55, 0, 0, (uint8_t)n, (uint8_t)i };
+            (void)umac_mesh_proxy_learn(&T, h, node, t0);
+        }
+        CHECK(!umac_mesh_proxy_learn_leaf(&T, fresh5, node5, VIA, false, t0 + 1000),
+              "relay entries are not leaf hints and are never evicted");
+
+        /* A relay learn over a leaf entry leaves no leaf state behind. */
+        umac_mesh_pathtbl_init(&T);
+        (void)umac_mesh_proxy_learn_leaf(&T, X, H1, VIA, true, t0);
+        (void)umac_mesh_proxy_learn(&T, X, H2, t0 + 1);
+        e = umac_mesh_proxy_entry(&T, X, t0 + 1);
+        CHECK(e != NULL && !e->leaf && !e->uni, "a relay re-learn clears leaf state");
+        CHECK(umac_mesh_proxy_entry(&T, X, t0 + 1 + UMAC_MESH_PROXY_LIFETIME_MS) == NULL, "entry lookup honours expiry");
+
+        /* A lapsed pinned entry's slot, reused by a flood, carries no pin. */
+        umac_mesh_pathtbl_init(&T);
+        (void)umac_mesh_proxy_learn_leaf(&T, X, H1, VIA, true, t0);
+        uint8_t Y2[6] = { 0x00, 0x77, 0, 0, 0, 1 };
+        (void)umac_mesh_proxy_learn_leaf(&T, Y2, H1, VIA, false, t0 + UMAC_MESH_PROXY_LIFETIME_MS + 1);
+        e = umac_mesh_proxy_entry(&T, Y2, t0 + UMAC_MESH_PROXY_LIFETIME_MS + 1);
+        CHECK(e != NULL && e->leaf && !e->uni && e->uni_ms == 0,
+              "leaf: a reused slot does not inherit a lapsed entry's unicast pin");
+
+        /* Nor does the SAME host back after its entry lapsed: a lapsed entry is
+         * gone, not revived. */
+        umac_mesh_pathtbl_init(&T);
+        (void)umac_mesh_proxy_learn_leaf(&T, X, H1, VIA, true, t0);
+        (void)umac_mesh_proxy_learn_leaf(&T, X, H1, VIA, false, t0 + UMAC_MESH_PROXY_LIFETIME_MS + 1);
+        e = umac_mesh_proxy_entry(&T, X, t0 + UMAC_MESH_PROXY_LIFETIME_MS + 1);
+        CHECK(e != NULL && e->leaf && !e->uni && e->uni_ms == 0,
+              "leaf: the same host back after its entry lapsed carries no stale pin");
+
+        /* Every learn, not only the first, restarts the lifetime. */
+        umac_mesh_pathtbl_init(&T);
+        (void)umac_mesh_proxy_learn_leaf(&T, X, H1, VIA, false, t0);
+        (void)umac_mesh_proxy_learn_leaf(&T, X, H1, VIA, false, t0 + 400000u);
+        e = umac_mesh_proxy_entry(&T, X, t0 + 400000u);
+        CHECK(e != NULL && e->exp_ms == t0 + 400000u + UMAC_MESH_PROXY_LIFETIME_MS,
+              "leaf: a re-learn restarts the entry at now + %u ms", (unsigned)UMAC_MESH_PROXY_LIFETIME_MS);
+        CHECK(umac_mesh_proxy_entry(&T, X, t0 + 700000u) != NULL,
+              "leaf: ...so it is still known 700 s after it was first learned");
+
+        /* A unicast pin belongs to the node it came from: the same node's flood
+         * keeps it, a move to another node drops it, the new node's unicast re-pins. */
+        umac_mesh_pathtbl_init(&T);
+        (void)umac_mesh_proxy_learn_leaf(&T, X, H1, VIA, true, t0);
+        (void)umac_mesh_proxy_learn_leaf(&T, X, H1, VIA, false, t0 + 1);
+        e = umac_mesh_proxy_entry(&T, X, t0 + 1);
+        CHECK(e != NULL && e->uni && e->uni_ms == t0, "leaf: a flood from the same node keeps the pin and its time");
+        (void)umac_mesh_proxy_learn_leaf(&T, X, H2, VIA, false, t0 + 2);
+        e = umac_mesh_proxy_entry(&T, X, t0 + 2);
+        CHECK(e != NULL && memcmp(e->mesh_sta, H2, 6) == 0 && !e->uni && e->uni_ms == 0,
+              "leaf: re-learned behind another node, the host loses the old node's pin");
+        (void)umac_mesh_proxy_learn_leaf(&T, X, H2, VIA, true, t0 + 3);
+        e = umac_mesh_proxy_entry(&T, X, t0 + 3);
+        CHECK(e != NULL && e->uni && e->uni_ms == t0 + 3, "leaf: a unicast from the new node pins it again");
+    }
+
+    /* ---- the sweep bounds a leaf pin's age ---------------------------------
+     *
+     * umac_mesh_fwd_leaf_learn holds a unicast's relay while the unsigned age
+     * now - uni_ms is under UMAC_MESH_LEAF_VIA_HOLD_MS. Only a unicast rewrites
+     * uni_ms, and floods keep the entry live for as long as they come, so left
+     * alone the age wraps to 0 after 2^32 ms (49.7 days) and the hold re-arms.
+     * Once the hold is over, the sweep pulls uni_ms up to the hold behind now.
+     * Pinned: inside the hold it is untouched (to the ms); past it uni_ms is
+     * exactly now - hold; the pin itself stays, so a full table still gives up
+     * a flood hint rather than the pinned host; a flood-only entry is left
+     * alone. test_mesh_fwd drives the same sweep across 2^32 ms.
+     */
+    {
+        static const uint8_t VIA[6] = { 0x02, 0, 0, 0, 0, 0xaa };
+        static const uint8_t Y[6] = { 0x00, 0x77, 0, 0, 0, 2 };
+        const uint32_t t0 = 300000, hold = UMAC_MESH_LEAF_VIA_HOLD_MS;
+        const struct umac_mesh_proxy *e;
+        umac_mesh_pathtbl_init(&T);
+        CHECK(umac_mesh_proxy_learn_leaf(&T, X, H1, VIA, true, t0) &&
+                  umac_mesh_proxy_learn_leaf(&T, Y, H1, VIA, false, t0),
+              "pin age: X pinned by a unicast, Y a flood hint, both behind H1");
+        CHECK(umac_mesh_path_expire(&T, t0 + hold - 1u) == 0, "pin age: the sweep frees nothing");
+        e = umac_mesh_proxy_entry(&T, X, t0 + hold - 1u);
+        CHECK(e != NULL && e->uni && e->uni_ms == t0,
+              "pin age: 1 ms before the hold ends, the sweep leaves uni_ms alone");
+        CHECK(umac_mesh_path_expire(&T, t0 + hold + 1u) == 0, "pin age: nor does a later one");
+        e = umac_mesh_proxy_entry(&T, X, t0 + hold + 1u);
+        CHECK(e != NULL && e->uni && e->uni_ms == t0 + 1u,
+              "pin age: 1 ms after it, uni_ms is pulled up to now - hold and the pin stays (off by %ld)",
+              e != NULL ? (long)(int32_t)(e->uni_ms - (t0 + 1u)) : -1L);
+        e = umac_mesh_proxy_entry(&T, Y, t0 + hold + 1u);
+        CHECK(e != NULL && !e->uni && e->uni_ms == 0, "pin age: the flood hint's uni_ms is left at 0");
+
+        /* X and Y share an expiry and X has the lower slot: were the pin gone,
+         * X would be the victim. */
+        const uint32_t tf = t0 + hold + 2u;
+        for (uint32_t n = 0, k = 0; n < 4; n++) for (uint32_t i = 0; i < UMAC_MESH_PROXY_PER_NODE && k < 30u; i++, k++)
+        {
+            uint8_t node[6] = { 0x02, 0, 0, 0, 0, (uint8_t)(0x20 + n) }, h[6] = { 0x00, 0x55, 0, 0, (uint8_t)n, (uint8_t)i };
+            (void)umac_mesh_proxy_learn_leaf(&T, h, node, VIA, false, tf);
+        }
+        CHECK(umac_mesh_proxy_count(&T, tf) == UMAC_MESH_PROXY_MAX, "pin age: table full");
+        const uint8_t fresh[6] = { 0x00, 0x66, 0, 0, 0, 9 }, node5[6] = { 0x02, 0, 0, 0, 0, 0x50 };
+        CHECK(umac_mesh_proxy_learn_leaf(&T, fresh, node5, VIA, false, tf + 1u) &&
+                  umac_mesh_proxy_entry(&T, X, tf + 1u) != NULL &&
+                  umac_mesh_proxy_entry(&T, Y, tf + 1u) == NULL,
+              "pin age: a newcomer takes the flood hint Y's slot, not the pinned X's");
+
+        /* The age is unsigned here too: a first sweep 2^31 ms late still bounds it. */
+        umac_mesh_pathtbl_init(&T);
+        (void)umac_mesh_proxy_learn_leaf(&T, X, H1, VIA, true, t0);
+        uint32_t late = t0;
+        for (uint32_t k = 0; k < 7200u; k++)
+        {
+            late += 300000u;
+            (void)umac_mesh_proxy_learn_leaf(&T, X, H1, VIA, false, late);
+        }
+        (void)umac_mesh_path_expire(&T, late);
+        e = umac_mesh_proxy_entry(&T, X, late);
+        CHECK(e != NULL && e->uni && e->uni_ms == late - hold,
+              "pin age: a first sweep %lu ms after the unicast (past 2^31) still pulls uni_ms up",
+              (unsigned long)(late - t0));
+    }
+
     /* ---- NULL safety ------------------------------------------------------- */
     CHECK(umac_mesh_path_lookup(NULL, D, now) == NULL, "NULL table lookup");
     CHECK(!umac_mesh_path_update(&T, NULL, H1, 1, 1, 1, LT, now), "NULL dst update");
     CHECK(!umac_mesh_path_invalidate(NULL, D, 1, H1, now), "NULL table invalidate");
     CHECK(umac_mesh_proxy_lookup(&T, NULL, now) == NULL, "NULL ext lookup");
 
+    /* A relay keeps a path as long as its originator says (50 s for
+     * OpenMANET 1.8.0), so the table must hold one per active originator. */
+    CHECK(UMAC_MESH_PATH_MAX == 32u, "room for %u paths (want 32)", (unsigned)UMAC_MESH_PATH_MAX);
     printf("sizeof(struct umac_mesh_pathtbl) = %u bytes\n", (unsigned)sizeof(struct umac_mesh_pathtbl));
     CHECK(sizeof(struct umac_mesh_pathtbl) <= 2048, "tables fit in 2 KiB");
+    /* The leaf proxy entry must also leave room for a 32-path table in the same 2 KiB. */
+    unsigned at32 = (unsigned)(32u * sizeof(struct umac_mesh_path) + sizeof(T.x));
+    CHECK(sizeof(struct umac_mesh_proxy) <= 32u && at32 <= 2048,
+          "a %u-byte proxy entry: 32 paths + %u proxies = %u bytes, within 2 KiB",
+          (unsigned)sizeof(struct umac_mesh_proxy), (unsigned)UMAC_MESH_PROXY_MAX, at32);
 
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("test_mesh_pathtbl: all passed\n");

@@ -2,12 +2,14 @@
  * L2 bridge between the tethered surfaces and the mesh.
  *
  * NAT mode (the default) gives every warthog the same 192.168.4.1 /
- * 192.168.5.1, which is why CoT and mDNS cannot cross it: the addresses they
- * carry alias the receiver's own subnet. Bridge mode puts USB, the Wi-Fi AP
+ * 192.168.5.1, so CoT and mDNS a tethered host originates carry addresses that
+ * alias the receiver's own subnet. Bridge mode puts USB, the Wi-Fi AP
  * and the mesh netif on one lwIP bridge; a host's frames leave the mesh with
  * the host's MAC in Address Extension and come back the same way, and its
- * address comes from whatever DHCP server the mesh has (an OpenMANET node's
- * dnsmasq), so two hosts on opposite sides are distinct.
+ * address comes from whatever DHCP server the mesh has (an OpenMANET node whose
+ * mesh interface is bridged), so two hosts on opposite sides are distinct.
+ * Neither mode crosses bat0: a wizard-configured OpenMANET node's apps sit
+ * behind batman-adv, which this firmware does not speak.
  *
  * Needs CONFIG_ESP_NETIF_BRIDGE_EN. Without it the node says so and stays in
  * NAT mode rather than pretending.
