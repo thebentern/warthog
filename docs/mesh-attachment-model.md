@@ -62,9 +62,11 @@ Warthogs (`warthog-mesh-sae-swccmp`, 2026-09-29/30), against two OpenMANET 1.8.0
 Pis (batman-adv 2025.4) whose `bat0` was set up by hand, all one hop apart:
 neighbours, originators and translation tables both ways, the gateway Pi chosen
 by the Warthogs, a DHCP lease from a Pi, pings from a Pi's LAN, and Meshtastic's group reaching it. A
-Linux node's unicast above about 1000 bytes arrives only with its RTS threshold
-off. Not measured: a wizard-configured node, and a path of two or more hops (so
-no Warthog relaying). See `wiki/Batman-Mode.md`.
+Linux node's unicast above about 1000 bytes arrives from every node only on
+`warthog-mesh-sae-swccmp-meshvif` or with the node set to CTS-to-self or RTS off;
+on other builds only from the peer the chip registered last.
+Not measured: a wizard-configured node, and a path of two or more hops (so no
+Warthog relaying). See `wiki/Batman-Mode.md`.
 
 Gives up: plain IP over 802.11s. In batman mode only batman frames cross the
 mesh, so every node on it must speak batman.

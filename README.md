@@ -438,9 +438,12 @@ because `warthog-mesh-sae` refuses it. Measured on air on 2026-09-29/30 against
 two OpenMANET 1.8.0 Pis (batman-adv 2025.4) whose `bat0` was set up by hand, one
 hop apart: batman tables both ways, a DHCP lease from a Pi, pings, and
 Meshtastic's group into a Pi's LAN; not against a wizard node or over more than
-one hop. A Linux node's unicast above about 1000 bytes reaches a Warthog only
-with the node's RTS threshold off (`iw phy <phy> set rts off`; 1000 on both
-bench Pis). Current builds try DHCP first and learn the hosts behind a bridged
+one hop. A Linux node's unicast above its RTS threshold (1000 on both bench
+Pis) reaches a Warthog from every node only on
+`warthog-mesh-sae-swccmp-meshvif`, which runs the mesh on a MESH chip interface,
+or with the node set to CTS-to-self or RTS off; on other builds only from the
+peer the chip registered last
+([OpenMANET Interop](wiki/OpenMANET-Interop.md#frames-over-about-1000-bytes-from-a-linux-node)). Current builds try DHCP first and learn the hosts behind a bridged
 peer from Address Extension; neither has been on a radio against a bridged
 node.
 
@@ -577,8 +580,9 @@ unicast; the Pis' protected group PREQs taken and answered, so they held an
 originators and translation tables both ways; the Warthogs choosing the gateway
 Pi; a DHCP lease from a Pi;
 pings; Meshtastic's group into a Pi's LAN; heap and stack in batman mode. Also
-measured then: a Linux node's unicast above about 1000 bytes never reaches a
-Warthog while the node's RTS threshold is on (1000 on both Pis), and the chip
+measured then: on the STA chip interface a Linux node's unicast above its RTS
+threshold (1000 on both Pis) reaches a Warthog only from the peer the chip
+registered last, which `warthog-mesh-sae-swccmp-meshvif` fixes, and the chip
 hands the host unicast data addressed to other stations
 ([Batman Mode](wiki/Batman-Mode.md#measured-on-air)).
 

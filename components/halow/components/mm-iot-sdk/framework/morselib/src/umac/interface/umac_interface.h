@@ -79,6 +79,21 @@ enum mmwlan_status umac_interface_reinstall_vif(struct umac_data *umacd,
                                                 enum umac_interface_type type,
                                                 uint16_t *vif_id);
 
+/* The chip's type (enum mmdrv_interface_type) for the VIF in use, 0 with none (warthog mesh fork). */
+uint8_t umac_interface_get_chip_vif_type(struct umac_data *umacd);
+
+/* True when the mesh runs on a MESH-type chip VIF: built with WARTHOG_MESH_CHIP_VIF_MESH and
+ * the chip took it. Every other build and a STA fallback keep the STA-VIF behaviour. */
+static inline bool umac_interface_chip_vif_is_mesh(struct umac_data *umacd)
+{
+#if WARTHOG_MESH_CHIP_VIF_MESH
+    return umac_interface_get_chip_vif_type(umacd) == MMDRV_INTERFACE_TYPE_MESH;
+#else
+    (void)umacd;
+    return false;
+#endif
+}
+
 
 enum mmwlan_status umac_interface_get_fw_version(struct umac_data *umacd,
                                                  struct mmdrv_fw_version *version);

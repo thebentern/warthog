@@ -86,25 +86,6 @@ bool umac_interface_get_control_response_bw_1mhz_out_enabled(struct umac_data *u
     return false;
 }
 
-/* Interface types added so far: umac_interface.c answers a vif id only for a type that
- * is active, and a mesh node has only UMAC_INTERFACE_MESH (the RX path then delivers on
- * the AP VIF, as on the firmware). */
-static uint16_t s_active_types;
-
-uint16_t umac_interface_get_vif_id(struct umac_data *umacd, uint16_t type_mask)
-{
-    (void)umacd;
-    return (type_mask & s_active_types) != 0u ? s_vif_id : UMAC_INTERFACE_VIF_ID_INVALID;
-}
-
-enum mmwlan_status umac_interface_get_mac_addr(struct umac_sta_data *stad, uint8_t *mac_addr)
-{
-    (void)stad;
-    if (mac_addr == NULL) { return MMWLAN_INVALID_ARGUMENT; }
-    memcpy(mac_addr, s_own_mac, 6);
-    return MMWLAN_SUCCESS;
-}
-
 /* The RX filter asks this with the record it just looked up, then writes that record's
  * duplicate cache: the hook runs the event loop in between. */
 static void (*s_rx_filter_hook)(void);
@@ -127,40 +108,14 @@ bool umac_interface_addr_matches_mac_addr(struct umac_sta_data *stad, const uint
  * harness has to have been "connected" enough to answer this. */
 static struct mmwlan_sta_args s_sta_args;
 
-/* ---- the mesh VIF ------------------------------------------------------
+/* ---- the chip VIF ------------------------------------------------------
  *
- * Adding the interface is chip configuration, not radio-stack filler, so it
- * is written out rather than generated. A generated stub returns success and
- * leaves *vif_id untouched, which left umac_mesh.c's pre-seeded
- * UMAC_INTERFACE_VIF_ID_INVALID (0xffff) in place: every mesh frame then went
- * out tagged with the invalid sentinel while the datapath read 0 from
- * umac_interface_get_vif_id, so data and management frames disagreed about
- * the VIF they were on and no chipcfg assertion could catch a wrong one. */
+ * Adding, re-adding and removing the interface is the real umac_interface.c
+ * (interface_seam.c); the chip it talks to (fake_chip.c) reports this node's MAC at
+ * mmdrv_init and hands out this VIF id at ADD_INTERFACE. */
 
-static bool s_vif_add_fails;
-
-/** Make the next interface add fail, for the "chip refused a mesh VIF"
- *  branch -- the diagnostic umac_mesh.c keeps for a firmware image without
- *  mesh support. */
-void simnode_fail_vif_add(bool fail) { s_vif_add_fails = fail; }
-
-enum mmwlan_status umac_interface_add(struct umac_data *umacd, enum umac_interface_type type,
-                                      const uint8_t *mac_addr, uint16_t *vif_id)
-{
-    (void)umacd;
-    if (s_vif_add_fails) { return MMWLAN_ERROR; }
-    s_active_types |= (uint16_t)type;
-    if (mac_addr != NULL) { simnode_set_identity(mac_addr, s_vif_id); }
-    if (vif_id != NULL) { *vif_id = s_vif_id; }
-    return MMWLAN_SUCCESS;
-}
-
-/* umac_ba.c's source address: ours, once an interface is up (umac_interface.c). */
-const uint8_t *umac_interface_peek_mac_addr(struct umac_sta_data *stad)
-{
-    (void)stad;
-    return s_active_types != 0u ? s_own_mac : NULL;
-}
+const uint8_t *simnode_own_mac(void) { return s_own_mac; }
+uint16_t simnode_own_vif_id(void) { return s_vif_id; }
 
 /* ---- A-MPDU ------------------------------------------------------------
  *

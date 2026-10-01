@@ -620,9 +620,12 @@ open mesh one peering link per peer.
   host-tested and simulated, not yet run on air. In batman mode batman relays
   instead ([Batman Mode](Batman-Mode)).
 - SAE/AMPE requires a `warthog-mesh-sae` build (`warthog-mesh-sae-swccmp` against OpenMANET); the default smoke build still peers open or with the fixed key.
-- **A Linux node's unicast above about 1000 bytes needs its RTS threshold
-  off.** OpenMANET 1.8.0 nodes ran it at 1000 on the bench, and frames above it
-  never arrived, while with it off they did (measured 2026-09-30 in batman
-  mode). The RTS/CTS exchange is most likely what fails; nothing on air was
-  captured. `iw phy <phy> set rts off` on the node;
-  see [OpenMANET Interop](OpenMANET-Interop#frames-over-about-1000-bytes-from-a-linux-node).
+- **A Linux node's unicast above its RTS threshold arrives from every node only
+  on `warthog-mesh-sae-swccmp-meshvif`.** OpenMANET 1.8.0 nodes ran it at 1000
+  on the bench, so larger frames go behind RTS/CTS. On the STA chip interface
+  every other build runs the mesh on, the Warthog's CTS is taken only by the
+  peer the chip registered last, and the other nodes' large frames never arrive
+  (the chips' MAC counters on both ends, 2026-09-30). On other builds set each
+  node to CTS-to-self or `iw phy <phy> set rts off` (both measured set at
+  runtime, neither persistent); see
+  [OpenMANET Interop](OpenMANET-Interop#frames-over-about-1000-bytes-from-a-linux-node).

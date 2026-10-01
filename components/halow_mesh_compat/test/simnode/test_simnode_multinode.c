@@ -51,6 +51,11 @@ static int failures;
 
 /* ---- one node = one loaded copy of the whole simulator ----------------- */
 
+/* The per-node copies' name: each build of this test (flag set) loads its own. */
+#ifndef SIMNODE_SO_PREFIX
+#define SIMNODE_SO_PREFIX "libsimnode"
+#endif
+
 #define NODES 4
 enum { A = 0, W = 1, B = 2, R = 3 }; /* R joins only the four-node scenario */
 
@@ -119,7 +124,7 @@ static void open_nodes(void)
     for (int i = 0; i < NODES; i++)
     {
         char path[512];
-        snprintf(path, sizeof(path), "%s/libsimnode%d" SIMNODE_SO_SUFFIX, s_exedir, i);
+        snprintf(path, sizeof(path), "%s/" SIMNODE_SO_PREFIX "%d" SIMNODE_SO_SUFFIX, s_exedir, i);
         nd[i].lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (nd[i].lib == NULL) { printf("FAIL dlopen(%s): %s\n", path, dlerror()); exit(1); }
         nd[i].name = names[i];

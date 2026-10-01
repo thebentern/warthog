@@ -110,20 +110,30 @@ must keep up with it.
 
 Pings from an OpenMANET node pass with small payloads and fail every time from
 about 900 bytes, and the Warthog counts nothing arriving (no `micfail` in
-`AT+SWCCMP?`, no `uc_rx` in `AT+BATSTAT?`). The node's RTS threshold (1000 on
-both OpenMANET 1.8.0 bench Pis) makes it precede those frames with RTS/CTS,
-most likely the step that fails: they fail only while that threshold is on,
-and pass between two Pis. Nothing on air was captured. On the node:
+`AT+SWCCMP?`, no `uc_rx` in `AT+BATSTAT?`); another node's may pass. The node's
+RTS threshold (1000 on both OpenMANET 1.8.0 bench Pis) puts an RTS/CTS exchange
+before those frames. On a STA chip interface, which every build but
+`warthog-mesh-sae-swccmp-meshvif` runs the mesh on, the Warthog's CTS is taken
+only by the peer the chip registered last; every other node times out and never
+sends the frame. Measured on 2026-09-30 with the chips' MAC counters on both
+ends.
+
+Fix: flash `warthog-mesh-sae-swccmp-meshvif`; `AT+MESHCFG?` must read
+`chip_vif=mesh(5)`. On other builds, on each node:
 
 ```sh
+echo Y > /sys/module/mm6108_sdio/parameters/enable_cts_to_self
+# or
 iw dev wlh0 info | grep wiphy      # wiphy N: the phy is phyN
-iw phy phyN set rts off            # does not survive a reboot
+iw phy phyN set rts off
 ```
 
-Measured on 2026-09-30 in batman mode ([Batman Mode](Batman-Mode#limits)).
-Frames from the Warthog are unaffected: with RTS off on the node, the
-Warthog's echo replies of 900–1400 bytes arrived, and a node's RTS threshold
-governs only what that node sends.
+Both measured set at runtime on 2026-09-30; neither survives a reboot.
+`mm6108_sdio` is the bench Pis' MM6108 SDIO driver; the module name follows the
+chip and bus (`ls /sys/module/*/parameters/enable_cts_to_self`). Frames from the
+Warthog are unaffected: a node's RTS threshold governs only what that node
+sends. See
+[OpenMANET Interop](OpenMANET-Interop#frames-over-about-1000-bytes-from-a-linux-node).
 
 ## Mesh: perfect peering, zero data in both directions
 

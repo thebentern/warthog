@@ -26,7 +26,9 @@ and translation tables both ways, the Warthogs choosing the gateway Pi (`gw=`
 10.0/2.0), a DHCP lease from a Pi, pings from a Pi's LAN and between Warthogs,
 and Meshtastic's group reaching a Pi's LAN. The Pis' `bat0` was set up by
 hand at runtime, not by the wizard, with openmanetd stopped. A Linux node's
-unicast above about 1000 bytes needs its RTS threshold off ([Limits](#limits)).
+unicast above about 1000 bytes arrives from every node only on
+`warthog-mesh-sae-swccmp-meshvif` or with a setting on the node; on other builds
+only from the peer the chip registered last ([Limits](#limits)).
 
 Before that: host tests (engine unit, golden-capture and multi-engine simulator
 tests; the firmware port, `bat_port.c`, the AT setters and the bat0 addressing
@@ -50,9 +52,9 @@ control without it (a restart 12 s after the previous one went 18 s without
 replies), pings, bursts and a 3-minute soak. The full-table request backoff, the
 TTVN its unicast carries toward a node whose table it cannot take and a count of
 two gateways have run on the host and in the VM only (one hop, tables in sync).
-`warthog-us`, `warthog-mesh-smoke`, `warthog-mesh-sae` and
-`warthog-mesh-sae-swccmp` build. Only `warthog-mesh-sae-swccmp` has run batman
-mode on a board.
+`warthog-us`, `warthog-mesh-smoke`, `warthog-mesh-sae`,
+`warthog-mesh-sae-swccmp` and `-swccmp-meshvif` build. Only
+`warthog-mesh-sae-swccmp` and `-swccmp-meshvif` have run batman mode on a board.
 
 ## Builds
 
@@ -62,6 +64,7 @@ mode on a board.
 | `warthog-mesh-sae` | SAE, chip crypto | **no**: peers' group frames are dropped | **refused** (`sae-no-host-ccmp`) |
 | `warthog-mesh-sae-nochipkey` | SAE, no host CCMP | no | **refused** |
 | `warthog-mesh-sae-swccmp`, `-swccmp-on` | SAE + host CCMP | through host CCMP (`-swccmp` measured on air, 2026-09-29) | accepted; batman mode arms host CCMP at boot |
+| `warthog-mesh-sae-swccmp-meshvif` | as `-swccmp`, on a MESH chip interface: takes a node's frames above its RTS threshold ([Limits](#limits)) | through host CCMP (measured on air, 2026-09-30) | accepted, as `-swccmp` |
 
 Every ELP, OGM and broadcast a Linux node sends is an 802.11s group frame under
 its own group key. Only the host-CCMP builds decrypt those. Against the wizard's
@@ -111,10 +114,11 @@ Two node settings the wizard makes, and a node configured by hand may not:
   in range and `AT+MESHGRP=0`, batman worked with forwarding on
   ([Measured on air](#measured-on-air)).
 
-One more node setting, which the wizard does not make: the RTS threshold of 1000
-both bench OpenMANET 1.8.0 Pis ran keeps a node's unicast above about 1000 bytes
-from reaching the Warthog. Turn it off on each node, `iw phy <phy> set rts off`,
-after every reboot ([Limits](#limits)).
+On every build but `warthog-mesh-sae-swccmp-meshvif`, one more node setting,
+which the wizard does not make: with the RTS threshold of 1000 both bench
+OpenMANET 1.8.0 Pis ran, a node's unicast above about 1000 bytes reaches the
+Warthog only if the Warthog's chip registered that node last. Set each node to
+CTS-to-self or RTS off ([Limits](#limits)).
 
 ## What changes on the Warthog
 
@@ -248,23 +252,25 @@ Details in the [AT Command Reference](AT-Command-Reference#batman-mode).
   broadcasts and multicasts of 1497–1500 bytes; the wizard's 1460 and the
   Warthog's are below the ceiling. Whether the Warthog's chip has the same one,
   with the 12 extra bytes of an AE-2 copy, is not measured.
-- A Linux node's unicast frames longer than its RTS threshold never reach a
-  Warthog. The node sends them only after an RTS/CTS exchange, most likely the
-  step that fails: they fail only while the threshold is on, and pass Pi to Pi.
-  Nothing on air was captured, so whether the Warthog sends no CTS, the node
-  does not hear it, or the chip drops the frame after it is not known. Both
-  OpenMANET 1.8.0 bench Pis ran a threshold of 1000 (not set in uci; what sets
-  it was not found). Measured 2026-09-30: pings from a Pi with payloads up to
-  700 bytes passed, 900 bytes and above failed every time with nothing counted
-  on the Warthog (no `micfail`, no `uc_rx`), while Pi to Pi they pass.
-  Full-size TCP segments and large UDP toward the Warthog and its tethered
-  hosts are above it (derived, not measured separately). Workaround on each
-  OpenMANET node: `iw phy <phy> set rts off` (`iw dev wlh0 info` prints
-  `wiphy N`: the phy is `phyN`); with it off, 900-, 1000- and 1400-byte pings
-  passed (3/4, 4/4, 3/4). `iw` settings do not survive a reboot. Frames from
-  the Warthog are unaffected: in those pings its echo replies of the same
-  sizes arrived, and a node's RTS threshold governs only what that node sends.
-  A radio limit, not a batman one.
+- A Linux node's unicast frames longer than its RTS threshold (1000 on both
+  OpenMANET 1.8.0 bench Pis) go out behind RTS/CTS; full-size TCP segments and
+  large UDP toward the Warthog and its tethered hosts are among them (derived).
+  On a STA chip interface, which every build but
+  `warthog-mesh-sae-swccmp-meshvif` runs the mesh on, the Warthog's chip
+  addresses its CTS from the peer it registered last, so only that node's large
+  frames arrive; the others time out and never send them (the chips' MAC
+  counters on both ends, 2026-09-30). `-meshvif` runs the mesh on a MESH chip
+  interface, which addresses its CTS to each RTS's sender (per the chip
+  firmware's disassembly) and whose CTS both Pis took: on air on 2026-09-30,
+  with the Pis' threshold at 1000, 500-, 1000- and 1400-byte pings over batman
+  passed 10/10 each. On the other builds set each OpenMANET node to CTS-to-self,
+  `echo Y > /sys/module/mm6108_sdio/parameters/enable_cts_to_self` (the bench
+  Pis' MM6108 SDIO driver; elsewhere find the module with
+  `ls /sys/module/*/parameters/enable_cts_to_self`), or RTS off,
+  `iw phy <phy> set rts off` (`iw dev wlh0 info` prints `wiphy N`: the phy is
+  `phyN`); both measured set at runtime, and neither survives a reboot
+  ([OpenMANET Interop](OpenMANET-Interop#frames-over-about-1000-bytes-from-a-linux-node)).
+  Frames from the Warthog are unaffected. A radio limit, not a batman one.
 - Not implemented: the distributed ARP table (DAT), multicast optimisation
   (the Warthog reads as "wants all multicast", which is what OpenMANET's forced
   flood does anyway), announcing itself as a gateway and gateway-steered DHCP (the
@@ -399,6 +405,7 @@ effective `mesh_nolearn` 0; on both Pis `bat0` was a port of `br-lan`.
 | IP | 09-30: a host on the gateway Pi's `br-lan` pinged each Warthog's bat0 address, 9/10 and 10/10 (small packets). 09-29, Warthog to Warthog over bat0: `AT+MPING` 8/8 (69–267 ms) one way, 5/8 the other (lost while the tables were learned and while a DHCP attempt beside the static address re-applied it) |
 | Meshtastic | 10/10 datagrams to `239.0.0.69:4403` from one Warthog reached the other over batman and appeared on the gateway Pi's `br-lan`, bridged from `bat0` |
 | 802.11s forwarding on the Pis | `AT+BATSTAT?` `rx_relayed` 343 on one Warthog on 09-29, and from 363 to 388 between two readings on 09-30: the Pis re-sent batman frames at 802.11s, the Warthog dropped those copies, and the direct copies arrived (every result above) |
+| `warthog-mesh-sae-swccmp-meshvif` | 09-30, one Warthog on a MESH chip interface, the Pis' RTS threshold at 1000: a DHCP lease from a Pi, the Pi's `batctl n` lists it, and 500-, 1000- and 1400-byte pings over batman 10/10 each |
 
 A 1.8.0 node (effective `mesh_nolearn` 0) sends unicast only over an 802.11s
 path, which its own group PREQ sets up: CCMP-protected under the node's MGTK
@@ -422,14 +429,13 @@ node (`mesh_nolearn` 1) sends to a one-hop peer directly.
 |---|---|
 | Unicast between two other stations, which the MM6108 also hands up (data seen on 2026-09-30 as host CCMP `micfail`). Data is dropped before any decryption (host-tested). Management frames between them are only counted: whether the chip hands those up is not measured, and a Protected one from a peer still reaches host CCMP (`micfail`) | while two neighbours exchange unicast, `AT+FILTSTAT?` `not_ours` rises. Its second line's `mgmt_nours` says whether their unicast management (PREPs as their path refreshes, Block Ack) reaches the Warthog; `AT+SWCCMP?` `micfail` stays flat only while `mgmt_nours` does, since between neighbours running MFP (the Pis' `ieee80211w=2`) those frames are Protected. If it rises, they need dropping before host CCMP and Block Ack as data is |
 | A host tethered to the Warthog reaching the batman mesh: the AT console on USB CDC-ACM ran in batman mode, but no host on USB NCM or the Wi-Fi AP has sent traffic through NAT onto bat0, and the AP's start in batman mode is not checked | with `AT+MESHBATMAN=1` and a lease (`AT+MESHBATMAN?` `addr=leased`), a host on USB NCM (a `192.168.4.x` lease) and one on the AP (`192.168.5.x`) each ping the lease's `router=` address and a Pi's `br-lan` or `br-ahwlan` address, and resolve a name with `AT+DNS=` set to that router |
-| Why a Linux node's unicast above its RTS threshold does not arrive (Limits): most likely the RTS/CTS exchange, not captured | with no other large traffic on the mesh, `AT+FILTSTAT?` `rts` rising with each failed large ping from the node (retries included) shows its RTS reaches the Warthog's host (0 settles nothing: the chip need not pass RTS up); a capture on a third radio shows whether a CTS answers it |
-| Frames near the 1500-byte batman MTU cross the chip with AE-2 and CCMP overhead. From a Linux node only with its RTS threshold off (Limits); with it off 1400-byte pings passed | with RTS off on the node, `ping -s 1432 -M do` between the node's `br-ahwlan` address (bat0 has none on a wizard node) and the Warthog's bat0 address, both ways |
+| Frames near the 1500-byte batman MTU cross the chip with AE-2 and CCMP overhead. From every Linux node only on `-meshvif` or with the node set to CTS-to-self or RTS off, on other builds only from the peer the chip registered last (Limits); 1400-byte pings passed either way | on `-meshvif`, or with the node so set, `ping -s 1432 -M do` between the node's `br-ahwlan` address (bat0 has none on a wizard node) and the Warthog's bat0 address, both ways |
 | `AT+MESHGRP=1`: whether a Linux node takes the Warthog's group frames under its MGTK (on the swccmp builds only if the chip starts that key at the TX PN it was installed with; [OpenMANET Interop](OpenMANET-Interop#management-frame-protection-peering-does-not-need-it-path-selection-does)), and the airtime of AE-2 copies against group frames, 1 against 3 broadcast copies. Only `0` has run on air | `batctl n` on the node still lists the Warthog with `AT+MESHGRP=1`; Meshtastic multicast delivery and OGM loss under both settings |
 | DHCP against the two 30 s holds above: in the VM (batman-adv 2024.3, veth) the leases came inside the 45 s wait; the on-air leases of 2026-09-30 were not timed against either hold; on air it depends on how long the node's mesh and the Warthog's peering take | power a node and the Warthog up together, then power-cycle the Warthog (not `AT+RESET`, which keeps its sequence numbers) within 5 s of its first route; `AT+STATUS?` must show an address from the node's DHCP pool, not `10.41.253.x` |
 | Sequence numbers kept across a reset that keeps power (RTC memory): host, VM, and on air in the Pi harness (a killed process that kept its record); whether each ESP32-S3 reset path keeps RTC memory is not measured | `AT+RESET` twice, 5 s apart: the boot log's batman line ends `seq=carried`, `AT+BATO?` `ogmseq=` resumes about 256 above its value before each reset, and on the node the Warthog's last-seen in `batctl o` stays under 2 s |
 | DHCP again: after the lease's router leaves, and beside a static address. Run only against a model of lwIP; the engine's lookups ran in the VM | with a lease from a point (`AT+MESHBATMAN?` `router=...(ok)`), power that point off while a gate stays up: within about 2 min the `bat0` line must show `restarts=1` and a lease from another node. Start the Warthog with no DHCP server reachable, then bring a gate up: `addr=static` must become `addr=leased` without a reboot |
 | DHCP with several servers in range: run only in the VM (lwIP's DHCP client, dnsmasq on veth); on air the order of the chosen server's ACK and the other servers' NAKs depends on hop count | a gate and two or more points all within one hop of the Warthog: `AT+RESET` 20 times; each time `AT+MESHBATMAN?` must reach `addr=leased`, never `addr=static` |
-| Block Ack with a wizard node under SAE: the Warthog now protects its ADDBA request and response and its DELBA to a peer that runs MFP, which the node's mac80211 dropped in the clear, so A-MPDU sessions can now form both ways, where before every attempt failed. Host-tested only; whether the node accepts them, and what aggregation then does to batman's unicast, is not known, and no setting turns A-MPDU off ([OpenMANET Interop](OpenMANET-Interop#management-frame-protection-peering-does-not-need-it-path-selection-does)) | on the Warthog, `AT+MESHFWDSTAT?` `mgmt tx host` (host CCMP, which batman mode arms) rising with `drop` at 0; on the node, `agg_status` under `/sys/kernel/debug/ieee80211/phy*/netdev:wlh0/stations/<Warthog's mesh MAC>/` lists the sessions, and 3000-byte pings through bat0 still answer both ways (with the node's RTS off, Limits) |
+| Block Ack with a wizard node under SAE: the Warthog now protects its ADDBA request and response and its DELBA to a peer that runs MFP, which the node's mac80211 dropped in the clear, so A-MPDU sessions can now form both ways, where before every attempt failed. Host-tested only; whether the node accepts them, and what aggregation then does to batman's unicast, is not known, and no setting turns A-MPDU off ([OpenMANET Interop](OpenMANET-Interop#management-frame-protection-peering-does-not-need-it-path-selection-does)) | on the Warthog, `AT+MESHFWDSTAT?` `mgmt tx host` (host CCMP, which batman mode arms) rising with `drop` at 0; on the node, `agg_status` under `/sys/kernel/debug/ieee80211/phy*/netdev:wlh0/stations/<Warthog's mesh MAC>/` lists the sessions, and 3000-byte pings through bat0 still answer both ways (on `-meshvif`, or with the node set to CTS-to-self or RTS off, Limits) |
 | Roaming past more than 4 points under SAE: from the code and a one-off host simulation the Warthog strands at the fifth (Limits, above) | walk a Warthog past 5 powered points one at a time; `AT+BATN?` must list the fifth. Expected to fail until silent SAE peers are expired |
 | A node set up by the wizard and run by openmanetd: the bench Pis' `bat0` was made by hand with openmanetd stopped, mesh11sd `mesh_fwding` 1, and on both Pis `bat0` in `br-lan` | against a wizard node (`br-ahwlan`, `mesh_fwding` 0, openmanetd's `multicast_mode`, alfred): the checks in [Measured on air](#measured-on-air), and a lease from the `br-ahwlan` pool |
 | Whether the Warthog's lower throughput figure (0.7–1.6 Mbit/s under the Pis' for the same links) steers routes away from a Warthog relay beyond one hop | with a Warthog and a Pi both able to relay between two nodes out of each other's range, compare `batctl o` throughput via each; set `AT+MESHBATTP` only if the Warthog is never chosen where it should be |

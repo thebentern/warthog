@@ -10,8 +10,12 @@
 #include "beacon.h"
 #include "driver/driver.h"
 #include "driver/morse_driver/hw.h"
+#include "mmdrv.h" /* WARTHOG_MESH_CHIP_VIF_MESH */
 #include "mmlog.h"
 #include "mmosal.h"
+
+/* Chip beacon IRQs and host beacon ticks that yielded to them (AT+BCNSTAT?; main/at.c). */
+extern volatile uint32_t g_warthog_bcn_chip_irq, g_warthog_bcn_host_yield;
 
 void morse_beacon_irq_handle(struct driver_data *driverd, uint32_t status1_reg)
 {
@@ -19,6 +23,8 @@ void morse_beacon_irq_handle(struct driver_data *driverd, uint32_t status1_reg)
 
     if (status1_reg & 1ul << beacon_irq_num)
     {
+        driverd->beacon.chip_irqs++;
+        g_warthog_bcn_chip_irq++;
         /* Diagnostic: count beacon IRQs. In mesh mode we
          * see mmdrv_host_get_beacon fire exactly once (initial template
          * request) and never again. If THIS IRQ never fires for the mesh
@@ -107,6 +113,14 @@ static void morse_beacon_host_timer_cb(struct mmosal_timer *timer)
     struct driver_data *driverd = (struct driver_data *)mmosal_timer_get_arg(timer);
     if (driverd != NULL && driverd->beacon.enabled)
     {
+#if WARTHOG_MESH_CHIP_VIF_MESH
+        /* A chip that schedules its own TBTT (a MESH VIF, as Linux relies on) beacons alone. */
+        if (morse_beacon_host_tick_yields(driverd->beacon.chip_irqs, &driverd->beacon.chip_irqs_seen))
+        {
+            g_warthog_bcn_host_yield++;
+            return;
+        }
+#endif
         driver_task_notify_event(driverd, DRV_EVT_BEACON_REQ_PEND);
     }
 }
@@ -115,6 +129,8 @@ int morse_beacon_start(struct driver_data *driverd, uint16_t vif_id, uint32_t pe
 {
     MMLOG_INF("Start beaconing (host_timer=%lums)\n", (unsigned long)period_ms);
     driverd->beacon.count = 0;
+    driverd->beacon.chip_irqs = 0;
+    driverd->beacon.chip_irqs_seen = 0;
     driverd->beacon.enabled = true;
     driverd->beacon.vif_id = vif_id;
     driverd->beacon.beacon_work_fn = morse_beacon_work_;

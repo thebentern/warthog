@@ -31,6 +31,7 @@
 #include "umac/datapath/umac_datapath_private.h"
 #include "umac/mesh/umac_mesh_fwd.h"
 #include "umac/data/umac_data.h"
+#include "umac/interface/umac_interface.h" /* umac_interface_chip_vif_is_mesh */
 #include "umac/supplicant_shim/umac_supp_shim.h"
 #include "dot11/dot11.h"
 #include "dot11/dot11_utils.h"
@@ -59,6 +60,9 @@ extern volatile uint32_t g_warthog_tx_data_deq;
 extern volatile uint32_t g_warthog_tx_data_hdr;
 extern volatile uint32_t g_warthog_mesh_chip_sta_fail;
 extern volatile uint32_t g_warthog_mesh_key_fail;
+/* SET_STA_STATE (by state) and INSTALL_KEY the chip refused, and the last status (AT+MESHCFG?). */
+extern volatile uint32_t g_warthog_chipcmd_sta_refused[5], g_warthog_chipcmd_key_refused;
+extern volatile int32_t g_warthog_chipcmd_sta_status, g_warthog_chipcmd_key_status;
 extern volatile uint32_t g_warthog_ampe_mtk_installed, g_warthog_ampe_mgtk_installed;
 extern volatile uint32_t g_warthog_mgtk_reinst, g_warthog_mgtk_rsc_fail;
 extern volatile uint32_t g_warthog_mesh_secure;
@@ -579,6 +583,24 @@ static void mesh_own_pn_store_(uint64_t base)
 }
 #endif
 
+/* A key into the chip, true if it took it. A refusal (its status, which morse_cmd_tx does
+ * not return) is counted and fails the install, as Linux's does (morse_driver command.c:214). */
+static bool mesh_chip_install_key_(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *kc)
+{
+    int32_t st = 0;
+    if (mmdrv_install_key_status(vif_id, aid, kc, &st) != 0)
+    {
+        return false;
+    }
+    if (st != 0)
+    {
+        g_warthog_chipcmd_key_refused++;
+        g_warthog_chipcmd_key_status = st;
+        return false;
+    }
+    return true;
+}
+
 /* Our own MGTK into the chip's group slot: at TX PN 0, or with WARTHOG_MESH_MGTK_PN_BASE
  * at a fresh base above every earlier install and every PN our MGTK has used. */
 static enum mmwlan_status mesh_put_own_mgtk_(uint16_t vif_id)
@@ -590,7 +612,7 @@ static enum mmwlan_status mesh_put_own_mgtk_(uint16_t vif_id)
     struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = s_own_mgtk.id,
                                  .length = UMAC_KEY_AES_128_LEN, .tx_pn = pn };
     memcpy(kc.key, s_own_mgtk.key, sizeof(s_own_mgtk.key));
-    if (mmdrv_install_key(vif_id, 0, &kc) != 0)
+    if (!mesh_chip_install_key_(vif_id, 0, &kc))
     {
         MMLOG_WRN("mesh: own MGTK chip install failed\n");
         return MMWLAN_ERROR;
@@ -731,6 +753,26 @@ static const uint8_t k_mesh_p1_mgtk[UMAC_KEY_AES_128_LEN] = {
  * stays behind the flag as the seam where a real per-link key lands once that
  * exists.
  */
+/* One SET_STA_STATE; a refusal (its status, which morse_cmd_tx does not return) is counted
+ * by state, and the station carries on as before. Returns the transport result. */
+static int mesh_chip_sta_state_(uint16_t vif_id, uint16_t aid, const uint8_t *peer_addr,
+                                enum morse_sta_state state)
+{
+    int32_t st = 0;
+    int r = mmdrv_update_sta_state_status(vif_id, aid, peer_addr, state, &st);
+    if (r == 0 && st != 0)
+    {
+        if ((unsigned)state < sizeof(g_warthog_chipcmd_sta_refused) / sizeof(g_warthog_chipcmd_sta_refused[0]))
+        {
+            g_warthog_chipcmd_sta_refused[state]++;
+        }
+        g_warthog_chipcmd_sta_status = st;
+        MMLOG_WRN("mesh: chip refused sta_state %d for " MM_MAC_ADDR_FMT " (status %ld)\n",
+                  (int)state, MM_MAC_ADDR_VAL(peer_addr), (long)st);
+    }
+    return r;
+}
+
 /* Walk a station up to AUTHORIZED in the chip. Same sequence umac_ap_update_sta()
  * uses; AID is 1-based (0 means "no station" to the chip). */
 static void mesh_chip_register_sta_(uint16_t vif_id, uint16_t aid, const uint8_t *peer_addr)
@@ -740,7 +782,7 @@ static void mesh_chip_register_sta_(uint16_t vif_id, uint16_t aid, const uint8_t
     };
     for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
     {
-        int r = mmdrv_update_sta_state(vif_id, aid, peer_addr, seq[i]);
+        int r = mesh_chip_sta_state_(vif_id, aid, peer_addr, seq[i]);
         if (r != 0)
         {
             MMLOG_WRN("mesh: chip sta_state %d for " MM_MAC_ADDR_FMT " -> %d\n",
@@ -879,7 +921,7 @@ static enum mmwlan_status umac_datapath_mesh_install_peer_keys(struct umac_sta_d
         struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = mgtk.key_id,
                                      .length = mgtk.key_len, .tx_pn = 0 };
         memcpy(kc.key, mgtk.key_data, mgtk.key_len);
-        if (mmdrv_install_key(vif_id, 0, &kc) != 0)
+        if (!mesh_chip_install_key_(vif_id, 0, &kc))
         {
             MMLOG_WRN("mesh: MGTK chip install failed\n");
             return MMWLAN_ERROR;
@@ -1518,11 +1560,20 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
             }
             MMOSAL_TASK_EXIT_CRITICAL();
             mmpkt_list_clear(&gone);
-            /* Tell the chip the station is gone. */
-            (void)mmdrv_update_sta_state(umac_sta_data_get_vif_id(stad),
-                                         umac_sta_data_get_aid(stad),
-                                         umac_sta_data_peek_peer_addr(stad),
-                                         MORSE_STA_NOTEXIST);
+            /* Tell the chip the station is gone. A MESH chip VIF is walked down one state at
+             * a time to NONE, as mac80211 does (morse_driver skips NONE -> NOTEXIST). */
+            static const enum morse_sta_state mesh_down[] = {
+                MORSE_STA_ASSOCIATED, MORSE_STA_AUTHENTICATED, MORSE_STA_NONE
+            };
+            static const enum morse_sta_state sta_down[] = { MORSE_STA_NOTEXIST };
+            const bool mesh_vif = umac_interface_chip_vif_is_mesh(umac_sta_data_get_umacd(stad));
+            const enum morse_sta_state *down = mesh_vif ? mesh_down : sta_down;
+            const size_t n_down = mesh_vif ? sizeof(mesh_down) / sizeof(mesh_down[0]) : 1u;
+            for (size_t k = 0; k < n_down; k++)
+            {
+                (void)mesh_chip_sta_state_(umac_sta_data_get_vif_id(stad), umac_sta_data_get_aid(stad),
+                                           umac_sta_data_peek_peer_addr(stad), down[k]);
+            }
             umac_rc_stop(stad);
             /* Loop timeouts point into the record (ADDBA retry, RX reorder, defrag): stop them. */
             umac_ba_deinit(stad);
@@ -1541,16 +1592,21 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
              * with no restore, the surviving peers stopped receiving entirely
              * -- sender enq=4/drv_ok=4, receiver rx_data=0 with rxdrop=0, i.e.
              * discarded by the chip before it ever reached the host. Put every
-             * survivor back: station state first, then its key if the link is keyed. */
+             * survivor back: station state first, then its key if the link is keyed.
+             * Measured on the STA chip VIF. A MESH VIF keeps its stations, as Linux relies on,
+             * but its key slots are unmeasured, so the keys still go back. */
             for (int j = 0; j < MESH_MAX_PEERS; j++)
             {
                 if (s_peers[j] == NULL)
                 {
                     continue;
                 }
-                uint8_t survivor[MMWLAN_MAC_ADDR_LEN];
-                umac_sta_data_get_peer_addr(s_peers[j], survivor);
-                mesh_chip_register_sta_(vif_id, umac_sta_data_get_aid(s_peers[j]), survivor);
+                if (!mesh_vif)
+                {
+                    uint8_t survivor[MMWLAN_MAC_ADDR_LEN];
+                    umac_sta_data_get_peer_addr(s_peers[j], survivor);
+                    mesh_chip_register_sta_(vif_id, umac_sta_data_get_aid(s_peers[j]), survivor);
+                }
                 (void)mesh_restore_peer_key_(s_peers[j], vif_id);
             }
         }

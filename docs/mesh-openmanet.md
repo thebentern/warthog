@@ -25,7 +25,9 @@ by hand. Host CCMP opened the Pis' group frames and unicast, and once the
 Warthog took their protected group PREQs the Pis held `ACTIVE` paths to it:
 pings from a host on a Pi's LAN, `batctl ping` from a Pi, and DHCP leases from
 a Pi, with small frames (`wiki/Batman-Mode.md`, *Measured on air*). A Pi's
-unicast above about 1000 bytes needs its RTS threshold off (*Troubleshooting*).
+unicast above about 1000 bytes arrives from every Pi only on
+`warthog-mesh-sae-swccmp-meshvif` or with a setting on the Pi; on other builds
+only from the Pi the chip registered last (*Troubleshooting*).
 
 ## Build and flash
 
@@ -317,7 +319,7 @@ AT+MPING=10.77.191.116,8
 | Nothing routes, mpath empty, peer `tx packets` stuck at 5 | peer `ip -s link` vs per-station counters | Mesh interface still enslaved to a bridge — see step 1 above. |
 | Peering fine, zero data both ways | `AT+MESHSEC?` | Keyed Warthog against an open peer. `AT+MESHSEC=0`. |
 | Frames arrive, nothing delivered | `AT+FILTSTAT?` | Names which of the RX filter's nine drop paths is firing. |
-| Small pings from the Linux node pass, ~900-byte payloads and up never arrive | nothing counted on the Warthog (`AT+SWCCMP?` `micfail`, `AT+BATSTAT?` `uc_rx` flat); `iw phy <phy> info` on the node shows `RTS threshold: 1000` | The node sends those frames behind RTS/CTS, most likely what fails (they fail only while the threshold is on, and pass between two Linux nodes; not captured). `iw phy <phy> set rts off` on the node (not persistent). Measured 2026-09-30. |
+| Small pings from the Linux node pass, ~900-byte payloads and up never arrive | nothing counted on the Warthog (`AT+SWCCMP?` `micfail`, `AT+BATSTAT?` `uc_rx` flat); `iw phy <phy> info` on the node shows `RTS threshold: 1000` | The node sends those frames behind RTS/CTS, and on a STA chip interface the Warthog's CTS reaches only the peer it registered last. Flash `warthog-mesh-sae-swccmp-meshvif` (`AT+MESHCFG?` `chip_vif=mesh(5)`), or on the node `echo Y > /sys/module/mm6108_sdio/parameters/enable_cts_to_self` (the bench Pis' MM6108 SDIO driver; elsewhere `ls /sys/module/*/parameters/enable_cts_to_self`) or `iw phy <phy> set rts off` (neither persistent). Measured 2026-09-30 (`wiki/OpenMANET-Interop.md`). |
 
 A counter that is *not* evidence of a fault: `rx_data` counts frames reaching
 the datapath, not frames delivered to the IP stack; it moving slowly while pings
@@ -377,8 +379,9 @@ stack.
   dropped (`AT+BATSTAT?` `rx_relayed` 343 on one board on 09-29, 363 to 388
   between two readings on 09-30) while the direct copies arrived. Beyond one hop
   a frame that reaches the Warthog only as a relayed copy is lost.
-- A Linux node's unicast above about 1000 bytes reaches a Warthog only with the
-  node's RTS threshold off (1000 on both OpenMANET 1.8.0 bench Pis; most likely
-  the RTS/CTS exchange fails, not captured on air). Frames from the Warthog are
-  unaffected: its echo replies of the same sizes arrived, and a node's RTS
-  threshold governs only what that node sends.
+- A Linux node's unicast above its RTS threshold (1000 on both OpenMANET 1.8.0
+  bench Pis) goes out behind RTS/CTS, and on a STA chip interface the Warthog's
+  CTS reaches only the peer it registered last. `warthog-mesh-sae-swccmp-meshvif`,
+  on a MESH chip interface, took them from both Pis, 8/8 each (on air,
+  2026-09-30); on other builds set the node to CTS-to-self or RTS off. Frames from the Warthog
+  are unaffected: a node's RTS threshold governs only what that node sends.

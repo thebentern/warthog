@@ -35,7 +35,7 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
            ../src/dot11ah/debug.c
 
 TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
-           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd sim_mesh test_supp_mesh_conf test_mesh_bip test_bat_mode
+           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd sim_mesh test_supp_mesh_conf test_mesh_bip test_bat_mode test_beacon_yield test_chipvif_glue test_chipvif_glue_off
 
 # ---- simnode: the real stack with only the chip and the RTOS replaced ----
 #
@@ -45,7 +45,7 @@ TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
 # the frame the firmware would have handed to the radio. It covers the glue,
 # which is the one mesh file no freestanding test can link.
 SIMNODE      := simnode
-SIMNODE_TESTS := test_simnode_smoke test_simnode_peering test_simnode_datapath test_simnode_multinode test_simnode_glue test_simnode_keys test_simnode_keys_nochip test_simnode_keys_pnbase_off test_simnode_keys_nochip_pnbase_off test_simnode_capacity test_simnode_discovery test_simnode_mfp test_simnode_mfp_swccmp test_simnode_batman
+SIMNODE_TESTS := test_simnode_smoke test_simnode_peering test_simnode_datapath test_simnode_multinode test_simnode_glue test_simnode_keys test_simnode_keys_nochip test_simnode_keys_pnbase_off test_simnode_keys_nochip_pnbase_off test_simnode_capacity test_simnode_discovery test_simnode_mfp test_simnode_mfp_swccmp test_simnode_batman test_simnode_meshvif test_simnode_meshvif_off test_simnode_keys_meshvif test_simnode_keys_pnbase_off_meshvif test_simnode_keys_nochip_meshvif test_simnode_mfp_swccmp_meshvif test_simnode_batman_meshvif test_simnode_multinode_meshvif
 # Appended after the fact: TESTS above is an immediate assignment, so a
 # reference to this from there would expand to nothing.
 TESTS += $(SIMNODE_TESTS)
@@ -78,13 +78,16 @@ SIMNODE_REAL = $(addprefix $(SDKMESH)/,umac_mesh.c umac_mesh_fwd_glue.c umac_mes
 # What it replaces: the chip, the RTOS, the radio stack below the mesh, and
 # the app-side storage that lives in main/at.c on the firmware.
 SIMNODE_FAKE = $(addprefix $(SIMNODE)/,fake_rtos.c fake_chip.c fake_config.c fake_app.c \
-                  fake_radio_stack.c warthog_globals.c simnode.c sta_data_seam.c)
+                  fake_radio_stack.c warthog_globals.c simnode.c sta_data_seam.c interface_seam.c)
 SIMNODE_SRCS = $(SIMNODE_REAL) $(SIMNODE_FAKE)
 # umac_sta_data.c is compiled inside sta_data_seam.c, which adds a hook at its peer-address
-# read, and umac_ba.c with it. Each is a prerequisite, so an edit rebuilds, and SIMNODE_C
-# keeps it off the command line.
-SIMNODE_SEAMED = $(FW)/morselib/src/umac/data/umac_sta_data.c $(FW)/morselib/src/umac/ba/umac_ba.c
-SIMNODE_HDRS = $(wildcard $(SIMNODE)/*.h) $(MESHHDRS) $(SIMNODE_SEAMED)
+# read, and umac_ba.c with it; umac_interface.c inside interface_seam.c. Each is a
+# prerequisite, so an edit rebuilds, and SIMNODE_C keeps it off the command line.
+SIMNODE_SEAMED = $(FW)/morselib/src/umac/data/umac_sta_data.c $(FW)/morselib/src/umac/ba/umac_ba.c \
+                 $(FW)/morselib/src/umac/interface/umac_interface.c
+SIMNODE_HDRS = $(wildcard $(SIMNODE)/*.h) $(MESHHDRS) $(SIMNODE_SEAMED) \
+               $(addprefix $(FW)/morselib/src/umac/interface/,umac_interface.h umac_interface_data.h) \
+               $(FW)/morselib/src/internal/mmdrv.h
 SIMNODE_C = $(filter-out $(SIMNODE_SEAMED),$(filter %.c,$^))
 
 # The shipping mesh byte-layout code, compiled straight out of the vendored SDK.
@@ -146,6 +149,32 @@ test_mudp_classify: test_mudp_classify.c $(MAINDIR)/mudp_classify.c $(MAINDIR)/m
 # port's engine config and link throughput, and how bat0 gets its address.
 test_bat_mode: test_bat_mode.c $(MAINDIR)/bat_mode.c $(MAINDIR)/bat_mode.h $(MAINDIR)/bat/bat.h
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) -I$(MAINDIR)/bat $(filter %.c,$^) -o $@
+
+# When the host beacon timer yields to a chip that schedules its own TBTT (a MESH chip VIF).
+BCNDIR := ../../halow/components/mm-iot-sdk/framework/morselib/src/driver/beacon
+test_beacon_yield: test_beacon_yield.c $(BCNDIR)/beacon.h
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(BCNDIR) $(filter %.c,$^) -o $@
+
+# The chip VIF pieces no simnode links: driver.c's reads of the chip's own status (extracted
+# by name into test_chipvif_glue.fns) against a fake morse_cmd_tx, beacon.c's IRQ count and
+# host-tick yield, and umac_ps.c's CONFIG_PS gate; with the MESH-VIF flag and without.
+DRVSRC := $(FW)/morselib/src/driver/driver.c
+CHIPVIF_FNS := mmdrv_add_if mmdrv_add_if_status mmdrv_set_bssid mmdrv_cfg_bss_beacon \
+               mmdrv_mesh_config mmdrv_get_capabilities_status mmdrv_update_sta_state \
+               mmdrv_update_sta_state_status mmdrv_install_key mmdrv_install_key_status
+CHIPVIF_DEPS := test_chipvif_glue.c test_chipvif_glue.fns $(BCNDIR)/beacon.c $(BCNDIR)/beacon.h \
+                $(FW)/morselib/src/umac/ps/umac_ps.c $(SIMNODE_HDRS)
+test_chipvif_glue.fns: $(DRVSRC) Makefile
+	@for f in $(CHIPVIF_FNS); do \
+	  awk -v f="$$f" '$$0 ~ ("^int " f "\\(") {on=1} on {print} on && /^}/ {exit}' $(DRVSRC) | grep . || \
+	    { echo "$(DRVSRC) has no int $$f(" >&2; exit 1; }; \
+	done > $@.tmp && mv $@.tmp $@
+
+test_chipvif_glue: $(CHIPVIF_DEPS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_CHIP_VIF_MESH=1 -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $< -o $@
+
+test_chipvif_glue_off: $(CHIPVIF_DEPS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $< -o $@
 
 # AT output into the 512 B CDC TX FIFO: a long reply and its OK arrive whole.
 test_cdc_out: test_cdc_out.c $(MAINDIR)/cdc_out.c $(MAINDIR)/cdc_out.h
@@ -291,6 +320,43 @@ test_simnode_mfp: $(SIMNODE)/test_simnode_mfp.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
 test_simnode_batman: $(SIMNODE)/test_simnode_batman.c $(SIMNODE_SRCS) $(SIMNODE_HDRS) $(BAT_SRCS) $(BAT_HDRS) $(MAINDIR)/bat_mode.c $(MAINDIR)/bat_mode.h
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) -I$(BATDIR) -I$(MAINDIR) $(SIMNODE_C) -o $@
 
+# The mesh's chip VIF type through the real umac_interface.c: as warthog-mesh-sae-swccmp-meshvif
+# builds it (MESH VIF started beaconless, STA fallback), and as warthog-mesh-sae-swccmp does
+# (the boot STA VIF).
+SWCCMP_DEFS := -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1 -DWARTHOG_MESH_MGTK_PN_BASE=1
+test_simnode_meshvif: $(SIMNODE)/test_simnode_meshvif.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(SWCCMP_DEFS) -DWARTHOG_MESH_CHIP_VIF_MESH=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+test_simnode_meshvif_off: $(SIMNODE)/test_simnode_meshvif.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(SWCCMP_DEFS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+# Existing suites again with the mesh on a MESH chip VIF: the keys, crypto, batman and
+# multinode behaviour each build pins must hold there too (chip keys included).
+MESHVIF := -DWARTHOG_MESH_CHIP_VIF_MESH=1
+test_simnode_keys_meshvif: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+test_simnode_keys_pnbase_off_meshvif: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+test_simnode_keys_nochip_meshvif: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) $(SWCCMP_DEFS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+test_simnode_mfp_swccmp_meshvif: $(SIMNODE)/test_simnode_mfp.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) $(SWCCMP_DEFS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+test_simnode_batman_meshvif: $(SIMNODE)/test_simnode_batman.c $(SIMNODE_SRCS) $(SIMNODE_HDRS) $(BAT_SRCS) $(BAT_HDRS) $(MAINDIR)/bat_mode.c $(MAINDIR)/bat_mode.h
+	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) -I$(BATDIR) -I$(MAINDIR) $(SIMNODE_C) -o $@
+
+# Its own per-node copies (libsimnodemv*), so it never loads test_simnode_multinode's.
+test_simnode_multinode_meshvif: $(SIMNODE)/test_simnode_multinode.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) -Wno-unused-function -Wno-void-pointer-to-int-cast \
+	  $(SIMNODE_SOFLAGS) $(SIMNODE_INCS) $(SIMNODE_SRCS) -o libsimnodemv$(SIMNODE_SO)
+	@i=0; while [ $$i -lt $(SIMNODE_NODES) ]; do \
+	  cp libsimnodemv$(SIMNODE_SO) libsimnodemv$$i$(SIMNODE_SO); i=$$((i+1)); done
+	$(CC) $(CFLAGS) $(SANFLAGS) -DSIMNODE_SO_SUFFIX='"$(SIMNODE_SO)"' -DSIMNODE_SO_PREFIX='"libsimnodemv"' \
+	  -DSIMNODE_NODES=$(SIMNODE_NODES) $(SIMNODE_INCS) $< -o $@ $(SIMNODE_DLLIBS)
+
 test_simnode_mfp_swccmp: $(SIMNODE)/test_simnode_mfp.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1 -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
@@ -368,6 +434,7 @@ freestanding:
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_pathtbl.c && echo "ok   umac_mesh_pathtbl.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_hwmp_relay.c && echo "ok   umac_mesh_hwmp_relay.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_fwd.c && echo "ok   umac_mesh_fwd.c is freestanding"
+	@$(CC) $(CFLAGS) -Werror -fsyntax-only -include $(BCNDIR)/beacon.h -x c /dev/null && echo "ok   driver/beacon/beacon.h is freestanding"
 
 test_s1g_ieee80211: test_s1g_ieee80211.c ../src/dot11ah/s1g_ieee80211.c $(COMPAT)
 	$(CC) $(CFLAGS) $(INCS) $^ -o $@
@@ -396,5 +463,5 @@ linkcheck: linkcheck_main.c $(DOT11AH) $(COMPAT)
 	@echo "link OK: dot11ah layer is self-contained"
 
 clean:
-	rm -f $(TESTS) linkcheck_all libsimnode*.dylib libsimnode*.so
+	rm -f $(TESTS) linkcheck_all libsimnode*.dylib libsimnode*.so test_chipvif_glue.fns test_chipvif_glue.fns.tmp
 	rm -rf *.dSYM

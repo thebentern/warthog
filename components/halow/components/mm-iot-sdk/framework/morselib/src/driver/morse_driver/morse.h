@@ -204,6 +204,9 @@ struct driver_data
          * appear on air. NULL / period 0 => host timer disabled. */
         struct mmosal_timer *host_timer;
         uint32_t period_ms;
+        /* Chip beacon IRQs since the start, and the count the last host tick saw. */
+        volatile uint32_t chip_irqs;
+        uint32_t chip_irqs_seen;
     } beacon;
 };
 

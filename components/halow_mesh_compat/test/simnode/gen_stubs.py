@@ -107,7 +107,8 @@ def decl_for(sym, incdirs, roots):
             # glued onto the return type and every stub comes out malformed.
             text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)
             text = re.sub(r'//[^\n]*', ' ', text)
-            text = re.sub(r'^\s*#.*$', ' ', text, flags=re.M)
+            # A directive runs on across backslash continuations (a multi-line #define).
+            text = re.sub(r'^\s*#(?:[^\n]*\\\n)*[^\n]*$', ' ', text, flags=re.M)
             # Join the statement containing the match.
             idx = text.find(sym)
             while idx != -1:

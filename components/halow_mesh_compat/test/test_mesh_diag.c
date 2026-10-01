@@ -20,6 +20,11 @@
  * from the report before last (or the last tick with a peer) to now. So a pass
  * seen once stops masking the floor two reports later, a report read just after
  * a roll still spans a full period, and a wrapped counter still subtracts right.
+ *
+ * The mesh start's RESULT line states what the chip answered: PASS only on the chip
+ * interface the build asks for (MESH on -meshvif, the boot STA one elsewhere) with
+ * MESH_CONFIG(START) accepted. A fallback or a refused MESH_CONFIG used to print "mesh VIF
+ * added AND MESH_CONFIG(START) accepted" too, and that line is what people grep.
  */
 #include <stdio.h>
 #include <string.h>
@@ -27,6 +32,87 @@
 #include "mesh_diag.h"
 
 static int failures;
+
+#define CHECK(cond, ...) do { \
+    if (cond) { printf("ok   "); printf(__VA_ARGS__); printf("\n"); } \
+    else      { printf("FAIL "); printf(__VA_ARGS__); printf("\n"); failures++; } \
+} while (0)
+
+/* The RESULT line for @p in, and its verdict. */
+static char s_line[512];
+static enum warthog_mesh_start_verdict start_(const struct warthog_mesh_start_in *in)
+{
+    memset(s_line, 0, sizeof(s_line));
+    return warthog_mesh_start_result(in, s_line, sizeof(s_line));
+}
+
+static void t_start_result(void)
+{
+    /* -meshvif, the chip took the MESH VIF and its beaconless MESH_CONFIG(START). */
+    struct warthog_mesh_start_in in = { .status = 0, .built_mesh = 1, .chip_vif = 5,
+                                        .meshcfg_mode = 2 };
+    CHECK(start_(&in) == WARTHOG_MESH_START_PASS && strstr(s_line, "RESULT: PASS") == s_line &&
+              strstr(s_line, "chip_vif=mesh(5)") && strstr(s_line, "fallback=0(add_st=0)") &&
+              strstr(s_line, "mesh_config=accepted,beaconless(st=0)"),
+          "start: a MESH VIF with MESH_CONFIG accepted is a PASS that says so (%s)", s_line);
+
+    /* -meshvif, the chip refused the MESH VIF: the STA fallback carries the mesh, beaconing. */
+    in.chip_vif = 1;
+    in.fallback = 1;
+    in.add_status = -1;
+    in.meshcfg_mode = 1;
+    CHECK(start_(&in) == WARTHOG_MESH_START_WARN && strstr(s_line, "RESULT: WARN") == s_line &&
+              strstr(s_line, "chip_vif=sta(1)") && strstr(s_line, "fallback=1(add_st=-1)") &&
+              !strstr(s_line, "PASS") && !strstr(s_line, "mesh VIF added"),
+          "start: a STA fallback on a MESH-VIF build is a WARN naming the STA VIF (%s)", s_line);
+
+    /* Every other env: the boot STA VIF is the one asked for. */
+    in = (struct warthog_mesh_start_in){ .status = 0, .built_mesh = 0, .chip_vif = 1,
+                                         .meshcfg_mode = 1 };
+    CHECK(start_(&in) == WARTHOG_MESH_START_PASS && strstr(s_line, "chip_vif=sta(1)"),
+          "start: the boot STA VIF on a STA build is a PASS (%s)", s_line);
+    in.chip_vif = 5;
+    CHECK(start_(&in) == WARTHOG_MESH_START_WARN, "start: a MESH VIF a STA build did not ask for is a WARN");
+
+    /* MESH_CONFIG(START) refused, on either build: up, but not accepted. */
+    in = (struct warthog_mesh_start_in){ .status = 0, .built_mesh = 1, .chip_vif = 5,
+                                         .meshcfg_refused = 1, .meshcfg_status = -22,
+                                         .meshcfg_mode = 2 };
+    CHECK(start_(&in) == WARTHOG_MESH_START_WARN &&
+              strstr(s_line, "mesh_config=REFUSED,beaconless(st=-22)") && !strstr(s_line, "accepted"),
+          "start: a refused MESH_CONFIG is a WARN with its status (%s)", s_line);
+    in.built_mesh = 0;
+    in.chip_vif = 1;
+    CHECK(start_(&in) == WARTHOG_MESH_START_WARN, "start: on a STA build too");
+
+    /* The start failed: FAIL, with what the chip answered on the way. */
+    in = (struct warthog_mesh_start_in){ .status = 3, .built_mesh = 1, .chip_vif = 0,
+                                         .fallback = 1, .add_status = -110 };
+    CHECK(start_(&in) == WARTHOG_MESH_START_FAIL && strstr(s_line, "RESULT: FAIL") == s_line &&
+              strstr(s_line, "status=3") && strstr(s_line, "chip_vif=none(0)") &&
+              strstr(s_line, "fallback=1(add_st=-110)") && strstr(s_line, "mesh_config=none"),
+          "start: a failed start is a FAIL with the chip's answers (%s)", s_line);
+
+    /* No chip VIF claimed although the enable succeeded is never a PASS. */
+    in = (struct warthog_mesh_start_in){ .status = 0, .built_mesh = 0, .chip_vif = 0 };
+    CHECK(start_(&in) == WARTHOG_MESH_START_WARN, "start: no chip VIF is never a PASS");
+
+    /* The longest line fits the buffer main/mesh.c gives it, whole. */
+    in = (struct warthog_mesh_start_in){ .status = -2147483647 - 1, .built_mesh = 1,
+                                         .chip_vif = 4294967295u, .fallback = 4294967295u,
+                                         .add_status = -2147483647 - 1,
+                                         .meshcfg_refused = 4294967295u,
+                                         .meshcfg_status = -2147483647 - 1,
+                                         .meshcfg_mode = 4294967295u };
+    (void)start_(&in);
+    const size_t fail_len = strlen(s_line);
+    in.status = 0;
+    (void)start_(&in);
+    const size_t up_len = strlen(s_line);
+    CHECK(fail_len < WARTHOG_MESH_START_RESULT_LEN && up_len < WARTHOG_MESH_START_RESULT_LEN,
+          "start: the longest lines fit %u bytes (%zu, %zu)", (unsigned)WARTHOG_MESH_START_RESULT_LEN,
+          fail_len, up_len);
+}
 
 static void expect(const char *what, enum warthog_mesh_diag got,
                    enum warthog_mesh_diag want)
@@ -209,6 +295,8 @@ int main(void)
     }
     expect("NULL input does not report a fault", warthog_mesh_diagnose(NULL),
            WARTHOG_MESH_DIAG_PEERED);
+
+    t_start_result();
 
     if (failures) {
         printf("%d FAILURE(S)\n", failures);

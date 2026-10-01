@@ -136,6 +136,11 @@ correct stopping point for hardware-free implementation.
   are both accepted by the firmware. Phases 0-3 complete and HW-verified.
   Not yet confirmed: that the over-the-air beacons are well-formed 802.11s
   (needs a sniffer or a second board). The host command path is proven.
+  Correction (2026-09-30): these lines do not show that the chip accepted either
+  command. No response status was read (`morse_cmd_tx` returns 0 once any response
+  arrives), and the PASS line was printed whenever `mmwlan_mesh_enable()` succeeded.
+  The start now prints what the chip answered (`warthog_mesh_start_result()`), and
+  `AT+MESHCFG?` shows the chip interface type in use; see fork-inventory.md.
 
 - **2026-05-24 — Phase 4a + 4b DONE, build-verified.**
   Two attempts: the first hit a regression on `warthog-us` (boot loop at

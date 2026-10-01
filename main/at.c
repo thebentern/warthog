@@ -401,6 +401,8 @@ volatile uint32_t g_warthog_bcn_enq_ok = 0;   /* beacon enqueued to chip TX queu
 volatile uint32_t g_warthog_bcn_enq_err = 0;  /* beacon enqueue failed */
 volatile uint32_t g_warthog_bcn_txcomp = 0;   /* chip reported beacon TX completion */
 volatile uint32_t g_warthog_bcn_inactive = 0; /* asked while mesh not active */
+volatile uint32_t g_warthog_bcn_chip_irq = 0;  /* chip beacon IRQs (beacon.c) */
+volatile uint32_t g_warthog_bcn_host_yield = 0; /* host ticks that left a TBTT to the chip */
 
 /* Mesh probe-response counters (AT+PRSPSTAT?). rx = probe requests received
  * from peers, tx = probe responses successfully handed to the chip. */
@@ -489,6 +491,29 @@ volatile uint32_t g_warthog_mesh_peer_add_fail = 0;
 volatile uint32_t g_warthog_mesh_chip_sta_fail = 0;
 /* umac_keys_install_key() failures at ESTAB. */
 volatile uint32_t g_warthog_mesh_key_fail = 0;
+/* The chip VIF in use (umac_interface.c): its MMDRV_INTERFACE_TYPE (0 none, 1 STA, 2 AP,
+ * 5 MESH) and id, MESH adds that fell back to STA, and the last such add's status or error. */
+volatile uint32_t g_warthog_chipvif_type = 0;
+volatile uint32_t g_warthog_chipvif_id = 0;
+volatile uint32_t g_warthog_chipvif_fallback = 0;
+volatile int32_t g_warthog_chipvif_add_status = 0;
+/* BSSID_SET / MESH_CONFIG the chip refused (umac_mesh.c), and the last refusal's status. */
+volatile uint32_t g_warthog_chipcmd_bssid_refused = 0;
+volatile int32_t g_warthog_chipcmd_bssid_status = 0;
+volatile uint32_t g_warthog_chipcmd_meshcfg_refused = 0;
+volatile int32_t g_warthog_chipcmd_meshcfg_status = 0;
+/* BSS_BEACON_CONFIG, SET_STA_STATE (by state, NOTEXIST..AUTHORIZED) and INSTALL_KEY the chip
+ * refused, each with the last refusal's status; accepted keys at another hw index than asked
+ * (a MESH-VIF build counts them, others assert); and the MESH_CONFIG(START) sent: 0 none,
+ * 1 beaconing, 2 beaconless. */
+volatile uint32_t g_warthog_chipcmd_beacon_refused = 0;
+volatile int32_t g_warthog_chipcmd_beacon_status = 0;
+volatile uint32_t g_warthog_chipcmd_sta_refused[5] = {0};
+volatile int32_t g_warthog_chipcmd_sta_status = 0;
+volatile uint32_t g_warthog_chipcmd_key_refused = 0;
+volatile int32_t g_warthog_chipcmd_key_status = 0;
+volatile uint32_t g_warthog_chipcmd_keyidx_mismatch = 0;
+volatile uint32_t g_warthog_chipcmd_meshcfg_mode = 0;
 /* Mesh data-plane protection. 1 (default) = register peers as secured and
  * install the static MTK/MGTK; 0 = leave them OPEN.
  *
@@ -831,15 +856,20 @@ static void cmd_meshstat(void)
  * The documented symptom is "the beacon IRQ fires once at startup and never
  * again". req==1 confirms the chip stopped asking; req climbing with served==0
  * means the host is failing to build; req climbing with served climbing means
- * beacons ARE being served and the problem is downstream of this handshake. */
+ * beacons ARE being served and the problem is downstream of this handshake.
+ * chip_irq = beacon IRQs the chip raised (1 on a STA chip VIF; one per TBTT when it
+ * schedules its own); host_yield = host timer ticks that left the beacon to it. */
 static void cmd_bcnstat(void)
 {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "+BCNSTAT: req=%lu served=%lu null=%lu inactive=%lu enq=%lu/%lu txcomp=%lu\r\n",
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+             "+BCNSTAT: req=%lu served=%lu null=%lu inactive=%lu enq=%lu/%lu txcomp=%lu "
+             "chip_irq=%lu host_yield=%lu\r\n",
              (unsigned long)g_warthog_bcn_req, (unsigned long)g_warthog_bcn_served,
              (unsigned long)g_warthog_bcn_null, (unsigned long)g_warthog_bcn_inactive,
              (unsigned long)g_warthog_bcn_enq_ok, (unsigned long)g_warthog_bcn_enq_err,
-             (unsigned long)g_warthog_bcn_txcomp);
+             (unsigned long)g_warthog_bcn_txcomp, (unsigned long)g_warthog_bcn_chip_irq,
+             (unsigned long)g_warthog_bcn_host_yield);
     cdc_write(buf);
     reply_ok();
 }
@@ -1039,6 +1069,64 @@ static int meshcfg_bat_line_(char *buf, size_t len, const struct meshcfg_mode *m
                     m->grp_std ? "std" : "replicate", m->copies, (unsigned long)m->tput_override);
 }
 
+/* The AT+MESHCFG? chip VIF lines, libc only: the glue guard compiles them out of this file
+ * and checks they name each type and refusal and fit line[320]. */
+struct meshcfg_chipvif {
+    uint32_t type, vif_id, fallback, bssid_refused, meshcfg_refused;
+    int32_t add_status, bssid_status, meshcfg_status;
+    bool built_mesh;
+    uint32_t beacon_refused, sta_refused[5], key_refused, keyidx_mismatch, meshcfg_mode;
+    int32_t beacon_status, sta_status, key_status;
+};
+
+static const char *meshcfg_chipvif_name_(uint32_t type)
+{
+    switch (type) {
+    case 0: return "none";
+    case 1: return "sta";
+    case 2: return "ap";
+    case 5: return "mesh";
+    default: return "other";
+    }
+}
+
+static int meshcfg_chipvif_line_(char *buf, size_t len, const struct meshcfg_chipvif *c)
+{
+    return snprintf(buf, len,
+                    "+MESHCFG: chip_vif=%s(%lu) vif_id=%lu built=%s fallback=%lu add_st=%ld "
+                    "bssid_refused=%lu(st=%ld) mesh_config_refused=%lu(st=%ld)\r\n",
+                    meshcfg_chipvif_name_(c->type), (unsigned long)c->type,
+                    (unsigned long)c->vif_id, c->built_mesh ? "mesh" : "sta",
+                    (unsigned long)c->fallback, (long)c->add_status,
+                    (unsigned long)c->bssid_refused, (long)c->bssid_status,
+                    (unsigned long)c->meshcfg_refused, (long)c->meshcfg_status);
+}
+
+static const char *meshcfg_sent_name_(uint32_t mode)
+{
+    switch (mode) {
+    case 0: return "none";
+    case 1: return "beaconing";
+    case 2: return "beaconless";
+    default: return "other";
+    }
+}
+
+/* Refusals by command, SET_STA_STATE by state (NOTEXIST/NONE/AUTH/ASSOC/AUTHORIZED). */
+static int meshcfg_chipcmd_line_(char *buf, size_t len, const struct meshcfg_chipvif *c)
+{
+    return snprintf(buf, len,
+                    "+MESHCFG: chip_refused beacon_config=%lu(st=%ld) sta_state=%lu/%lu/%lu/%lu/%lu(st=%ld) "
+                    "install_key=%lu(st=%ld) keyidx_mismatch=%lu mesh_config_sent=%s(%lu)\r\n",
+                    (unsigned long)c->beacon_refused, (long)c->beacon_status,
+                    (unsigned long)c->sta_refused[0], (unsigned long)c->sta_refused[1],
+                    (unsigned long)c->sta_refused[2], (unsigned long)c->sta_refused[3],
+                    (unsigned long)c->sta_refused[4], (long)c->sta_status,
+                    (unsigned long)c->key_refused, (long)c->key_status,
+                    (unsigned long)c->keyidx_mismatch, meshcfg_sent_name_(c->meshcfg_mode),
+                    (unsigned long)c->meshcfg_mode);
+}
+
 /* AT+MESHCFG? -- every value a peer matches on, plus what this node will not
  * do. Interop failures are mismatches, and comparing them one AT verb at a
  * time is how they get missed; the capability lines are here so nobody has to
@@ -1088,6 +1176,35 @@ static void cmd_meshcfg(void)
     snprintf(line, sizeof(line), "+MESHCFG: peers=%u beacons_heard=%lu\r\n",
              peers, (unsigned long)g_warthog_rxchan_beacon);
     cdc_write(line);
+    {
+        struct meshcfg_chipvif c = {
+            .type = g_warthog_chipvif_type,
+            .vif_id = g_warthog_chipvif_id,
+            .fallback = g_warthog_chipvif_fallback,
+            .add_status = g_warthog_chipvif_add_status,
+            .bssid_refused = g_warthog_chipcmd_bssid_refused,
+            .bssid_status = g_warthog_chipcmd_bssid_status,
+            .meshcfg_refused = g_warthog_chipcmd_meshcfg_refused,
+            .meshcfg_status = g_warthog_chipcmd_meshcfg_status,
+#if defined(WARTHOG_MESH_CHIP_VIF_MESH) && WARTHOG_MESH_CHIP_VIF_MESH
+            .built_mesh = true,
+#endif
+            .beacon_refused = g_warthog_chipcmd_beacon_refused,
+            .beacon_status = g_warthog_chipcmd_beacon_status,
+            .sta_status = g_warthog_chipcmd_sta_status,
+            .key_refused = g_warthog_chipcmd_key_refused,
+            .key_status = g_warthog_chipcmd_key_status,
+            .keyidx_mismatch = g_warthog_chipcmd_keyidx_mismatch,
+            .meshcfg_mode = g_warthog_chipcmd_meshcfg_mode,
+        };
+        for (unsigned i = 0; i < 5; i++) {
+            c.sta_refused[i] = g_warthog_chipcmd_sta_refused[i];
+        }
+        meshcfg_chipvif_line_(line, sizeof(line), &c);
+        cdc_write(line);
+        meshcfg_chipcmd_line_(line, sizeof(line), &c);
+        cdc_write(line);
+    }
     {
         struct warthog_mesh_diag_in in = {
             .peers           = peers,
@@ -1206,6 +1323,54 @@ static void cmd_hwmpstat(void)
     cdc_write(buf);
     reply_ok();
 }
+/* AT+MACSTATS? (core 1, the MAC) or AT+MACSTATS=<core>[,1] -- every counter in the chip's stats
+ * blob as tag=value, reset after reading with ,1. The blob is the TLV stream morse_cli decodes. */
+static void cmd_macstats(uint32_t core, bool reset)
+{
+    struct mmwlan_morse_stats *s = mmwlan_get_morse_stats(core, reset);
+    if (s == NULL || s->buf == NULL) {
+        mmwlan_free_morse_stats(s);
+        reply_error("stats unavailable");
+        return;
+    }
+    char line[224];
+    snprintf(line, sizeof(line), "+MACSTATS: core=%lu len=%lu\r\n", (unsigned long)core,
+             (unsigned long)s->len);
+    cdc_write(line);
+    int off = 0;
+    const uint8_t *p = s->buf;
+    uint32_t left = s->len;
+    while (left >= 4u) {
+        uint16_t tag = (uint16_t)(p[0] | (p[1] << 8));
+        uint16_t len = (uint16_t)(p[2] | (p[3] << 8));
+        if ((uint32_t)len + 4u > left) {
+            break;
+        }
+        uint64_t v = 0;
+        for (uint16_t b = 0; b < len && b < 8u; b++) {
+            v |= (uint64_t)p[4 + b] << (8u * b);
+        }
+        if (off == 0) {
+            off = snprintf(line, sizeof(line), "+MACSTATS:");
+        }
+        off += snprintf(line + off, sizeof(line) - (size_t)off, len <= 8u ? " %u=%llu" : " %u=len%u",
+                        (unsigned)tag, len <= 8u ? (unsigned long long)v : (unsigned long long)len);
+        if (off > (int)sizeof(line) - 40) {
+            snprintf(line + off, sizeof(line) - (size_t)off, "\r\n");
+            cdc_write(line);
+            off = 0;
+        }
+        p += 4u + len;
+        left -= 4u + len;
+    }
+    if (off > 0) {
+        snprintf(line + off, sizeof(line) - (size_t)off, "\r\n");
+        cdc_write(line);
+    }
+    mmwlan_free_morse_stats(s);
+    reply_ok();
+}
+
 static void cmd_filtstat(void)
 {
     char buf[240];
@@ -2469,6 +2634,12 @@ static void dispatch(char *line)
         cmd_hwmpstat();
     } else if (strcasecmp(verb, "FILTSTAT") == 0 && terminator == '?') {
         cmd_filtstat();
+    } else if (strcasecmp(verb, "MACSTATS") == 0 && terminator == '?') {
+        cmd_macstats(1, false);
+    } else if (strcasecmp(verb, "MACSTATS") == 0 && terminator == '=') {
+        unsigned core = 1, rst = 0;
+        (void)sscanf(args, "%u,%u", &core, &rst);
+        cmd_macstats(core, rst != 0);
     } else if (strcasecmp(verb, "RXREORD") == 0 && terminator == '?') {
         cmd_rxreord();
     } else if (strcasecmp(verb, "RXCHAN") == 0 && terminator == '?') {

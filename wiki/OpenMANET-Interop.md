@@ -15,8 +15,10 @@ a stock image runs no mesh (see below):
 
 Encrypted (SAE, `ieee80211w=2`), `warthog-mesh-sae-swccmp` in batman mode
 against OpenMANET 1.8.0 on 2026-09-30: pings from a host on a Pi's LAN,
-`batctl ping` from a Pi and a DHCP lease from a Pi, with small frames ([Batman Mode](Batman-Mode#measured-on-air); for large
-ones, [below](#frames-over-about-1000-bytes-from-a-linux-node)).
+`batctl ping` from a Pi and a DHCP lease from a Pi, with small frames ([Batman Mode](Batman-Mode#measured-on-air)).
+`warthog-mesh-sae-swccmp-meshvif` also took the Pis' 1000- and 1400-byte frames
+with their RTS threshold at 1000, the same day
+([below](#frames-over-about-1000-bytes-from-a-linux-node)).
 
 ## Pick the security mode first
 
@@ -24,7 +26,7 @@ Warthog and OpenMANET must agree on mesh security. Two working combinations:
 
 | Mesh | Warthog build | OpenMANET config |
 |---|---|---|
-| **Encrypted (SAE/AMPE)** | `warthog-mesh-sae-swccmp`; `warthog-mesh-sae` peers but gets no unicast from a 1.8.0 node | mesh wizard default, or `uci` (below) |
+| **Encrypted (SAE/AMPE)** | `warthog-mesh-sae-swccmp`, or `warthog-mesh-sae-swccmp-meshvif` for a node's frames above its RTS threshold ([below](#frames-over-about-1000-bytes-from-a-linux-node)); `warthog-mesh-sae` peers but gets no unicast from a 1.8.0 node | mesh wizard default, or `uci` (below) |
 | Open | `warthog-mesh-smoke` + `AT+MESHSEC=0` | `encryption='none'`, set by the operator |
 
 A fresh OpenMANET image runs no mesh: its HaLow radio is an SAE access point in
@@ -157,8 +159,9 @@ and any unicast with more than one peer, therefore needs host CCMP
 (`warthog-mesh-sae-swccmp`, armed with `AT+SWCCMP=1` or by batman mode). **For
 encrypted cross-vendor data use `warthog-mesh-sae-swccmp`**; a 1.8.0 node gets
 no path to `warthog-mesh-sae` at all (below). A Linux node's unicast above about
-1000 bytes needs its RTS threshold off
-([below](#frames-over-about-1000-bytes-from-a-linux-node)).
+1000 bytes arrives from every node only on `warthog-mesh-sae-swccmp-meshvif` or
+with a setting on the node; on other builds only from the peer the chip
+registered last ([below](#frames-over-about-1000-bytes-from-a-linux-node)).
 
 Earlier findings, still relevant:
 
@@ -296,27 +299,55 @@ properly and does not need it.
 
 ## Frames over about 1000 bytes from a Linux node
 
-Turn the node's RTS threshold off. Both OpenMANET 1.8.0 bench Pis ran it at 1000
-(not set in uci; what sets it was not found), so each unicast frame longer than
-that goes out behind an RTS/CTS exchange, and the frame never reaches the
-Warthog. The exchange is most likely what fails: those frames fail only while the
-threshold is on, and pass between two Pis; nothing on air was captured. Measured
-on 2026-09-30 (SAE, batman mode): pings from a Pi with payloads up to 700 bytes
-passed, 900 bytes and up failed every time, and the Warthog counted nothing
-arriving (no `micfail`, no `uc_rx`); between the two Pis the same pings pass.
-With RTS off on the Pis, 900-, 1000- and 1400-byte pings passed (3/4, 4/4, 3/4):
+Both OpenMANET 1.8.0 bench Pis run an RTS threshold of 1000 (not set in uci;
+what sets it was not found), so each unicast frame longer than that goes out
+behind an RTS/CTS exchange (full-size TCP segments and large UDP too; derived).
+The Warthog's chip answers the RTS with a CTS, but on the STA chip interface
+every build except `warthog-mesh-sae-swccmp-meshvif` runs the mesh on, it
+addresses that CTS from the peer it registered last. Only that neighbour takes
+it; every other node times out and never sends the frame. Measured on
+2026-09-30 with the chips' MAC counters on both ends: after another Pi had
+re-peered with the Warthog, a Pi's 1000-byte pings went 0/8, with its RTS +64,
+CTS timeouts +64 and `RX CTS for RTS` +0, while the Warthog counted 63 RTS
+received and 63 CTS sent; the Pi that peered last got 8/8. Frames from the
+Warthog are unaffected: a node's RTS threshold governs only what that node
+sends.
+
+**Fix: `warthog-mesh-sae-swccmp-meshvif`.** It runs the mesh on a MESH chip
+interface, as Linux does, which addresses its CTS to each RTS's sender (per the
+chip firmware's disassembly); both Pis took it. Measured on air on
+2026-09-30 against the two Pis at threshold 1000: in the same case the Pi's
+1000-byte pings went 8/8, `RX CTS for RTS` +8, CTS timeouts +0; the other Pi
+8/8; a Pi to a second `-meshvif` Warthog 8/8. In batman mode, 500-, 1000- and
+1400-byte pings over batman passed 10/10 each ([Batman Mode](Batman-Mode)).
+`AT+MESHCFG?` must read `chip_vif=mesh(5)`: a fallback to `sta` behaves as the
+other builds. A 54-minute soak the same day (both Warthogs on `-meshvif`, both
+Pis at threshold 1000, a round every 5 minutes): 237/240 1000-byte pings from the
+Pis to the Warthogs, 60/60 Warthog to Warthog, `chip_vif=mesh(5)` with 3 peers
+and no fallback in all 24 readings.
+
+Not measured on a MESH chip interface: the SAE builds that put keys in the chip
+(the fix exists only as `-swccmp-meshvif`, which keeps them in the host), an open
+mesh, three or more Warthogs (two were), recovery after a chip restart, and a
+soak longer than an hour.
+
+**Other builds: set each OpenMANET node** to use CTS-to-self in place of
+RTS/CTS, or turn RTS off. Either works alone:
 
 ```sh
+echo Y > /sys/module/mm6108_sdio/parameters/enable_cts_to_self
+# or
 iw dev wlh0 info | grep wiphy      # wiphy N: the phy is phyN
-iw phy phyN info | grep -i rts     # RTS threshold: 1000
 iw phy phyN set rts off
 ```
 
-`iw` settings do not survive a reboot. The Warthog's frames to the node are
-unaffected: its echo replies of the same sizes arrived, and a node's RTS
-threshold governs only what that node sends. It is the radio, not batman: plain mesh mode
-sends the same frames, and full-size TCP segments and large UDP toward a Warthog
-are above the threshold (neither measured separately).
+`mm6108_sdio` is the bench Pis' MM6108 SDIO driver; the module name follows the
+chip and bus (`ls /sys/module/*/parameters/enable_cts_to_self`). Both were
+measured set at runtime on 2026-09-30: with CTS-to-self, 900-, 1000- and
+1400-byte pings passed; with RTS off, 3/4, 4/4 and 3/4. Neither survives a
+reboot. The persistent CTS-to-self setting is
+`uci set wireless.<radio>.enable_cts_to_self=1` and a driver reload, read from
+OpenMANET's `netifd-morse` source, not measured.
 
 ## Verifying
 

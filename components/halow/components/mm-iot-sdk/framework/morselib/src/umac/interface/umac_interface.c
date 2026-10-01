@@ -113,6 +113,94 @@ bool umac_interface_get_control_response_bw_1mhz_out_enabled(struct umac_data *u
 
 #define VIF_STA_INTERFACE_TYPES_MASK (UMAC_INTERFACE_SCAN | UMAC_INTERFACE_STA)
 
+/* The chip VIF type and id in use, for AT+MESHCFG? (storage in main/at.c). */
+extern volatile uint32_t g_warthog_chipvif_type, g_warthog_chipvif_id;
+
+static void umac_interface_set_chip_vif_type_(struct umac_interface_data *data, uint8_t type)
+{
+    data->chip_vif_type = type;
+    g_warthog_chipvif_type = type;
+    g_warthog_chipvif_id = data->vif_id;
+}
+
+#if WARTHOG_MESH_CHIP_VIF_MESH
+/* MESH adds that fell back to STA, and the last one's status or error (main/at.c). */
+extern volatile uint32_t g_warthog_chipvif_fallback;
+extern volatile int32_t g_warthog_chipvif_add_status;
+
+/* Adds the mesh's chip VIF as MESH, as Linux adds a mesh point, replacing the boot VIF when
+ * @p replace (then with the new VIF's capabilities, as Linux reads them per VIF). A firmware
+ * that refuses it, or a failed remove, leaves the mesh on a STA VIF, counted. So does a MESH
+ * VIF with an id other than 0: beacons and data are tagged VIF 0 (single-VIF datapath). */
+static int umac_interface_add_mesh_vif_(struct umac_data *umacd,
+                                        struct umac_interface_data *data,
+                                        bool replace)
+{
+    int ret = 0;
+    int32_t st = 0;
+    if (replace)
+    {
+        ret = mmdrv_rm_if(data->vif_id);
+        if (ret != 0)
+        {
+            g_warthog_chipvif_fallback++;
+            g_warthog_chipvif_add_status = ret;
+            MMLOG_WRN("Mesh VIF: REMOVE_INTERFACE failed (%d); staying on the STA VIF\n", ret);
+            return 0;
+        }
+        data->vif_id = 0;
+        umac_interface_set_chip_vif_type_(data, 0);
+        umac_ps_reset(umacd);
+    }
+
+    ret = mmdrv_add_if_status(&data->vif_id, data->mac_addr, MMDRV_INTERFACE_TYPE_MESH, &st);
+    if (ret == 0 && st == 0 && data->vif_id != 0)
+    {
+        g_warthog_chipvif_add_status = -1000 - (int32_t)data->vif_id;
+        MMLOG_WRN("Mesh VIF: the chip gave it id %u, not 0; removing it\n", data->vif_id);
+        ret = mmdrv_rm_if(data->vif_id);
+        if (ret != 0)
+        {
+            MMLOG_WRN("Mesh VIF: REMOVE_INTERFACE(%u) failed (%d)\n", data->vif_id, ret);
+            return ret;
+        }
+        data->vif_id = 0;
+        g_warthog_chipvif_fallback++;
+        ret = mmdrv_add_if(&data->vif_id, data->mac_addr, MMDRV_INTERFACE_TYPE_STA);
+        if (ret == 0)
+        {
+            umac_interface_set_chip_vif_type_(data, MMDRV_INTERFACE_TYPE_STA);
+        }
+        return ret;
+    }
+    if (ret == 0 && st == 0)
+    {
+        umac_interface_set_chip_vif_type_(data, MMDRV_INTERFACE_TYPE_MESH);
+        struct morse_caps caps = data->capabilities;
+        if (replace && mmdrv_get_capabilities_status(data->vif_id, &caps, &st) == 0 && st == 0)
+        {
+            data->capabilities = caps;
+        }
+        else if (replace)
+        {
+            MMLOG_WRN("Mesh VIF: GET_CAPABILITIES refused; keeping the boot VIF's\n");
+        }
+        return 0;
+    }
+
+    g_warthog_chipvif_fallback++;
+    g_warthog_chipvif_add_status = (ret != 0) ? ret : st;
+    MMLOG_WRN("Mesh VIF: ADD_INTERFACE(MESH) %s (%ld); falling back to STA\n",
+              (ret != 0) ? "failed" : "refused", (long)g_warthog_chipvif_add_status);
+    ret = mmdrv_add_if(&data->vif_id, data->mac_addr, MMDRV_INTERFACE_TYPE_STA);
+    if (ret == 0)
+    {
+        umac_interface_set_chip_vif_type_(data, MMDRV_INTERFACE_TYPE_STA);
+    }
+    return ret;
+}
+#endif
+
 static void umac_interface_init_vif(struct umac_data *umacd,
                                     enum umac_interface_type type,
                                     uint16_t vif_id)
@@ -238,7 +326,19 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
         {
             drv_if_type = MMDRV_INTERFACE_TYPE_MESH;
         }
+#if WARTHOG_MESH_CHIP_VIF_MESH
+        if (type == UMAC_INTERFACE_MESH)
+        {
+            ret = umac_interface_add_mesh_vif_(umacd, data, false);
+            drv_if_type = (enum mmdrv_interface_type)data->chip_vif_type;
+        }
+        else
+        {
+            ret = mmdrv_add_if(&data->vif_id, data->mac_addr, drv_if_type);
+        }
+#else
         ret = mmdrv_add_if(&data->vif_id, data->mac_addr, drv_if_type);
+#endif
         /* mmdrv_add_if can legitimately fail if the chip firmware rejects the
          * requested interface type (e.g. a STA/AP-only firmware build refusing
          * MESH). Don't assert — surface it so umac_mesh can report it. */
@@ -249,6 +349,8 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
             status = MMWLAN_ERROR;
             goto error;
         }
+
+        umac_interface_set_chip_vif_type_(data, (uint8_t)drv_if_type);
 
         MMLOG_DBG("Added IF type=%s, mac_addr=" MM_MAC_ADDR_FMT ", vif_id=%u\n",
                   umac_interface_type_to_str(type),
@@ -271,6 +373,7 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
 
         ret = mmdrv_add_if(&data->vif_id, data->mac_addr, MMDRV_INTERFACE_TYPE_STA);
         MMOSAL_ASSERT(ret == 0);
+        umac_interface_set_chip_vif_type_(data, MMDRV_INTERFACE_TYPE_STA);
     }
     else if (!(data->active_interface_types & UMAC_INTERFACE_AP) && (type == UMAC_INTERFACE_AP))
     {
@@ -284,7 +387,23 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
 
         ret = mmdrv_add_if(&data->vif_id, data->mac_addr, MMDRV_INTERFACE_TYPE_AP);
         MMOSAL_ASSERT(ret == 0);
+        umac_interface_set_chip_vif_type_(data, MMDRV_INTERFACE_TYPE_AP);
     }
+#if WARTHOG_MESH_CHIP_VIF_MESH
+    /* The mesh replaces the boot VIF (chip type STA) with a MESH one. */
+    else if (!(data->active_interface_types & UMAC_INTERFACE_MESH) &&
+             (type == UMAC_INTERFACE_MESH) &&
+             data->chip_vif_type != MMDRV_INTERFACE_TYPE_MESH)
+    {
+        ret = umac_interface_add_mesh_vif_(umacd, data, true);
+        if (ret != 0)
+        {
+            MMLOG_WRN("mmdrv_add_if(type=%s) failed: %d\n", umac_interface_type_to_str(type), ret);
+            status = MMWLAN_ERROR;
+            goto error;
+        }
+    }
+#endif
 
     data->active_interface_types |= type;
 
@@ -376,6 +495,7 @@ void umac_interface_remove(struct umac_data *umacd, enum umac_interface_type typ
         struct mmdrv_fw_version fw_version;
         memcpy(&fw_version, &data->fw_version, sizeof(fw_version));
         memset(data, 0, sizeof(*data));
+        umac_interface_set_chip_vif_type_(data, 0);
         memcpy(data->mac_addr, backup_mac_addr, sizeof(data->mac_addr));
         memcpy(&data->fw_version, &fw_version, sizeof(fw_version));
         data->morse_chip_id_string = chip_id_string;
@@ -429,6 +549,8 @@ enum mmwlan_status umac_interface_reinstall_vif(struct umac_data *umacd,
         return MMWLAN_UNAVAILABLE;
     }
 
+    /* Only the STA path reinstalls (umac_connection.c): a chip restart under an active mesh
+     * asserts in hw_restart_evt_handler (umac_mmdrv_shim.c), so no mesh VIF is re-added. */
     enum mmdrv_interface_type drv_if_type = (type == UMAC_INTERFACE_AP) ? MMDRV_INTERFACE_TYPE_AP :
                                                                           MMDRV_INTERFACE_TYPE_STA;
     int ret = mmdrv_add_if(&data->vif_id, data->mac_addr, drv_if_type);
@@ -436,6 +558,7 @@ enum mmwlan_status umac_interface_reinstall_vif(struct umac_data *umacd,
     {
         return MMWLAN_ERROR;
     }
+    umac_interface_set_chip_vif_type_(data, (uint8_t)drv_if_type);
 
     if (vif_id != NULL)
     {
@@ -445,6 +568,11 @@ enum mmwlan_status umac_interface_reinstall_vif(struct umac_data *umacd,
     umac_interface_init_vif(umacd, type, data->vif_id);
 
     return MMWLAN_SUCCESS;
+}
+
+uint8_t umac_interface_get_chip_vif_type(struct umac_data *umacd)
+{
+    return umac_data_get_interface(umacd)->chip_vif_type;
 }
 
 enum mmwlan_status umac_interface_get_fw_version(struct umac_data *umacd,

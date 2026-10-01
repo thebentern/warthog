@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "mesh_diag.h"
 
+#include <stdio.h>
+
 enum warthog_mesh_diag warthog_mesh_diagnose(const struct warthog_mesh_diag_in *in)
 {
     if (in == NULL) {
@@ -92,4 +94,42 @@ const char *warthog_mesh_diag_text(enum warthog_mesh_diag d)
                "join it. Check mesh ID, operating class and security";
     }
     return "unknown";
+}
+
+static const char *mesh_start_vif_name_(uint32_t type)
+{
+    switch (type) {
+    case 0: return "none";
+    case 1: return "sta";
+    case 2: return "ap";
+    case 5: return "mesh";
+    default: return "other";
+    }
+}
+
+enum warthog_mesh_start_verdict warthog_mesh_start_result(const struct warthog_mesh_start_in *in,
+                                                          char *buf, size_t len)
+{
+    const char *cfg = in->meshcfg_mode == 0 ? "none"
+                    : in->meshcfg_refused != 0 ? "REFUSED" : "accepted";
+    const char *mode = in->meshcfg_mode == 1 ? ",beaconing" : in->meshcfg_mode == 2 ? ",beaconless" : "";
+    enum warthog_mesh_start_verdict v = WARTHOG_MESH_START_FAIL;
+    if (in->status == 0) {
+        /* The chip interface this build asks for: MESH on -meshvif, the boot STA one elsewhere. */
+        const uint32_t want = in->built_mesh ? 5u : 1u;
+        v = (in->chip_vif == want && in->meshcfg_refused == 0) ? WARTHOG_MESH_START_PASS
+                                                               : WARTHOG_MESH_START_WARN;
+    }
+    int n = (v == WARTHOG_MESH_START_FAIL)
+                ? snprintf(buf, len, "RESULT: FAIL -- mmwlan_mesh_enable() returned status=%d;", in->status)
+                : snprintf(buf, len, "RESULT: %s -- mesh up on",
+                           v == WARTHOG_MESH_START_PASS ? "PASS" : "WARN");
+    if (n > 0 && (size_t)n < len) {
+        snprintf(buf + n, len - (size_t)n,
+                 " chip_vif=%s(%lu) fallback=%lu(add_st=%ld) mesh_config=%s%s(st=%ld)",
+                 mesh_start_vif_name_(in->chip_vif), (unsigned long)in->chip_vif,
+                 (unsigned long)in->fallback, (long)in->add_status, cfg, mode,
+                 (long)in->meshcfg_status);
+    }
+    return v;
 }

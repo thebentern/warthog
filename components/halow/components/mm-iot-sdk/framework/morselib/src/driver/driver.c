@@ -516,6 +516,14 @@ int mmdrv_set_txpower(int32_t *out_power_dbm, int txpower_dbm)
 
 int mmdrv_add_if(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_type type)
 {
+    return mmdrv_add_if_status(vif_id, addr, type, NULL);
+}
+
+/* morse_cmd_tx returns 0 once any response arrives when given a response buffer, so the
+ * chip's own verdict is only in resp.status; Linux reads it (command.c:214). */
+int mmdrv_add_if_status(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_type type,
+                        int32_t *chip_status)
+{
     MM_STATIC_ASSERT((int)MMDRV_INTERFACE_TYPE_STA == (int)MORSE_CMD_INTERFACE_TYPE_STA,
                      "MMDRV_INTERFACE_TYPE_STA/MORSE_CMD_INTERFACE_TYPE_STA enum mismatch");
     MM_STATIC_ASSERT((int)MMDRV_INTERFACE_TYPE_AP == (int)MORSE_CMD_INTERFACE_TYPE_AP,
@@ -557,12 +565,20 @@ int mmdrv_add_if(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_typ
 
     memcpy(cmd.addr.octet, addr, sizeof(cmd.addr.octet));
 
+    if (chip_status != NULL)
+    {
+        *chip_status = 0;
+    }
     ret = morse_cmd_tx(&driver_data,
                        (struct morse_cmd_resp *)&resp,
                        (struct morse_cmd_req *)&cmd,
                        sizeof(resp),
                        0);
-    if (ret == 0)
+    if (ret == 0 && chip_status != NULL)
+    {
+        *chip_status = (int32_t)le32toh(resp.status);
+    }
+    if (ret == 0 && (chip_status == NULL || *chip_status == 0))
     {
         *vif_id = le16toh(resp.hdr.vif_id);
     }
@@ -597,8 +613,12 @@ int mmdrv_start_beaconing_period(uint16_t vif_id, uint32_t host_timer_period_ms)
  *   - own_addr                       — Linux default (won't help RX directly
  *                                      but pairs with FIF_OTHER_BSS filter
  *                                      flag — which we don't have access to) */
-int mmdrv_set_bssid(uint16_t vif_id, const uint8_t bssid[6])
+int mmdrv_set_bssid(uint16_t vif_id, const uint8_t bssid[6], int32_t *chip_status)
 {
+    if (chip_status != NULL)
+    {
+        *chip_status = 0;
+    }
     if (!driver_data.started)
     {
         return -ENODEV;
@@ -609,20 +629,27 @@ int mmdrv_set_bssid(uint16_t vif_id, const uint8_t bssid[6])
         MORSE_COMMAND_INIT(cmd, MORSE_CMD_ID_BSSID_SET, vif_id);
     memcpy(cmd.bssid, bssid, sizeof(cmd.bssid));
 
-    return morse_cmd_tx(&driver_data,
-                        (struct morse_cmd_resp *)&resp,
-                        (struct morse_cmd_req *)&cmd,
-                        sizeof(resp),
-                        0);
+    int ret = morse_cmd_tx(&driver_data,
+                           (struct morse_cmd_resp *)&resp,
+                           (struct morse_cmd_req *)&cmd,
+                           sizeof(resp),
+                           0);
+    if (ret == 0 && chip_status != NULL)
+    {
+        *chip_status = (int32_t)le32toh(resp.status);
+    }
+    return ret;
 }
 
-/* warthog mesh-support fork (step17) — BSS_BEACON_CONFIG. The opcode the
- * Linux driver fires on every BSS_CHANGED_BEACON_ENABLED event (for AP,
- * STA, and mesh — NOT IBSS) per mac.c:4062. Hypothesis: this is what
- * actually arms the chip's beacon-path RX, separate from MESH_CONFIG.
- * We've been missing this entirely. */
-int mmdrv_cfg_bss_beacon(uint16_t vif_id, bool enable)
+/* warthog mesh-support fork (step17) — BSS_BEACON_CONFIG. Linux sends it on
+ * BSS_CHANGED_BEACON_ENABLED only when beaconing restarts or stops
+ * (morse_driver mac.c:4221-4232), never on a VIF's first start. */
+int mmdrv_cfg_bss_beacon(uint16_t vif_id, bool enable, int32_t *chip_status)
 {
+    if (chip_status != NULL)
+    {
+        *chip_status = 0;
+    }
     if (!driver_data.started)
     {
         return -ENODEV;
@@ -635,11 +662,16 @@ int mmdrv_cfg_bss_beacon(uint16_t vif_id, bool enable)
                            vif_id,
                            .enable = enable ? 1 : 0);
 
-    return morse_cmd_tx(&driver_data,
-                        (struct morse_cmd_resp *)&resp,
-                        (struct morse_cmd_req *)&cmd,
-                        sizeof(resp),
-                        0);
+    int ret = morse_cmd_tx(&driver_data,
+                           (struct morse_cmd_resp *)&resp,
+                           (struct morse_cmd_req *)&cmd,
+                           sizeof(resp),
+                           0);
+    if (ret == 0 && chip_status != NULL)
+    {
+        *chip_status = (int32_t)le32toh(resp.status);
+    }
+    return ret;
 }
 
 /* warthog mesh-support fork: send MESH_CONFIG (0x0039) to start/stop 802.11s
@@ -658,8 +690,12 @@ int mmdrv_cfg_bss_beacon(uint16_t vif_id, bool enable)
  * chip's RX may be gated on being an active MBCA participant — peer
  * beacons would be ignored otherwise. With TBTT_SEL_ENABLE=1 we tell the
  * chip "yes, you ARE part of this mesh BSS, participate in TBTT". */
-int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing)
+int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing, int32_t *chip_status)
 {
+    if (chip_status != NULL)
+    {
+        *chip_status = 0;
+    }
     if (!driver_data.started)
     {
         return -ENODEV;
@@ -700,30 +736,15 @@ int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing)
      *
      * Sending the real Linux MBCA defaults (TBTT_SEL_ENABLE + the gap/scan/
      * adjust timers below) is what puts the chip in a beaconing mesh mode. */
-    /* MEASURED against a real beaconing MM8108 -- supersedes the theory above.
-     *
-     * A Linux MM8108 was brought up as a mesh point and SDR-confirmed beaconing
-     * at +15.24 dB. The exact MESH_CONFIG it was sent (command.c
-     * morse_cmd_cfg_mesh) was:
-     *
-     *     enable_beaconing            = 1        (= !mesh_beaconless_mode)
-     *     mbca_config                 = 0        (mesh_conf->mbca.config, never set)
-     *     min_beacon_gap_ms           = 0
-     *     tbtt_adj_timer_interval_ms  = 0
-     *     mbss_start_scan_duration_ms = 0
-     *
-     * So mbca_config == 0 does NOT select a beaconless mode -- that is what the
-     * separate mesh_beaconless_mode field does, and it is what drives
-     * enable_beaconing. A device with mbca_config = 0 beacons happily.
-     *
-     * Warthog was sending mbca_config = TBTT_SEL_ENABLE plus non-zero MBCA
-     * timers, and does not beacon: MESH_CONFIG(START) is accepted, the beacon
-     * IRQ fires once and never again, and on air there are only the 2 s probe
-     * bursts. Enabling MBCA TBTT-selection makes the chip wait to schedule its
-     * TBTT against neighbours it has not found yet, so it never starts.
-     *
-     * Match the known-good configuration exactly: MBCA off, all MBCA timers 0.
-     * Set WARTHOG_MESH_MBCA_ENABLE to 1 to restore the old behaviour. */
+    /* From the Linux source (an earlier "measured" note here was not): MBCA 0 does not select
+     * beaconless, and no beaconing Linux mesh sends it. Every Linux MESH_POINT VIF
+     * gets TBTT_SEL with gap 25, tbtt 60000 and scan 2048 at add_interface (morse_driver
+     * mesh.c:914-918), wpa_supplicant overrides them with 1/10/60000/2048 (SET_MCBA_CONF,
+     * hostap mesh.c:636-661), and command.c:2544-2552 sends the timers whenever it beacons.
+     * Only a beaconless mesh zeroes MBCA (mesh.c:149-150), with enable_beaconing 0. So MBCA
+     * and its timers 0 with beaconing on is this fork's own tuple; the STA chip VIF never ran
+     * a mesh TBTT on it. A MESH chip VIF gets the beaconless start, the Pis' (umac_mesh.c).
+     * Set WARTHOG_MESH_MBCA_ENABLE to 1 to restore the old MBCA-on behaviour. */
     #define WARTHOG_MESH_MBCA_ENABLE 0
 
     struct morse_cmd_resp_mesh_config resp;
@@ -742,11 +763,16 @@ int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing)
         .tbtt_adj_timer_interval_ms =
             htole16(WARTHOG_MESH_MBCA_ENABLE ? WARTHOG_MESH_MBCA_TBTT_ADJ_INT_MS : 0u));
 
-    return morse_cmd_tx(&driver_data,
-                        (struct morse_cmd_resp *)&resp,
-                        (struct morse_cmd_req *)&cmd,
-                        sizeof(resp),
-                        0);
+    int ret = morse_cmd_tx(&driver_data,
+                           (struct morse_cmd_resp *)&resp,
+                           (struct morse_cmd_req *)&cmd,
+                           sizeof(resp),
+                           0);
+    if (ret == 0 && chip_status != NULL)
+    {
+        *chip_status = (int32_t)le32toh(resp.status);
+    }
+    return ret;
 }
 
 int mmdrv_rm_if(uint16_t vif_id)
@@ -994,6 +1020,19 @@ int mmdrv_update_sta_state(uint16_t vif_id,
                            const uint8_t *addr,
                            enum morse_sta_state state)
 {
+    return mmdrv_update_sta_state_status(vif_id, aid, addr, state, NULL);
+}
+
+int mmdrv_update_sta_state_status(uint16_t vif_id,
+                                  uint16_t aid,
+                                  const uint8_t *addr,
+                                  enum morse_sta_state state,
+                                  int32_t *chip_status)
+{
+    if (chip_status != NULL)
+    {
+        *chip_status = 0;
+    }
     if (!driver_data.started)
     {
         return -ENODEV;
@@ -1017,16 +1056,24 @@ int mmdrv_update_sta_state(uint16_t vif_id,
 
     memcpy(cmd.sta_addr, addr, sizeof(cmd.sta_addr));
 
-    return morse_cmd_tx(&driver_data,
-                        (struct morse_cmd_resp *)&resp,
-                        (struct morse_cmd_req *)&cmd,
-                        sizeof(resp),
-                        0);
+    int ret = morse_cmd_tx(&driver_data,
+                           (struct morse_cmd_resp *)&resp,
+                           (struct morse_cmd_req *)&cmd,
+                           sizeof(resp),
+                           0);
+    if (ret == 0 && chip_status != NULL)
+    {
+        *chip_status = (int32_t)le32toh(resp.status);
+    }
+    return ret;
 }
 
 /* Key-install trace (storage in main/at.c; AT+KEYINST?). */
 extern volatile uint32_t g_warthog_keyinst[8];
 extern volatile uint32_t g_warthog_keyinst_n;
+/* INSTALL_KEYs the chip refused, the last one's status, and hw-index mismatches (AT+MESHCFG?). */
+extern volatile uint32_t g_warthog_chipcmd_key_refused, g_warthog_chipcmd_keyidx_mismatch;
+extern volatile int32_t g_warthog_chipcmd_key_status;
 
 /* Ask the chip to stop doing crypto and hand protected frames to the host raw.
  *
@@ -1119,6 +1166,26 @@ int mmdrv_get_crypto_in_host(uint16_t vif_id, uint32_t *out_value)
 
 int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_conf)
 {
+    int32_t st = 0;
+    int ret = mmdrv_install_key_status(vif_id, aid, key_conf, &st);
+    if (ret == 0 && st != 0)
+    {
+        g_warthog_chipcmd_key_refused++;
+        g_warthog_chipcmd_key_status = st;
+        return (int)st;
+    }
+    return ret;
+}
+
+int mmdrv_install_key_status(uint16_t vif_id,
+                             uint16_t aid,
+                             struct mmdrv_key_conf *key_conf,
+                             int32_t *chip_status)
+{
+    if (chip_status != NULL)
+    {
+        *chip_status = 0;
+    }
     if (!driver_data.started)
     {
         return -ENODEV;
@@ -1132,6 +1199,8 @@ int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_
 
     uint16_t requested_key_idx = key_conf->key_idx;
     struct morse_cmd_resp_install_key resp;
+    /* A status-only reply leaves the rest of it unwritten (morse_cmd_tx copies what came). */
+    memset(&resp, 0, sizeof(resp));
 
     MMLOG_DBG("%s Installing key for vif (%d):\n"
               "\tkey->idx: %d\n"
@@ -1186,6 +1255,18 @@ int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_
         MMLOG_WRN("mmdrv_add_key - morse_cmd_install_key failed %d\n", result);
         return result;
     }
+    /* The chip's verdict, which morse_cmd_tx does not return: a refused key is not in it. */
+    const int32_t status = (int32_t)le32toh(resp.status);
+    if (chip_status != NULL)
+    {
+        *chip_status = status;
+    }
+    if (status != 0)
+    {
+        MMLOG_WRN("mmdrv_add_key - chip refused key %u (aid %u): status %ld\n",
+                  (unsigned)requested_key_idx, (unsigned)aid, (long)status);
+        return 0;
+    }
 
     /* Record what the CHIP assigned. It returns the hardware slot it chose,
      * which is the only evidence of whether keys are per-STA or per-VIF on
@@ -1204,7 +1285,15 @@ int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_
     MMLOG_DBG("%s Installed key @ hw index: %d\n", __func__, resp.key_idx);
 
 
+#if WARTHOG_MESH_CHIP_VIF_MESH
+    /* Linux keeps the chip's index as the key's (morse_driver mac.c:1105): counted. */
+    if (requested_key_idx != key_conf->key_idx)
+    {
+        g_warthog_chipcmd_keyidx_mismatch++;
+    }
+#else
     MMOSAL_ASSERT(requested_key_idx == key_conf->key_idx);
+#endif
 
     return result;
 }
@@ -1805,6 +1894,16 @@ int mmdrv_set_whitelist_filter(uint16_t vif_id, const struct mmwlan_config_white
 
 int mmdrv_get_capabilities(uint16_t vif_id, struct morse_caps *caps)
 {
+    return mmdrv_get_capabilities_status(vif_id, caps, NULL);
+}
+
+/* As mmdrv_get_capabilities; with @p chip_status, @p caps is written only if the chip accepted. */
+int mmdrv_get_capabilities_status(uint16_t vif_id, struct morse_caps *caps, int32_t *chip_status)
+{
+    if (chip_status != NULL)
+    {
+        *chip_status = 0;
+    }
     if (!driver_data.started)
     {
         return -ENODEV;
@@ -1822,6 +1921,14 @@ int mmdrv_get_capabilities(uint16_t vif_id, struct morse_caps *caps)
     if (ret != 0)
     {
         return ret;
+    }
+    if (chip_status != NULL)
+    {
+        *chip_status = (int32_t)le32toh(rsp.status);
+        if (*chip_status != 0)
+        {
+            return ret;
+        }
     }
 
     caps->ampdu_mss = rsp.capabilities.ampdu_mss;

@@ -273,6 +273,13 @@ enum mmdrv_interface_type
     MMDRV_INTERFACE_TYPE_MESH = 5,
 };
 
+/* warthog mesh fork: 1 creates the mesh's chip VIF as MESH, as Linux does for a mesh point,
+ * started beaconless (enable_beaconing 0, MBCA 0: the MESH_CONFIG the OpenMANET Pis send),
+ * falling back to STA if the firmware refuses it; 0 runs the mesh on the boot STA VIF. */
+#ifndef WARTHOG_MESH_CHIP_VIF_MESH
+#define WARTHOG_MESH_CHIP_VIF_MESH 0
+#endif
+
 /**
  * Add an interface.
  *
@@ -287,6 +294,17 @@ enum mmdrv_interface_type
  * @returns 0 on success or an appropriate error code.
  */
 int mmdrv_add_if(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_type type);
+
+/**
+ * As mmdrv_add_if, also reporting the chip's own status (warthog mesh fork).
+ *
+ * @param[out] chip_status  The status in the chip's response, 0 if it accepted; set only
+ *                          when the return value is 0. @p vif_id is written only on 0 and 0.
+ *
+ * @returns 0 once the chip answered, else a transport error code.
+ */
+int mmdrv_add_if_status(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_type type,
+                        int32_t *chip_status);
 
 /**
  * Remove the given interface.
@@ -316,9 +334,10 @@ int mmdrv_start_beaconing_period(uint16_t vif_id, uint32_t host_timer_period_ms)
  * @param vif_id            VIF ID of the mesh interface.
  * @param start             true = START (begin mesh operation), false = STOP.
  * @param enable_beaconing  true to have the firmware emit mesh beacons.
- * @returns 0 on success, negative errno or chip error code otherwise.
+ * @param[out] chip_status  If not NULL, the chip's own status (0 accepted) when the return is 0.
+ * @returns 0 once the chip answered, else a transport error code.
  */
-int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing);
+int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing, int32_t *chip_status);
 
 /**
  * warthog mesh-support fork (step15) — set the chip's RX BSSID filter.
@@ -335,31 +354,25 @@ int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing);
  *
  * @param vif_id  VIF to apply the BSSID filter to.
  * @param bssid   6-byte BSSID. Caller's buffer; copied into the request.
- * @returns 0 on success, negative errno or chip error code otherwise.
+ * @param[out] chip_status  If not NULL, the chip's own status (0 accepted) when the return is 0.
+ * @returns 0 once the chip answered, else a transport error code.
  */
-int mmdrv_set_bssid(uint16_t vif_id, const uint8_t bssid[6]);
+int mmdrv_set_bssid(uint16_t vif_id, const uint8_t bssid[6], int32_t *chip_status);
 
 /**
  * warthog mesh-support fork (step17) — enable/disable the chip's BSS beacon
- * timer + beacon TX/RX path. Linux driver calls this on every
- * BSS_CHANGED_BEACON_ENABLED event (mac.c:4062) for AP/STA/MESH (NOT IBSS).
- *
- * Hypothesis: this command is what actually arms the chip's RX path for
- * beacon frames on the BSS. We never call it, which would explain why every
- * other piece of mesh config is accepted but the chip delivers no peer
- * beacons.
+ * timer + beacon TX/RX path. Linux sends it on BSS_CHANGED_BEACON_ENABLED only
+ * when beaconing restarts or stops (mac.c:4221-4232), never on a VIF's first start.
  *
  * Sends MORSE_CMD_ID_BSS_BEACON_CONFIG (opcode 0x003D) with payload
- * {uint8_t enable; padding}. Should be called after BSS_CONFIG (which
- * sets cssid/dtim/beacon_interval) and either before or after MESH_CONFIG
- * — Linux emits both in close succession on the same bss_info_changed
- * call.
+ * {uint8_t enable; padding}.
  *
  * @param vif_id  the VIF to enable beaconing on
  * @param enable  true to enable, false to disable
- * @returns 0 on success, chip error code otherwise
+ * @param[out] chip_status  If not NULL, the chip's own status (0 accepted) when the return is 0.
+ * @returns 0 once the chip answered, else a transport error code.
  */
-int mmdrv_cfg_bss_beacon(uint16_t vif_id, bool enable);
+int mmdrv_cfg_bss_beacon(uint16_t vif_id, bool enable, int32_t *chip_status);
 
 /**
  * Configure scan mode.
@@ -442,6 +455,14 @@ int mmdrv_update_sta_state(uint16_t vif_id,
                            const uint8_t *addr,
                            enum morse_sta_state state);
 
+/** As mmdrv_update_sta_state, with the chip's own status (warthog mesh fork): @p chip_status
+ *  is set when the return is 0, which it is once the chip answered, refusal included. */
+int mmdrv_update_sta_state_status(uint16_t vif_id,
+                                  uint16_t aid,
+                                  const uint8_t *addr,
+                                  enum morse_sta_state state,
+                                  int32_t *chip_status);
+
 /**
  * Install an encryption key.
  *
@@ -449,9 +470,17 @@ int mmdrv_update_sta_state(uint16_t vif_id,
  * @param aid          The STA AID.
  * @param key_conf     Configuration of the Key to install.
  *
- * @returns 0 on success or an appropriate error code.
+ * @returns 0 on success or an appropriate error code; a key the chip refused returns its
+ *          status (warthog mesh fork).
  */
 int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_conf);
+
+/** As mmdrv_install_key, with the chip's own status (warthog mesh fork): returns 0 once the
+ *  chip answered and sets @p chip_status; a refused key leaves @p key_conf untouched. */
+int mmdrv_install_key_status(uint16_t vif_id,
+                             uint16_t aid,
+                             struct mmdrv_key_conf *key_conf,
+                             int32_t *chip_status);
 
 /** Ask the chip to hand protected frames to the host undecrypted. */
 int mmdrv_set_crypto_in_host(uint16_t vif_id, bool enable, uint32_t *out_value);
@@ -1112,6 +1141,10 @@ int mmdrv_set_whitelist_filter(uint16_t vif_id, const struct mmwlan_config_white
  * @returns 0 on success or an appropriate error code.
  */
 int mmdrv_get_capabilities(uint16_t vif_id, struct morse_caps *caps);
+
+/** As mmdrv_get_capabilities, with the chip's own status (warthog mesh fork): @p caps is
+ *  written only when it is 0. */
+int mmdrv_get_capabilities_status(uint16_t vif_id, struct morse_caps *caps, int32_t *chip_status);
 
 /**
  * Configure minimum packet spacing window.

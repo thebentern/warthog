@@ -28,6 +28,9 @@ struct umac_interface_data
 
     uint16_t vif_id;
 
+    /* enum mmdrv_interface_type of the chip VIF, 0 with none (warthog mesh fork). */
+    uint8_t chip_vif_type;
+
     uint8_t mac_addr[DOT11_MAC_ADDR_LEN];
 
     struct mmdrv_fw_version fw_version;

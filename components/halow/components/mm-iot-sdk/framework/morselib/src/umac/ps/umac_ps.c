@@ -7,6 +7,7 @@
 #include "umac_ps_data.h"
 #include "umac/datapath/umac_datapath.h"
 #include "umac/connection/umac_connection.h"
+#include "umac/interface/umac_interface.h"
 #include "umac/core/umac_core.h"
 #include "umac/config/umac_config.h"
 #include "common/common.h"
@@ -58,6 +59,11 @@ static void umac_ps_update(struct umac_data *umacd, bool suspended_state_changed
     uint16_t sta_vif_id =
         umac_interface_get_vif_id(umacd,
                                   UMAC_INTERFACE_NONE | UMAC_INTERFACE_SCAN | UMAC_INTERFACE_STA);
+    /* Linux sends CONFIG_PS to STA VIFs only (morse_mac_config_ps): a MESH chip VIF has none. */
+    if (umac_interface_chip_vif_is_mesh(umacd))
+    {
+        sta_vif_id = UMAC_INTERFACE_VIF_ID_INVALID;
+    }
 
     if (sta_vif_id == UMAC_INTERFACE_VIF_ID_INVALID)
     {

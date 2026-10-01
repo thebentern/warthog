@@ -126,6 +126,12 @@ extern volatile uint32_t g_warthog_sae_offer_full;
 extern volatile uint32_t g_warthog_sae_fail, g_warthog_sae_offer_held, g_warthog_plink_fail;
 extern volatile int32_t g_warthog_mesh_rssi_floor;
 extern volatile uint32_t g_warthog_mesh_rssi_skip, g_warthog_mesh_rssi_pass;
+/* BSSID_SET / MESH_CONFIG / BSS_BEACON_CONFIG the chip refused, the last refusal's status,
+ * and the MESH_CONFIG(START) sent: 1 beaconing, 2 beaconless (main/at.c). */
+extern volatile uint32_t g_warthog_chipcmd_bssid_refused, g_warthog_chipcmd_meshcfg_refused;
+extern volatile int32_t g_warthog_chipcmd_bssid_status, g_warthog_chipcmd_meshcfg_status;
+extern volatile uint32_t g_warthog_chipcmd_beacon_refused, g_warthog_chipcmd_meshcfg_mode;
+extern volatile int32_t g_warthog_chipcmd_beacon_status;
 
 /* Every established MPM link takes a datapath slot. */
 MM_STATIC_ASSERT(MPM_MAX_LINKS <= UMAC_DATAPATH_MESH_MAX_PEERS,
@@ -230,7 +236,8 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
         return status;
     }
 
-    MMLOG_INF("mesh: chip firmware ACCEPTED a mesh VIF (vif_id=%u)\n", vif_id);
+    MMLOG_INF("mesh: interface up (vif_id=%u, chip VIF type %u)\n", vif_id,
+              (unsigned)umac_interface_get_chip_vif_type(umacd));
 
     /* Install the mesh datapath ops HERE, immediately after the vif exists and
      * BEFORE any command that can make the chip start delivering frames.
@@ -294,6 +301,8 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
      *
      * The critical bit: Linux sends BSS_BEACON_CONFIG + MESH_CONFIG(START)
      * BEFORE BSSID_SET + BSS_CONFIG. We had it the other way around.
+     * (Not so, per the driver source read since: a first start sends BSS_CONFIG, then
+     * MESH_CONFIG(START) from wpa_supplicant; BSS_BEACON_CONFIG only on a restart, no BSSID_SET.)
      *
      * Hypothesis: MESH_CONFIG(START) is the trigger that arms the chip's
      * `mesh_delayed_start` task (confirmed present as a FreeRTOS task name
@@ -366,18 +375,28 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
     MMLOG_INF("mesh: SET_NDP_PROBE_SUPPORT skipped (reference port never sends it)\n");
 
 
-    /* Linux step 2 (BSS_CHANGED_BEACON_ENABLED handler, first thing in
-     * morse_mac_bss_info_changed): BSS_BEACON_CONFIG enable=true.
-     * This is the chip's "arm the beacon timer hardware" command. */
-    int ret = mmdrv_cfg_bss_beacon(vif_id, /*enable=*/true);
-    if (ret != 0)
+    /* BSS_BEACON_CONFIG enable=true, the chip's "arm the beacon timer" command. Linux sends it
+     * only when beaconing restarts (morse_driver mac.c:4221-4232), after a first start has
+     * sent BSS_CONFIG: a fresh MESH VIF gets none, as Linux's first start; the STA VIF keeps it. */
+    int ret = 0;
+    int32_t chip_st = 0;
+    if (umac_interface_chip_vif_is_mesh(umacd))
+    {
+        MMLOG_INF("mesh: no BSS_BEACON_CONFIG on the new MESH VIF, as Linux's first start\n");
+    }
+    else if ((ret = mmdrv_cfg_bss_beacon(vif_id, /*enable=*/true, &chip_st)) != 0)
     {
         MMLOG_WRN("mesh: BSS_BEACON_CONFIG(enable=1) rejected: %d\n", ret);
     }
+    else if (chip_st != 0)
+    {
+        g_warthog_chipcmd_beacon_refused++;
+        g_warthog_chipcmd_beacon_status = chip_st;
+        MMLOG_WRN("mesh: chip refused BSS_BEACON_CONFIG(enable=1) (status %ld)\n", (long)chip_st);
+    }
     else
     {
-        MMLOG_INF("mesh: [step27] BSS_BEACON_CONFIG(enable=1) OK "
-                  "(now sent BEFORE BSSID/BSS_CONFIG, matching Linux)\n");
+        MMLOG_INF("mesh: [step27] BSS_BEACON_CONFIG(enable=1) OK (before BSSID/BSS_CONFIG)\n");
     }
 
     /* MESH_CONFIG(START) USED TO BE HERE — it is now the LAST chip command in
@@ -447,10 +466,23 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
     shared_bssid[5] = 0x5a;
 #endif
 
-    ret = mmdrv_set_bssid(vif_id, shared_bssid);
-    if (ret != 0)
+    /* mac80211 gives a mesh bss_conf.bssid = zero_addr and never raises BSS_CHANGED_BSSID at
+     * mesh start, so a Linux MESH VIF gets no BSSID_SET; the STA VIF keeps the derived one. */
+    const bool send_bssid = !umac_interface_chip_vif_is_mesh(umacd);
+    ret = send_bssid ? mmdrv_set_bssid(vif_id, shared_bssid, &chip_st) : 0;
+    if (!send_bssid)
+    {
+        MMLOG_INF("mesh: no BSSID_SET on the MESH VIF, as Linux\n");
+    }
+    else if (ret != 0)
     {
         MMLOG_WRN("mesh: [step32] BSSID_SET(shared) rejected: %d\n", ret);
+    }
+    else if (chip_st != 0)
+    {
+        g_warthog_chipcmd_bssid_refused++;
+        g_warthog_chipcmd_bssid_status = chip_st;
+        MMLOG_WRN("mesh: chip refused BSSID_SET (status %ld)\n", (long)chip_st);
     }
     else
     {
@@ -562,25 +594,38 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
                   vif_id);
     }
 
-    /* MESH_CONFIG(START, enable_beaconing=1) — LAST chip command, deliberately.
+    /* MESH_CONFIG(START) — LAST chip command, deliberately.
      *
      * Everything the firmware needs before it may beacon is now in place:
-     * BSSID_SET, BSS_CONFIG (beacon_int + cssid), the beacon constructor
+     * BSSID_SET (STA VIF only), BSS_CONFIG (beacon_int + cssid), the beacon constructor
      * (umac_mesh_beacon_init), and the host beacon engine / beacon IRQ
      * (mmdrv_start_beaconing). Only now is it safe to let the firmware start
      * requesting beacons, because mmdrv_host_get_beacon() can actually answer.
      *
      * enable_beaconing selects beaconing, not MBCA: mmdrv_mesh_config sends
-     * mbca_config 0 with every MBCA timer 0, as the beaconing Linux MM8108
-     * measured in driver.c was sent. */
-    ret = mmdrv_mesh_config(vif_id, /*start=*/true, /*enable_beaconing=*/true);
+     * mbca_config 0 with every MBCA timer 0, which no beaconing Linux mesh sends (driver.c).
+     * A MESH VIF starts beaconless, the tuple the OpenMANET Pis send: the beaconing one hung the
+     * board about 2 s after the firmware started (on air, 2026-09-30). A STA VIF keeps it. */
+    const bool beaconing = !umac_interface_chip_vif_is_mesh(umacd);
+    ret = mmdrv_mesh_config(vif_id, /*start=*/true, beaconing, &chip_st);
     if (ret != 0)
     {
         MMLOG_ERR("mesh: MESH_CONFIG(START) rejected by firmware: %d\n", ret);
         return MMWLAN_ERROR;
     }
-    MMLOG_INF("mesh: MESH_CONFIG(START) accepted LAST (after BSSID/BSS_CONFIG/"
-              "beacon-engine) — firmware TBTT scan ~2s, then beacon IRQs\n");
+    g_warthog_chipcmd_meshcfg_mode = beaconing ? 1u : 2u;
+    /* A refusal was invisible before (morse_cmd_tx returned 0): counted, the mesh carries on. */
+    if (chip_st != 0)
+    {
+        g_warthog_chipcmd_meshcfg_refused++;
+        g_warthog_chipcmd_meshcfg_status = chip_st;
+        MMLOG_WRN("mesh: chip refused MESH_CONFIG(START) (status %ld)\n", (long)chip_st);
+    }
+    else
+    {
+        MMLOG_INF("mesh: MESH_CONFIG(START, %s) accepted LAST (after BSS_CONFIG/beacon-engine)\n",
+                  beaconing ? "beaconing" : "beaconless");
+    }
 
     /* Already installed right after ADD_INTERFACE above; re-asserting is
      * idempotent. The ops (umac_datapath_mesh.c) carry the peer table, the

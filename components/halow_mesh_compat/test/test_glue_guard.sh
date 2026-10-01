@@ -2970,5 +2970,141 @@ else
   bad "AT+BATSTAT? port keys missing from the AT reference row:$why"
 fi
 
+# 40. The AT+MESHCFG? chip VIF lines (meshcfg_chipvif_line_ and meshcfg_chipcmd_line_ in
+#     main/at.c), compiled out and run: every type the firmware sets is named (and an unknown
+#     one shown as other), refusals by command and SET_STA_STATE by state, the MESH_CONFIG
+#     sent by name; each line fits line[320] with every field at its extreme, and cmd_meshcfg
+#     fills both from the storage morselib writes.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{ awk '/^struct meshcfg_chipvif \{/,/^};/' "$A"
+  awk '/^static const char \*meshcfg_chipvif_name_\(/,/^}/' "$A"
+  awk '/^static int meshcfg_chipvif_line_\(/,/^}/' "$A"
+  awk '/^static const char \*meshcfg_sent_name_\(/,/^}/' "$A"
+  awk '/^static int meshcfg_chipcmd_line_\(/,/^}/' "$A"; } > "$T/fn.c"
+size40=$(awk '/^static void cmd_meshcfg\(void\)/ {on=1} on && /char line\[[0-9]+\];/ {match($0, /\[[0-9]+\]/); print substr($0, RSTART + 1, RLENGTH - 2); exit}' "$A")
+cat > "$T/t.c" <<'EOF2'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fn.c"
+int main(int argc, char **argv)
+{
+    unsigned size = (unsigned)atoi(argv[1]);
+    static const struct { uint32_t t; const char *want; } names[] = {
+        { 0, "chip_vif=none(0) " }, { 1, "chip_vif=sta(1) " }, { 2, "chip_vif=ap(2) " },
+        { 5, "chip_vif=mesh(5) " }, { 99, "chip_vif=other(99) " } };
+    char buf[1024];
+    struct meshcfg_chipvif c;
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        memset(&c, 0, sizeof(c));
+        c.type = names[i].t;
+        meshcfg_chipvif_line_(buf, sizeof(buf), &c);
+        if (strncmp(buf, "+MESHCFG: ", 10) != 0 || !strstr(buf, names[i].want) || !strstr(buf, "built=sta ")) {
+            printf("content (type %lu) %s", (unsigned long)names[i].t, buf); return 0;
+        }
+    }
+    memset(&c, 0, sizeof(c));
+    c.type = 5; c.vif_id = 2; c.built_mesh = true; c.fallback = 3; c.add_status = -1;
+    c.bssid_refused = 4; c.bssid_status = -13; c.meshcfg_refused = 6; c.meshcfg_status = -22;
+    meshcfg_chipvif_line_(buf, sizeof(buf), &c);
+    if (!strstr(buf, "vif_id=2 built=mesh fallback=3 add_st=-1 bssid_refused=4(st=-13) "
+                     "mesh_config_refused=6(st=-22)\r\n")) { printf("content (fields) %s", buf); return 0; }
+    memset(&c, 0, sizeof(c));
+    c.beacon_refused = 1; c.beacon_status = -7; c.sta_status = -3; c.key_refused = 2;
+    c.key_status = -95; c.keyidx_mismatch = 5; c.meshcfg_mode = 2;
+    for (unsigned i = 0; i < 5; i++) c.sta_refused[i] = 10 + i;
+    meshcfg_chipcmd_line_(buf, sizeof(buf), &c);
+    if (strncmp(buf, "+MESHCFG: chip_refused ", 23) != 0 ||
+        !strstr(buf, " beacon_config=1(st=-7) sta_state=10/11/12/13/14(st=-3) install_key=2(st=-95) "
+                     "keyidx_mismatch=5 mesh_config_sent=beaconless(2)\r\n")) {
+        printf("content (refusals) %s", buf); return 0;
+    }
+    static const struct { uint32_t m; const char *want; } modes[] = {
+        { 0, "mesh_config_sent=none(0)" }, { 1, "mesh_config_sent=beaconing(1)" },
+        { 2, "mesh_config_sent=beaconless(2)" }, { 7, "mesh_config_sent=other(7)" } };
+    for (unsigned i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        c.meshcfg_mode = modes[i].m;
+        meshcfg_chipcmd_line_(buf, sizeof(buf), &c);
+        if (!strstr(buf, modes[i].want)) { printf("content (mode %lu) %s", (unsigned long)modes[i].m, buf); return 0; }
+    }
+    memset(&c, 0xff, sizeof(c));
+    c.add_status = c.bssid_status = c.meshcfg_status = INT32_MIN;
+    c.beacon_status = c.sta_status = c.key_status = INT32_MIN;
+    int n = meshcfg_chipvif_line_(buf, sizeof(buf), &c);
+    int n2 = meshcfg_chipcmd_line_(buf, sizeof(buf), &c);
+    if (n2 > n) n = n2;
+    (void)argc;
+    printf("%s %d/%u\n", n + 1 <= (int)size ? "ok" : "short", n + 1, size);
+    return 0;
+}
+EOF2
+fit40=""
+if [ -n "$size40" ] && ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then
+  fit40=$("$T/t" "$size40")
+fi
+rm -rf "$T"
+fill40=$(awk '/^static void cmd_meshcfg\(void\)/,/^}/' "$A" | tr -d ' \n')
+for f in '.type=g_warthog_chipvif_type' '.vif_id=g_warthog_chipvif_id' '.fallback=g_warthog_chipvif_fallback' \
+         '.add_status=g_warthog_chipvif_add_status' '.bssid_refused=g_warthog_chipcmd_bssid_refused' \
+         '.bssid_status=g_warthog_chipcmd_bssid_status' '.meshcfg_refused=g_warthog_chipcmd_meshcfg_refused' \
+         '.meshcfg_status=g_warthog_chipcmd_meshcfg_status' \
+         '.beacon_refused=g_warthog_chipcmd_beacon_refused' '.beacon_status=g_warthog_chipcmd_beacon_status' \
+         '.sta_status=g_warthog_chipcmd_sta_status' '.key_refused=g_warthog_chipcmd_key_refused' \
+         '.key_status=g_warthog_chipcmd_key_status' '.keyidx_mismatch=g_warthog_chipcmd_keyidx_mismatch' \
+         '.meshcfg_mode=g_warthog_chipcmd_meshcfg_mode' \
+         'for(unsignedi=0;i<5;i++){c.sta_refused[i]=g_warthog_chipcmd_sta_refused[i];}' \
+         '#ifdefined(WARTHOG_MESH_CHIP_VIF_MESH)&&WARTHOG_MESH_CHIP_VIF_MESH.built_mesh=true,#endif' \
+         'meshcfg_chipvif_line_(line,sizeof(line),&c);cdc_write(line);' \
+         'meshcfg_chipcmd_line_(line,sizeof(line),&c);cdc_write(line);'; do
+  case "$fill40" in *"$f"*) ;; *) fit40="cmd_meshcfg does not set $f"; break ;; esac
+done
+case "$fit40" in
+  ok*) ok "AT+MESHCFG?'s chip VIF lines name every type and refusal, are filled from morselib's storage and fit line[$size40] (${fit40#ok })" ;;
+  *)   bad "AT+MESHCFG?'s chip VIF lines: ${fit40:-did not build or run}" ;;
+esac
+
+# 41. AT+BCNSTAT? fits its buffer at its longest (every %lu at 10 digits), chip_irq= and
+#     host_yield= included.
+fit=$(awk '/^static void cmd_bcnstat\(void\)/ {on=1}
+  on && /char buf\[[0-9]+\]/ { match($0, /\[[0-9]+\]/); size = substr($0, RSTART + 1, RLENGTH - 2) + 0 }
+  on && /snprintf\(buf, sizeof\(buf\),/ { args = 1 }
+  args { l = $0; while (match(l, /"[^"]*"/)) { fmt = fmt substr(l, RSTART + 1, RLENGTH - 2); l = substr(l, RSTART + RLENGTH) } }
+  on && /cdc_write\(buf\);/ { exit }
+  END {
+    if (!index(fmt, "chip_irq=%lu host_yield=%lu")) { print "no chip_irq=/host_yield="; exit }
+    gsub(/\\[rn]/, "x", fmt); lu = gsub(/%lu/, "", fmt)
+    if (size == 0 || lu == 0 || index(fmt, "%")) { print "unparsed"; exit }
+    need = length(fmt) + 10 * lu + 1
+    print (need <= size ? "ok " : "short ") need "/" size
+  }' "$A")
+case "$fit" in
+  ok*) ok "AT+BCNSTAT? fits its buffer at its longest (${fit#ok } bytes)" ;;
+  *)   bad "AT+BCNSTAT?: ${fit:-nothing parsed}" ;;
+esac
+
+# 42. main/mesh.c's RESULT line is warthog_mesh_start_result (main/mesh_diag.c, run by
+#     test_mesh_diag) fed from what morselib stored: the chip VIF type, its fallback and the
+#     MESH_CONFIG answer; a fixed "mesh VIF added" PASS line no longer survives beside it.
+#     (driver.c's status reads, beacon.c and umac_ps.c run in test_chipvif_glue.)
+MC=../../../main/mesh.c
+fill42=$(awk '/^void warthog_mesh_smoke_test\(/,/^}/' "$MC" | sed 's:/\*.*\*/::' | tr -d ' \n')
+why=""
+for f in '.status=(int)st' '.chip_vif=g_warthog_chipvif_type' '.fallback=g_warthog_chipvif_fallback' \
+         '.add_status=g_warthog_chipvif_add_status' '.meshcfg_refused=g_warthog_chipcmd_meshcfg_refused' \
+         '.meshcfg_status=g_warthog_chipcmd_meshcfg_status' '.meshcfg_mode=g_warthog_chipcmd_meshcfg_mode' \
+         '#ifdefined(WARTHOG_MESH_CHIP_VIF_MESH)&&WARTHOG_MESH_CHIP_VIF_MESH.built_mesh=1,#endif' \
+         'warthog_mesh_start_result(&res,result,sizeof(result))'; do
+  case "$fill42" in *"$f"*) ;; *) why="$why the start does not set $f;" ;; esac
+done
+case "$fill42" in *'charresult[WARTHOG_MESH_START_RESULT_LEN]'*) ;; *) why="$why its buffer is not WARTHOG_MESH_START_RESULT_LEN;" ;; esac
+if grep -q 'mesh VIF added AND' "$MC"; then why="$why a fixed 'mesh VIF added' line is still printed;"; fi
+if [ -z "$why" ]; then
+  ok "mesh.c's RESULT line is warthog_mesh_start_result, from the chip VIF and MESH_CONFIG answers morselib stored"
+else
+  bad "mesh.c RESULT line:$why"
+fi
+
 [ $fail -eq 0 ] && echo "GLUE INVARIANTS OK" || echo "GLUE INVARIANTS FAILED"
 exit $fail

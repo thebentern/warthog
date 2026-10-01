@@ -214,10 +214,14 @@ frame from it — `last_fc=0x0088` (type 2 DATA, subtype 8 QoS Data),
 `last_ta=3c:1a:cc:4c:81:9d`. So warthog *can* see a valid peer address; the beacons'
 mangled A2 is a separate, secondary issue.
 
-Note the Linux reference sends `mbca_config = 0` with `enable_beaconing = 1` and beacons
-fine (`mesh.c:148-152` zeroes `mbca.config` only for beaconless mode; it is 0 by default
-anyway). warthog now matches that exactly and still does not beacon, so the MBCA fields
-are not the cause.
+Correction (2026-09-30, from the Linux source; the note here said otherwise): a beaconing
+Linux mesh never sends `mbca_config = 0`. Every MESH_POINT interface gets `TBTT_SEL` with
+gap 25, TBTT adjust 60000 and start scan 2048 at add_interface (`mesh.c:914-918`),
+wpa_supplicant overrides them with 1/10/60000/2048 before `MESH_CONFIG` (`SET_MCBA_CONF`),
+and `mesh.c:149-150` zeroes `mbca.config` only for beaconless mode, which also sends
+`enable_beaconing = 0`. warthog's tuple (beaconing, MBCA 0, timers 0) is its own. It did not
+beacon with MBCA on either, so on the STA chip interface the MBCA fields were not the cause;
+on a MESH interface that is not measured.
 
 ### Measured: the host beacon path is fine; the chip never asks
 

@@ -281,6 +281,9 @@ void simnode_set_mesh_id(const uint8_t *id, uint8_t len)
     s_mesh_id_len = ok ? len : 7u;
 }
 
+static bool s_boot_scan;
+void simnode_set_boot_scan(bool on) { s_boot_scan = on; }
+
 static bool simnode_start_(const uint8_t mac[6], bool sae, uint16_t vif_id)
 {
     if (s_up) { simnode_stop(); }
@@ -302,6 +305,22 @@ static bool simnode_start_(const uint8_t mac[6], bool sae, uint16_t vif_id)
     }
     args.max_peers = 4;
     args.beacon_interval_tu = 100;
+
+    /* The board boots the chip before the mesh exists (mmhalow_init -> mmwlan_boot adds a
+     * NONE interface), and every env but -swccmp-on then runs the scan probe. */
+    if (umac_interface_add(s_umacd, UMAC_INTERFACE_NONE, NULL, NULL) != MMWLAN_SUCCESS)
+    {
+        return false;
+    }
+    if (s_boot_scan)
+    {
+        uint16_t scan_vif = UMAC_INTERFACE_VIF_ID_INVALID;
+        if (umac_interface_add(s_umacd, UMAC_INTERFACE_SCAN, NULL, &scan_vif) != MMWLAN_SUCCESS)
+        {
+            return false;
+        }
+        umac_interface_remove(s_umacd, UMAC_INTERFACE_SCAN);
+    }
 
     /* The real bring-up: interface add, mesh config, beaconing, and the
      * forwarding glue's own init. */

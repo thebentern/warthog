@@ -116,6 +116,49 @@ void simnode_keyinst_clear(void);
 /** Make the next INSTALL_KEY fail, as the chip would; nothing is recorded for it. */
 void simnode_fail_next_install_key(void);
 
+/* ---- chip interface, BSS and station commands --------------------------- */
+
+/** One interface, BSS or station command the firmware sent the chip, with what it
+ *  answered. The start sends the boot ADD_INTERFACE (mmwlan_boot) before the mesh's own. */
+struct simnode_chipcmd {
+    uint16_t id;      /* MORSE_CMD_ID_* */
+    uint16_t vif_id;  /* ADD_INTERFACE: the id the chip handed out (UINT16_MAX: none) */
+    uint32_t arg;     /* ADD_INTERFACE: interface type; SET_STA_STATE: state; MESH_CONFIG: start;
+                       * BSS_CONFIG: beacon interval; BSS_BEACON_CONFIG: enable;
+                       * REMOVE_INTERFACE: the VIF id */
+    bool     beaconing; /* MESH_CONFIG: enable_beaconing */
+    uint16_t aid;     /* SET_STA_STATE */
+    uint8_t  addr[6]; /* ADD_INTERFACE: VIF MAC; BSSID_SET: BSSID; SET_STA_STATE: station */
+    int32_t  status;  /* the chip's own status in its response; 0 accepted */
+    int      ret;     /* the transport result */
+};
+unsigned simnode_chipcmd_count(void);
+const struct simnode_chipcmd *simnode_chipcmd_get(unsigned i);
+void simnode_chipcmd_clear(void);
+/** Logged commands with @p id and, unless it is UINT32_MAX, @p arg. */
+unsigned simnode_chipcmd_n(uint16_t id, uint32_t arg);
+/** Arm a refusal: the chip answers an ADD_INTERFACE of @p type (0: any) with @p status, or
+ *  fails its transport with @p ret when that is non-zero. Refusals are taken in the order
+ *  armed, each by the first ADD_INTERFACE after the one before it that matches. */
+void simnode_chip_refuse_add_if(uint32_t type, int32_t status, int ret);
+/** The next REMOVE_INTERFACE fails with @p ret. */
+void simnode_chip_refuse_rm_if(int ret);
+/** The chip answers the next BSSID_SET, MESH_CONFIG, BSS_BEACON_CONFIG, SET_STA_STATE or
+ *  INSTALL_KEY (@p id) with @p status; a refused key is not installed. */
+void simnode_chip_refuse_next(uint16_t id, int32_t status);
+/** As simnode_chip_refuse_next, for the next such command whose arg is @p arg: SET_STA_STATE
+ *  its state, INSTALL_KEY its aid. REMOVE_INTERFACE (arg: the VIF id) fails its transport
+ *  with @p status instead, having no status of its own. */
+void simnode_chip_refuse_next_arg(uint16_t id, uint32_t arg, int32_t status);
+/** Refusals armed and not yet taken, of any kind; and dropping them all. */
+unsigned simnode_chip_refusals_armed(void);
+void simnode_chip_refusals_clear(void);
+/** ADD_INTERFACE for a MESH VIF hands out @p vif_id (the others keep the start's). */
+void simnode_chip_set_mesh_vif_id(uint16_t vif_id);
+/** Run the boot scan probe's interface churn (SCAN add and remove) at the next starts,
+ *  as every mesh env but -swccmp-on does (main/mesh.c). Off by default. */
+void simnode_set_boot_scan(bool on);
+
 /* ---- the chip's TX queue ---------------------------------------------- */
 
 /** By default the chip sends each data frame as it arrives and reports its TX status.

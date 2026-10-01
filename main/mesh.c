@@ -817,15 +817,33 @@ void warthog_mesh_smoke_test(void)
         warthog_bat_port_mesh_failed();
     }
 
-    /* : mmwlan_mesh_enable() returns SUCCESS only when BOTH
-     * ADD_INTERFACE(type=MESH) and MESH_CONFIG(START) were accepted by the
-     * chip — see umac_mesh_enable_mesh(). The per-step "mesh: ..." lines
-     * above (visible via the per-file MMLOG_LEVEL_OVRD in umac_mesh.c)
-     * show exactly how far it got. */
+    /* SUCCESS means the mesh is up and MESH_CONFIG(START) was answered, not that the chip took
+     * a MESH interface or the MESH_CONFIG: a MESH add falls back to STA and a refusal is only
+     * counted (umac_interface.c, umac_mesh.c). The RESULT line states what it answered, as
+     * AT+MESHCFG?'s chip_vif= lines do; the "mesh: ..." lines above say why. */
+    extern volatile uint32_t g_warthog_chipvif_type, g_warthog_chipvif_fallback;
+    extern volatile uint32_t g_warthog_chipcmd_meshcfg_refused, g_warthog_chipcmd_meshcfg_mode;
+    extern volatile int32_t g_warthog_chipvif_add_status, g_warthog_chipcmd_meshcfg_status;
+    const struct warthog_mesh_start_in res = {
+        .status = (int)st,
+        .chip_vif = g_warthog_chipvif_type,
+        .fallback = g_warthog_chipvif_fallback,
+        .add_status = g_warthog_chipvif_add_status,
+        .meshcfg_refused = g_warthog_chipcmd_meshcfg_refused,
+        .meshcfg_status = g_warthog_chipcmd_meshcfg_status,
+        .meshcfg_mode = g_warthog_chipcmd_meshcfg_mode,
+#if defined(WARTHOG_MESH_CHIP_VIF_MESH) && WARTHOG_MESH_CHIP_VIF_MESH
+        .built_mesh = 1,
+#endif
+    };
+    char result[WARTHOG_MESH_START_RESULT_LEN];
+    const enum warthog_mesh_start_verdict verdict = warthog_mesh_start_result(&res, result, sizeof(result));
     if (st == MMWLAN_SUCCESS) {
-        ESP_LOGW(TAG, "RESULT: PASS — mesh VIF added AND MESH_CONFIG(START) accepted.");
-        ESP_LOGW(TAG, "        The chip is beaconing as an 802.11s mesh STA.");
-        ESP_LOGW(TAG, "        done; next is (PLINK peering).");
+        ESP_LOGW(TAG, "%s", result);
+        if (verdict != WARTHOG_MESH_START_PASS) {
+            ESP_LOGW(TAG, "        not the chip interface this build asks for, or MESH_CONFIG refused:");
+            ESP_LOGW(TAG, "        see the 'mesh: ...' warnings above and AT+MESHCFG? chip_vif=");
+        }
 
         /* start the periodic probe-request burst task. */
         BaseType_t tret = xTaskCreate(mesh_probe_burst_task,
@@ -848,8 +866,7 @@ void warthog_mesh_smoke_test(void)
          * the code in place for future re-enabling if needed. */
         (void)mesh_opcode_probe_task;
     } else {
-        ESP_LOGE(TAG, "RESULT: FAIL — mmwlan_mesh_enable() returned status=%d.", (int)st);
-        ESP_LOGE(TAG, "        See the 'mesh: ...' lines above for the failing step");
-        ESP_LOGE(TAG, "        (ADD_INTERFACE vs MESH_CONFIG) and docs/history/mesh-port-scope.md.");
+        ESP_LOGE(TAG, "%s", result);
+        ESP_LOGE(TAG, "        See the 'mesh: ...' lines above for the failing step.");
     }
 }

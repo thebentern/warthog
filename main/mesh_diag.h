@@ -80,4 +80,32 @@ void warthog_mesh_diag_window_fill(const struct warthog_mesh_diag_window *w,
 /* One line naming the cause and what to do about it. Never NULL. */
 const char *warthog_mesh_diag_text(enum warthog_mesh_diag d);
 
+/* The mesh start's verdict, from what the chip answered rather than what was asked. */
+enum warthog_mesh_start_verdict {
+    /* Up on the chip interface this build asks for, MESH_CONFIG(START) accepted. */
+    WARTHOG_MESH_START_PASS = 0,
+    /* Up, but on a fallback STA interface or with MESH_CONFIG(START) refused. */
+    WARTHOG_MESH_START_WARN,
+    /* mmwlan_mesh_enable() failed. */
+    WARTHOG_MESH_START_FAIL,
+};
+
+struct warthog_mesh_start_in {
+    int      status;          /* mmwlan_mesh_enable(); 0 is success */
+    int      built_mesh;      /* WARTHOG_MESH_CHIP_VIF_MESH: the build asks for a MESH chip VIF */
+    uint32_t chip_vif;        /* chip VIF type in use: 0 none, 1 STA, 2 AP, 5 MESH */
+    uint32_t fallback;        /* MESH adds that fell back to STA */
+    int32_t  add_status;      /* and the last one's status or error */
+    uint32_t meshcfg_refused; /* MESH_CONFIG the chip refused */
+    int32_t  meshcfg_status;  /* and the last refusal's status */
+    uint32_t meshcfg_mode;    /* MESH_CONFIG(START) sent: 0 none, 1 beaconing, 2 beaconless */
+};
+
+/* A buffer this long holds any RESULT line whole. */
+#define WARTHOG_MESH_START_RESULT_LEN 192
+
+/* The RESULT line for @p in into @p buf (no line ending); returns the verdict. */
+enum warthog_mesh_start_verdict warthog_mesh_start_result(const struct warthog_mesh_start_in *in,
+                                                          char *buf, size_t len);
+
 #endif /* WARTHOG_MESH_DIAG_H */
