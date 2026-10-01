@@ -97,13 +97,16 @@ batman's job, and no Warthog relay has been measured in a `bat0` fabric.
 1. **Batman-adv is broadcast-first, and encrypted broadcast needs host
    CCMP.** OGMs flood; the translation table floods.
    `AT+MESHGRP=1` sends standard 802.11s group frames, but Warthog puts only
-   its own MGTK in the chip, so under SAE a peer's group frames decrypt only
-   through host CCMP, which does so on air (see *Prerequisite:
+   its own MGTK in the chip (except `warthog-mesh-sae-meshvif`,
+   on which batman mode is refused), so under SAE a peer's group frames
+   decrypt only through host CCMP, which does so on air (see *Prerequisite:
    group-addressed frames*). HWMP's control plane rides the management path
    instead, which does not use the data-plane group key; toward a peer running
    MFP (the wizard's `ieee80211w=2`) it must itself be protected (CCMP unicast
    under the link key; group under the sender's MGTK, group-addressed privacy as
-   mac80211 sends it on any SAE mesh, which only host CCMP opens on Warthog),
+   mac80211 sends it on any SAE mesh, which only host CCMP opens on Warthog,
+   except `warthog-mesh-sae-meshvif`, on which batman mode is
+   refused),
    which is measured for a node's group PREQ and the Warthog's unicast PREP
    (2026-09-30) and not for a Warthog relay's group path selection.
 2. **HWMP is already half-present.** The mesh port answers path requests

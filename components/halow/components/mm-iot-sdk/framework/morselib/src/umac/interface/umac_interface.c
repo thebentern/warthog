@@ -303,6 +303,11 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
             status = MMWLAN_ERROR;
             goto error;
         }
+        {
+            /* warthog: a chip that boots holds no key; the mesh forgets what it held. */
+            extern void umac_datapath_mesh_chip_booted(void);
+            umac_datapath_mesh_chip_booted();
+        }
 
         data->fw_version.major = chip_info.fw_version.major;
         data->fw_version.minor = chip_info.fw_version.minor;

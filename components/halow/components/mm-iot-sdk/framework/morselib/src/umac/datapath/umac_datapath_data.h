@@ -14,23 +14,11 @@
 #include "dot11/dot11.h"
 
 
-struct datapath_defrag_data_chain
-{
-
-    uint16_t sequence_number;
-
-    bool is_protected;
-
-    struct mmpkt *buf;
-};
-
-
-#define MAX_FRAG_CHAINS (MMWLAN_MAX_QOS_TID + 2)
-
-
+/* warthog: a peer's fragment chains sit in datapath_defrag.c's node-wide table, found by this
+ * member's address; nothing is stored in it. */
 struct datapath_defrag_data
 {
-    struct datapath_defrag_data_chain frag_chains[MAX_FRAG_CHAINS];
+    uint8_t anchor;
 };
 
 

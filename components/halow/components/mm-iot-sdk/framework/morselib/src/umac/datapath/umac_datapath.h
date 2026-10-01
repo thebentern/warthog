@@ -134,6 +134,12 @@ void umac_datapath_stad_flush(struct umac_data *umacd, struct umac_sta_data *sta
  *  defrag timeouts that point into it and release what it holds for reordering or defrag. */
 void umac_datapath_stad_teardown(struct umac_data *umacd, struct umac_sta_data *stad);
 
+/** warthog: discard @p stad's incomplete fragment chains (its key changed); event loop only. */
+void umac_datapath_stad_flush_defrag(struct umac_data *umacd, struct umac_sta_data *stad);
+
+/** warthog: release fragment chains past their time (a periodic tick); event loop only. */
+void umac_datapath_defrag_expire(struct umac_data *umacd);
+
 
 void umac_datapath_stad_flush_txq(struct umac_data *umacd, struct umac_sta_data *stad);
 

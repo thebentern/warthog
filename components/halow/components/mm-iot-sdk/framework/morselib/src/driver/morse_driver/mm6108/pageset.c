@@ -20,6 +20,9 @@
 #include "driver/morse_driver/skb_header.h"
 #include "driver/transport/morse_transport.h"
 
+/* Frames read off the chip (storage in main/at.c). */
+extern volatile uint32_t g_warthog_rx_read_seq;
+
 
 #ifndef MAX_PAGES_PER_TX_TXN
 #define MAX_PAGES_PER_TX_TXN 16
@@ -603,6 +606,8 @@ static int morse_pageset_read(struct morse_pageset *pageset)
     }
 
     mmdrv_get_rx_metadata(mmpkt)->read_timestamp_ms = mmosal_get_time_ms();
+    /* warthog: in read order, for the mesh peer-MGTK fence (umac_datapath_mesh.c). */
+    mmdrv_get_rx_metadata(mmpkt)->read_seq = ++g_warthog_rx_read_seq;
 
     hdr = (struct morse_buff_skb_header *)buf;
 

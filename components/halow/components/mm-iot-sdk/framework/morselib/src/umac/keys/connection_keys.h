@@ -42,6 +42,10 @@ bool connection_keys_uninstall_key(struct connection_keys_data *data, uint8_t ke
 enum umac_key_type connection_keys_get_key_type(struct connection_keys_data *data, uint8_t key_id);
 
 
+/** warthog: connection_keys_check_and_update_rx_replay's verdict, with no update. */
+bool connection_keys_rx_replay_fresh(struct connection_keys_data *data, uint8_t key_id,
+                                     uint64_t packet_number, enum umac_key_rx_counter_space space);
+
 enum mmwlan_status connection_keys_check_and_update_rx_replay(struct connection_keys_data *data,
                                                               uint8_t key_id,
                                                               uint64_t packet_number,
@@ -49,6 +53,9 @@ enum mmwlan_status connection_keys_check_and_update_rx_replay(struct connection_
 
 
 size_t connection_keys_get_key_len(struct connection_keys_data *data, uint8_t key_id);
+
+/** warthog: the colour of the key at @p key_id, 0 when there is none. */
+uint32_t connection_keys_get_key_gen(struct connection_keys_data *data, uint8_t key_id);
 
 
 const uint8_t *connection_keys_get_key_data(struct connection_keys_data *data, uint8_t key_id);

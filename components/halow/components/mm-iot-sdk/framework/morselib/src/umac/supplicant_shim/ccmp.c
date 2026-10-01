@@ -29,6 +29,27 @@ static uint64_t parse_ccmp_packet_number(const uint8_t *header)
            (((uint64_t)(*(header + 7)) << 40));
 }
 
+uint64_t ccmp_get_packet_number(const uint8_t *ccmp_header)
+{
+    return parse_ccmp_packet_number(ccmp_header);
+}
+
+bool ccmp_is_fresh(struct umac_sta_data *stad,
+                   const uint8_t *ccmp_header,
+                   enum umac_key_rx_counter_space space)
+{
+    if (ccmp_header == NULL || stad == NULL)
+    {
+        return false;
+    }
+    const uint8_t key_id = (ccmp_header[3] & CCMP_HEADER_KEY_OCT_KEY_ID) >> 6;
+    if (umac_keys_get_key_type(stad, key_id) == UMAC_KEY_TYPE_BLANK)
+    {
+        return false;
+    }
+    return umac_keys_rx_replay_fresh(stad, key_id, parse_ccmp_packet_number(ccmp_header), space);
+}
+
 bool ccmp_is_valid(struct umac_sta_data *stad,
                    uint8_t *ccmp_header,
                    enum umac_key_rx_counter_space space)

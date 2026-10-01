@@ -45,7 +45,7 @@ TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
 # the frame the firmware would have handed to the radio. It covers the glue,
 # which is the one mesh file no freestanding test can link.
 SIMNODE      := simnode
-SIMNODE_TESTS := test_simnode_smoke test_simnode_peering test_simnode_datapath test_simnode_multinode test_simnode_glue test_simnode_keys test_simnode_keys_nochip test_simnode_keys_pnbase_off test_simnode_keys_nochip_pnbase_off test_simnode_capacity test_simnode_discovery test_simnode_mfp test_simnode_mfp_swccmp test_simnode_batman test_simnode_meshvif test_simnode_meshvif_off test_simnode_keys_meshvif test_simnode_keys_pnbase_off_meshvif test_simnode_keys_nochip_meshvif test_simnode_mfp_swccmp_meshvif test_simnode_batman_meshvif test_simnode_multinode_meshvif
+SIMNODE_TESTS := test_simnode_smoke test_simnode_peering test_simnode_datapath test_simnode_multinode test_simnode_glue test_simnode_keys test_simnode_keys_nochip test_simnode_keys_pnbase_off test_simnode_keys_nochip_pnbase_off test_simnode_capacity test_simnode_discovery test_simnode_mfp test_simnode_mfp_swccmp test_simnode_batman test_simnode_meshvif test_simnode_meshvif_off test_simnode_keys_meshvif test_simnode_keys_pnbase_off_meshvif test_simnode_keys_nochip_meshvif test_simnode_mfp_swccmp_meshvif test_simnode_batman_meshvif test_simnode_multinode_meshvif test_simnode_peergtk_meshvif test_simnode_peergtk test_simnode_peergtk_swccmp_meshvif test_simnode_mfp_meshvif test_simnode_frag test_simnode_frag_nochip test_simnode_frag_swccmp test_simnode_frag_meshvif test_simnode_frag_swccmp_meshvif
 # Appended after the fact: TESTS above is an immediate assignment, so a
 # reference to this from there would expand to nothing.
 TESTS += $(SIMNODE_TESTS)
@@ -87,6 +87,7 @@ SIMNODE_SEAMED = $(FW)/morselib/src/umac/data/umac_sta_data.c $(FW)/morselib/src
                  $(FW)/morselib/src/umac/interface/umac_interface.c
 SIMNODE_HDRS = $(wildcard $(SIMNODE)/*.h) $(MESHHDRS) $(SIMNODE_SEAMED) \
                $(addprefix $(FW)/morselib/src/umac/interface/,umac_interface.h umac_interface_data.h) \
+               $(wildcard $(FW)/morselib/src/umac/datapath/*.h) $(wildcard $(FW)/morselib/src/umac/keys/*.h) \
                $(FW)/morselib/src/internal/mmdrv.h
 SIMNODE_C = $(filter-out $(SIMNODE_SEAMED),$(filter %.c,$^))
 
@@ -342,6 +343,11 @@ test_simnode_keys_pnbase_off_meshvif: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_S
 test_simnode_keys_nochip_meshvif: $(SIMNODE)/test_simnode_keys.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) $(SWCCMP_DEFS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
+# As warthog-mesh-sae-meshvif: chip keys on a MESH chip VIF, where the chip holds each peer's
+# MGTK at its AID and opens the peer's group path selection itself.
+test_simnode_mfp_meshvif: $(SIMNODE)/test_simnode_mfp.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
 test_simnode_mfp_swccmp_meshvif: $(SIMNODE)/test_simnode_mfp.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) $(SWCCMP_DEFS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
@@ -356,6 +362,37 @@ test_simnode_multinode_meshvif: $(SIMNODE)/test_simnode_multinode.c $(SIMNODE_SR
 	  cp libsimnodemv$(SIMNODE_SO) libsimnodemv$$i$(SIMNODE_SO); i=$$((i+1)); done
 	$(CC) $(CFLAGS) $(SANFLAGS) -DSIMNODE_SO_SUFFIX='"$(SIMNODE_SO)"' -DSIMNODE_SO_PREFIX='"libsimnodemv"' \
 	  -DSIMNODE_NODES=$(SIMNODE_NODES) $(SIMNODE_INCS) $< -o $@ $(SIMNODE_DLLIBS)
+
+# A peer's MGTK in the chip at its AID, as Linux installs it, and the group frames the
+# chip then opens (the fake chip's receive model, simnode_rx_air): as warthog-mesh-sae-meshvif
+# builds it, and pinned as warthog-mesh-sae and warthog-mesh-sae-swccmp-meshvif do.
+test_simnode_peergtk_meshvif: $(SIMNODE)/test_simnode_peergtk.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+test_simnode_peergtk: $(SIMNODE)/test_simnode_peergtk.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+test_simnode_peergtk_swccmp_meshvif: $(SIMNODE)/test_simnode_peergtk.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) $(SWCCMP_DEFS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+# Fragmented unicast through the real receive path: reassembled before Mesh Control, the
+# forwarding engine and leaf learning, with mac80211's FragAttacks checks. As warthog-mesh-sae
+# (the chip opens it), -nochipkey (nothing opens SAE data), -swccmp (host CCMP), -meshvif, and
+# -swccmp-meshvif, the build measured on air.
+test_simnode_frag: $(SIMNODE)/test_simnode_frag.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+test_simnode_frag_nochip: $(SIMNODE)/test_simnode_frag.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+test_simnode_frag_swccmp: $(SIMNODE)/test_simnode_frag.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(SWCCMP_DEFS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+test_simnode_frag_meshvif: $(SIMNODE)/test_simnode_frag.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
+
+test_simnode_frag_swccmp_meshvif: $(SIMNODE)/test_simnode_frag.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) $(MESHVIF) $(SWCCMP_DEFS) -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@
 
 test_simnode_mfp_swccmp: $(SIMNODE)/test_simnode_mfp.c $(SIMNODE_SRCS) $(SIMNODE_HDRS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1 -DWARTHOG_MESH_MGTK_PN_BASE=1 -Wno-unused-function -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $(SIMNODE_C) -o $@

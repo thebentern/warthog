@@ -582,17 +582,20 @@ static void t_del_peer_stops_peer_timeouts(void)
     simnode_advance_run(150);
     CHECK(simnode_host_rx_count() == 0u, "and nothing is delivered from the freed record");
 
-    /* A fragment chain, and its expiry. */
+    /* A fragment chain, and its expiry. The node's chains sit outside the peer records and
+     * share one expiry timeout, which points at no record. */
     (void)simnode_add_peer(A);
     rec = umac_datapath_mesh_find_peer(A);
     n = mk_uni_seq(f, A, 7, 0, true);
+    const unsigned pend = simnode_timeouts_pending();
     (void)simnode_rx(f, n, -50);
-    CHECK(simnode_timeouts_holding(rec) == 1u && simnode_live_allocs() == live0 + 2u,
-          "a first fragment from A opens a chain with an expiry timeout on A's record");
+    CHECK(simnode_timeouts_holding(rec) == 0u && simnode_timeouts_pending() == pend + 1u &&
+              simnode_live_allocs() == live0 + 2u,
+          "a first fragment from A opens a chain with an expiry timeout, none on A's record");
     simnode_del_peer(A);
-    CHECK(simnode_timeouts_holding(rec) == 0u && simnode_live_allocs() == live0,
-          "del_peer(A) cancels it and releases the chain (%u timeouts, %u -> %u live)",
-          simnode_timeouts_holding(rec), live0, simnode_live_allocs());
+    CHECK(simnode_timeouts_pending() == pend && simnode_live_allocs() == live0,
+          "del_peer(A) releases the chain and cancels its timeout (%u -> %u pending, %u -> %u live)",
+          pend, simnode_timeouts_pending(), live0, simnode_live_allocs());
     simnode_advance_run(1200);
     CHECK(simnode_live_allocs() == live0, "and the chain's expiry never runs (%u live)",
           simnode_live_allocs());

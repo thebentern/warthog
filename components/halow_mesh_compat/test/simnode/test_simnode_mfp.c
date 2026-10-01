@@ -46,7 +46,10 @@
  *      MMIE counts as one. So a relay re-sends under our MGTK no PREQ or PERR anyone
  *      could have sent in a keyed peer's name, and the forwarding glue refuses one in
  *      the clear itself. The chip build opens none, another Warthog relay's on the
- *      same image included: dropped, counted;
+ *      same image included: dropped, counted -- except on a MESH chip VIF
+ *      (test_simnode_mfp_meshvif), where the chip holds each peer's MGTK at its AID and
+ *      opens the peer's under it, taken (gp chip), replay-checked, and a forgery there is
+ *      one it opened under another key id (gp own);
  *  (7) MFP comes from the IGTK in the peer's AMPE (authenticated; hostap sends one
  *      exactly when it runs ieee80211w != 0), never from the RSN element of an Open,
  *      which anyone can send in the peer's name.
@@ -82,6 +85,16 @@
 #include "umac/mesh/umac_mesh_fwd.h"
 #include "umac/mesh/umac_mesh_fwd_glue.h"
 
+#ifndef WARTHOG_MESH_CHIP_VIF_MESH
+#define WARTHOG_MESH_CHIP_VIF_MESH 0
+#endif
+/* The chip holds each peer's MGTK at its AID (chip-key builds on a MESH chip VIF). */
+#if WARTHOG_MESH_CHIP_VIF_MESH && !defined(WARTHOG_MESH_AMPE_NO_CHIP_KEY)
+#define PEER_GTK_IN_CHIP 1
+#else
+#define PEER_GTK_IN_CHIP 0
+#endif
+
 static int failures;
 #define CHECK(cond, ...) do { \
     if (cond) { printf("ok   "); printf(__VA_ARGS__); printf("\n"); } \
@@ -95,7 +108,7 @@ extern volatile uint32_t g_warthog_hwmp_tx_prot, g_warthog_hwmp_tx_gp, g_warthog
 extern volatile uint32_t g_warthog_mgmt_prot_chip, g_warthog_mgmt_prot_host,
     g_warthog_mgmt_prot_nodec, g_warthog_mgmt_prot_grpkey;
 extern volatile uint32_t g_warthog_mgmt_gp_nodec, g_warthog_mgmt_gp_own, g_warthog_mgmt_gp_key,
-    g_warthog_mgmt_gp_replay;
+    g_warthog_mgmt_gp_replay, g_warthog_mgmt_gp_chip;
 extern volatile uint32_t g_warthog_hwmp_tx_qdrop, g_warthog_hwmp_relay_preq;
 extern volatile uint32_t g_warthog_hwmp_unestab, g_warthog_fwd_drop_bad;
 
@@ -262,6 +275,26 @@ static void rx_gp_body_(const uint8_t *ta, const uint8_t key[16], uint8_t kid, u
     (void)warthog_ccm_ae(key, nonce, 8, aad, al, f + 32, bl, f + 32 + bl);
     (void)simnode_rx(f, (uint16_t)(32 + bl + 8), -50);
 }
+
+#if PEER_GTK_IN_CHIP
+/* As rx_gp_body_, received through the chip (simnode_rx_air), which opens it if it holds the
+ * sender's MGTK at the sender's AID. */
+static void rx_preq_gp_air_(const uint8_t *ta, const uint8_t key[16], uint8_t kid, uint64_t pn64,
+                            uint32_t sn)
+{
+    uint8_t f[160];
+    hdr_(f, BC, ta, true);
+    const uint8_t pn[6] = { (uint8_t)(pn64 >> 40), (uint8_t)(pn64 >> 32), (uint8_t)(pn64 >> 24),
+                            (uint8_t)(pn64 >> 16), (uint8_t)(pn64 >> 8), (uint8_t)pn64 };
+    umac_ccmp_write_header(f + 24, pn, kid);
+    const uint16_t bl = preq_(f + 32, ta, sn);
+    uint8_t aad[UMAC_CCMP_AAD_MAXLEN], nonce[13];
+    const uint32_t al = umac_ccmp_build_aad(f, aad);
+    umac_ccmp_build_nonce(f, pn, nonce);
+    (void)warthog_ccm_ae(key, nonce, 8, aad, al, f + 32, bl, f + 32 + bl);
+    (void)simnode_rx_air(f, (uint16_t)(32 + bl + 8), -50);
+}
+#endif
 
 /* A group PREQ for us that way. A Linux node sends it under its own MGTK, key id 1. */
 static void rx_preq_gp_(const uint8_t *ta, const uint8_t key[16], uint8_t kid, uint8_t pn0,
@@ -501,11 +534,13 @@ static void t_rx_group(void)
           g_warthog_hwmp_mmie - s.mmie);
 
     s = snap_();
-    rx_preq_chipdec_kid_(A, BC, 12, 200, 1);
+    /* On a MESH VIF chip-key build the chip holds A's MGTK at A's AID under key id 1, so the
+     * forgery there is one it opened under another key id. */
+    rx_preq_chipdec_kid_(A, BC, 12, 200, PEER_GTK_IN_CHIP ? 2 : 1);
     CHECK(hwmp_(HWMP_EID_PREP, 0) == NULL && g_warthog_mgmt_gp_own - s.gown == 1 &&
               g_warthog_mgmt_prot_chip == s.chip && g_warthog_hwmp_gp == s.gp,
-          "a group PREQ the chip opened, so under our own MGTK, is refused as forged in A's "
-          "name (gp own %u)", g_warthog_mgmt_gp_own - s.gown);
+          "a group PREQ the chip opened under anything but A's MGTK at A's AID (here our own) is "
+          "refused as forged in A's name (gp own %u)", g_warthog_mgmt_gp_own - s.gown);
 
     keyed_(B, false);
     mgtk_(B, K_MGTK_B);
@@ -617,6 +652,27 @@ static void t_rx_group(void)
     rx_preq_gp_(A, K_MGTK_A, 1, 60, 44);
     CHECK(simnode_outbox_count() == 0 && g_warthog_mgmt_gp_nodec - s.gnodec == 1,
           "with host CCMP disarmed it cannot be opened: dropped, counted gp nodec");
+#elif PEER_GTK_IN_CHIP
+    simnode_outbox_clear();
+    s = snap_();
+    const uint32_t gc0 = g_warthog_mgmt_gp_chip;
+    rx_preq_gp_air_(A, K_MGTK_A, 1, 6, 30);
+    const struct simnode_frame *p = hwmp_(HWMP_EID_PREP, 0);
+    CHECK(g_warthog_mgmt_gp_chip - gc0 == 1 && g_warthog_hwmp_gp - s.gp == 1 &&
+              g_warthog_mgmt_gp_nodec == s.gnodec && to_(p, A) && protected_(p) && hw_enc_(p),
+          "chip build on a MESH VIF: a group PREQ under A's MGTK is opened by the chip, which holds "
+          "A's MGTK at A's AID (gp chip %u), taken and answered by a protected PREP to A",
+          g_warthog_mgmt_gp_chip - gc0);
+    simnode_outbox_clear();
+    s = snap_();
+    rx_preq_gp_air_(A, K_MGTK_A, 1, 6, 31);
+    CHECK(simnode_outbox_count() == 0 && g_warthog_mgmt_gp_replay - s.greplay == 1,
+          "the same PN again is refused as a replay (gp replay %u)", g_warthog_mgmt_gp_replay - s.greplay);
+    s = snap_();
+    rx_preq_gp_air_(A, K_MGTK_W, 1, 50, 32);
+    CHECK(simnode_outbox_count() == 0 && g_warthog_mgmt_gp_nodec - s.gnodec == 1,
+          "under our own MGTK in A's name the chip does not open it (gp nodec %u)",
+          g_warthog_mgmt_gp_nodec - s.gnodec);
 #else
     simnode_outbox_clear();
     s = snap_();
@@ -813,10 +869,11 @@ static void t_rx_unicast_group_key(void)
     simnode_outbox_clear();
     s = snap_();
     const uint32_t g1 = g_warthog_mgmt_prot_grpkey;
-    rx_preq_chipdec_kid_(B, BC, 96, 11, 1);
+    rx_preq_chipdec_kid_(B, BC, 96, 11, PEER_GTK_IN_CHIP ? 2 : 1); /* not B's MGTK's id there */
     CHECK(hwmp_(HWMP_EID_PREP, 0) == NULL && g_warthog_mgmt_prot_grpkey == g1 &&
               g_warthog_mgmt_gp_own - s.gown == 1,
-          "a group frame is not judged by it: one the chip opened is refused as under our own MGTK");
+          "a group frame is not judged by it: one the chip opened under anything but B's MGTK at "
+          "B's AID is refused (gp own)");
 }
 
 static void t_rx_pins(void)

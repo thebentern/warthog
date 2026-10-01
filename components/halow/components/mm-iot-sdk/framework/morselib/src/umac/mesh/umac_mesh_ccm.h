@@ -33,3 +33,12 @@ int warthog_ccm_ae(const uint8_t *key, const uint8_t *nonce, size_t M, const uin
  */
 int warthog_ccm_ad(const uint8_t *key, const uint8_t *nonce, size_t M, const uint8_t *aad,
                    size_t aad_len, uint8_t *data, size_t data_len, const uint8_t *auth);
+
+/**
+ * The @p M-byte MIC CCM sends with plaintext @p data, which is left as it is: what
+ * warthog_ccm_ae() writes to @p auth, without the encryption.
+ *
+ * @returns 0 on success, negative on bad arguments or a cipher failure.
+ */
+int warthog_ccm_mic(const uint8_t *key, const uint8_t *nonce, size_t M, const uint8_t *aad,
+                    size_t aad_len, const uint8_t *data, size_t data_len, uint8_t *auth);

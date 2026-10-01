@@ -8,7 +8,8 @@
  * while ours takes (key, nonce, M, aad, aad_len, data, data_len, ...) -- so a
  * transposed call compiles cleanly and silently produces wrong ciphertext.
  * Comparing outputs byte for byte across a spread of lengths is the cheapest
- * thing that catches that, and it runs without hardware.
+ * thing that catches that, and it runs without hardware. warthog_ccm_mic, the
+ * read-only MIC the chip-opened group frame check uses, must match the same MIC.
  */
 #include <stdio.h>
 #include <string.h>
@@ -61,6 +62,15 @@ int main(void)
 
         check(memcmp(a, b, n) == 0, "ciphertext differs", n);
         check(memcmp(mic_a, mic_b, 8) == 0, "MIC differs", n);
+
+        /* warthog_ccm_mic: the same MIC from the plaintext, which it must leave alone. */
+        {
+            uint8_t mic_c[8];
+            memcpy(b, pt, n);
+            check(warthog_ccm_mic(key, nonce, 8, aad, sizeof(aad), b, n, mic_c) == 0 &&
+                      memcmp(mic_c, mic_a, 8) == 0, "warthog_ccm_mic MIC differs", n);
+            check(memcmp(b, pt, n) == 0, "warthog_ccm_mic changed the plaintext", n);
+        }
 
         /* ours must decrypt the reference's ciphertext */
         memcpy(b, a, n);

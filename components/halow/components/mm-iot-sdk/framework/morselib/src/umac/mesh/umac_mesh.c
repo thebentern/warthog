@@ -120,6 +120,7 @@ extern volatile uint32_t g_warthog_cryptohost_req, g_warthog_cryptohost_done;
 extern volatile uint32_t g_warthog_cryptohost_rc, g_warthog_cryptohost_val;
 extern volatile uint32_t g_warthog_ccmp_kat_ran;
 void umac_datapath_mesh_service_rekey(void);
+void umac_datapath_mesh_service_peer_gtk(void);
 extern volatile char g_warthog_mpm_links[256];
 extern volatile uint32_t g_warthog_mesh_peer_add_fail;
 extern volatile uint32_t g_warthog_sae_offer_full;
@@ -768,10 +769,11 @@ static void mpm_expire_stale_(uint32_t now_ms);
  * dereferences those stations there; the probe task only posts this. */
 static void mesh_service_evt_(struct umac_data *umacd, const struct umac_evt *evt)
 {
-    (void)umacd;
     (void)evt;
     s_service_queued = false;
     umac_datapath_mesh_service_rekey(); /* AT+REKEY=<n>, AT+MESHRELINK */
+    umac_datapath_mesh_service_peer_gtk(); /* AT+GTKPERSTA; peer-MGTK fences retire */
+    umac_datapath_defrag_expire(umacd);    /* fragment chains past their 1 s */
 
     /* Expire dead peers on OUR clock. The only other caller runs when a
      * neighbour transmits, which is the peer's clock -- and a peer going

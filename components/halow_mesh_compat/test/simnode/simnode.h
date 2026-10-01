@@ -10,7 +10,8 @@
  *
  * What this cannot tell you: anything the radio does. No modulation, no
  * timing, no interference, no chip behaviour beyond a TX status per data frame
- * (and per frame under our group key) and the group key slot's PN, and nothing
+ * (and per frame under our group key), the group key slot's PN and, through
+ * simnode_rx_air only, which key the chip opens a received frame under, and nothing
  * about what a real mac80211 peer
  * does with the bytes. A green run here means the firmware's
  * own logic is consistent, not that it works on the air.
@@ -118,16 +119,17 @@ void simnode_fail_next_install_key(void);
 
 /* ---- chip interface, BSS and station commands --------------------------- */
 
-/** One interface, BSS or station command the firmware sent the chip, with what it
- *  answered. The start sends the boot ADD_INTERFACE (mmwlan_boot) before the mesh's own. */
+/** One interface, BSS, station or key-removal command the firmware sent the chip, with what
+ *  it answered. The start sends the boot ADD_INTERFACE (mmwlan_boot) before the mesh's own. */
 struct simnode_chipcmd {
     uint16_t id;      /* MORSE_CMD_ID_* */
     uint16_t vif_id;  /* ADD_INTERFACE: the id the chip handed out (UINT16_MAX: none) */
     uint32_t arg;     /* ADD_INTERFACE: interface type; SET_STA_STATE: state; MESH_CONFIG: start;
                        * BSS_CONFIG: beacon interval; BSS_BEACON_CONFIG: enable;
-                       * REMOVE_INTERFACE: the VIF id */
+                       * REMOVE_INTERFACE: the VIF id; DISABLE_KEY: the hardware key index */
     bool     beaconing; /* MESH_CONFIG: enable_beaconing */
-    uint16_t aid;     /* SET_STA_STATE */
+    bool     pairwise;  /* DISABLE_KEY: a pairwise key, else a group one */
+    uint16_t aid;     /* SET_STA_STATE, DISABLE_KEY */
     uint8_t  addr[6]; /* ADD_INTERFACE: VIF MAC; BSSID_SET: BSSID; SET_STA_STATE: station */
     int32_t  status;  /* the chip's own status in its response; 0 accepted */
     int      ret;     /* the transport result */
@@ -147,8 +149,9 @@ void simnode_chip_refuse_rm_if(int ret);
  *  INSTALL_KEY (@p id) with @p status; a refused key is not installed. */
 void simnode_chip_refuse_next(uint16_t id, int32_t status);
 /** As simnode_chip_refuse_next, for the next such command whose arg is @p arg: SET_STA_STATE
- *  its state, INSTALL_KEY its aid. REMOVE_INTERFACE (arg: the VIF id) fails its transport
- *  with @p status instead, having no status of its own. */
+ *  its state, INSTALL_KEY its aid. REMOVE_INTERFACE (arg: the VIF id) and DISABLE_KEY (arg:
+ *  its aid; the key stays) fail their transport with @p status instead, having no status
+ *  of their own. */
 void simnode_chip_refuse_next_arg(uint16_t id, uint32_t arg, int32_t status);
 /** Refusals armed and not yet taken, of any kind; and dropping them all. */
 unsigned simnode_chip_refusals_armed(void);
@@ -158,6 +161,32 @@ void simnode_chip_set_mesh_vif_id(uint16_t vif_id);
 /** Run the boot scan probe's interface churn (SCAN add and remove) at the next starts,
  *  as every mesh env but -swccmp-on does (main/mesh.c). Off by default. */
 void simnode_set_boot_scan(bool on);
+
+/* ---- the chip's keys and its receive crypto (fake_chip.c) ---------------- */
+
+/** True while the chip holds a key at @p aid of that kind and index (a group key's index is
+ *  its key id), copied to @p key if non-NULL. Held from the INSTALL_KEY it accepted until a
+ *  DISABLE_KEY or an install over it; a station's removal is not assumed to take it. */
+bool simnode_chip_key_held(uint16_t aid, bool pairwise, uint8_t idx, uint8_t key[16]);
+/** A frame off the air, received through the chip. A Protected one is opened under the key
+ *  the chip holds for its transmitter's station (from SET_STA_STATE) under the frame's key
+ *  id -- pairwise for a unicast, that station's group key for a group frame on a MESH VIF,
+ *  the VIF's group key at AID 0 on a STA VIF -- and handed up decrypted
+ *  (MMDRV_RX_FLAG_DECRYPTED, MIC octets still in place); else it goes up as it came. */
+bool simnode_rx_air(const uint8_t *frame, uint16_t len, int16_t rssi);
+/** As simnode_rx_air, returning once the frame is read and queued: the event loop has not
+ *  run (simnode_rx_flags_queued). */
+bool simnode_rx_air_queued(const uint8_t *frame, uint16_t len, int16_t rssi);
+/** On a MESH VIF, a group frame whose station holds no group key under its key id is tried
+ *  under the VIF's group key at AID 0, as a chip with that fallback would. Off by default;
+ *  survives a start. */
+void simnode_chip_group_fallback(bool on);
+/** On a MESH VIF, a group frame whose MIC fails under its station's group key is tried
+ *  under the VIF's group key at AID 0 too, and handed up with that key's MIC octets in place:
+ *  a chip with that fallback (not measured on the MM6108). Off by default; survives a start. */
+void simnode_chip_group_fallback_mic(bool on);
+/** Frames simnode_rx_air's chip has opened since the simulator was loaded. */
+unsigned simnode_chip_rx_opened(void);
 
 /* ---- the chip's TX queue ---------------------------------------------- */
 
@@ -195,6 +224,9 @@ bool simnode_rx(const uint8_t *frame, uint16_t len, int16_t rssi);
  * frame is one the chip could not decrypt.
  */
 bool simnode_rx_flags(const uint8_t *frame, uint16_t len, int16_t rssi, uint8_t rx_flags);
+/** As simnode_rx_flags, returning on the chip driver's task: the frame is read off the chip
+ *  (its read order stamped, as pageset.c does) and queued; the event loop has not run. */
+bool simnode_rx_flags_queued(const uint8_t *frame, uint16_t len, int16_t rssi, uint8_t rx_flags);
 
 /** Run the 2 s service tick (held-frame flush, peering watchdog, rekey). */
 void simnode_tick(void);

@@ -22,7 +22,10 @@
  * (8) with an unkeyed SAE candidate in the first slot, a broadcast went out in
  *     the clear (and a plaintext replica went to the candidate);
  * (9) a group frame the chip decrypted -- under OUR MGTK, the only group key it
- *     holds -- was delivered as the TA's and booked against the TA's replay counter;
+ *     holds -- was delivered as the TA's and booked against the TA's replay counter.
+ *     Built with WARTHOG_MESH_CHIP_VIF_MESH (chip keys), where the chip also holds A's
+ *     MGTK at A's AID: one sealed under our MGTK in A's name is not opened (rxdrop 4);
+ *     the rest of that rule is test_simnode_peergtk's;
  * (10) a survivor's restored MTK restarted the chip's shared PN counter below
  *     frames already sent, so the survivor dropped ours as replays;
  * (11, built with WARTHOG_MESH_AMPE_NO_CHIP_KEY) the restore pushed a key into
@@ -491,11 +494,31 @@ static void t_decrypted_group_is_forged(void)
 
     uint8_t frame[160];
     uint16_t n = mk_group_decrypted(frame, A, 1, 0xfe);
+#if WARTHOG_MESH_CHIP_VIF_MESH
+    /* On a MESH chip VIF the chip holds A's own MGTK at A's AID (test_simnode_peergtk), so key
+     * id 1 opened there is A's. One sealed under OUR MGTK in A's name is what a member holding
+     * it would send: the chip, trying A's key, does not open it. */
+    {
+        const uint8_t pn[6] = { 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff };
+        uint8_t aad[UMAC_CCMP_AAD_MAXLEN], nonce[13];
+        const uint32_t hl = umac_ccmp_hdr_len(frame);
+        const uint32_t al = umac_ccmp_build_aad(frame, aad);
+        umac_ccmp_build_nonce(frame, pn, nonce);
+        (void)warthog_ccm_ae(K_OWN_MGTK, nonce, 8, aad, al, frame + hl + UMAC_CCMP_HDR_LEN,
+                             (size_t)(n - hl - UMAC_CCMP_HDR_LEN - 8u), frame + n - 8u);
+        (void)simnode_rx_air(frame, n, -60);
+    }
+    CHECK(simnode_host_rx_count() == 0u, "MESH VIF: one sealed under our MGTK is not delivered as "
+          "A's (%u delivered)", simnode_host_rx_count());
+    CHECK(g_warthog_rxdrop_reason == 4u, "MESH VIF: the chip does not open it, rxdrop 4 (got %lu)",
+          (unsigned long)g_warthog_rxdrop_reason);
+#else
     (void)simnode_rx_flags(frame, n, -60, MMDRV_RX_FLAG_DECRYPTED);
     CHECK(simnode_host_rx_count() == 0u, "not delivered as A's (%u delivered)",
           simnode_host_rx_count());
     CHECK(g_warthog_rxdrop_reason == 95u, "rxdrop reason 95 (got %lu)",
           (unsigned long)g_warthog_rxdrop_reason);
+#endif
 }
 
 /* ---- 10. the chip's shared PN counter never goes backwards --------------- */

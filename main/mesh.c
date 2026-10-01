@@ -683,6 +683,9 @@ void warthog_mesh_smoke_test(void)
     /* Before the first beacon is heard; AT+MESHRSSI= also sets it live. */
     extern volatile int32_t g_warthog_mesh_rssi_floor;
     g_warthog_mesh_rssi_floor = warthog_cfg_get_mesh_rssi();
+    /* Before the first peer's MGTK arrives; AT+GTKPERSTA= also sets it live. */
+    extern volatile uint32_t g_warthog_peer_gtk_mode;
+    g_warthog_peer_gtk_mode = warthog_cfg_get_mesh_gtk();
 #if WARTHOG_MESH_SAE && !defined(WARTHOG_MESH_HOST_CCMP)
     if (g_warthog_mesh_grp) {
         ESP_LOGE(TAG, "mesh: standard group frames under SAE with chip crypto: sent under our "

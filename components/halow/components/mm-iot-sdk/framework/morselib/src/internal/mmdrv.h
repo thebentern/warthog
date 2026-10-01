@@ -1275,6 +1275,8 @@ struct mmdrv_rx_metadata
     uint8_t vif_id;
     /** Timestamp at which the MPDU was read from the chip. */
     uint32_t read_timestamp_ms;
+    /** warthog: g_warthog_rx_read_seq when it was read; orders frames against key installs. */
+    uint32_t read_seq;
 };
 
 /**

@@ -153,10 +153,23 @@ enum mmwlan_status umac_keys_check_and_update_rx_replay(struct umac_sta_data *st
                                                       space);
 }
 
+bool umac_keys_rx_replay_fresh(struct umac_sta_data *stad, uint8_t key_id, uint64_t packet_number,
+                               enum umac_key_rx_counter_space space)
+{
+    struct umac_keys_sta_data *sta_data = umac_sta_data_get_keys(stad);
+    return connection_keys_rx_replay_fresh(&sta_data->keys, key_id, packet_number, space);
+}
+
 size_t umac_keys_get_key_len(struct umac_sta_data *stad, uint8_t key_id)
 {
     struct umac_keys_sta_data *sta_data = umac_sta_data_get_keys(stad);
     return connection_keys_get_key_len(&sta_data->keys, key_id);
+}
+
+uint32_t umac_keys_get_key_gen(struct umac_sta_data *stad, uint8_t key_id)
+{
+    struct umac_keys_sta_data *sta_data = umac_sta_data_get_keys(stad);
+    return connection_keys_get_key_gen(&sta_data->keys, key_id);
 }
 
 const uint8_t *umac_keys_get_key_data(struct umac_sta_data *stad, uint8_t key_id)

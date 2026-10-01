@@ -63,6 +63,7 @@ two gateways have run on the host and in the VM only (one hop, tables in sync).
 | region images with `AT+MESHEN=1`, `warthog-mesh-smoke` | open with `AT+MESHSEC=0`; the default `1` keys the mesh with a key published in the source, which no Linux node joins | yes (plain group frames) | accepted |
 | `warthog-mesh-sae` | SAE, chip crypto | **no**: peers' group frames are dropped | **refused** (`sae-no-host-ccmp`) |
 | `warthog-mesh-sae-nochipkey` | SAE, no host CCMP | no | **refused** |
+| `warthog-mesh-sae-meshvif` | SAE, chip crypto on a MESH chip interface, each peer's MGTK in the chip at its AID | in the chip ([OpenMANET Interop](OpenMANET-Interop#group-frames-in-the-chip-warthog-mesh-sae-meshvif)) | **refused** (`sae-no-host-ccmp`) |
 | `warthog-mesh-sae-swccmp`, `-swccmp-on` | SAE + host CCMP | through host CCMP (`-swccmp` measured on air, 2026-09-29) | accepted; batman mode arms host CCMP at boot |
 | `warthog-mesh-sae-swccmp-meshvif` | as `-swccmp`, on a MESH chip interface: takes a node's frames above its RTS threshold ([Limits](#limits)) | through host CCMP (measured on air, 2026-09-30) | accepted, as `-swccmp` |
 

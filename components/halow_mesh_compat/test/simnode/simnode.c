@@ -473,7 +473,9 @@ bool simnode_rx(const uint8_t *frame, uint16_t len, int16_t rssi)
     return simnode_rx_flags(frame, len, rssi, 0);
 }
 
-bool simnode_rx_flags(const uint8_t *frame, uint16_t len, int16_t rssi, uint8_t rx_flags)
+extern volatile uint32_t g_warthog_rx_read_seq;
+
+static bool rx_flags_(const uint8_t *frame, uint16_t len, int16_t rssi, uint8_t rx_flags, bool pump)
 {
     if (!s_up || frame == NULL || len == 0) { return false; }
     struct mmpkt *pkt = mmpkt_alloc_on_heap(0, len, sizeof(struct mmdrv_rx_metadata));
@@ -483,12 +485,26 @@ bool simnode_rx_flags(const uint8_t *frame, uint16_t len, int16_t rssi, uint8_t 
     md->rssi = rssi;
     md->flags = rx_flags;
     md->read_timestamp_ms = mmosal_get_time_ms(); /* as pageset.c stamps it; the reorder timeout reads it */
+    md->read_seq = ++g_warthog_rx_read_seq;       /* and its read order */
     struct mmpktview *v = mmpkt_open(pkt);
     mmpkt_append_data(v, frame, len);
     mmpkt_close(&v);
     umac_datapath_rx_frame(s_umacd, pkt);
-    simnode_pump();
+    if (pump)
+    {
+        simnode_pump();
+    }
     return true;
+}
+
+bool simnode_rx_flags(const uint8_t *frame, uint16_t len, int16_t rssi, uint8_t rx_flags)
+{
+    return rx_flags_(frame, len, rssi, rx_flags, true);
+}
+
+bool simnode_rx_flags_queued(const uint8_t *frame, uint16_t len, int16_t rssi, uint8_t rx_flags)
+{
+    return rx_flags_(frame, len, rssi, rx_flags, false);
 }
 
 void simnode_tick(void)

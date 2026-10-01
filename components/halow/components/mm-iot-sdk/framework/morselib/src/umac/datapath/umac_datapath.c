@@ -137,9 +137,19 @@ extern volatile uint32_t g_warthog_rxdrop_count;
 extern volatile uint32_t g_warthog_reord_outdated, g_warthog_reord_buffered;
 extern volatile uint32_t g_warthog_reord_released, g_warthog_reord_bypass;
 extern volatile uint32_t g_warthog_reord_last_seq, g_warthog_reord_last_exp;
+/* Refused before reassembly: fragments group-addressed (rxdrop 7) or in the clear on a keyed link
+ * (98); mesh data, whole or not, of a shape mac80211 drops (89). */
+extern volatile uint32_t g_warthog_defrag_mcast, g_warthog_defrag_plain, g_warthog_defrag_shape;
 void umac_mesh_handle_s1g_beacon(struct mmpktview *rxbufview);
 extern volatile uint32_t g_warthog_nodec_group, g_warthog_nodec_fc, g_warthog_nodec_keyid;
 extern volatile uint32_t g_warthog_nodec_group_n, g_warthog_nodec_uni_n;
+/* Group data the chip opened under the sender's MGTK at its AID and taken (past the replay
+ * check), refused as opened under any other key, and refused for its MIC octets. */
+extern volatile uint32_t g_warthog_rx_grp_chip, g_warthog_rx_grp_forged, g_warthog_rx_grp_micdrop;
+/* Whether the MIC octets the chip left on such a frame verify under that key (counted); false
+ * to drop it, once a verified one has armed the check for its class (0 data, 1 management). */
+bool umac_mesh_rx_chip_mic_note(struct umac_sta_data *stad, uint8_t key_id, const uint8_t *header,
+                                const uint8_t *ccmp, uint32_t len, unsigned cls);
 extern volatile uint8_t g_warthog_nodec_ta[6];
 extern volatile uint8_t g_warthog_rxdata_head[64];
 extern volatile uint16_t g_warthog_rxdata_head_len;
@@ -602,6 +612,24 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     bool have_ae_da = false, have_ae_sa = false;
     struct umac_mesh_fwd_rx_result fwd_res = { 0 };
     bool fwd_active = false;
+    /* warthog: what reassembly needs of this MPDU: its QoS Control, and its CCMP PN and key. */
+    struct datapath_defrag_mpdu frag_mpdu = { .mesh = data->ops == &datapath_ops_mesh };
+
+    /* warthog: any data frame sweeps reassembly chains past their time. */
+    datapath_defrag_expire(umacd);
+
+    /* warthog: as mac80211's ieee80211_rx_mesh_check: mesh data with a group RA is FromDS only
+     * (3-address), with a unicast RA 4-address; else a group-key holder could pass a frame sealed
+     * under a group key up as a unicast from the TA. */
+    if (data->ops == &datapath_ops_mesh &&
+        (mm_mac_addr_is_multicast(dot11_get_ra(header))
+             ? (dot11_frame_control_get_to_ds(header->frame_control) ||
+                !dot11_frame_control_get_from_ds(header->frame_control))
+             : !dot11_is_4addr_hdr(header->frame_control)))
+    {
+        g_warthog_defrag_shape++;
+        g_warthog_rxdrop_reason = 89; g_warthog_rxdrop_count++; goto drop;
+    }
 
     if (dot11_frame_control_get_subtype(header->frame_control) == DOT11_FC_SUBTYPE_QOS_DATA)
     {
@@ -609,6 +637,7 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             (struct dot11_qos_ctrl *)mmpkt_remove_from_start(rxbufview, sizeof(*qos_control));
 
         MMOSAL_ASSERT(qos_control);
+        frag_mpdu.qos = le16toh(qos_control->field);
 
         if (!mm_mac_addr_is_multicast(dot11_get_ra(header)))
         {
@@ -661,8 +690,17 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
 
     /* Under SAE every data frame is protected, and a candidate AMPE has not keyed
      * is still OPEN: its cleartext must not be delivered, learned from or relayed. */
-    if ((umac_sta_data_get_security_type(stad) != MMWLAN_OPEN ||
-         (data->ops == &datapath_ops_mesh && umac_mesh_sae_active())) &&
+    const bool keyed_link = umac_sta_data_get_security_type(stad) != MMWLAN_OPEN ||
+                            (data->ops == &datapath_ops_mesh && umac_mesh_sae_active());
+    /* warthog: no fragment arrives in the clear on a keyed link; EAPOL is never fragmented, and
+     * a later fragment's first octets are payload (CVE-2020-26140/26143/26147). */
+    if (keyed_link && !dot11_frame_control_get_protected(header->frame_control) &&
+        datapath_defrag_is_fragment(header))
+    {
+        g_warthog_defrag_plain++;
+        { g_warthog_rxdrop_reason = 98; g_warthog_rxdrop_count++; goto drop; }
+    }
+    if (keyed_link &&
         !dot11_frame_control_get_protected(header->frame_control) &&
         !umac_datapath_is_eapol_frame(rxbufview))
     {
@@ -673,6 +711,7 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     if (dot11_frame_control_get_protected(header->frame_control))
     {
         bool sw_decrypted = false;
+        bool grp_chip = false; /* a peer's group frame the chip opened, taken so far */
         if (!(rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED))
         {
 #ifdef WARTHOG_MESH_HOST_CCMP
@@ -708,13 +747,32 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             { g_warthog_rxdrop_reason = 4; g_warthog_rxdrop_count++; goto drop; }
         }
 
-        /* Under SAE the chip's only group key is our own TX MGTK, which no peer sends
-         * under; a group frame it decrypted is forged in the TA's name. */
+        /* Under SAE a group frame the chip decrypted is the TA's only when the chip holds the
+         * TA's own MGTK at its AID under the frame's key id (chip-key builds on a MESH chip VIF),
+         * read after that key went in, with no stale key at the AID. Under any other key -- our
+         * own MGTK above all, which every peer holds -- it may be forged in the TA's name. The
+         * replay check below is the host's, per sender and TID; a fresh frame's MIC octets are
+         * checked before it moves (a replay costs no MIC work and is dropped there, 5). */
         if ((rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED) &&
             data->ops == &datapath_ops_mesh && umac_mesh_sae_active() &&
             mm_mac_addr_is_multicast(dot11_get_ra(header)))
         {
-            g_warthog_rxdrop_reason = 95; g_warthog_rxdrop_count++; goto drop;
+            const uint8_t *gch = mmpkt_get_data_start(rxbufview);
+            const bool gch_ok = umac_datapath_validate_buf_len(rxbufview, DOT11_CCMP_HEADER_LEN);
+            const uint8_t gkid = gch_ok ? (uint8_t)((gch[3] & 0xc0u) >> 6) : 0u;
+            if (!gch_ok || !umac_datapath_mesh_peer_gtk_opened(stad, gkid, rx_metadata->read_seq))
+            {
+                g_warthog_rx_grp_forged++;
+                g_warthog_rxdrop_reason = 95; g_warthog_rxdrop_count++; goto drop;
+            }
+            if (ccmp_is_fresh(stad, gch, rx_space) &&
+                !umac_mesh_rx_chip_mic_note(stad, gkid, (const uint8_t *)header, gch,
+                                            mmpkt_get_data_length(rxbufview), 0u))
+            {
+                g_warthog_rx_grp_micdrop++;
+                g_warthog_rxdrop_reason = 95; g_warthog_rxdrop_count++; goto drop;
+            }
+            grp_chip = true;
         }
 
         uint8_t *ccmp_header = mmpkt_remove_from_start(rxbufview, DOT11_CCMP_HEADER_LEN);
@@ -742,6 +800,14 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
             umac_stats_increment_datapath_rx_ccmp_failures(umacd);
             { g_warthog_rxdrop_reason = 5; g_warthog_rxdrop_count++; goto drop; }
         }
+        if (grp_chip)
+        {
+            g_warthog_rx_grp_chip++;
+        }
+        frag_mpdu.is_protected = true;
+        frag_mpdu.key_id = (uint8_t)((ccmp_header[3] & 0xc0u) >> 6);
+        frag_mpdu.pn = ccmp_get_packet_number(ccmp_header);
+        frag_mpdu.key_gen = umac_keys_get_key_gen(stad, frag_mpdu.key_id);
 
 
         if (mmpkt_remove_from_end(rxbufview, DOT11_CCMP_128_MIC_LEN) == NULL)
@@ -759,8 +825,31 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
         umac_ba_set_expected_rx_seq_num(stad, tid_index, dot11_get_next_sequence_control(header));
     }
 
-
-
+    /* warthog: reassemble before anything reads the body. Only the first fragment carries Mesh
+     * Control, so it is parsed once, from the whole MSDU, as mac80211 does (rx.c: defragment
+     * before the mesh header). Group frames are never fragmented: a fragment with a group RA
+     * (addr1, as rx.c tests) is dropped. */
+    if (datapath_defrag_is_fragment(header) && mm_mac_addr_is_multicast(dot11_get_ra(header)))
+    {
+        MMLOG_INF("Drop Mcast/Bcast frame with fragment bit on\n");
+        g_warthog_defrag_mcast++;
+        { g_warthog_rxdrop_reason = 7; g_warthog_rxdrop_count++; goto drop; }
+    }
+    if (datapath_defrag_is_fragment(header))
+    {
+        MMOSAL_DEV_ASSERT(mmpkt_contains_ptr(rxbufview, (const void *)data_hdr));
+        rx_metadata = NULL;
+        rxbuf = datapath_defrag(umacd, &sta_data->defrag_data, &data_hdr, &rxbufview, rxbuf,
+                                tid_index, &frag_mpdu);
+        if (rxbuf == NULL)
+        {
+            MMOSAL_DEV_ASSERT(rxbufview == NULL);
+            return;
+        }
+        header = &data_hdr->base;
+        MMOSAL_DEV_ASSERT(mmpkt_from_view(rxbufview) == rxbuf);
+        MMOSAL_DEV_ASSERT(mmpkt_contains_ptr(rxbufview, (const void *)data_hdr));
+    }
 
     /* 802.11s Mesh Control sits INSIDE the (now-decrypted) body, i.e. after
      * the CCMP header. Strip it here -- after the CCMP header and MIC are gone
@@ -874,38 +963,11 @@ static void umac_datapath_process_rx_data_frame_after_reorder(
     if (mm_mac_addr_is_broadcast(dot11_get_da(header)) ||
         mm_mac_addr_is_multicast(dot11_get_da(header)))
     {
-        if (dot11_frame_control_get_more_fragments(header->frame_control))
-        {
-            MMLOG_INF("Drop Mcast/Bcast frame with fragment bit on\n");
-            { g_warthog_rxdrop_reason = 7; g_warthog_rxdrop_count++; goto drop; }
-        }
-
-
         if (dot11_frame_control_get_from_ds(header->frame_control) &&
             umac_interface_addr_matches_mac_addr(stad, dot11_get_sa_data(data_hdr)))
         {
             MMLOG_DBG("Filter out Bcast frame which AP relayed for us\n");
             { g_warthog_rxdrop_reason = 8; g_warthog_rxdrop_count++; goto drop; }
-        }
-    }
-    else
-    {
-
-        MMOSAL_DEV_ASSERT(mmpkt_contains_ptr(rxbufview, (const void *)data_hdr));
-        rx_metadata = NULL;
-        rxbuf =
-            datapath_defrag(umacd, &sta_data->defrag_data, &data_hdr, &rxbufview, rxbuf, tid_index);
-        if (rxbuf == NULL)
-        {
-
-            MMOSAL_DEV_ASSERT(rxbufview == NULL);
-            return;
-        }
-        else
-        {
-            header = &data_hdr->base;
-            MMOSAL_DEV_ASSERT(mmpkt_from_view(rxbufview) == rxbuf);
-            MMOSAL_DEV_ASSERT(mmpkt_contains_ptr(rxbufview, (const void *)data_hdr));
         }
     }
 
@@ -1396,9 +1458,11 @@ drop:
 extern volatile uint32_t g_warthog_mgmt_prot_chip, g_warthog_mgmt_prot_host,
     g_warthog_mgmt_prot_nodec, g_warthog_mgmt_prot_grpkey;
 /* Group-addressed ones (group-addressed privacy, under the sender's MGTK): opened by neither,
- * by the chip (so under our own MGTK), under a key id not the sender's MGTK, or replayed. */
+ * by the chip under anything but the sender's MGTK at its AID (own), under a key id not the
+ * sender's MGTK, or replayed; opened by the chip under the sender's MGTK at its AID and taken
+ * (chip), or refused for their MIC octets (micdrop). */
 extern volatile uint32_t g_warthog_mgmt_gp_nodec, g_warthog_mgmt_gp_own, g_warthog_mgmt_gp_key,
-    g_warthog_mgmt_gp_replay;
+    g_warthog_mgmt_gp_replay, g_warthog_mgmt_gp_chip, g_warthog_mgmt_gp_micdrop;
 
 static bool umac_datapath_process_mgmt_frame_ccmp_header(struct umac_data *umacd,
                                                          struct umac_sta_data *stad,
@@ -1418,12 +1482,30 @@ static bool umac_datapath_process_mgmt_frame_ccmp_header(struct umac_data *umacd
                           umac_mesh_sae_active();
     const bool group = mm_mac_addr_is_multicast(dot11_get_ra(header));
     bool decrypted = (rx_metadata->flags & MMDRV_RX_FLAG_DECRYPTED) != 0;
-    /* As rxdrop 95, and before any replay counter moves: the chip's only group key is our
-     * own MGTK, which every peer holds, so a group frame it opened is forged in the TA's name. */
+    /* As rxdrop 95, and before any replay counter moves: a group frame the chip opened is the
+     * TA's only under the TA's own MGTK at its AID (read after it went in, no stale key there);
+     * under our own MGTK, which every peer holds, or anything else, it may be forged in the TA's
+     * name. A fresh one's MIC octets are checked as for data; a replay is left to the check below. */
+    bool gp_chip = false;
     if (mesh_sae && decrypted && group)
     {
-        g_warthog_mgmt_gp_own++;
-        return false;
+        const uint8_t *gf = (const uint8_t *)header;
+        const uint32_t glen = mmpkt_get_data_length(rxbufview);
+        const bool gf_ok = glen >= sizeof(*header) + DOT11_CCMP_HEADER_LEN;
+        const uint8_t gkid = gf_ok ? (uint8_t)((gf[sizeof(*header) + 3] & 0xc0u) >> 6) : 0u;
+        if (!gf_ok || !umac_datapath_mesh_peer_gtk_opened(stad, gkid, rx_metadata->read_seq))
+        {
+            g_warthog_mgmt_gp_own++;
+            return false;
+        }
+        if (ccmp_is_fresh(stad, gf + sizeof(*header), UMAC_KEY_RX_COUNTER_SPACE_IND_ROBUST_MGMT) &&
+            !umac_mesh_rx_chip_mic_note(stad, gkid, gf, gf + sizeof(*header),
+                                        glen - (uint32_t)sizeof(*header), 1u))
+        {
+            g_warthog_mgmt_gp_micdrop++;
+            return false;
+        }
+        gp_chip = true;
     }
     if (mesh_sae && decrypted)
     {
@@ -1492,6 +1574,10 @@ static bool umac_datapath_process_mgmt_frame_ccmp_header(struct umac_data *umacd
         MMLOG_WRN("Unable to validate frame security, dropping.\n");
         umac_stats_increment_datapath_rx_ccmp_failures(umacd);
         return false;
+    }
+    if (gp_chip)
+    {
+        g_warthog_mgmt_gp_chip++;
     }
 
 
@@ -1959,6 +2045,16 @@ void umac_datapath_stad_teardown(struct umac_data *umacd, struct umac_sta_data *
     /* Released, not delivered: the peer is already out of the table. */
     mmpkt_list_clear(&sta_data->rx_reorder_list);
     datapath_defrag_deinit(umacd, &sta_data->defrag_data);
+}
+
+void umac_datapath_stad_flush_defrag(struct umac_data *umacd, struct umac_sta_data *stad)
+{
+    datapath_defrag_deinit(umacd, &umac_sta_data_get_datapath(stad)->defrag_data);
+}
+
+void umac_datapath_defrag_expire(struct umac_data *umacd)
+{
+    datapath_defrag_expire(umacd);
 }
 
 static void umac_datapath_flush_txq(struct umac_data *umacd);

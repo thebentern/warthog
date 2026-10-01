@@ -26,7 +26,7 @@ Warthog and OpenMANET must agree on mesh security. Two working combinations:
 
 | Mesh | Warthog build | OpenMANET config |
 |---|---|---|
-| **Encrypted (SAE/AMPE)** | `warthog-mesh-sae-swccmp`, or `warthog-mesh-sae-swccmp-meshvif` for a node's frames above its RTS threshold ([below](#frames-over-about-1000-bytes-from-a-linux-node)); `warthog-mesh-sae` peers but gets no unicast from a 1.8.0 node | mesh wizard default, or `uci` (below) |
+| **Encrypted (SAE/AMPE)** | `warthog-mesh-sae-swccmp`, or `warthog-mesh-sae-swccmp-meshvif` for a node's frames above its RTS threshold ([below](#frames-over-about-1000-bytes-from-a-linux-node)); `warthog-mesh-sae` peers but gets no unicast from a 1.8.0 node; `warthog-mesh-sae-meshvif` opens the node's group frames in the chip ([below](#group-frames-in-the-chip-warthog-mesh-sae-meshvif)) | mesh wizard default, or `uci` (below) |
 | Open | `warthog-mesh-smoke` + `AT+MESHSEC=0` | `encryption='none'`, set by the operator |
 
 A fresh OpenMANET image runs no mesh: its HaLow radio is an SAE access point in
@@ -68,6 +68,9 @@ pio run -e warthog-mesh-sae-swccmp -t upload   # passphrase: -DWARTHOG_MESH_PASS
 `warthog-mesh-sae` peers the same way, but its chip crypto cannot open the
 node's group frames, so it gets no path and no unicast from a 1.8.0 node
 ([below](#management-frame-protection-peering-does-not-need-it-path-selection-does)).
+`warthog-mesh-sae-meshvif` puts the node's MGTK into the chip at its AID, as
+Linux does, so its chip can
+([below](#group-frames-in-the-chip-warthog-mesh-sae-meshvif)).
 On `warthog-mesh-sae-swccmp` turn host CCMP on after each boot (`AT+SWCCMP=1`);
 batman mode and the `warthog-mesh-sae-swccmp-on` build arm it at boot.
 
@@ -148,10 +151,13 @@ On the chip-crypto build (`warthog-mesh-sae`), in the 2026-09-20 run, ICMP was
 0/30 and every undecryptable frame was group-addressed
 (`AT+RXCHAN?` showed `nodec grp` climbing 1:1 with pings while `uni` stayed
 0). Measured on Warthog's chip firmware (`mm6108.mbin` 1.17.6) on the mesh
-interface: one pairwise key, where the last install wins, and a second
+interface (the STA chip interface every build but the `-meshvif` ones runs
+the mesh on): one pairwise key, where the last install wins, and a second
 group-key install breaks group decryption, while every 802.11s peer generates
-its own MGTK. (A Linux node installs each peer's keys at that peer's AID; that
-order is untested on this firmware.) The only group key in the chip is now
+its own MGTK. (A Linux node installs each peer's keys at that peer's AID;
+`warthog-mesh-sae-meshvif` now does the same on a MESH chip interface,
+[below](#group-frames-in-the-chip-warthog-mesh-sae-meshvif).)
+On every other build the only group key in the chip is
 Warthog's own TX MGTK, installed with the first peer, so standard group frames
 (`AT+MESHGRP=1`) go out under Warthog's own key; each peer's MGTK stays in the
 host keychain. Under SAE, receiving any peer's group frames,
@@ -303,7 +309,7 @@ Both OpenMANET 1.8.0 bench Pis run an RTS threshold of 1000 (not set in uci;
 what sets it was not found), so each unicast frame longer than that goes out
 behind an RTS/CTS exchange (full-size TCP segments and large UDP too; derived).
 The Warthog's chip answers the RTS with a CTS, but on the STA chip interface
-every build except `warthog-mesh-sae-swccmp-meshvif` runs the mesh on, it
+every build except the `-meshvif` ones runs the mesh on, it
 addresses that CTS from the peer it registered last. Only that neighbour takes
 it; every other node times out and never sends the frame. Measured on
 2026-09-30 with the chips' MAC counters on both ends: after another Pi had
@@ -326,10 +332,16 @@ Pis at threshold 1000, a round every 5 minutes): 237/240 1000-byte pings from th
 Pis to the Warthogs, 60/60 Warthog to Warthog, `chip_vif=mesh(5)` with 3 peers
 and no fallback in all 24 readings.
 
-Not measured on a MESH chip interface: the SAE builds that put keys in the chip
-(the fix exists only as `-swccmp-meshvif`, which keeps them in the host), an open
-mesh, three or more Warthogs (two were), recovery after a chip restart, and a
-soak longer than an hour.
+A 4-hour soak of a `-swccmp-meshvif` Warthog (2026-09-30 to 10-01, a round every
+9 minutes) passed 401/480: from 2 h in, every 1000-byte ping from one Pi failed
+while its 300-byte pings passed. That was fragmentation, not RTS
+([below](#fragmented-frames-on-low-rate-links)). On `warthog-mesh-sae-meshvif`
+(AMPE keys in the chip), a 1-hour soak on 2026-10-01 passed 239/240 300- and
+1000-byte pings from both Pis. After `AT+RESET` of that Warthog, all three peers
+were back within 51 s.
+
+Not measured on a MESH chip interface: an open mesh, three or more Warthogs (two
+were), recovery after a chip restart.
 
 **Other builds: set each OpenMANET node** to use CTS-to-self in place of
 RTS/CTS, or turn RTS off. Either works alone:
@@ -348,6 +360,182 @@ measured set at runtime on 2026-09-30: with CTS-to-self, 900-, 1000- and
 reboot. The persistent CTS-to-self setting is
 `uci set wireless.<radio>.enable_cts_to_self=1` and a driver reload, read from
 OpenMANET's `netifd-morse` source, not measured.
+
+## Fragmented frames on low-rate links
+
+The MM6108 firmware fragments a frame too long for one transmission at a low
+rate, with no fragmentation threshold set (Morse's `mmwlan_set_fragment_threshold()`
+documents this; Morse rate control names 1 MHz MCS0-2 as such rates). Measured on
+2026-10-01: an OpenMANET 1.8.0 node (chip firmware 2.0.1) whose rate to a Warthog
+had fallen to MCS0 sent each 1000-byte ping as two fragments (`morse_cli -i wlh0
+stats` `TX fragment` +10 for 5 pings); 300-byte pings, and 1000-byte pings relayed
+by a node at MCS7, were not fragmented and passed 8/8.
+
+Earlier builds delivered every fragmented frame corrupt: they removed a Mesh
+Control from each fragment, though only the first carries one, and the IP stack
+dropped the result (ping replies never arrived and no drop counter moved). Fixed:
+fragments are reassembled after decryption and before Mesh Control is read, with
+mac80211's checks (one key, consecutive packet numbers, matching headers, 1 s
+limit); `AT+DEFRAG?` counts them. At most 4 frames are reassembled at once, 2 per
+peer. Measured on 2026-10-01 with a Pi forced to fragment (`iw phy phy0 set frag
+512`, path pinned to the Warthog): 1000- and 1400-byte pings passed 8/8 each on
+`-swccmp-meshvif` and on `warthog-mesh-sae-meshvif`, `AT+DEFRAG?` `in=56 ok=16`
+with every drop counter at 0 on both.
+
+`AT+DATASTAT?` counts `rx_data` per fragment and `delivered` per reassembled
+frame, so `rx_data` minus `delivered` is the fragment count minus 1 for each
+fragmented frame, with or without the fix; it does not show whether the fix works.
+
+To reproduce, pin a Linux node's path through the Warthog and ping at 1000 bytes
+while its rate is low:
+
+```sh
+iw dev wlh0 mpath new <warthog-mac> next_hop <warthog-mac>
+ping -s 1000 <warthog-ip>
+morse_cli -i wlh0 stats | grep -i 'tx fragment'
+```
+
+Pass: every ping is answered, `TX fragment` rises, and on the Warthog
+`AT+DEFRAG?` `ok` rises by 1 for each fragmented ping while `nofirst`, `order`,
+`pn`, `key`, `prot`, `hdr` and `oversize` stay at 0.
+
+What the Warthog sends is not fixed. When its own chip fragments (forced with
+`AT+FRAG=512`, or by itself at 1 MHz MCS0-2 on a weak link), a Linux node loses
+the frame. Measured on 2026-10-01, 1000-byte replies to a pinned Pi:
+
+| Build | Result | On the Pi |
+|---|---|---|
+| `-swccmp-meshvif` (host CCMP) | 0/8 | `RX MPDUs with MIC fail` +24: the chip split frames the host had already encrypted |
+| `warthog-mesh-sae-meshvif` (chip crypto) | 0/8 | only the first fragment of each frame was decrypted; the rest never reached mac80211 |
+| either, `AT+FRAG=0` | 8/8 | |
+
+Warthog to Warthog, chip-crypto fragments reassemble (`AT+DEFRAG?` `in=9 ok=3`
+for 3 datagrams), and Pi to Pi fragments pass, so the loss is between the
+Warthog's chip firmware (1.17.6) and the Pi's (2.0.1). Large unicast from a
+Warthog to a Linux node on a link slow enough to fragment is lost.
+
+## Group frames in the chip (`warthog-mesh-sae-meshvif`)
+
+Measured on air on 2026-10-01 (results [below](#measured-on-air-2026-10-01)).
+`warthog-mesh-sae-meshvif` is
+`warthog-mesh-sae` (AMPE keys in the chip) on the MESH chip interface of
+`warthog-mesh-sae-swccmp-meshvif`.
+
+On 2026-09-30, before the change below, it peered with both 1.8.0 Pis;
+`AT+KEYINST?` showed Warthog's own MGTK at AID 0 and each Pi's MTK at that Pi's
+AID, and Warthog-to-Warthog unicast passed. Every Pi group frame was
+undecryptable (`AT+RXCHAN?` `nodec grp` climbing, reason 4): the Pi's broadcast
+ARP, and its group PREQs (group-addressed privacy, under the Pi's MGTK). So the
+Pi built no path to the Warthog and sent it no unicast: the Warthog's ARP
+reached the Pi, the Pi's reply never arrived.
+
+The Pis' morse_driver (`mac.c` `morse_mac_ops_set_key`) installs every key that
+has a station into the chip at that station's AID with the key's own key id:
+the peer's MTK and the peer's MGTK. A group key without a station goes at AID 0.
+That is how the Pis' chips open each other's group frames. This build does the
+same:
+
+- A peer's MGTK goes into the chip at the peer's AID when AMPE delivers it, as
+  a group key under its key id (hostap always uses 1), beside Warthog's own MGTK
+  at AID 0. `AT+KEYINST?` lists it as `aid=<n> pw=0`. Each install starts the
+  key's TX PN at a fresh 2^20 epoch above every earlier install, so if the chip
+  ever sealed Warthog's group frames under it no PN would repeat;
+  `AT+GTKPERSTA=2` installs at TX PN 0 instead, as Linux does.
+- A group frame the chip opened is taken as its transmitter's only when all of
+  these hold: that peer is keyed (its MTK installed); the chip holds the peer's
+  MGTK at the peer's AID under the frame's key id; the frame was read off the
+  chip after that key went in (the fence below); and no refused `DISABLE_KEY`
+  left a stale key at that AID (the taint below). Anything else the chip opens
+  is refused as possibly forged in the transmitter's name, among it a frame
+  under Warthog's own MGTK (every peer holds it). Data: `AT+RXCHAN?` reason 95;
+  group path selection: `mgmt gp own`.
+- Replay is checked in the host, as mac80211 checks it behind a chip that
+  decrypts: per sender, per TID for data and on the management counter for group
+  path selection, above the Key RSC the peer's AMPE carried. A replay is dropped
+  there (reason 5, `gp replay`) before any MIC work and is not counted in
+  `rx_grp`, `mgmt_gp` or `mic_ok`.
+- The MIC octets the chip leaves on a fresh frame are checked in the host under
+  the sender's MGTK. Until one verifies, the check only counts (`mic_ok`,
+  `mic_bad`): whether the chip keeps those octets is not measured. The first
+  `mic_ok` proves it does (a chance match is 2^-64) and arms the check for that
+  frame class (`mic_arm=1` data, `2` group path selection, `3` both). From then
+  on a frame whose MIC fails is dropped before any replay counter moves (95 or
+  `gp micdrop`; `micdrop=<data>/<path selection>` in `AT+GTKSTAT?`).
+- The fence. A frame the chip opened under a peer's previous MGTK can still be
+  queued in the host when a different MGTK for that peer goes in (on a live link,
+  or after the peer left and re-peered with the same MAC). Every frame read off
+  the chip at or before that install is refused (`fence`), so it is never
+  replay-checked against the new key's fresh counter. The same key installed
+  again (a re-delivery, a survivor's re-install, `AT+REKEY`) moves no fence. A
+  fence retires a minute after its install, on the 2 s service tick.
+- The taint. If the chip refuses a `DISABLE_KEY` (`delfail`), it may still hold
+  that key at that AID. Every group frame the chip then opens for that AID is
+  refused (`taint`; `tainted=<slot bitmask>`) until a `DISABLE_KEY` there
+  succeeds: the next install at that AID retries it first (a re-peer, a
+  survivor's re-install, `AT+REKEY`), and the peer leaving takes the key at
+  that index. A chip that boots clears it.
+- A leaving peer's MGTK is taken out of the chip (`DISABLE_KEY`) where mac80211
+  frees a station's keys. A new MGTK for the same peer replaces it. If the chip
+  refuses an install, the old key is taken out and that peer's group frames stay
+  unopened (reason 4) until the next delivery. A survivor's MGTK goes back in
+  with its MTK when another peer leaves, and with `AT+REKEY`.
+- `AT+GTKPERSTA=0|1|2` switches this at run time and persists it (NVS). `0`
+  refuses every group frame the chip opens for a peer at once, and within one
+  service tick (about 2 s) takes every peer's MGTK out of the chip and installs
+  none: the behaviour measured before this change, on the same flash. `1` (the
+  default) and `2` put them back. `AT+GTKSTAT?` shows `per_sta=off(at)`, `on`
+  or `on(pn0)`.
+- On a STA chip interface (every other build, and this one if the chip refused
+  the MESH interface: `AT+MESHCFG?` `chip_vif=sta(1)`) peers' MGTKs stay
+  host-only: a second group key there broke group decryption (measured).
+
+### Measured on air 2026-10-01
+
+One Warthog on this build, both 1.8.0 Pis and a `-swccmp-meshvif` Warthog:
+
+- The chip (`mm6108.mbin` 1.17.6) opens a peer's group frames under the key at
+  that peer's AID: `inst=3 fail=0`, `nodec grp` flat (before: about 32 a
+  minute), group PREQs answered with PREPs, and each Pi holds an `ACTIVE` path
+  to the Warthog.
+- Pi to Warthog, 20/20 pings and 10/10 at 1000 bytes; Warthog to each Pi and to
+  the other Warthog, 10/10 (before: 0/3). One-hour soak: 239/240 from the Pis,
+  60/60 to the other Warthog, `rx_grp` 2152, `mgmt_gp` 62, `forged`, `fence`,
+  `taint` and `delfail` 0.
+- Warthog's own MGTK at AID 0 still seals its group frames: its broadcast ARP
+  reaches the Pis.
+- `AT+GTKPERSTA=0` took the 3 keys out (`del=3 delfail=0`) and the Pis' group
+  frames went undecryptable again, not `forged`, so `DISABLE_KEY` removes the
+  key; `=1` put them back.
+- The chip does not leave the MIC octets intact: `mic_bad` counts every frame,
+  `mic_ok` stays 0, so the MIC check never arms and the first residual below
+  stays open.
+- Not measured: `AT+GTKPERSTA=2`, AID reuse after a peer leaves and another
+  joins. Batman mode stays refused on this build.
+
+Residuals, as on Linux:
+
+- If the chip, after the key at the sender's AID failed the MIC, also tried
+  Warthog's own at AID 0 under the same key id (both are key id 1), any member
+  could forge a peer's group frames, at any PN: the frame is taken, and pushes
+  that peer's replay counter (its data TID, or its group path selection) so its
+  real frames are refused on this node until its link is re-formed. Once the
+  MIC check is armed such a frame is dropped before it moves anything.
+- A frame the chip opened under a previous key and handed to the host only after
+  the new key's `INSTALL_KEY` answer is not caught by the fence, which goes by
+  when the host read it.
+- Every peer of a node holds that node's MGTK, so any of them can forge the
+  node's group frames under it ([below](#management-frame-protection-peering-does-not-need-it-path-selection-does)): that frame's
+  MIC verifies.
+
+Check it on the bench with `AT+GTKSTAT?`: `per_sta=on`, one `[<mac> aid= id=1
+hw=]` per keyed peer; `inst` one per keyed peer after a fresh start (it grows by
+one for each survivor when a peer leaves, on `AT+REKEY` and on an MGTK
+re-delivery); `rx_grp` and `mgmt_gp` climbing with the node's broadcasts and
+PREQs; `mic_ok` keeping pace with them and `mic_arm=3` once both have arrived;
+`fail`, `delfail`, `tainted`, `taint`, `micdrop` at 0 and `forged` flat in
+steady state (`fence` may move by a frame or two when a peer re-keys).
+`AT+RXCHAN?` `nodec grp` should stay flat, and on the node `iw dev wlh0 mpath
+dump` should list the Warthog `ACTIVE`.
 
 ## Verifying
 
@@ -449,12 +637,14 @@ Warthog, on the SAE build:
   aggregation to a wizard node misbehaves on air there is no fallback short of a
   rebuild. Host-tested only;
 - refuses that peer's unprotected unicast path selection, and takes its group
-  path selection only Protected: opened by host CCMP under the node's MGTK (from
-  its AMPE) and above that key's management replay counter. In the clear (from
-  any peer, MFP or not, stricter than mac80211), with an MMIE, under another key
-  id, or opened by the chip (whose only group key is Warthog's own MGTK, which
-  every peer holds, so such a frame could be forged in the node's name by any of
-  them), it is refused.
+  path selection only Protected: opened under the node's MGTK (from its AMPE),
+  by host CCMP or, on `warthog-mesh-sae-meshvif`, by the chip holding that MGTK
+  at the node's AID, and above that key's management replay counter. In the
+  clear (from any peer, MFP or not, stricter than mac80211), with an MMIE, under
+  another key id, or opened by the chip under anything but the node's MGTK at
+  its AID (on every other build the chip's only group key is Warthog's own MGTK,
+  which every peer holds, so such a frame could be forged in the node's name by
+  any of them), it is refused.
 
 Group path selection proves only that its sender is a mesh member, not which
 one. Every peer of a node holds that node's MGTK, and hostap never rekeys it
@@ -463,12 +653,14 @@ A in radio range can forge A's group PREQ or PERR, and can push A's management
 replay counter to the top, after which Warthog refuses A's own direct group path
 selection until A's link to it is torn down and re-formed (the same key installed
 again on a live link keeps the counter), or, if the forger keeps at it, until A
-restarts its mesh. mac80211 behaves the same way. Only the builds that can open
-these frames (host CCMP on) are exposed.
+restarts its mesh. A node's group data is pushed the same way, per TID. mac80211
+behaves the same way. Only the builds that can open these frames are exposed:
+host CCMP on, and `warthog-mesh-sae-meshvif`.
 
 Only a swccmp build with host CCMP on (`AT+SWCCMP=1`, or `-swccmp-on`; batman
-mode arms it) can open the node's group path selection. The chip holds one group
-key, Warthog's own, so on `warthog-mesh-sae` and the other chip-crypto images
+mode arms it), or `warthog-mesh-sae-meshvif`, can open the
+node's group path selection. Elsewhere the chip holds one group key, Warthog's
+own, so on `warthog-mesh-sae` and the other chip-crypto images
 every such frame is undecryptable, as the node's group data is (`AT+RXCHAN?`
 reason 4, or 95 for one the chip opened under our MGTK): `mgmt gp nodec` climbs
 and a wizard node has no path to Warthog. Another Warthog's group path selection

@@ -201,18 +201,23 @@ limits, unless a point says otherwise:
   frame when the next hop already has 8 queued, so a relay cannot starve its
   own traffic or peering of buffers.
 - **Under SAE, relays reach each other's group path selection only through
-  host CCMP.** A relay's or bridge's group PREQs and PERRs go out Protected
-  under its own MGTK, and a chip holds only its own, so on `warthog-mesh-sae`,
+  host CCMP, or on `warthog-mesh-sae-meshvif` through the chip.** A relay's or
+  bridge's group PREQs and PERRs go out Protected under its own MGTK, and on
+  every other build a chip holds only its own, so on `warthog-mesh-sae`,
   `-nochipkey`, and a swccmp build with host CCMP off, no relay takes another
   Warthog's, at either `AT+MESHPMF` setting and even when every Warthog runs
   the same image. Relay discovery between Warthogs under SAE needs a swccmp
-  build with host CCMP on (`-swccmp-on`, or `AT+SWCCMP=1` after each boot).
+  build with host CCMP on (`-swccmp-on`, or `AT+SWCCMP=1` after each boot), or
+  `warthog-mesh-sae-meshvif`, whose chip holds each peer's MGTK at its AID
+  ([Encryption](#encryption)).
 
 Read the state with `AT+MESHPATH?` and the counters with `AT+MESHFWDSTAT?`.
 
 **Group frames and OpenMANET, honestly.** Under SAE a warthog's chip cannot
-decrypt a peer's group frames — its one group slot holds its own TX MGTK — so
-by default a broadcast leaves as one unicast per peer. In leaf mode that copy
+decrypt a peer's group frames — its one group slot holds its own TX MGTK —
+except on `warthog-mesh-sae-meshvif`, which puts each peer's MGTK into the chip
+at its AID ([Encryption](#encryption)). By default a
+broadcast leaves as one unicast per peer. In leaf mode that copy
 is a plain unicast to the peer with no Address Extension. With `AT+MESHFWD=1`
 or `AT+MESHBRIDGE=1` it carries the group address in Address Extension 2,
 which a warthog relay recognises as the broadcast it is and re-floods. A
@@ -224,11 +229,12 @@ default a warthog's broadcast (ARP, DHCP, mDNS, Meshtastic UDP) reaches a
 Linux node and stops there; nothing beyond a Linux relay hears it. The reverse
 direction works on an open mesh, because Linux sends standard frames; under
 SAE, receiving them needs host CCMP (measured on air on 2026-09-29,
-`warthog-mesh-sae-swccmp` against OpenMANET 1.8.0). Whenever a Linux node is
+`warthog-mesh-sae-swccmp` against OpenMANET 1.8.0), or `warthog-mesh-sae-meshvif` (measured on air on 2026-10-01). Whenever a Linux node is
 expected to relay a warthog's broadcasts, set `AT+MESHGRP=1`. `AT+MESHGRP=1` switches to standard 3-address broadcasts, which every
 mac80211 receiver floods correctly. Under SAE they go out under the sender's
 own MGTK, which each peer receives in AMPE; a warthog receiver decrypts them
-only with host CCMP, and a Linux receiver doing so is not yet measured. On an
+only with host CCMP or on `warthog-mesh-sae-meshvif`, and a Linux receiver
+doing so is not yet measured. On an
 open mesh, use it.
 
 **Two deliberate deviations from mac80211, both on the wire.**
@@ -353,7 +359,8 @@ build choice; the passphrase and the legacy shared key are runtime settings:
 
 | Mode | Build | What it is |
 |---|---|---|
-| **SAE/AMPE** | `warthog-mesh-sae`; `warthog-mesh-sae-swccmp` against OpenMANET | Real 802.11s security: SAE (Dragonfly, group 19) authentication and AMPE per-link key exchange. This is the mode to use. Only the host-CCMP build opens a Linux node's group frames, which its path to the Warthog needs ([OpenMANET Interop](OpenMANET-Interop#management-frame-protection-peering-does-not-need-it-path-selection-does)). |
+| **SAE/AMPE** | `warthog-mesh-sae`; `warthog-mesh-sae-swccmp` against OpenMANET | Real 802.11s security: SAE (Dragonfly, group 19) authentication and AMPE per-link key exchange. This is the mode to use. Of the measured builds only the host-CCMP one opens a Linux node's group frames, which its path to the Warthog needs ([OpenMANET Interop](OpenMANET-Interop#management-frame-protection-peering-does-not-need-it-path-selection-does)). |
+| SAE/AMPE, chip crypto on a MESH chip interface | `warthog-mesh-sae-meshvif` | As `warthog-mesh-sae` (AMPE keys in the chip), on the MESH chip interface of `warthog-mesh-sae-swccmp-meshvif`, with each peer's MGTK in the chip at that peer's AID, as Linux installs it, so the chip opens a Linux node's group frames itself ([OpenMANET Interop](OpenMANET-Interop#group-frames-in-the-chip-warthog-mesh-sae-meshvif)). Measured on air on 2026-10-01: the Pis' group frames open in the chip and Pi to Warthog unicast passes both ways; before that change every Pi group frame was undecryptable. `AT+GTKPERSTA=0` returns it to that measured behaviour on the same flash. Batman mode is refused on it (`sae-no-host-ccmp`). |
 | Shared key | `warthog-mesh-smoke` + `AT+MESHSEC=1` | One hardcoded key baked into every image — obfuscation, not security. Kept for bring-up debugging only. |
 | Open | `warthog-mesh-smoke` + `AT+MESHSEC=0` | No keys. Interops with an open OpenMANET mesh. |
 
@@ -419,8 +426,9 @@ list; a list without it relies on the peer's commit and is unmeasured. The
 MODP groups 15 and 16 are not supported. AMPE then derives a per-link
 pairwise key (MTK) and each side sends the other its own group key (MGTK).
 The MTK and Warthog's own MGTK go
-into the chip; a peer's MGTK stays in the host keychain, because the chip has
-one group slot. Peering completes in a single
+into the chip; a peer's MGTK stays in the host keychain only, because the chip
+has one group slot on the STA chip interface, except on `warthog-mesh-sae-meshvif`, which also puts it into the chip
+at the peer's AID. Peering completes in a single
 Open/Confirm exchange and data flows CCMP-encrypted end to end. Verify:
 
 ```
@@ -435,16 +443,25 @@ AT+KEYINST?
 `ampe_mtk` counts pairwise keys installed in the chip; `ampe_mgtk` counts
 Warthog's own MGTK, installed with the first peer, plus each peer's MGTK in the
 host keychain, so one peer reads 2. `AT+KEYINST?` shows the pairwise key on the
-peer's AID and Warthog's own group key on AID 0. Bench-measured: peering +
-keying in one exchange, 8/8 pings at 0% loss, ~16 ms RTT over the keyed link.
+peer's AID and Warthog's own group key on AID 0. Bench-measured on
+`warthog-mesh-sae`: peering + keying in one exchange, 8/8 pings at 0% loss,
+~16 ms RTT over the keyed link.
+
+On `warthog-mesh-sae-meshvif` `AT+KEYINST?` also lists the peer's MGTK (`pw=0`)
+on the peer's AID, and `AT+GTKSTAT?` lists it per peer. That install was measured on air on 2026-10-01 and can be switched at run time: `AT+GTKPERSTA=0` takes every
+peer's MGTK back out of the chip (the behaviour measured before it existed),
+`1` (default) puts them in, `2` puts them in at TX PN 0 as Linux does; the
+setting persists ([OpenMANET Interop](OpenMANET-Interop#group-frames-in-the-chip-warthog-mesh-sae-meshvif)).
 
 Each MGTK travels with a Key RSC, the receiver's replay floor for it: group
 frames at or below it are dropped (rxdrop 5). Warthog installs a peer's MGTK
 with the RSC that peer advertised (little-endian, as mac80211 reads it);
 installing the same key again on a live link keeps its counter. The floor is
-enforced only where host CCMP decrypts a peer's group frames:
-`warthog-mesh-sae-swccmp` with `AT+SWCCMP=1`, or `-swccmp-on`. Other builds
-drop those frames before the replay check (rxdrop 4, or 95). What Warthog
+enforced where a peer's group frames are opened: by host CCMP on
+`warthog-mesh-sae-swccmp` with `AT+SWCCMP=1`, or `-swccmp-on`, and by the chip
+on `warthog-mesh-sae-meshvif`, where the host still checks the PN per sender
+and TID, as mac80211 does behind a chip that decrypts. Other builds drop those
+frames before the replay check (rxdrop 4, or 95). What Warthog
 advertises for its own MGTK depends on the build: `warthog-mesh-sae-swccmp`
 and `-swccmp-on` put it into the chip at a nonzero TX PN base and advertise one
 below it, re-installing at a fresh base when an Open follows group traffic

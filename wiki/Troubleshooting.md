@@ -135,6 +135,13 @@ Warthog are unaffected: a node's RTS threshold governs only what that node
 sends. See
 [OpenMANET Interop](OpenMANET-Interop#frames-over-about-1000-bytes-from-a-linux-node).
 
+If instead the Warthog counts the frames arriving (`AT+DATASTAT?` `rx_data` and
+`delivered` both climb, no drop counter moves) and the node's `morse_cli -i wlh0
+stats` `TX fragment` rises, the node's chip is fragmenting them at a low rate.
+Builds without `AT+DEFRAG?` corrupt every fragmented frame; flash a current build.
+`AT+DEFRAG?` `ok` then climbs with each one, its drop counts at 0; see
+[OpenMANET Interop](OpenMANET-Interop#fragmented-frames-on-low-rate-links).
+
 ## Mesh: perfect peering, zero data in both directions
 
 ```

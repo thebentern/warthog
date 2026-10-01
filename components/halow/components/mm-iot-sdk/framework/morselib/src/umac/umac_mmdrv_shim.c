@@ -138,6 +138,11 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
 
         mmdrv_deinit();
         MMOSAL_ASSERT(mmdrv_init(NULL, country_code) == 0);
+        {
+            /* warthog: a chip that boots holds no key; the mesh forgets what it held. */
+            extern void umac_datapath_mesh_chip_booted(void);
+            umac_datapath_mesh_chip_booted();
+        }
 
         umac_interface_configure_periodic_health_check(umacd);
         umac_stats_increment_hw_restart_counter(umacd);

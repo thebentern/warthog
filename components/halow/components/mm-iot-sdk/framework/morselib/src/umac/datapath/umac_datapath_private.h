@@ -93,6 +93,16 @@ struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr);
 bool umac_datapath_mesh_peer_estab(const uint8_t *addr);
 /** Key id of our own TX MGTK once hostap has delivered it, else -1. */
 int umac_datapath_mesh_own_group_key_id(void);
+/** A group frame the chip opened from @p stad under key id @p key_id, read off the chip at
+ *  @p read_seq (mmdrv_rx_metadata), is that peer's: AMPE keyed it, its own MGTK sits in the chip
+ *  at its AID under that id (chip-key SAE builds on a MESH chip VIF, AT+GTKPERSTA on), the
+ *  frame was read after that key went in (the fence) and no refused DISABLE_KEY leaves a stale
+ *  key at the AID (the taint). False everywhere else, where the chip's only group key is our own. */
+bool umac_datapath_mesh_peer_gtk_opened(struct umac_sta_data *stad, uint8_t key_id, uint32_t read_seq);
+/** The chip booted: it holds no key, so no AID is tainted and no peer MGTK is in it. */
+void umac_datapath_mesh_chip_booted(void);
+/** Service tick: retire old fences; carry out an AT+GTKPERSTA change. Event loop only. */
+void umac_datapath_mesh_service_peer_gtk(void);
 /** One frame went to the chip for encryption under our own TX MGTK. */
 void umac_datapath_mesh_own_group_tx_note(void);
 /** The chip reported TX status for a frame counted by tx_note: it draws no further PN. */

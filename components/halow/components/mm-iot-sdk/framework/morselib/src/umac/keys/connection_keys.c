@@ -111,6 +111,17 @@ bool connection_keys_install_key(struct connection_keys_data *data, struct umac_
 
     MMOSAL_TASK_ENTER_CRITICAL();
 
+    /* warthog: a new colour unless this is the key already there (mac80211 keeps an identical
+     * key's), so no fragment chain begun under one key is completed under another. */
+    static uint32_t s_gen;
+    const bool same = new_key->key_type == key->key_type && new_key->key_len == key->key_len &&
+                      new_key->gen != 0u &&
+                      memcmp(new_key->key_data, key->key_data, key->key_len) == 0;
+    if (!same)
+    {
+        s_gen = (s_gen + 1u != 0u) ? s_gen + 1u : 1u;
+        new_key->gen = s_gen;
+    }
     data->keys[key->key_id] = new_key;
     data->keys[key->key_id]->key_id = key->key_id;
     data->keys[key->key_id]->key_type = key->key_type;
@@ -186,6 +197,22 @@ enum mmwlan_status connection_keys_check_and_update_rx_replay(struct connection_
     return status;
 }
 
+bool connection_keys_rx_replay_fresh(struct connection_keys_data *data, uint8_t key_id,
+                                     uint64_t packet_number, enum umac_key_rx_counter_space space)
+{
+    MMOSAL_ASSERT(connection_keys_key_id_is_valid(key_id));
+
+    bool fresh = false;
+    MMOSAL_TASK_ENTER_CRITICAL();
+    if (connection_keys_key_is_installed(data, key_id))
+    {
+        fresh = packet_number > data->keys[key_id]->rx_seq[space];
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+
+    return fresh;
+}
+
 size_t connection_keys_get_key_len(struct connection_keys_data *data, uint8_t key_id)
 {
     MMOSAL_ASSERT(connection_keys_key_id_is_valid(key_id));
@@ -200,6 +227,22 @@ size_t connection_keys_get_key_len(struct connection_keys_data *data, uint8_t ke
     MMOSAL_TASK_EXIT_CRITICAL();
 
     return key_len;
+}
+
+uint32_t connection_keys_get_key_gen(struct connection_keys_data *data, uint8_t key_id)
+{
+    if (!connection_keys_key_id_is_valid(key_id))
+    {
+        return 0;
+    }
+    uint32_t gen = 0;
+    MMOSAL_TASK_ENTER_CRITICAL();
+    if (connection_keys_key_is_installed(data, key_id))
+    {
+        gen = data->keys[key_id]->gen;
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+    return gen;
 }
 
 const uint8_t *connection_keys_get_key_data(struct connection_keys_data *data, uint8_t key_id)

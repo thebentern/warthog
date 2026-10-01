@@ -101,6 +101,12 @@ esp_err_t warthog_cfg_set_mesh_bridge(uint8_t on);
 uint8_t   warthog_cfg_get_mesh_grp(void);
 esp_err_t warthog_cfg_set_mesh_grp(uint8_t on);
 
+/* A peer's MGTK in the chip at its AID (AT+GTKPERSTA; chip-key SAE builds on a MESH chip VIF):
+ * 0 off, 1 on at a fresh TX PN epoch per install (default), 2 on at TX PN 0 as Linux.
+ * Applies at once and persists. */
+uint8_t   warthog_cfg_get_mesh_gtk(void);
+esp_err_t warthog_cfg_set_mesh_gtk(uint8_t mode);
+
 /* Management frame protection for the mesh: 0 = off (the warthog-to-warthog
  * default that is measured working), 1 = MFP required.
  *

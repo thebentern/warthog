@@ -601,6 +601,314 @@ static bool mesh_chip_install_key_(uint16_t vif_id, uint16_t aid, struct mmdrv_k
     return true;
 }
 
+/* ---- A peer's MGTK in the chip at its AID ------------------------------------
+ *
+ * As morse_driver does (mac.c morse_mac_ops_set_key: a key with a station goes in at that
+ * station's AID with its own index), on chip-key SAE builds running on a MESH chip VIF: the
+ * chip then opens each peer's group frames itself. On a STA chip VIF a second group key broke
+ * group RX (measured), so there every peer's MGTK stays host-only. Per slot, what the chip
+ * holds for that peer; a group frame the chip opened is the peer's only while it does.
+ * AT+GTKPERSTA turns it off (0) or on (1, or 2 to install at TX PN 0 as Linux) at run time. */
+extern volatile uint32_t g_warthog_peer_gtk_inst, g_warthog_peer_gtk_fail;
+extern volatile uint32_t g_warthog_peer_gtk_del, g_warthog_peer_gtk_delfail;
+extern volatile uint32_t g_warthog_peer_gtk[4], g_warthog_peer_gtk_mac[4];
+extern volatile uint32_t g_warthog_peer_gtk_mode, g_warthog_peer_gtk_fence, g_warthog_peer_gtk_taint;
+extern volatile uint32_t g_warthog_peer_gtk_tainted, g_warthog_rx_read_seq;
+_Static_assert(MESH_MAX_PEERS <= 4, "g_warthog_peer_gtk has a slot per peer");
+
+struct mesh_peer_gtk
+{
+    bool held;
+    uint8_t key_id;
+    uint8_t hw_idx; /* the chip's index for it, which DISABLE_KEY takes */
+    uint8_t key[UMAC_KEY_AES_128_LEN]; /* the same key put back moves no fence */
+};
+static struct mesh_peer_gtk s_peer_gtk[MESH_MAX_PEERS];
+
+/* Per slot (so per AID), what else decides whether a group frame the chip opened is the peer's.
+ * The fence: one read off the chip at or before the read order of the last install of a
+ * different key may have been opened under what the chip held before (the replay check would
+ * then judge it against the new key's counter). It retires PEER_GTK_FENCE_MS later, on the
+ * service tick, long before the 32-bit read order could wrap. The taint: hardware indexes whose
+ * DISABLE_KEY the chip refused, so a key no longer tracked may still sit there (mac80211's
+ * KEY_FLAG_TAINTED). Cleared by a DISABLE_KEY there that the chip takes, or the chip booting;
+ * bit 15 stands for any index above 14 and only the chip booting clears it. */
+#define PEER_GTK_FENCE_MS 60000u
+static struct
+{
+    bool fence_live;
+    uint32_t fence_seq;
+    uint32_t fence_ms;
+    uint16_t taint;
+} s_peer_aid[MESH_MAX_PEERS];
+static uint32_t s_peer_gtk_applied = 1u; /* the AT+GTKPERSTA mode the slots were last brought to */
+
+static bool mesh_peer_gtk_wanted_(struct umac_sta_data *stad)
+{
+#ifdef WARTHOG_MESH_AMPE_NO_CHIP_KEY
+    (void)stad;
+    return false;
+#else
+    return stad != NULL && g_warthog_peer_gtk_mode != 0u && umac_mesh_sae_active() &&
+           umac_interface_chip_vif_is_mesh(umac_sta_data_get_umacd(stad));
+#endif
+}
+
+static int mesh_slot_of_stad_(const struct umac_sta_data *stad)
+{
+    for (int i = 0; stad != NULL && i < MESH_MAX_PEERS; i++)
+    {
+        if (s_peers[i] == stad)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void mesh_peer_gtk_publish_(int slot, struct umac_sta_data *stad)
+{
+    const struct mesh_peer_gtk r = s_peer_gtk[slot];
+    const uint8_t *a = umac_sta_data_peek_peer_addr(stad);
+    g_warthog_peer_gtk[slot] = r.held ? (0x80000000u | ((uint32_t)(umac_sta_data_get_aid(stad) & 0xffu) << 16) |
+                                         ((uint32_t)r.key_id << 8) | r.hw_idx)
+                                      : 0u;
+    g_warthog_peer_gtk_mac[slot] = r.held ? (((uint32_t)a[3] << 16) | ((uint32_t)a[4] << 8) | a[5]) : 0u;
+}
+
+static void mesh_peer_gtk_publish_taint_(void)
+{
+    uint32_t m = 0;
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        m |= s_peer_aid[i].taint != 0u ? 1u << i : 0u;
+    }
+    g_warthog_peer_gtk_tainted = m;
+}
+
+static uint16_t mesh_taint_bit_(uint8_t hw_idx)
+{
+    return (uint16_t)(1u << (hw_idx < 15u ? hw_idx : 15u));
+}
+
+/* Slot @p slot's record, cleared: from here no group frame the chip opens for it is taken. */
+static struct mesh_peer_gtk mesh_peer_gtk_take_(int slot)
+{
+    struct mesh_peer_gtk r = { 0 };
+    if (slot < 0 || slot >= MESH_MAX_PEERS)
+    {
+        return r;
+    }
+    MMOSAL_TASK_ENTER_CRITICAL();
+    r = s_peer_gtk[slot];
+    memset(&s_peer_gtk[slot], 0, sizeof(s_peer_gtk[slot]));
+    MMOSAL_TASK_EXIT_CRITICAL();
+    g_warthog_peer_gtk[slot] = 0u;
+    g_warthog_peer_gtk_mac[slot] = 0u;
+    return r;
+}
+
+/* Take hardware index @p hw_idx out of the chip at @p stad's AID (morse_cmd_disable_key), slot
+ * @p slot: counted; a refusal taints that index, a success clears it. */
+static void mesh_peer_gtk_disable_idx_(int slot, struct umac_sta_data *stad, uint8_t hw_idx)
+{
+    const bool ok = mmdrv_disable_key(umac_sta_data_get_vif_id(stad), umac_sta_data_get_aid(stad),
+                                      hw_idx, false) == 0;
+    MMOSAL_TASK_ENTER_CRITICAL();
+    if (!ok)
+    {
+        s_peer_aid[slot].taint |= mesh_taint_bit_(hw_idx);
+    }
+    else if (hw_idx < 15u)
+    {
+        s_peer_aid[slot].taint &= (uint16_t)~mesh_taint_bit_(hw_idx);
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+    mesh_peer_gtk_publish_taint_();
+    if (ok)
+    {
+        g_warthog_peer_gtk_del++;
+    }
+    else
+    {
+        g_warthog_peer_gtk_delfail++;
+        MMLOG_WRN("mesh: chip refused DISABLE_KEY (aid %u hw %u): AID tainted\n",
+                  (unsigned)umac_sta_data_get_aid(stad), (unsigned)hw_idx);
+    }
+}
+
+/* Take @p old out of the chip at @p stad's AID by the chip's index, as mac80211 disables a
+ * station's keys before it goes. */
+static void mesh_peer_gtk_disable_(int slot, struct umac_sta_data *stad, const struct mesh_peer_gtk *old)
+{
+    if (old->held && slot >= 0 && slot < MESH_MAX_PEERS)
+    {
+        mesh_peer_gtk_disable_idx_(slot, stad, old->hw_idx);
+    }
+}
+
+/* Before an install at slot @p slot: retry each tainted index. One the tracked key sits at
+ * goes too; the install that follows puts that key back, and the AID then holds nothing else. */
+static void mesh_peer_gtk_untaint_(int slot, struct umac_sta_data *stad)
+{
+    for (uint8_t i = 0; i < 15u; i++)
+    {
+        if ((s_peer_aid[slot].taint & mesh_taint_bit_(i)) != 0u)
+        {
+            mesh_peer_gtk_disable_idx_(slot, stad, i);
+        }
+    }
+}
+
+/* @p stad's MGTK @p key_id, from its keychain, into the chip at its AID as a group key: at a
+ * fresh TX PN epoch (AT+GTKPERSTA=1), or at 0 as Linux (=2); it only receives. @p old, what the
+ * chip held for it, goes unless the new key took its index. A different key from @p old's
+ * fences every frame read before it went in. True if it went in. */
+static bool mesh_peer_gtk_put_(int slot, struct umac_sta_data *stad, uint8_t key_id,
+                               const struct mesh_peer_gtk *old)
+{
+    struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = key_id,
+                                 .length = UMAC_KEY_AES_128_LEN, .tx_pn = 0 };
+    const uint8_t *key = key_id < UMAC_KEYS_NUM_KEY_IDS ? umac_keys_get_key_data(stad, key_id) : NULL;
+    bool ok = false;
+    if (key != NULL && umac_keys_get_key_len(stad, key_id) == UMAC_KEY_AES_128_LEN &&
+        umac_keys_get_key_type(stad, key_id) == UMAC_KEY_TYPE_GROUP)
+    {
+        memcpy(kc.key, key, UMAC_KEY_AES_128_LEN);
+        if (g_warthog_peer_gtk_mode != 2u)
+        {
+            kc.tx_pn = mesh_next_pn_base_(mesh_own_group_pn_top_());
+        }
+        mesh_peer_gtk_untaint_(slot, stad);
+        ok = mesh_chip_install_key_(umac_sta_data_get_vif_id(stad), umac_sta_data_get_aid(stad), &kc);
+    }
+    if (!(ok && old->held && old->hw_idx == kc.key_idx))
+    {
+        mesh_peer_gtk_disable_(slot, stad, old);
+    }
+    if (!ok)
+    {
+        g_warthog_peer_gtk_fail++;
+        MMLOG_WRN("mesh: peer MGTK chip install failed (aid %u)\n",
+                  (unsigned)umac_sta_data_get_aid(stad));
+        return false;
+    }
+    const bool same = old->held && old->key_id == key_id &&
+                      memcmp(old->key, kc.key, UMAC_KEY_AES_128_LEN) == 0;
+    const uint32_t seq = g_warthog_rx_read_seq; /* read after INSTALL_KEY returned */
+    const uint32_t now = mmosal_get_time_ms();
+    MMOSAL_TASK_ENTER_CRITICAL();
+    s_peer_gtk[slot].held = true;
+    s_peer_gtk[slot].key_id = key_id;
+    s_peer_gtk[slot].hw_idx = kc.key_idx;
+    memcpy(s_peer_gtk[slot].key, kc.key, UMAC_KEY_AES_128_LEN);
+    if (!same)
+    {
+        s_peer_aid[slot].fence_live = true;
+        s_peer_aid[slot].fence_seq = seq;
+        s_peer_aid[slot].fence_ms = now;
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+    mesh_peer_gtk_publish_(slot, stad);
+    g_warthog_peer_gtk_inst++;
+    return true;
+}
+
+/* Put a peer's current MGTK back in the chip at its AID (a survivor, AT+REKEY, AT+GTKPERSTA),
+ * where this build and VIF keep peers' MGTKs there. */
+static void mesh_peer_gtk_restore_(struct umac_sta_data *stad)
+{
+    const int slot = mesh_slot_of_stad_(stad);
+    const int kid = stad != NULL ? umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_GROUP) : -1;
+    if (slot < 0 || kid < 0 || !mesh_peer_gtk_wanted_(stad))
+    {
+        return;
+    }
+    const struct mesh_peer_gtk old = mesh_peer_gtk_take_(slot);
+    (void)mesh_peer_gtk_put_(slot, stad, (uint8_t)kid, &old);
+}
+
+bool umac_datapath_mesh_peer_gtk_opened(struct umac_sta_data *stad, uint8_t key_id, uint32_t read_seq)
+{
+    bool ok = false, fenced = false, tainted = false;
+    if (!mesh_peer_gtk_wanted_(stad))
+    {
+        return false;
+    }
+    MMOSAL_TASK_ENTER_CRITICAL();
+    const int slot = mesh_slot_of_stad_(stad);
+    if (slot >= 0 && s_peer_estab[slot] && s_peer_gtk[slot].held && s_peer_gtk[slot].key_id == key_id)
+    {
+        tainted = s_peer_aid[slot].taint != 0u;
+        fenced = !tainted && s_peer_aid[slot].fence_live &&
+                 (int32_t)(read_seq - s_peer_aid[slot].fence_seq) <= 0;
+        ok = !tainted && !fenced;
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+    if (tainted)
+    {
+        g_warthog_peer_gtk_taint++;
+    }
+    if (fenced)
+    {
+        g_warthog_peer_gtk_fence++;
+    }
+    return ok;
+}
+
+void umac_datapath_mesh_chip_booted(void)
+{
+    MMOSAL_TASK_ENTER_CRITICAL();
+    memset(s_peer_aid, 0, sizeof(s_peer_aid));
+    memset(s_peer_gtk, 0, sizeof(s_peer_gtk));
+    MMOSAL_TASK_EXIT_CRITICAL();
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        g_warthog_peer_gtk[i] = 0u;
+        g_warthog_peer_gtk_mac[i] = 0u;
+    }
+    mesh_peer_gtk_publish_taint_();
+    s_peer_gtk_applied = g_warthog_peer_gtk_mode;
+}
+
+void umac_datapath_mesh_service_peer_gtk(void)
+{
+    const uint32_t now = mmosal_get_time_ms();
+    MMOSAL_TASK_ENTER_CRITICAL();
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        if (s_peer_aid[i].fence_live && now - s_peer_aid[i].fence_ms > PEER_GTK_FENCE_MS)
+        {
+            s_peer_aid[i].fence_live = false;
+        }
+    }
+    MMOSAL_TASK_EXIT_CRITICAL();
+
+    const uint32_t mode = g_warthog_peer_gtk_mode;
+    if (mode == s_peer_gtk_applied)
+    {
+        return;
+    }
+    s_peer_gtk_applied = mode;
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        struct umac_sta_data *stad = s_peers[i];
+        if (stad == NULL)
+        {
+            continue;
+        }
+        if (mode == 0u)
+        {
+            const struct mesh_peer_gtk old = mesh_peer_gtk_take_(i);
+            mesh_peer_gtk_disable_(i, stad, &old);
+        }
+        else
+        {
+            mesh_peer_gtk_restore_(stad);
+        }
+    }
+}
+
 /* Our own MGTK into the chip's group slot: at TX PN 0, or with WARTHOG_MESH_MGTK_PN_BASE
  * at a fresh base above every earlier install and every PN our MGTK has used. */
 static enum mmwlan_status mesh_put_own_mgtk_(uint16_t vif_id)
@@ -932,23 +1240,29 @@ static enum mmwlan_status umac_datapath_mesh_install_peer_keys(struct umac_sta_d
 }
 
 /* Put a peer's own pairwise key back in the chip: its AMPE MTK under SAE, the
- * constant on a keyed non-SAE mesh, nothing on an open one. True if one went in. */
+ * constant on a keyed non-SAE mesh, nothing on an open one. True if one went in.
+ * Under SAE its MGTK goes back too where the chip keeps peers' MGTKs at their AIDs. */
 static bool mesh_restore_peer_key_(struct umac_sta_data *stad, uint16_t vif_id)
 {
     if (umac_mesh_sae_active())
     {
-#ifndef WARTHOG_MESH_AMPE_NO_CHIP_KEY
         /* An unkeyed candidate has no MTK yet. The chip's PN counter is shared by
          * every link, so the reinstall starts a fresh epoch, never below it. */
-        int kid = umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE);
+        const int kid = umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE);
+        bool ok = false;
+#ifndef WARTHOG_MESH_AMPE_NO_CHIP_KEY
         if (kid >= 0)
         {
-            return umac_keys_reinstall_key(stad, vif_id, (uint8_t)kid,
-                                           mesh_next_pn_base_(mesh_own_group_pn_top_())) ==
-                   MMWLAN_SUCCESS;
+            ok = umac_keys_reinstall_key(stad, vif_id, (uint8_t)kid,
+                                         mesh_next_pn_base_(mesh_own_group_pn_top_())) ==
+                 MMWLAN_SUCCESS;
         }
 #endif
-        return false;
+        if (kid >= 0)
+        {
+            mesh_peer_gtk_restore_(stad); /* nothing where peers' MGTKs stay host-only */
+        }
+        return ok;
     }
     if (g_warthog_mesh_secure)
     {
@@ -1077,6 +1391,7 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
 
     s_peer_estab[slot] = !sae;
     s_peer_mfp[slot] = false;
+    (void)mesh_peer_gtk_take_(slot); /* del_peer cleared it; nothing of a former peer's counts */
     s_peers[slot] = stad;
     MMLOG_INF("mesh: peer " MM_MAC_ADDR_FMT " added (slot %d)\n", MM_MAC_ADDR_VAL(peer_addr), slot);
     return MMWLAN_SUCCESS;
@@ -1090,9 +1405,10 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
  *
  *  - the pairwise TX packet number must only ever move FORWARD across
  *    installs, or existing peers reject our frames as replays; and
- *  - one group key goes into the chip, at aid 0 (a second install broke group
- *    RX on this firmware). It is our own TX MGTK; each peer's MGTK stays in
- *    that peer's host keychain.
+ *  - our own TX MGTK goes into the chip at aid 0. A peer's MGTK goes into that
+ *    peer's host keychain and, on chip-key builds running on a MESH chip VIF,
+ *    into the chip at the peer's AID as Linux installs it; on a STA chip VIF a
+ *    second group key broke group RX, so there it stays host-only.
  *
  * @param peer_addr  the peer the key belongs to, or the broadcast address for
  *                   our own TX MGTK.
@@ -1152,6 +1468,8 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
 
     if (pairwise)
     {
+        /* No fragment chain begun under the link's old key is completed under the new one. */
+        umac_datapath_stad_flush_defrag(umac_sta_data_get_umacd(stad), stad);
         k.tx_seq = mesh_next_pn_base_(mesh_own_group_pn_top_());
 #ifdef WARTHOG_MESH_AMPE_NO_CHIP_KEY
         /* Same feasibility probe as WARTHOG_MESH_NO_CHIP_KEY above, on the
@@ -1224,14 +1542,33 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
         MMOSAL_TASK_EXIT_CRITICAL();
     }
 
+    /* No group frame the chip opens is taken as this peer's from before the keychain changes
+     * until its new MGTK is in the chip at its AID. */
+    const int slot = mesh_slot_of_stad_(stad);
+    const struct mesh_peer_gtk old = mesh_peer_gtk_take_(slot);
     if (!connection_keys_install_key(kd, &k))
     {
         MMLOG_WRN("mesh: AMPE MGTK keychain install failed\n");
+        if (slot >= 0)
+        {
+            MMOSAL_TASK_ENTER_CRITICAL();
+            s_peer_gtk[slot] = old; /* nothing changed: the chip and keychain still agree */
+            MMOSAL_TASK_EXIT_CRITICAL();
+            mesh_peer_gtk_publish_(slot, stad);
+        }
         return MMWLAN_ERROR;
     }
-    /* A peer's RX MGTK stays host-only: every peer generates its own, the chip
-     * has one VIF-wide slot, and that slot belongs to our TX key. */
+    /* Into the chip at the peer's AID where this build and VIF do it (best effort: a refusal
+     * is counted and leaves its group frames to rxdrop 4); else host-only. */
     (void)vif_id;
+    if (slot >= 0 && mesh_peer_gtk_wanted_(stad))
+    {
+        (void)mesh_peer_gtk_put_(slot, stad, key_id, &old);
+    }
+    else if (slot >= 0)
+    {
+        mesh_peer_gtk_disable_(slot, stad, &old);
+    }
     g_warthog_ampe_mgtk_installed++;
     MMLOG_INF("mesh: AMPE MGTK installed (key_id %u, rx floor 0x%08lx)\n", (unsigned)k.key_id,
               (unsigned long)(k.rx_seq[UMAC_KEY_RX_COUNTER_SPACE_DEFAULT] & 0xffffffffu));
@@ -1449,7 +1786,8 @@ struct mmpkt *umac_datapath_mesh_protect_mgmt(struct mmpkt *txbuf, int *key_id)
 /* mac80211 parity (rx.c ieee80211_rx_h_decrypt, ieee80211_drop_unencrypted_mgmt): only from
  * an ESTAB peer (mesh_rx_path_sel_frame); unicast from one that runs MFP must be protected.
  * Group path selection is group-addressed privacy: Protected, opened under the sender's MGTK
- * and replay-checked on the way here. Stricter than mac80211, never in the clear or with an
+ * (by host CCMP, or by the chip where it holds that MGTK at the sender's AID) and
+ * replay-checked on the way here. Stricter than mac80211, never in the clear or with an
  * MMIE: every ESTAB peer's AMPE delivered its MGTK and it protects with it, and a relay
  * re-sends what it takes under our MGTK, which every MFP peer opens. */
 bool umac_datapath_mesh_hwmp_rx_ok(const uint8_t *frame, uint32_t len)
@@ -1550,6 +1888,7 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
              * (mesh_queue_one_), so nothing lands in the queue once it is taken. */
             struct mmpkt *pkt;
             struct mmpkt_list gone = MMPKT_LIST_INIT;
+            const struct mesh_peer_gtk gtk = mesh_peer_gtk_take_(i);
             MMOSAL_TASK_ENTER_CRITICAL();
             s_peers[i] = NULL;
             s_peer_mfp[i] = false;
@@ -1561,7 +1900,8 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
             MMOSAL_TASK_EXIT_CRITICAL();
             mmpkt_list_clear(&gone);
             /* Tell the chip the station is gone. A MESH chip VIF is walked down one state at
-             * a time to NONE, as mac80211 does (morse_driver skips NONE -> NOTEXIST). */
+             * a time to NONE, as mac80211 does (morse_driver skips NONE -> NOTEXIST), its MGTK
+             * taken out of the chip where mac80211 frees a station's keys, after the first step. */
             static const enum morse_sta_state mesh_down[] = {
                 MORSE_STA_ASSOCIATED, MORSE_STA_AUTHENTICATED, MORSE_STA_NONE
             };
@@ -1573,6 +1913,10 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
             {
                 (void)mesh_chip_sta_state_(umac_sta_data_get_vif_id(stad), umac_sta_data_get_aid(stad),
                                            umac_sta_data_peek_peer_addr(stad), down[k]);
+                if (k == 0)
+                {
+                    mesh_peer_gtk_disable_(i, stad, &gtk);
+                }
             }
             umac_rc_stop(stad);
             /* Loop timeouts point into the record (ADDBA retry, RX reorder, defrag): stop them. */
@@ -1607,7 +1951,7 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
                     umac_sta_data_get_peer_addr(s_peers[j], survivor);
                     mesh_chip_register_sta_(vif_id, umac_sta_data_get_aid(s_peers[j]), survivor);
                 }
-                (void)mesh_restore_peer_key_(s_peers[j], vif_id);
+                (void)mesh_restore_peer_key_(s_peers[j], vif_id); /* its MGTK too, where held */
             }
         }
     }

@@ -157,6 +157,45 @@ bool umac_mesh_rx_host_ccmp(struct umac_sta_data *stad, const struct dot11_hdr *
     return true;
 }
 
+/* A fresh group frame the chip opened from @p stad and the host takes as that peer's: do the MIC
+ * octets the chip left verify under the peer's key @p key_id? Read-only. mic ok means the chip
+ * opened it under that key and kept the MIC, and arms the check for frame class @p cls (0 data,
+ * 1 management): a match by chance is 2^-64, so it proves the chip leaves the MIC. mic bad means
+ * it did not keep the MIC, or opened the frame under another key. False -- drop it -- for a mic
+ * bad once @p cls is armed; until then the check only counts.
+ *
+ * @param header  the 802.11 header (the AAD and nonce come from it).
+ * @param ccmp    the CCMP header, followed by the plaintext and the 8 MIC octets.
+ * @param len     octets from @p ccmp to the end of the MIC. */
+extern volatile uint32_t g_warthog_rx_grp_mic_ok, g_warthog_rx_grp_mic_bad, g_warthog_rx_grp_mic_armed;
+bool umac_mesh_rx_chip_mic_note(struct umac_sta_data *stad, uint8_t key_id, const uint8_t *header,
+                                const uint8_t *ccmp, uint32_t len, unsigned cls)
+{
+    uint8_t pn[6], kid = 0, mic[SWCCMP_MIC_LEN], aad[UMAC_CCMP_AAD_MAXLEN], nonce[13];
+    const uint8_t *key = (stad != NULL && key_id < UMAC_KEYS_NUM_KEY_IDS)
+                             ? umac_keys_get_key_data(stad, key_id) : NULL;
+    bool ok = key != NULL && umac_keys_get_key_len(stad, key_id) == UMAC_KEY_AES_128_LEN &&
+              header != NULL && ccmp != NULL && len >= UMAC_CCMP_HDR_LEN + SWCCMP_MIC_LEN &&
+              umac_ccmp_parse_header(ccmp, pn, &kid) && kid == key_id;
+    if (ok)
+    {
+        const uint32_t aad_len = umac_ccmp_build_aad(header, aad);
+        umac_ccmp_build_nonce(header, pn, nonce);
+        ok = warthog_ccm_mic(key, nonce, SWCCMP_MIC_LEN, aad, aad_len, ccmp + UMAC_CCMP_HDR_LEN,
+                             len - UMAC_CCMP_HDR_LEN - SWCCMP_MIC_LEN, mic) == 0 &&
+             memcmp(mic, ccmp + len - SWCCMP_MIC_LEN, SWCCMP_MIC_LEN) == 0;
+    }
+    const uint32_t bit = 1u << (cls & 1u);
+    if (ok)
+    {
+        g_warthog_rx_grp_mic_ok++;
+        g_warthog_rx_grp_mic_armed |= bit;
+        return true;
+    }
+    g_warthog_rx_grp_mic_bad++;
+    return (g_warthog_rx_grp_mic_armed & bit) == 0u;
+}
+
 /* ---- TX ----------------------------------------------------------------- */
 
 extern volatile uint32_t g_warthog_swccmp_tx_ok;

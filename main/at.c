@@ -117,6 +117,16 @@ static bool meshrssi_parse_(const char *a, int32_t *out)
     return true;
 }
 
+/* AT+GTKPERSTA=<0|1|2>: the whole argument. The glue guard runs it. */
+static bool gtkpersta_parse_(const char *a, uint32_t *out)
+{
+    if (a == NULL || out == NULL || a[0] < '0' || a[0] > '2' || a[1] != '\0') {
+        return false;
+    }
+    *out = (uint32_t)(a[0] - '0');
+    return true;
+}
+
 /* Case-insensitive prefix check. */
 static bool starts_with_i(const char *s, const char *prefix)
 {
@@ -557,10 +567,36 @@ volatile uint32_t g_warthog_hwmp_unestab = 0;
 volatile uint32_t g_warthog_mgmt_prot_chip = 0, g_warthog_mgmt_prot_host = 0;
 volatile uint32_t g_warthog_mgmt_prot_nodec = 0, g_warthog_ampe_igtk_installed = 0;
 volatile uint32_t g_warthog_mgmt_prot_grpkey = 0;
-/* Protected group ones: opened by neither, by the chip (under our own MGTK, so refused),
- * under a key id not the sender's MGTK (refused), or replayed. */
+/* Protected group ones: opened by neither, by the chip under anything but the sender's MGTK
+ * at its AID (so refused), under a key id not the sender's MGTK (refused), or replayed. */
 volatile uint32_t g_warthog_mgmt_gp_nodec = 0, g_warthog_mgmt_gp_own = 0;
 volatile uint32_t g_warthog_mgmt_gp_key = 0, g_warthog_mgmt_gp_replay = 0;
+/* A peer's MGTK in the chip at its AID (chip-key SAE builds on a MESH chip VIF, AT+GTKSTAT?):
+ * installs the chip took and that failed, removals it took and that failed; per slot bit 31 =
+ * held, AID << 16, key id << 8, the chip's index, and the peer's low three octets. */
+volatile uint32_t g_warthog_peer_gtk_inst = 0, g_warthog_peer_gtk_fail = 0;
+volatile uint32_t g_warthog_peer_gtk_del = 0, g_warthog_peer_gtk_delfail = 0;
+volatile uint32_t g_warthog_peer_gtk[4], g_warthog_peer_gtk_mac[4];
+/* Group frames the chip opened under the sender's MGTK at its AID (data, management), and
+ * group data it opened under any other key, refused (rxdrop 95). */
+volatile uint32_t g_warthog_rx_grp_chip = 0, g_warthog_mgmt_gp_chip = 0;
+volatile uint32_t g_warthog_rx_grp_forged = 0;
+/* Of the fresh ones (past the replay peek), how many carried MIC octets that verify under the
+ * sender's MGTK. A mic ok arms the check for its class (bit 0 data, bit 1 management); once
+ * armed a mic bad is dropped (micdrop, data and management). */
+volatile uint32_t g_warthog_rx_grp_mic_ok = 0, g_warthog_rx_grp_mic_bad = 0;
+volatile uint32_t g_warthog_rx_grp_mic_armed = 0;
+volatile uint32_t g_warthog_rx_grp_micdrop = 0, g_warthog_mgmt_gp_micdrop = 0;
+/* AT+GTKPERSTA: 0 off, 1 on (a fresh TX PN epoch per install), 2 on at TX PN 0 as Linux.
+ * Seeded from NVS at mesh start. */
+volatile uint32_t g_warthog_peer_gtk_mode = 1;
+/* Chip-opened group frames refused because they were read off the chip before the sender's
+ * current MGTK went in (fence), or while a refused DISABLE_KEY leaves a stale key at its AID
+ * (taint); and the slots so tainted, one bit each. */
+volatile uint32_t g_warthog_peer_gtk_fence = 0, g_warthog_peer_gtk_taint = 0;
+volatile uint32_t g_warthog_peer_gtk_tainted = 0;
+/* Frames read off the chip (pageset.c / yaps.c stamp each one). */
+volatile uint32_t g_warthog_rx_read_seq = 0;
 /* Robust unicast management frames (Block Ack) sent to a peer that runs MFP: protected by the
  * chip, sealed with host CCMP, or dropped because they could not be sealed. */
 volatile uint32_t g_warthog_mgmt_tx_chip = 0, g_warthog_mgmt_tx_host = 0, g_warthog_mgmt_tx_drop = 0;
@@ -712,6 +748,18 @@ volatile uint32_t g_warthog_reord_released = 0;  /* handed up out of the list */
 volatile uint32_t g_warthog_reord_bypass = 0;    /* delivered, no BA session */
 volatile uint32_t g_warthog_reord_last_seq = 0;  /* seq at the last outdated drop */
 volatile uint32_t g_warthog_reord_last_exp = 0;  /* expected at that moment */
+
+/* Fragment reassembly (AT+DEFRAG?): unicast fragments taken in and MSDUs rebuilt; fragments
+ * dropped, by cause; group and plaintext fragments, and mesh data of a shape mac80211 drops
+ * (whole frames too, rxdrop 89), refused before it; chains discarded (evict: to stay within
+ * 2 per peer and 4 on the node). */
+volatile uint32_t g_warthog_defrag_in = 0, g_warthog_defrag_ok = 0;
+volatile uint32_t g_warthog_defrag_nofirst = 0, g_warthog_defrag_order = 0, g_warthog_defrag_pn = 0;
+volatile uint32_t g_warthog_defrag_key = 0, g_warthog_defrag_prot = 0, g_warthog_defrag_hdr = 0;
+volatile uint32_t g_warthog_defrag_amsdu = 0, g_warthog_defrag_oversize = 0, g_warthog_defrag_nomem = 0;
+volatile uint32_t g_warthog_defrag_mcast = 0, g_warthog_defrag_plain = 0, g_warthog_defrag_shape = 0;
+volatile uint32_t g_warthog_defrag_expired = 0, g_warthog_defrag_restart = 0, g_warthog_defrag_flush = 0;
+volatile uint32_t g_warthog_defrag_evict = 0;
 
 /* RX frame-filter drop accounting.
  *
@@ -1371,6 +1419,35 @@ static void cmd_macstats(uint32_t core, bool reset)
     reply_ok();
 }
 
+/* AT+FRAG=<n> / AT+FRAG?: the chip's TX fragmentation threshold (0 off, else >= 256). Not kept
+ * across a reboot or a chip restart. */
+static unsigned s_frag_threshold;
+static void cmd_frag_set(const char *args)
+{
+    unsigned n = 0;
+    if (sscanf(args, "%u", &n) != 1) {
+        reply_error("usage: AT+FRAG=<0|256..>");
+        return;
+    }
+    enum mmwlan_status st = mmwlan_set_fragment_threshold(n);
+    if (st != MMWLAN_SUCCESS) {
+        char why[48];
+        snprintf(why, sizeof(why), "fragment threshold refused (%d)", (int)st);
+        reply_error(why);
+        return;
+    }
+    s_frag_threshold = n;
+    reply_ok();
+}
+
+static void cmd_frag_query(void)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "+FRAG: %u\r\n", s_frag_threshold);
+    cdc_write(buf);
+    reply_ok();
+}
+
 static void cmd_filtstat(void)
 {
     char buf[240];
@@ -1404,6 +1481,43 @@ static void cmd_rxreord(void)
     cdc_write(buf);
     reply_ok();
 }
+/* AT+DEFRAG? -- fragment reassembly on the receive path. */
+struct defragstat {
+    uint32_t in, ok, nofirst, order, pn, key, prot, hdr, amsdu, oversize, nomem, mcast, plain;
+    uint32_t shape, expired, restart, flush, evict;
+};
+
+static int defragstat_line_(char *buf, size_t len, const struct defragstat *s)
+{
+    return snprintf(buf, len,
+                    "+DEFRAG: in=%lu ok=%lu | drop nofirst=%lu order=%lu pn=%lu key=%lu prot=%lu "
+                    "hdr=%lu amsdu=%lu oversize=%lu nomem=%lu mcast=%lu plain=%lu shape=%lu "
+                    "| chain expired=%lu restart=%lu flush=%lu evict=%lu\r\n",
+                    (unsigned long)s->in, (unsigned long)s->ok, (unsigned long)s->nofirst,
+                    (unsigned long)s->order, (unsigned long)s->pn, (unsigned long)s->key,
+                    (unsigned long)s->prot, (unsigned long)s->hdr, (unsigned long)s->amsdu,
+                    (unsigned long)s->oversize, (unsigned long)s->nomem, (unsigned long)s->mcast,
+                    (unsigned long)s->plain, (unsigned long)s->shape, (unsigned long)s->expired,
+                    (unsigned long)s->restart, (unsigned long)s->flush, (unsigned long)s->evict);
+}
+
+static void cmd_defragstat(void)
+{
+    char line[352];
+    const struct defragstat s = {
+        .in = g_warthog_defrag_in, .ok = g_warthog_defrag_ok, .nofirst = g_warthog_defrag_nofirst,
+        .order = g_warthog_defrag_order, .pn = g_warthog_defrag_pn, .key = g_warthog_defrag_key,
+        .prot = g_warthog_defrag_prot, .hdr = g_warthog_defrag_hdr, .amsdu = g_warthog_defrag_amsdu,
+        .oversize = g_warthog_defrag_oversize, .nomem = g_warthog_defrag_nomem,
+        .mcast = g_warthog_defrag_mcast, .plain = g_warthog_defrag_plain,
+        .shape = g_warthog_defrag_shape, .expired = g_warthog_defrag_expired, .restart = g_warthog_defrag_restart,
+        .flush = g_warthog_defrag_flush, .evict = g_warthog_defrag_evict,
+    };
+    defragstat_line_(line, sizeof(line), &s);
+    cdc_write(line);
+    reply_ok();
+}
+
 static void cmd_rxchan(void)
 {
     char buf[460];
@@ -1915,6 +2029,71 @@ static void cmd_keyinst(void)
     reply_ok();
 }
 
+/* AT+GTKSTAT? -- peers' MGTKs in the chip at their AIDs, as Linux installs them (chip-key SAE
+ * builds on a MESH chip VIF), and the group frames the chip opened under them. */
+struct gtkstat {
+    bool build;        /* this image puts a peer's MGTK into the chip */
+    uint32_t chip_vif; /* the chip VIF type the mesh runs on (5 = MESH) */
+    uint32_t mode;     /* AT+GTKPERSTA */
+    uint32_t inst, fail, del, delfail, tainted, rx_grp, forged, mgmt_gp, fence, taint;
+    uint32_t mic_ok, mic_bad, mic_arm, micdrop, gp_micdrop;
+    uint32_t slot[4], mac[4];
+};
+
+static int gtkstat_line_(char *buf, size_t len, const struct gtkstat *s)
+{
+    const char *mode = !s->build ? "off(build)" : s->chip_vif != 5u ? "off(sta_vif)"
+                     : s->mode == 0u ? "off(at)" : s->mode == 2u ? "on(pn0)" : "on";
+    int w = snprintf(buf, len,
+                     "+GTKSTAT: per_sta=%s inst=%lu fail=%lu del=%lu delfail=%lu tainted=%lx "
+                     "rx_grp=%lu forged=%lu mgmt_gp=%lu fence=%lu taint=%lu mic_ok=%lu mic_bad=%lu "
+                     "mic_arm=%lu micdrop=%lu/%lu",
+                     mode, (unsigned long)s->inst, (unsigned long)s->fail, (unsigned long)s->del,
+                     (unsigned long)s->delfail, (unsigned long)s->tainted, (unsigned long)s->rx_grp,
+                     (unsigned long)s->forged, (unsigned long)s->mgmt_gp, (unsigned long)s->fence,
+                     (unsigned long)s->taint, (unsigned long)s->mic_ok, (unsigned long)s->mic_bad,
+                     (unsigned long)s->mic_arm, (unsigned long)s->micdrop,
+                     (unsigned long)s->gp_micdrop);
+    for (unsigned i = 0; i < 4u && w >= 0 && (size_t)w < len; i++) {
+        const uint32_t v = s->slot[i];
+        w += (v & 0x80000000u) != 0u
+                 ? snprintf(buf + w, len - (size_t)w, " [%06lx aid=%lu id=%lu hw=%lu]",
+                            (unsigned long)(s->mac[i] & 0xffffffu), (unsigned long)((v >> 16) & 0xffu),
+                            (unsigned long)((v >> 8) & 0xffu), (unsigned long)(v & 0xffu))
+                 : snprintf(buf + w, len - (size_t)w, " [-]");
+    }
+    if (w >= 0 && (size_t)w < len) {
+        w += snprintf(buf + w, len - (size_t)w, "\r\n");
+    }
+    return w;
+}
+
+static void cmd_gtkstat(void)
+{
+    static char line[512]; /* AT task only */
+    struct gtkstat s = {
+#if !defined(WARTHOG_MESH_AMPE_NO_CHIP_KEY) && defined(WARTHOG_MESH_CHIP_VIF_MESH) && WARTHOG_MESH_CHIP_VIF_MESH
+        .build = true,
+#endif
+        .chip_vif = g_warthog_chipvif_type, .mode = g_warthog_peer_gtk_mode,
+        .inst = g_warthog_peer_gtk_inst, .fail = g_warthog_peer_gtk_fail,
+        .del = g_warthog_peer_gtk_del, .delfail = g_warthog_peer_gtk_delfail,
+        .tainted = g_warthog_peer_gtk_tainted, .rx_grp = g_warthog_rx_grp_chip,
+        .forged = g_warthog_rx_grp_forged, .mgmt_gp = g_warthog_mgmt_gp_chip,
+        .fence = g_warthog_peer_gtk_fence, .taint = g_warthog_peer_gtk_taint,
+        .mic_ok = g_warthog_rx_grp_mic_ok, .mic_bad = g_warthog_rx_grp_mic_bad,
+        .mic_arm = g_warthog_rx_grp_mic_armed, .micdrop = g_warthog_rx_grp_micdrop,
+        .gp_micdrop = g_warthog_mgmt_gp_micdrop,
+    };
+    for (unsigned i = 0; i < 4u; i++) {
+        s.slot[i] = g_warthog_peer_gtk[i];
+        s.mac[i] = g_warthog_peer_gtk_mac[i];
+    }
+    gtkstat_line_(line, sizeof(line), &s);
+    cdc_write(line);
+    reply_ok();
+}
+
 /* AT+MTPUT=<ip>,<count>,<size> -- push <count> UDP datagrams of <size> bytes
  * to <ip>:4403 as fast as lwIP accepts them, and report elapsed time and the
  * resulting goodput. The far end counts them on the socket AT+MCAST=1 already
@@ -2353,7 +2532,7 @@ static void dispatch(char *line)
                  "| hwmp prot=%lu unprotected=%lu unestab=%lu gp=%lu mmie=%lu nommie=%lu "
                  "| hwmp tx prot=%lu gp=%lu plain=%lu qdrop=%lu qfail=%lu "
                  "| mgmt prot chip=%lu host=%lu nodec=%lu grpkey=%lu "
-                 "| mgmt gp nodec=%lu own=%lu key=%lu replay=%lu | mgmt tx chip=%lu host=%lu drop=%lu "
+                 "| mgmt gp nodec=%lu own=%lu key=%lu replay=%lu chip=%lu | mgmt tx chip=%lu host=%lu drop=%lu "
                  "| igtk=%lu\r\n",
                  (unsigned long)g_warthog_mesh_fwd, (unsigned long)g_warthog_fwd_uni,
                  (unsigned long)g_warthog_fwd_grp, (unsigned long)g_warthog_fwd_nomem,
@@ -2377,7 +2556,7 @@ static void dispatch(char *line)
                  (unsigned long)g_warthog_mgmt_prot_nodec, (unsigned long)g_warthog_mgmt_prot_grpkey,
                  (unsigned long)g_warthog_mgmt_gp_nodec, (unsigned long)g_warthog_mgmt_gp_own,
                  (unsigned long)g_warthog_mgmt_gp_key, (unsigned long)g_warthog_mgmt_gp_replay,
-                 (unsigned long)g_warthog_mgmt_tx_chip, (unsigned long)g_warthog_mgmt_tx_host,
+                 (unsigned long)g_warthog_mgmt_gp_chip, (unsigned long)g_warthog_mgmt_tx_chip, (unsigned long)g_warthog_mgmt_tx_host,
                  (unsigned long)g_warthog_mgmt_tx_drop, (unsigned long)g_warthog_ampe_igtk_installed);
         cdc_write(line);
         reply_ok();
@@ -2516,6 +2695,27 @@ static void dispatch(char *line)
         cmd_keyfp();
     } else if (strcasecmp(verb, "KEYINST") == 0 && terminator == '?') {
         cmd_keyinst();
+    } else if (strcasecmp(verb, "GTKSTAT") == 0 && terminator == '?') {
+        cmd_gtkstat();
+    } else if (strcasecmp(verb, "GTKPERSTA") == 0 && terminator == '=') {
+        uint32_t v = 0;
+        if (!gtkpersta_parse_(trim(args), &v)) {
+            reply_error("usage: AT+GTKPERSTA=<0 off|1 on|2 on at TX PN 0>");
+        } else if (warthog_cfg_set_mesh_gtk((uint8_t)v) != ESP_OK) {
+            reply_error("nvs write failed");
+        } else {
+            g_warthog_peer_gtk_mode = v; /* live: the gate at once, the chip within a tick */
+            char line[96];
+            snprintf(line, sizeof(line), "+GTKPERSTA: %lu, stored, applies now\r\n", (unsigned long)v);
+            cdc_write(line);
+            reply_ok();
+        }
+    } else if (strcasecmp(verb, "GTKPERSTA") == 0 && terminator == '?') {
+        char line[64];
+        snprintf(line, sizeof(line), "+GTKPERSTA: %lu stored=%u\r\n",
+                 (unsigned long)g_warthog_peer_gtk_mode, (unsigned)warthog_cfg_get_mesh_gtk());
+        cdc_write(line);
+        reply_ok();
     } else if (strcasecmp(verb, "MPMPEERS") == 0 && terminator == '?') {
         cmd_mpmpeers();
     } else if (strcasecmp(verb, "MPMSTAT") == 0 && terminator == '?') {
@@ -2640,8 +2840,14 @@ static void dispatch(char *line)
         unsigned core = 1, rst = 0;
         (void)sscanf(args, "%u,%u", &core, &rst);
         cmd_macstats(core, rst != 0);
+    } else if (strcasecmp(verb, "FRAG") == 0 && terminator == '=') {
+        cmd_frag_set(args);
+    } else if (strcasecmp(verb, "FRAG") == 0 && terminator == '?') {
+        cmd_frag_query();
     } else if (strcasecmp(verb, "RXREORD") == 0 && terminator == '?') {
         cmd_rxreord();
+    } else if (strcasecmp(verb, "DEFRAG") == 0 && terminator == '?') {
+        cmd_defragstat();
     } else if (strcasecmp(verb, "RXCHAN") == 0 && terminator == '?') {
         cmd_rxchan();
     } else if (strcasecmp(verb, "FCRING") == 0 && terminator == '?') {

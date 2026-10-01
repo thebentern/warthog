@@ -220,7 +220,7 @@ nobody is answering.
 > (`encryption='sae'`) already produces a compatible SAE setup: match its mesh
 > ID and passphrase; no `sae_pwe` or group setting is needed. Against it use
 > `warthog-mesh-sae-swccmp`, whose host CCMP opens the node's group frames
-> (below). If you set
+> (below); `warthog-mesh-sae-meshvif` opens them in the chip. If you set
 > `sae_group` on the node, keep 19 in it (MODP 15 and 16 are not supported),
 > and do not use `ieee80211w=1` or `encryption='sae-mixed'`.
 >
@@ -345,7 +345,10 @@ stack.
   measured separately).
   OpenMANET's Linux driver runs different chip firmware (mm6108-2.0.1),
   installs each peer's keys at that peer's AID, and falls back to software
-  crypto per key.
+  crypto per key. `warthog-mesh-sae-meshvif` installs each peer's MGTK at its
+  AID the same way, on a MESH chip interface; 1.17.6 opens group frames that
+  way (measured on air on 2026-10-01)
+  (`wiki/OpenMANET-Interop.md`, *Group frames in the chip*).
 - A beaconing SAE node (the wizard default) starts SAE with Warthog only after
   a beacon or probe response from it that carries an RSN element, which
   Warthog's SAE build sends. That is from source, not measured.

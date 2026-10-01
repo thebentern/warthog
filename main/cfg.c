@@ -458,6 +458,38 @@ esp_err_t warthog_cfg_set_mesh_grp(uint8_t on)
     return err;
 }
 
+uint8_t warthog_cfg_get_mesh_gtk(void)
+{
+    nvs_handle_t h;
+    uint8_t mode = 1;
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v;
+        if (nvs_get_u8(h, "mesh_gtk", &v) == ESP_OK && v <= 2) {
+            mode = v;
+        }
+        nvs_close(h);
+    }
+    return mode;
+}
+
+esp_err_t warthog_cfg_set_mesh_gtk(uint8_t mode)
+{
+    if (mode > 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, "mesh_gtk", mode);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
 uint8_t warthog_cfg_get_mesh_pmf(void)
 {
     nvs_handle_t h;

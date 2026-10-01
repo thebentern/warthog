@@ -63,6 +63,9 @@ struct umac_key
     uint64_t rx_seq[UMAC_KEY_RX_COUNTER_NUM];
 
     uint64_t tx_seq;
+
+    /* warthog: this key's colour, set by the keychain (never 0); a new key gets a new one. */
+    uint32_t gen;
 };
 
 
@@ -96,7 +99,14 @@ enum mmwlan_status umac_keys_check_and_update_rx_replay(struct umac_sta_data *st
                                                         enum umac_key_rx_counter_space space);
 
 
+/** warthog: umac_keys_check_and_update_rx_replay's verdict, with no update. */
+bool umac_keys_rx_replay_fresh(struct umac_sta_data *stad, uint8_t key_id, uint64_t packet_number,
+                               enum umac_key_rx_counter_space space);
+
 size_t umac_keys_get_key_len(struct umac_sta_data *stad, uint8_t key_id);
+
+/** warthog: the colour of the key at @p key_id (mac80211's key->color), 0 when there is none. */
+uint32_t umac_keys_get_key_gen(struct umac_sta_data *stad, uint8_t key_id);
 
 
 const uint8_t *umac_keys_get_key_data(struct umac_sta_data *stad, uint8_t key_id);

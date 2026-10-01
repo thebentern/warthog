@@ -19,6 +19,9 @@
 #include "driver/morse_driver/skbq.h"
 #include "driver/transport/morse_transport.h"
 
+/* Frames read off the chip (storage in main/at.c). */
+extern volatile uint32_t g_warthog_rx_read_seq;
+
 #define BENCHMARK_PKT_LEN (1496)
 #define BENCHMARK_WAIT_MS (5000)
 
@@ -139,6 +142,8 @@ static bool yaps_read_pkt(struct morse_yaps *yaps)
     mmpkt_close(&view);
 
     mmdrv_get_rx_metadata(mmpkt)->read_timestamp_ms = mmosal_get_time_ms();
+    /* warthog: in read order, for the mesh peer-MGTK fence (umac_datapath_mesh.c). */
+    mmdrv_get_rx_metadata(mmpkt)->read_seq = ++g_warthog_rx_read_seq;
 
 
     if (hdr->sync != MORSE_SKB_HEADER_SYNC)

@@ -6,11 +6,12 @@
  * can assert on the exact bytes that would have gone on the air -- addresses,
  * QoS control, Mesh Control, Address Extension, the lot.
  *
- * Everything above this line is the real firmware. Below it only two things
+ * Everything above this line is the real firmware. Below it only three things
  * the host sees back are modelled: a TX status per data frame (and per management
- * frame under our group key), and the group key slot's TX PN, drawn when a frame is sent. No modulation, no timing, no
- * interference. What the radio does with these bytes is exactly what the
- * simulator cannot tell you.
+ * frame under our group key), the group key slot's TX PN, drawn when a frame is sent,
+ * and, for a frame a test passes through simnode_rx_air, which key the chip opens a
+ * Protected frame under. No modulation, no timing, no interference. What the radio
+ * does with these bytes is exactly what the simulator cannot tell you.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -24,6 +25,8 @@
 #include "umac/datapath/umac_datapath.h"
 #include "common/morse_commands.h" /* MORSE_CMD_ID_*: the command log's ids */
 #include "mmhal_wlan.h"
+#include "umac_mesh_ccm.h"      /* the receive model opens frames with the firmware's own CCM */
+#include "umac_mesh_ccmp_hdr.h"
 
 #ifndef SIMNODE_OUTBOX_MAX
 #define SIMNODE_OUTBOX_MAX 64u
@@ -354,6 +357,174 @@ void simnode_keyinst_clear(void) { s_keyinst_n = 0; }
 static unsigned s_install_fail_next;
 void simnode_fail_next_install_key(void) { s_install_fail_next++; }
 
+/* ---- the chip's stations and keys ---------------------------------------------------
+ *
+ * What the receive model (simnode_rx_air) opens frames with. A station is what
+ * SET_STA_STATE told the chip: an AID and an address, known from AUTHENTICATED up. A key
+ * is held per (AID, pairwise or group, index) from the INSTALL_KEY the chip accepted until
+ * a DISABLE_KEY for it or an install over it. Removing a station is NOT assumed to take its
+ * keys: whether the MM6108 does is not measured, so the firmware has to say so itself.
+ * Cleared when the chip boots. */
+#define SIMNODE_CHIP_STA_MAX 16u
+static struct { bool used; uint16_t aid; uint8_t addr[6]; uint32_t state; } s_sta[SIMNODE_CHIP_STA_MAX];
+#define SIMNODE_CHIP_KEY_MAX 32u
+static struct { bool used; uint16_t aid; bool pairwise; uint8_t idx; uint8_t key[16]; } s_key[SIMNODE_CHIP_KEY_MAX];
+static uint32_t s_vif_type;   /* the type of the interface the chip added last */
+static bool s_grp_fallback;   /* MESH VIF: a group frame no station key opens is tried at AID 0 */
+static bool s_grp_fallback_mic; /* ... and one whose MIC fails under its station's key */
+static unsigned s_rx_opened;
+
+static void chip_tables_clear_(void)
+{
+    memset(s_sta, 0, sizeof(s_sta));
+    memset(s_key, 0, sizeof(s_key));
+    s_vif_type = 0;
+}
+
+static void chip_sta_note_(uint16_t aid, const uint8_t *addr, uint32_t state)
+{
+    unsigned free_i = SIMNODE_CHIP_STA_MAX;
+    for (unsigned i = 0; i < SIMNODE_CHIP_STA_MAX; i++)
+    {
+        if (s_sta[i].used && s_sta[i].aid == aid) { free_i = i; break; }
+        if (!s_sta[i].used && free_i == SIMNODE_CHIP_STA_MAX) { free_i = i; }
+    }
+    if (free_i == SIMNODE_CHIP_STA_MAX) { return; }
+    s_sta[free_i].used = true;
+    s_sta[free_i].aid = aid;
+    s_sta[free_i].state = state;
+    if (addr != NULL) { memcpy(s_sta[free_i].addr, addr, 6); }
+}
+
+/* The AID of the station the chip knows at @p addr, or 0. */
+static uint16_t chip_sta_aid_(const uint8_t *addr)
+{
+    for (unsigned i = 0; i < SIMNODE_CHIP_STA_MAX; i++)
+    {
+        if (s_sta[i].used && s_sta[i].state >= (uint32_t)MORSE_STA_AUTHENTICATED &&
+            memcmp(s_sta[i].addr, addr, 6) == 0)
+        {
+            return s_sta[i].aid;
+        }
+    }
+    return 0;
+}
+
+static int chip_key_find_(uint16_t aid, bool pairwise, uint8_t idx)
+{
+    for (unsigned i = 0; i < SIMNODE_CHIP_KEY_MAX; i++)
+    {
+        if (s_key[i].used && s_key[i].aid == aid && s_key[i].pairwise == pairwise &&
+            s_key[i].idx == idx)
+        {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void chip_key_put_(uint16_t aid, bool pairwise, uint8_t idx, const uint8_t key[16])
+{
+    int i = chip_key_find_(aid, pairwise, idx);
+    for (unsigned j = 0; i < 0 && j < SIMNODE_CHIP_KEY_MAX; j++)
+    {
+        if (!s_key[j].used) { i = (int)j; }
+    }
+    if (i < 0) { return; }
+    s_key[i].used = true;
+    s_key[i].aid = aid;
+    s_key[i].pairwise = pairwise;
+    s_key[i].idx = idx;
+    memcpy(s_key[i].key, key, 16);
+}
+
+bool simnode_chip_key_held(uint16_t aid, bool pairwise, uint8_t idx, uint8_t key[16])
+{
+    const int i = chip_key_find_(aid, pairwise, idx);
+    if (i >= 0 && key != NULL) { memcpy(key, s_key[i].key, 16); }
+    return i >= 0;
+}
+
+void simnode_chip_group_fallback(bool on) { s_grp_fallback = on; }
+void simnode_chip_group_fallback_mic(bool on) { s_grp_fallback_mic = on; }
+unsigned simnode_chip_rx_opened(void) { return s_rx_opened; }
+
+/* ---- the chip's receive crypto ------------------------------------------------------
+ *
+ * What the chip does with a Protected frame before the host sees it, as Linux relies on
+ * it (morse_driver installs every key that has a station at that station's AID): it opens
+ * the frame under the key it holds for the transmitter's station with the frame's key id,
+ * pairwise for a unicast and that station's group key for a group frame. On a STA chip VIF
+ * a group frame opens only under the VIF's group key at AID 0 (measured: our own MGTK there
+ * opened a frame sealed under it). On a MESH VIF it does not, unless simnode_chip_group_fallback
+ * says the chip tries AID 0 when the station holds no group key under that id, or
+ * simnode_chip_group_fallback_mic when the station's key fails the MIC. A frame it
+ * cannot open goes up as it came, ciphertext and MIC intact (measured: rxdrop 4). It checks
+ * no replay. A frame it opens goes up with the MIC octets still in place. */
+static bool chip_rx_open_(uint8_t *f, uint16_t len)
+{
+    if (len < 24u || (f[1] & 0x40u) == 0u) { return false; }
+    const uint8_t type = (uint8_t)((f[0] >> 2) & 0x3u);
+    if (type != 0u && type != 2u) { return false; }
+    const uint32_t hl = umac_ccmp_hdr_len(f);
+    if (len < hl + UMAC_CCMP_HDR_LEN + UMAC_CCMP_MIC_LEN) { return false; }
+    uint8_t pn[6], kid = 0;
+    if (!umac_ccmp_parse_header(f + hl, pn, &kid)) { return false; }
+    const bool group = (f[4] & 0x01u) != 0u;
+    const bool mesh = s_vif_type == MMDRV_INTERFACE_TYPE_MESH;
+    const uint16_t aid = chip_sta_aid_(f + 10);
+    int k = -1;
+    if (aid != 0u && (!group || mesh))
+    {
+        k = chip_key_find_(aid, !group, kid);
+    }
+    uint8_t aad[UMAC_CCMP_AAD_MAXLEN], nonce[13], plain[1600];
+    const uint32_t al = umac_ccmp_build_aad(f, aad);
+    umac_ccmp_build_nonce(f, pn, nonce);
+    const uint32_t body = hl + UMAC_CCMP_HDR_LEN;
+    const uint32_t n = len - body - UMAC_CCMP_MIC_LEN;
+    bool ok = false;
+    if (k >= 0)
+    {
+        memcpy(plain, f + body, n);
+        ok = warthog_ccm_ad(s_key[k].key, nonce, UMAC_CCMP_MIC_LEN, aad, al, plain, n,
+                            f + len - UMAC_CCMP_MIC_LEN) == 0;
+    }
+    if (!ok && group && (!mesh || (k < 0 && s_grp_fallback) || (k >= 0 && s_grp_fallback_mic)))
+    {
+        k = chip_key_find_(0, false, kid);
+        if (k >= 0)
+        {
+            memcpy(plain, f + body, n);
+            ok = warthog_ccm_ad(s_key[k].key, nonce, UMAC_CCMP_MIC_LEN, aad, al, plain, n,
+                                f + len - UMAC_CCMP_MIC_LEN) == 0;
+        }
+    }
+    if (!ok) { return false; }
+    memcpy(f + body, plain, n);
+    s_rx_opened++;
+    return true;
+}
+
+static bool rx_air_(const uint8_t *frame, uint16_t len, int16_t rssi, bool queued)
+{
+    static uint8_t f[1600];
+    if (frame == NULL || len == 0u || len > sizeof(f)) { return false; }
+    memcpy(f, frame, len);
+    const uint8_t flags = chip_rx_open_(f, len) ? (uint8_t)MMDRV_RX_FLAG_DECRYPTED : 0u;
+    return queued ? simnode_rx_flags_queued(f, len, rssi, flags) : simnode_rx_flags(f, len, rssi, flags);
+}
+
+bool simnode_rx_air(const uint8_t *frame, uint16_t len, int16_t rssi)
+{
+    return rx_air_(frame, len, rssi, false);
+}
+
+bool simnode_rx_air_queued(const uint8_t *frame, uint16_t len, int16_t rssi)
+{
+    return rx_air_(frame, len, rssi, true);
+}
+
 /* A key the chip refuses (simnode_chip_refuse_next_arg(INSTALL_KEY, aid, status)) is not
  * installed and leaves @p key_conf as it was, as driver.c's status read does. */
 int mmdrv_install_key_status(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_conf,
@@ -372,7 +543,12 @@ int mmdrv_install_key_status(uint16_t vif_id, uint16_t aid, struct mmdrv_key_con
         return 0;
     }
     s_cfg.keys_installed++;
-    if (key_conf != NULL && !key_conf->is_pairwise)
+    if (key_conf != NULL)
+    {
+        chip_key_put_(aid, key_conf->is_pairwise, key_conf->key_idx, key_conf->key);
+    }
+    /* The TX PN model is the VIF's group key, at AID 0: a station's group key only receives. */
+    if (key_conf != NULL && !key_conf->is_pairwise && aid == 0u)
     {
         s_grp.valid = true;
         s_grp.key_idx = key_conf->key_idx;
@@ -399,10 +575,20 @@ int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_
     return ret != 0 ? ret : (int)st;
 }
 
+/* As driver.c: nothing goes to the chip for AID 0. Its response carries no status read, so a
+ * refusal (simnode_chip_refuse_next_arg(DISABLE_KEY, aid, ret)) fails the transport instead,
+ * and the key stays. */
 int mmdrv_disable_key(uint16_t vif_id, uint16_t aid, uint8_t hw_key_idx, bool is_pairwise)
 {
-    (void)vif_id; (void)aid; (void)hw_key_idx; (void)is_pairwise;
+    if (aid == 0u) { return 0; }
+    struct simnode_chipcmd *c = chipcmd_log_(MORSE_CMD_ID_DISABLE_KEY, vif_id, hw_key_idx);
+    c->aid = aid;
+    c->pairwise = is_pairwise;
+    c->ret = (int)chip_answer_(MORSE_CMD_ID_DISABLE_KEY, aid);
+    if (c->ret != 0) { return c->ret; }
     s_cfg.keys_disabled++;
+    const int i = chip_key_find_(aid, is_pairwise, hw_key_idx);
+    if (i >= 0) { s_key[i].used = false; }
     return 0;
 }
 
@@ -432,6 +618,7 @@ int mmdrv_update_sta_state_status(uint16_t vif_id, uint16_t aid, const uint8_t *
     if (addr != NULL) { memcpy(c->addr, addr, 6); }
     c->status = chip_answer_(MORSE_CMD_ID_SET_STA_STATE, c->arg);
     if (chip_status != NULL) { *chip_status = c->status; }
+    if (c->status == 0) { chip_sta_note_(aid, addr, (uint32_t)state); }
     s_cfg.sta_state_updates++;
     return 0;
 }
@@ -468,6 +655,7 @@ uint16_t simnode_own_vif_id(void);      /* fake_config.c */
 int mmdrv_init(struct mmdrv_chip_info *chip_info, const char *country_code)
 {
     (void)country_code;
+    chip_tables_clear_(); /* a chip that boots holds no station and no key */
     memset(chip_info, 0, sizeof(*chip_info));
     memcpy(chip_info->mac_addr, simnode_own_mac(), 6);
     chip_info->fw_version.major = 1;
@@ -506,6 +694,7 @@ static int chip_add_if_(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interf
     c->vif_id = (type == MMDRV_INTERFACE_TYPE_MESH && s_mesh_vif.set) ? s_mesh_vif.id
                                                                        : simnode_own_vif_id();
     *vif_id = c->vif_id;
+    s_vif_type = (uint32_t)type;
     return 0;
 }
 

@@ -536,7 +536,11 @@ our own key at AID 0 first, is untested). So a peer's group-addressed frames are
 not decrypted in hardware; each peer's group key is kept on the host, where only
 host software CCMP (`warthog-mesh-sae-swccmp`) can use it. That build carried
 encrypted traffic with OpenMANET 1.8.0 on air on 2026-09-29/30, in batman
-mode.
+mode. That measurement was on the STA chip interface every other build runs the
+mesh on. `warthog-mesh-sae-meshvif` keeps the keys in the chip on a MESH chip
+interface and installs each peer's group key at that peer's AID, as Linux does,
+so the chip can open a peer's group frames itself; measured on air on 2026-10-01 (before that change it peered with the Pis but opened none of their group frames). See
+[OpenMANET Interop](wiki/OpenMANET-Interop.md#group-frames-in-the-chip-warthog-mesh-sae-meshvif).
 
 Mesh is no longer confined to the capability builds: `AT+MESHEN=1` enables it
 on any image, region envs included, and the mesh ID, passphrase and channel are
@@ -723,7 +727,8 @@ out Protected under its own MGTK, sealed by the chip as its group data is, one
 frame for every peer; before hostap delivers that MGTK, or while its install in
 the chip has failed (retried with the next peer), it goes in the clear. A
 peer's group path selection is taken only if it arrived Protected, host CCMP
-opened it under that peer's MGTK (from its AMPE), and its PN is above that key's
+(or, on `warthog-mesh-sae-meshvif`, the chip holding that MGTK
+at the peer's AID) opened it under that peer's MGTK (from its AMPE), and its PN is above that key's
 management replay counter, whose floor is the RSC the AMPE carried. Answering it
 is the only way a 1.8.0 node, which sends Warthog unicast only over an HWMP path,
 gets that path. In the clear it is refused from every established peer, MFP or
@@ -733,10 +738,11 @@ delivered its MGTK, and mac80211 and Warthog both protect group path selection
 with it. Taken in the clear, anyone on the channel could send it in the name of a
 peer without MFP and have a relay re-send it under Warthog's MGTK, which every MFP
 node opens. It is also refused with an MMIE (18 or 26 octets, as mac80211 finds
-one), under another key id, or opened by the chip: the chip's only group key is
-Warthog's own MGTK, which every peer holds, so such a frame could be forged in the
-sender's name by any of them. The chip cannot open a peer's group
-path selection, so only the swccmp builds with host CCMP on can take it, as for
+one), under another key id, or opened by the chip under anything but the
+sender's own MGTK at its AID. On every build but `warthog-mesh-sae-meshvif` the chip's only group key is Warthog's own MGTK, which every
+peer holds, so such a frame could be forged in the sender's name by any of them. The chip cannot open a peer's group
+path selection (except on `warthog-mesh-sae-meshvif`), so only
+the swccmp builds with host CCMP on can take it, as for
 group data, whether it comes from a Linux node or a Warthog relay or bridge; on
 `warthog-mesh-sae` a wizard node never gets a path to Warthog. The same holds
 between Warthogs: on `warthog-mesh-sae`, `-nochipkey`, and a swccmp build with

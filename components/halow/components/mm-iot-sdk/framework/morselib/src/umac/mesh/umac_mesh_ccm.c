@@ -185,6 +185,33 @@ out:
     return rc;
 }
 
+int warthog_ccm_mic(const uint8_t *key, const uint8_t *nonce, size_t M, const uint8_t *aad,
+                    size_t aad_len, const uint8_t *data, size_t data_len, uint8_t *auth)
+{
+    mbedtls_aes_context ctx;
+    uint8_t x[CCM_BLOCK], s0[CCM_BLOCK], a[CCM_BLOCK];
+    int rc = -1;
+
+    mbedtls_aes_init(&ctx);
+    if (M > CCM_BLOCK || mbedtls_aes_setkey_enc(&ctx, key, 128) != 0)
+    {
+        goto out;
+    }
+    if (ccm_auth(&ctx, M, 2, nonce, aad, aad_len, data, data_len, x, s0, a) != 0)
+    {
+        goto out;
+    }
+    for (size_t i = 0; i < M; i++)
+    {
+        auth[i] = (uint8_t)(x[i] ^ s0[i]);
+    }
+    rc = 0;
+
+out:
+    mbedtls_aes_free(&ctx);
+    return rc;
+}
+
 int warthog_ccm_ad(const uint8_t *key, const uint8_t *nonce, size_t M, const uint8_t *aad,
                    size_t aad_len, uint8_t *data, size_t data_len, const uint8_t *auth)
 {

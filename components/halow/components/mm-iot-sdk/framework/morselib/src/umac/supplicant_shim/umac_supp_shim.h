@@ -129,6 +129,14 @@ bool bip_is_valid(struct umac_sta_data *stad,
                   size_t data_len);
 
 
+/** warthog: the packet number in a CCMP header. */
+uint64_t ccmp_get_packet_number(const uint8_t *ccmp_header);
+
+/** warthog: would ccmp_is_valid take this PN? Moves no replay counter. */
+bool ccmp_is_fresh(struct umac_sta_data *stad,
+                   const uint8_t *ccmp_header,
+                   enum umac_key_rx_counter_space space);
+
 bool ccmp_is_valid(struct umac_sta_data *stad,
                    uint8_t *ccmp_header,
                    enum umac_key_rx_counter_space space);

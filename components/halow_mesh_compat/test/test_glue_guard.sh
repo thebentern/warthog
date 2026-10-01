@@ -261,7 +261,7 @@ else
 fi
 
 # 11. AT+MESHFWDSTAT? prints each checked counter in its own slot (tblfull=,
-#     unestab=, qfail=, the mgmt tx, path-selection and mgmt gp groups). main/at.c
+#     unestab=, qfail=, the mgmt tx, path-selection and mgmt gp groups, gp chip= included). main/at.c
 #     is only scraped for storage on the host, so nothing runs it: pair each
 #     conversion in the format with its argument by position.
 A=../../../main/at.c
@@ -302,7 +302,7 @@ fi
 # Group path selection (group-addressed privacy), received, sent and at the CCMP layer.
 for grp in "hwmp prot=%lu unprotected=%lu unestab=%lu gp=%lu mmie=%lu nommie|6|g_warthog_hwmp_prot g_warthog_hwmp_unprotected g_warthog_hwmp_unestab g_warthog_hwmp_gp g_warthog_hwmp_mmie g_warthog_hwmp_nommie" \
            "hwmp tx prot=%lu gp=%lu plain|3|g_warthog_hwmp_tx_prot g_warthog_hwmp_tx_gp g_warthog_hwmp_tx_plain" \
-           "mgmt gp nodec=%lu own=%lu key=%lu replay|4|g_warthog_mgmt_gp_nodec g_warthog_mgmt_gp_own g_warthog_mgmt_gp_key g_warthog_mgmt_gp_replay"; do
+           "mgmt gp nodec=%lu own=%lu key=%lu replay=%lu chip|5|g_warthog_mgmt_gp_nodec g_warthog_mgmt_gp_own g_warthog_mgmt_gp_key g_warthog_mgmt_gp_replay g_warthog_mgmt_gp_chip"; do
   label=${grp%%|*}; rest=${grp#*|}; n=${rest%%|*}; want=${rest#*|}
   slot=$(fwdstat_slot "$label" "$n")
   if [ "$slot" = "$want" ]; then
@@ -3104,6 +3104,236 @@ if [ -z "$why" ]; then
   ok "mesh.c's RESULT line is warthog_mesh_start_result, from the chip VIF and MESH_CONFIG answers morselib stored"
 else
   bad "mesh.c RESULT line:$why"
+fi
+
+# 43. AT+GTKSTAT? (gtkstat_line_ in main/at.c), compiled out and run: the mode named for each
+#     build, chip VIF and AT+GTKPERSTA, every counter in its slot, a held peer key as
+#     [<mac> aid id hw] and an empty slot as [-]; it fits line[] with every field at its extreme;
+#     cmd_gtkstat fills it from the storage morselib writes and is dispatched.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{ awk '/^struct gtkstat \{/,/^};/' "$A"
+  awk '/^static int gtkstat_line_\(/,/^}/' "$A"; } > "$T/fn.c"
+size43=$(awk '/^static void cmd_gtkstat\(void\)/ {on=1} on && /char line\[[0-9]+\];/ {match($0, /\[[0-9]+\]/); print substr($0, RSTART + 1, RLENGTH - 2); exit}' "$A")
+cat > "$T/t.c" <<'EOF2'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fn.c"
+int main(int argc, char **argv)
+{
+    unsigned size = (unsigned)atoi(argv[1]);
+    char buf[1024];
+    struct gtkstat s;
+    static const struct { bool build; uint32_t vif, mode; const char *want; } modes[] = {
+        { false, 5, 1, "per_sta=off(build) " }, { false, 5, 0, "per_sta=off(build) " },
+        { true, 1, 1, "per_sta=off(sta_vif) " }, { true, 5, 1, "per_sta=on " },
+        { true, 5, 0, "per_sta=off(at) " }, { true, 5, 2, "per_sta=on(pn0) " } };
+    for (unsigned i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        memset(&s, 0, sizeof(s));
+        s.build = modes[i].build; s.chip_vif = modes[i].vif; s.mode = modes[i].mode;
+        gtkstat_line_(buf, sizeof(buf), &s);
+        if (strncmp(buf, "+GTKSTAT: ", 10) != 0 || !strstr(buf, modes[i].want)) { printf("mode %u: %s", i, buf); return 0; }
+    }
+    memset(&s, 0, sizeof(s));
+    s.build = true; s.chip_vif = 5; s.mode = 1; s.inst = 1; s.fail = 2; s.del = 3; s.delfail = 4;
+    s.tainted = 5; s.rx_grp = 6; s.forged = 7; s.mgmt_gp = 8; s.fence = 9; s.taint = 10; s.mic_ok = 11;
+    s.mic_bad = 12; s.mic_arm = 3; s.micdrop = 13; s.gp_micdrop = 14;
+    s.slot[1] = 0x80020107u; s.mac[1] = 0x00bfcdu; s.slot[2] = 0x00030101u;
+    gtkstat_line_(buf, sizeof(buf), &s);
+    if (strcmp(buf, "+GTKSTAT: per_sta=on inst=1 fail=2 del=3 delfail=4 tainted=5 rx_grp=6 forged=7 "
+                    "mgmt_gp=8 fence=9 taint=10 mic_ok=11 mic_bad=12 mic_arm=3 micdrop=13/14 "
+                    "[-] [00bfcd aid=2 id=1 hw=7] [-] [-]\r\n") != 0) { printf("fields: %s", buf); return 0; }
+    memset(&s, 0xff, sizeof(s));
+    s.build = true; s.chip_vif = 1;
+    int n = gtkstat_line_(buf, sizeof(buf), &s);
+    (void)argc;
+    printf("%s %d/%u\n", n + 1 <= (int)size ? "ok" : "short", n + 1, size);
+    return 0;
+}
+EOF2
+fit43=""
+if [ -n "$size43" ] && ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then
+  fit43=$("$T/t" "$size43")
+fi
+rm -rf "$T"
+fill43=$(awk '/^static void cmd_gtkstat\(void\)/,/^}/' "$A" | tr -d ' \n')
+for f in '#if!defined(WARTHOG_MESH_AMPE_NO_CHIP_KEY)&&defined(WARTHOG_MESH_CHIP_VIF_MESH)&&WARTHOG_MESH_CHIP_VIF_MESH.build=true,#endif' \
+         '.chip_vif=g_warthog_chipvif_type' '.mode=g_warthog_peer_gtk_mode' '.inst=g_warthog_peer_gtk_inst' \
+         '.fail=g_warthog_peer_gtk_fail' '.del=g_warthog_peer_gtk_del' '.delfail=g_warthog_peer_gtk_delfail' \
+         '.tainted=g_warthog_peer_gtk_tainted' '.rx_grp=g_warthog_rx_grp_chip' \
+         '.forged=g_warthog_rx_grp_forged' '.mgmt_gp=g_warthog_mgmt_gp_chip' \
+         '.fence=g_warthog_peer_gtk_fence' '.taint=g_warthog_peer_gtk_taint' \
+         '.mic_ok=g_warthog_rx_grp_mic_ok' '.mic_bad=g_warthog_rx_grp_mic_bad' \
+         '.mic_arm=g_warthog_rx_grp_mic_armed' '.micdrop=g_warthog_rx_grp_micdrop' \
+         '.gp_micdrop=g_warthog_mgmt_gp_micdrop' \
+         's.slot[i]=g_warthog_peer_gtk[i];s.mac[i]=g_warthog_peer_gtk_mac[i];' \
+         'gtkstat_line_(line,sizeof(line),&s);cdc_write(line);'; do
+  case "$fill43" in *"$f"*) ;; *) fit43="cmd_gtkstat does not set $f"; break ;; esac
+done
+grep -q 'strcasecmp(verb, "GTKSTAT") == 0 && terminator == .?.) {' "$A" && \
+  awk '/strcasecmp\(verb, "GTKSTAT"\)/ {getline; print}' "$A" | grep -q 'cmd_gtkstat();' || fit43="AT+GTKSTAT? is not dispatched to cmd_gtkstat"
+case "$fit43" in
+  ok*) ok "AT+GTKSTAT? names its mode, prints every counter and slot, is filled from morselib's storage and fits line[$size43] (${fit43#ok })" ;;
+  *)   bad "AT+GTKSTAT?: ${fit43:-did not build or run}" ;;
+esac
+
+# 44. AT+GTKPERSTA=<0|1|2>: the parser is compiled out of main/at.c and run; the command
+#     persists the mode and applies it live, boot restores it before the first peer's MGTK
+#     arrives, morselib reads it (the gate and the service tick, which the mesh tick runs) and
+#     every chip boot resets what the mesh holds in the chip.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^static bool gtkpersta_parse_\(/,/^}/' "$A" > "$T/fn.c"
+cat > "$T/t.c" <<'EOF2'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "fn.c"
+static int check(const char *in, bool want_ok, uint32_t want)
+{
+    uint32_t v = 77;
+    bool got = gtkpersta_parse_(in, &v);
+    if (got != want_ok || (got && v != want)) { printf("'%s' parsed as %d/%lu", in, (int)got, (unsigned long)v); return 1; }
+    return 0;
+}
+int main(void)
+{
+    return check("0", true, 0) || check("1", true, 1) || check("2", true, 2) || check("3", false, 0) ||
+           check("", false, 0) || check("01", false, 0) || check("1 ", false, 0) || check("-1", false, 0) ||
+           check("on", false, 0) || gtkpersta_parse_(NULL, NULL);
+}
+EOF2
+why=""
+if ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null && why=$("$T/t"); then
+  ok "AT+GTKPERSTA= accepts 0, 1 or 2 as the whole argument and rejects the rest"
+else
+  bad "gtkpersta_parse_ against its cases: ${why:-did not build or run}"
+fi
+rm -rf "$T"
+M=../../halow/components/mm-iot-sdk/framework/morselib/src/umac
+if awk '/"GTKPERSTA"\) == 0 && terminator == .=./ {on=1} on && /warthog_cfg_set_mesh_gtk\(/ {p=1}
+        on && p && /g_warthog_peer_gtk_mode = v;/ {l=1} on && /reply_ok\(\);/ {exit}
+        END {exit (p && l) ? 0 : 1}' "$A" && \
+   grep -q 'strcasecmp(verb, "GTKPERSTA") == 0 && terminator == .?.' "$A" && \
+   grep -q 'g_warthog_peer_gtk_mode = warthog_cfg_get_mesh_gtk();' ../../../main/mesh.c && \
+   grep -q '"mesh_gtk"' ../../../main/cfg.c && \
+   grep -q 'return stad != NULL && g_warthog_peer_gtk_mode != 0u && umac_mesh_sae_active() &&' "$M/datapath/umac_datapath_mesh.c" && \
+   grep -q '^    umac_datapath_mesh_service_peer_gtk();' "$M/mesh/umac_mesh.c" && \
+   grep -q '^            umac_datapath_mesh_chip_booted();' "$M/interface/umac_interface.c" && \
+   grep -q '^            umac_datapath_mesh_chip_booted();' "$M/umac_mmdrv_shim.c" && \
+   grep -q 'read_seq = ++g_warthog_rx_read_seq;' "$M/../driver/morse_driver/mm6108/pageset.c" && \
+   grep -q 'read_seq = ++g_warthog_rx_read_seq;' "$M/../driver/morse_driver/mm8108/yaps.c"; then
+  ok "AT+GTKPERSTA= persists the mode and applies it live; boot restores it; the gate and the tick read it; a chip boot resets the mesh's chip keys; both drivers stamp the read order"
+else
+  bad "AT+GTKPERSTA= is not persisted, applied live, restored at boot or read by morselib, or a chip boot or driver read is not wired"
+fi
+
+# 45. AT+DEFRAG? (defragstat_line_ in main/at.c), compiled out and run: every counter in its
+#     slot and the line within line[] with every field at its extreme; cmd_defragstat fills it
+#     from the storage morselib writes, every counter is written there, and it is dispatched.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{ awk '/^struct defragstat \{/,/^};/' "$A"
+  awk '/^static int defragstat_line_\(/,/^}/' "$A"; } > "$T/fn.c"
+size45=$(awk '/^static void cmd_defragstat\(void\)/ {on=1} on && /char line\[[0-9]+\];/ {match($0, /\[[0-9]+\]/); print substr($0, RSTART + 1, RLENGTH - 2); exit}' "$A")
+cat > "$T/t.c" <<'EOF2'
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fn.c"
+int main(int argc, char **argv)
+{
+    unsigned size = (unsigned)atoi(argv[1]);
+    char buf[1024];
+    struct defragstat s = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 };
+    defragstat_line_(buf, sizeof(buf), &s);
+    if (strcmp(buf, "+DEFRAG: in=1 ok=2 | drop nofirst=3 order=4 pn=5 key=6 prot=7 hdr=8 amsdu=9 "
+                    "oversize=10 nomem=11 mcast=12 plain=13 shape=14 | chain expired=15 restart=16 "
+                    "flush=17 evict=18\r\n") != 0) {
+        printf("fields: %s", buf);
+        return 0;
+    }
+    memset(&s, 0xff, sizeof(s));
+    int n = defragstat_line_(buf, sizeof(buf), &s);
+    (void)argc;
+    printf("%s %d/%u\n", n + 1 <= (int)size ? "ok" : "short", n + 1, size);
+    return 0;
+}
+EOF2
+fit45=""
+if [ -n "$size45" ] && ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then
+  fit45=$("$T/t" "$size45")
+fi
+rm -rf "$T"
+fill45=$(awk '/^static void cmd_defragstat\(void\)/,/^}/' "$A" | tr -d ' \n')
+DD=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/datapath
+for c in in ok nofirst order pn key prot hdr amsdu oversize nomem mcast plain shape expired restart flush evict; do
+  case "$fill45" in *".$c=g_warthog_defrag_$c,"*) ;; *) fit45="cmd_defragstat does not set .$c from g_warthog_defrag_$c"; break ;; esac
+  grep -q "^volatile uint32_t .*g_warthog_defrag_$c = 0" "$A" || { fit45="at.c has no storage for g_warthog_defrag_$c"; break; }
+  cat "$DD/datapath_defrag.c" "$DD/umac_datapath.c" | grep -Eq "g_warthog_defrag_$c\+\+|&g_warthog_defrag_$c;" || \
+    { fit45="morselib never writes g_warthog_defrag_$c"; break; }
+done
+case "$fill45" in *'defragstat_line_(line,sizeof(line),&s);cdc_write(line);'*) ;; *) fit45="cmd_defragstat does not print its line" ;; esac
+awk '/strcasecmp\(verb, "DEFRAG"\) == 0 && terminator == .\?./ {getline; print}' "$A" | grep -q 'cmd_defragstat();' || \
+  fit45="AT+DEFRAG? is not dispatched to cmd_defragstat"
+case "$fit45" in
+  ok*) ok "AT+DEFRAG? prints every counter in its slot, is filled from morselib's storage and fits line[$size45] (${fit45#ok })" ;;
+  *)   bad "AT+DEFRAG?: ${fit45:-did not build or run}" ;;
+esac
+
+# 46. Reassembly comes before anything reads a data frame's body past the CCMP header: in
+#     process_rx_data_frame_after_reorder, datapath_defrag runs after the replay check and the
+#     Block Ack update and before Mesh Control is parsed, learned from or relayed on; and a
+#     plaintext fragment on a keyed link is refused ahead of the EAPOL exception.
+order46=$(awk '/^static void umac_datapath_process_rx_data_frame_after_reorder\(/ {on=1} on && /^}/ {exit}
+  on && /ccmp_is_valid\(/ && !v {v=NR} on && /umac_ba_set_expected_rx_seq_num\(/ && !b {b=NR}
+  on && /datapath_defrag\(umacd,/ && !d {d=NR} on && /^    if \(mesh_ctrl_present\)/ && !m {m=NR}
+  on && /umac_mesh_ctrl_parse\(|umac_mesh_fwd_glue_rx\(|umac_mesh_fwd_glue_leaf_learn\(/ && !p {p=NR}
+  on && /datapath_defrag_is_fragment\(header\)\)/ && /^        / && !f {f=NR}
+  on && /umac_datapath_is_eapol_frame\(rxbufview\)\)/ && !e {e=NR}
+  END { if (v && b && d && m && p && f && e && v < d && b < d && d < m && d < p && f < e) print "ok";
+        else printf "replay %d, ba %d, defrag %d, mesh ctrl %d, first parse %d, plain fragment %d, eapol %d\n", v, b, d, m, p, f, e }' \
+  "$DD/umac_datapath.c")
+if [ "$order46" = ok ] && [ "$(grep -c 'datapath_defrag(umacd,' "$DD/umac_datapath.c")" = 1 ]; then
+  ok "reassembly runs once, after the replay check and Block Ack, before Mesh Control is read; plaintext fragments are refused before the EAPOL exception"
+else
+  bad "receive-path order: ${order46:-not found} (datapath_defrag call sites: $(grep -c 'datapath_defrag(umacd,' "$DD/umac_datapath.c"))"
+fi
+
+# 47. Reassembly's resources are bounded and outside what chip RX and hostap need: chain buffers
+#     come from the heap, never the chip RX pool; one node-wide table of DEFRAG_CHAINS_MAX (4)
+#     chains, DEFRAG_CHAINS_PER_PEER (2) a peer, none in the peer record; one core timeout for
+#     them all, not one a chain; chains past their time are swept on every data frame and on the
+#     mesh service tick. And the receive path's frame-shape rules: a fragment is group-addressed
+#     by addr1, as mac80211 tests it; QoS bit 8 is compared on the mesh only; mesh data with a
+#     group RA must be FromDS only and with a unicast RA 4-address (rxdrop 89), before decryption.
+DF=$DD/datapath_defrag.c
+DH=$DD/umac_datapath_data.h
+MS=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh.c
+why47=""
+grep -q 'mmpkt_alloc_on_heap(FRAG_CHAIN_HDR_SPACE, FRAG_CHAIN_BODY_SPACE, 0)' "$DF" || why47="chain buffers are not heap-allocated"
+grep -Eq 'mmdrv_alloc_mmpkt_for_defrag|mmhal_wlan_alloc_mmpkt_for_rx' "$DF" && why47="datapath_defrag.c takes chip RX pool blocks"
+grep -Eq '^#define DEFRAG_CHAINS_MAX +\(4\)' "$DF" && grep -Eq '^#define DEFRAG_CHAINS_PER_PEER +\(2\)' "$DF" && \
+  grep -q '^static struct datapath_defrag_chain s_chains\[DEFRAG_CHAINS_MAX\];' "$DF" || why47="${why47:-the chain table or its limits changed}"
+awk '/^struct datapath_defrag_data$/,/^};/' "$DH" | grep -Eq 'mmpkt|chain' && why47="${why47:-a peer record holds chain storage again}"
+[ "$(grep -c 'umac_core_register_timeout(' "$DF")" = 1 ] && \
+  grep -A2 'umac_core_register_timeout(' "$DF" | tr -d ' \n' | grep -q 'datapath_defrag_timeout,umacd,NULL)' || \
+  why47="${why47:-reassembly registers other than one node-wide timeout}"
+awk '/^static void umac_datapath_process_rx_data_frame_after_reorder\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c" > "${TMPDIR:-/tmp}/glueguard47.$$"
+AR="${TMPDIR:-/tmp}/glueguard47.$$"
+grep -q '^    datapath_defrag_expire(umacd);' "$AR" || why47="${why47:-data frames do not sweep the chains}"
+awk '/^static void mesh_service_evt_\(/,/^}/' "$MS" | grep -q 'umac_datapath_defrag_expire(umacd);' || why47="${why47:-the mesh service tick does not sweep the chains}"
+grep -q 'datapath_defrag_is_fragment(header) && mm_mac_addr_is_multicast(dot11_get_ra(header))' "$AR" || why47="${why47:-the group-fragment drop does not test addr1}"
+grep -q 'frag_mpdu = { .mesh = data->ops == &datapath_ops_mesh };' "$AR" || why47="${why47:-reassembly is not told the mesh from a BSS}"
+shape47=$(awk '/g_warthog_rxdrop_reason = 89;/ && !s {s=NR} /umac_mesh_rx_host_ccmp\(stad, header, rxbufview\)/ && !c {c=NR}
+  END { print (s && c && s < c) ? "ok" : "no" }' "$AR")
+[ "$shape47" = ok ] || why47="${why47:-the mesh frame-shape drop (89) is missing or after decryption}"
+rm -f "$AR"
+if [ -z "$why47" ]; then
+  ok "reassembly: heap buffers outside the chip RX pool, 4 chains a node and 2 a peer, one timeout, swept by data frames and the mesh tick; group fragments by addr1, QoS bit 8 on the mesh only, mesh frame shapes checked before decryption"
+else
+  bad "reassembly bounds / receive frame shapes: $why47"
 fi
 
 [ $fail -eq 0 ] && echo "GLUE INVARIANTS OK" || echo "GLUE INVARIANTS FAILED"
