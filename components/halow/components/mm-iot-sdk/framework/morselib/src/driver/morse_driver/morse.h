@@ -180,6 +180,7 @@ struct driver_data
         volatile atomic_uint_fast32_t periodic_check_vetoes;
 
         volatile bool check_demanded;
+        volatile bool force_fail; /* warthog: AT+CHIPRESTART fails the next check */
     } health_check;
 
     struct

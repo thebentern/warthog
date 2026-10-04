@@ -484,7 +484,8 @@ fi
 
 # 17. Under SAE, beacons and probe responses need the RSN element hostap puts in our
 #     Open/Confirm. The shim links hostap (simnode does not), so the hand-over is checked
-#     here: after SAE comes up, and after the beacon init that clears it.
+#     here: after SAE comes up, and after the beacon init that clears it, which runs on the
+#     first start only: the chip start a restart repeats (mesh_chip_start_, NULL) skips it.
 C=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/supplicant_shim/supplicant_core_mesh.c
 if awk '/^static int passive_init_ifmsh/,/^}/' "$C" | \
      awk '/mesh_rsn_auth_init\(wpa_s, mconf\)/ {a=NR} /g_warthog_sae_init = 1;/ {if (a) b=NR}
@@ -492,8 +493,15 @@ if awk '/^static int passive_init_ifmsh/,/^}/' "$C" | \
           /MMLOG_INF\("mesh: open mesh/ {if (c) d=NR}
           END {exit (a && b && c && d) ? 0 : 1}' && \
    awk '/^enum mmwlan_status umac_mesh_enable_mesh\(/,/^}/' "$M" | \
-     awk '/umac_mesh_beacon_init\(args, own_addr\);/ {i=NR} /umac_supp_add_mesh_interface\(umacd\)/ {if (i) s=NR}
-          END {exit (i && s) ? 0 : 1}'; then
+     awk '/status = mesh_chip_start_\(umacd, vif_id, args, own_addr\);/ {c=NR}
+          /mesh_enable_rest_\(umacd, vif_id, args, own_addr\)/ {if (c) r=NR} END {exit (c && r) ? 0 : 1}' && \
+   awk '/^static enum mmwlan_status mesh_chip_start_\(/ {n++} n == 2 {print} n == 2 && /^}/ {exit}' "$M" | tr -d ' \n' | \
+     grep -q 'if(own_addr!=NULL){enummmwlan_statusmac_status=mmwlan_get_mac_addr(own_addr);.*umac_mesh_beacon_init(args,own_addr);}' && \
+   awk '/^static enum mmwlan_status mesh_enable_rest_\(/ {n++} n == 2 {print} n == 2 && /^}/ {exit}' "$M" | \
+     grep -q 'umac_supp_add_mesh_interface(umacd)' && \
+   awk '/^enum mmwlan_status umac_mesh_handle_hw_restarted\(/,/^}/' "$M" | \
+     grep -q 'mesh_chip_start_(umacd, vif_id, &s_mesh_args, NULL)' && \
+   [ "$(grep -c 'umac_mesh_beacon_init(' "$M")" -eq 1 ]; then
   ok "the shim hands hostap's rsn_ie to the beacon module once SAE is up, after the init that clears it"
 else
   bad "hostap's RSN element no longer reaches the beacon and probe responses (or is cleared after it does)"
@@ -1207,7 +1215,8 @@ rm -rf "$T"
 # 34. main/bat_port.c itself, compiled against pthread-backed FreeRTOS queues, semaphores
 #     and tasks, recording ESP-IDF/morselib fakes and a counting engine stub: the start
 #     sequence (hook, driver, MTU, soft MAC, engine config, datapath gate, host CCMP), the
-#     tx gate and RA, both slot pools under a stuck engine, at most 16 delivered copies held
+#     tx gate and RA, both slot pools under a stuck engine, lwIP's wait for a TX slot (a fragment burst),
+#     at most 16 delivered copies held
 #     by a stalled lwIP (the rest dropped and counted), the render handshake's abandon
 #     and late-finish paths, at.c's cmd_bat_render paging a listing longer than one buffer
 #     (a node's rows alone for AT+BATO=/AT+BATTG=<mac>, a stalled cursor refused), the stat line
@@ -1342,6 +1351,9 @@ static pthread_mutex_t f_cm = PTHREAD_MUTEX_INITIALIZER;
 static int f_queues;
 static struct fq *f_q[8]; /* in creation order: the port's free RX slots first */
 static void (*f_timeout_hook)(struct fq *q);
+static struct fq *f_wait_q; /* a finite wait on it runs f_wait_hook first, once (no zero-tick poll does) */
+static void (*f_wait_hook)(void);
+static TickType_t f_wait_t;
 static uint64_t mono_us(void)
 {
     struct timespec ts;
@@ -1379,6 +1391,12 @@ BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t t)
 }
 BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t t)
 {
+    if (q == f_wait_q && t && t != portMAX_DELAY && f_wait_hook) {
+        void (*h)(void) = f_wait_hook;
+        f_wait_hook = NULL;
+        f_wait_t = t;
+        h();
+    }
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
     long ns = dl.tv_nsec + (long)(t == portMAX_DELAY ? 0 : t) * 50000L;
@@ -1665,6 +1683,11 @@ static const char *at(enum bat_render_kind k, const char *mac) /* NULL: the '?' 
     if (mac) { cmd_bat_render_mac(k, mac, "usage"); } else { cmd_bat_render(k, NULL); }
     return at_out;
 }
+static void open_gate_for_slot(void) /* the engine gets going while lwIP waits for a TX slot */
+{
+    gate(0);
+    for (int i = 0; i < 20000 && uxQueueMessagesWaiting(f_q[1]) == 0; i++) { sleep_ms(1); }
+}
 static struct fq *f_hooked;
 static void late_finish(struct fq *q) /* the engine finishes right after the caller's timeout */
 {
@@ -1829,7 +1852,26 @@ int main(int argc, char **argv)
     int drained = wait_ge(&f_rx_hard, rx0 + 6) && wait_ge(&f_tx_soft, tx0 + 4);
     sleep_ms(20);
     CHECK(busy && okc == 4 && full == ESP_ERR_NO_MEM && drained && ld(&f_rx_hard) == rx0 + 6,
-          "engine busy: 6 RX + 4 TX queue, the 7th RX and 5th TX are refused, then all 10 get through");
+          "engine busy: 6 RX + 4 TX queue, the 7th RX and 5th TX (after its wait) are refused, then all 10 get through");
+
+    /* lwIP's burst (ip4_frag ignores a refusal): the 5th frame waits for a slot the engine frees meanwhile. */
+    rx0 = ld(&f_rx_hard);
+    tx0 = ld(&f_tx_soft);
+    gate(1);
+    rx(TA, 0x4305, 0x04, 60);
+    busy = wait_ge(&f_in_rx, 1);
+    okc = 0;
+    for (int i = 0; i < 4; i++) { okc += soft(100) == ESP_OK; }
+    const unsigned idle_tx = uxQueueMessagesWaiting(f_q[1]);
+    f_wait_q = f_q[1];
+    f_wait_hook = open_gate_for_slot;
+    esp_err_t waited = soft(100);
+    f_wait_q = NULL;
+    gate(0);
+    drained = wait_ge(&f_rx_hard, rx0 + 1) && wait_ge(&f_tx_soft, tx0 + 5);
+    CHECK(busy && okc == 4 && idle_tx == 0 && waited == ESP_OK && f_wait_t > 50 && f_wait_t < 1000 && drained,
+          "a 5th soft frame while the engine is busy waits (%u ms, past bat_port_tx's 50) and is taken when a slot "
+          "frees; all 5 reach bat_tx_soft", (unsigned)f_wait_t);
 
     static const uint8_t in[20] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x08, 0x00, 0x45 };
     f_ops.deliver(f_user, in, sizeof(in));
@@ -3220,8 +3262,8 @@ if awk '/"GTKPERSTA"\) == 0 && terminator == .=./ {on=1} on && /warthog_cfg_set_
    grep -q '"mesh_gtk"' ../../../main/cfg.c && \
    grep -q 'return stad != NULL && g_warthog_peer_gtk_mode != 0u && umac_mesh_sae_active() &&' "$M/datapath/umac_datapath_mesh.c" && \
    grep -q '^    umac_datapath_mesh_service_peer_gtk();' "$M/mesh/umac_mesh.c" && \
-   grep -q '^            umac_datapath_mesh_chip_booted();' "$M/interface/umac_interface.c" && \
-   grep -q '^            umac_datapath_mesh_chip_booted();' "$M/umac_mmdrv_shim.c" && \
+   grep -q '^            umac_datapath_mesh_chip_booted(false);' "$M/interface/umac_interface.c" && \
+   grep -q '^            umac_datapath_mesh_chip_booted(true);' "$M/umac_mmdrv_shim.c" && \
    grep -q 'read_seq = ++g_warthog_rx_read_seq;' "$M/../driver/morse_driver/mm6108/pageset.c" && \
    grep -q 'read_seq = ++g_warthog_rx_read_seq;' "$M/../driver/morse_driver/mm8108/yaps.c"; then
   ok "AT+GTKPERSTA= persists the mode and applies it live; boot restores it; the gate and the tick read it; a chip boot resets the mesh's chip keys; both drivers stamp the read order"
@@ -3334,6 +3376,1868 @@ if [ -z "$why47" ]; then
   ok "reassembly: heap buffers outside the chip RX pool, 4 chains a node and 2 a peer, one timeout, swept by data frames and the mesh tick; group fragments by addr1, QoS bit 8 on the mesh only, mesh frame shapes checked before decryption"
 else
   bad "reassembly bounds / receive frame shapes: $why47"
+fi
+
+# 48. AT+HOSTFRAG? (hostfragstat_line_ in main/at.c), compiled out and run: the mode as off, auto or
+#     the threshold and the build's rule (max2, off, max16), every counter in its slot (agg and the
+#     Block Ack ones, ba_end nodelba ba_wait ba_late hold held hold_ms, too; hold_ms reads the hold-off
+#     before the mesh runs), the last rate as <MHz>M/MCS<n> or none, the fragment cap's and
+#     AT+SEALFIT's counters (seal_*, grp_*) and AT+TIDPARAMS' state and counters (ba_rcpt,
+#     delba_noack) on the fourth line, and each of its four lines within line[] with every field at
+#     its extreme; cmd_hostfragstat fills it from the storage morselib writes, mode as the build
+#     applies it (off where the rule is), every counter is written there, and it is dispatched.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{ awk '/^struct hostfragstat \{/,/^};/' "$A"
+  awk '/^static const char \*hostfrag_mode_\(/,/^}/' "$A"
+  awk '/^static int hostfragstat_line_\(/,/^}/' "$A"; } > "$T/fn.c"
+size48=$(awk '/^static void cmd_hostfragstat\(void\)/ {on=1} on && /char line\[[0-9]+\];/ {match($0, /\[[0-9]+\]/); print substr($0, RSTART + 1, RLENGTH - 2); exit}' "$A")
+cat > "$T/t.c" <<'EOF2'
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fn.c"
+int main(int argc, char **argv)
+{
+    unsigned size = (unsigned)atoi(argv[1]);
+    char buf[1024];
+    struct hostfragstat s = { 1, 512, 300, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 40, 17, 18,
+                              19, 20, 21, 22, 23, 24, 31, 35, 36, 37, 32, 33, 34, 25, 26, 27, 0x108,
+                              2, 46, 47, 48, 1, 49, 50, 51, 1, 44, 45, 52, 53, 54, 55 };
+    static const char *want[4] = {
+        "+HOSTFRAG: mode=auto stored=512 rule=max2 atfrag=300 | msdu=4 frag=5 by thresh=6 chip=7 rate=8 | "
+        "whole many=10 pool=11 | drop seal=12 drv=13\r\n",
+        "+HOSTFRAG: txst acked=14 noack=15 unsent=16 agg=40 | msdu ok=17 fail=18 | held wait=19 "
+        "mgmt=20 stale=21 | overlap=22\r\n",
+        "+HOSTFRAG: trim=23 chippn=24 | ba_end=31 nodelba=35 ba_wait=36 ba_late=37 hold=32 held=33 "
+        "hold_ms=34 | last n=25 len=26 lim=27 at=1M/MCS8\r\n",
+        "+HOSTFRAG: cap_trim=46 cap_sub=47 clamp=48 | sealfit=1 seal_trim=49 seal_sub=50 seal_nofit=51 "
+        "seal_ba=55 grp_trim=52 grp_sub=53 grp_nofit=54 | tidparams=1 ba_rcpt=44 delba_noack=45\r\n",
+    };
+    for (int i = 0; i < 4; i++) {
+        hostfragstat_line_(buf, sizeof(buf), &s, i);
+        if (strcmp(buf, want[i]) != 0) { printf("line %d: %s", i, buf); return 0; }
+    }
+    s.mode = 0; s.last_rate = 0xffff; s.rule = 0;
+    hostfragstat_line_(buf, sizeof(buf), &s, 0);
+    if (strncmp(buf, "+HOSTFRAG: mode=off stored=512 rule=off ", 40) != 0) { printf("off: %s", buf); return 0; }
+    s.rule = 16;
+    hostfragstat_line_(buf, sizeof(buf), &s, 0);
+    if (strstr(buf, " rule=max16 ") == NULL) { printf("rule 16: %s", buf); return 0; }
+    hostfragstat_line_(buf, sizeof(buf), &s, 2);
+    if (strstr(buf, " at=none\r\n") == NULL) { printf("no rate: %s", buf); return 0; }
+    int worst = 0;
+    for (int i = 0; i < 4; i++) {
+        memset(&s, 0xff, sizeof(s));
+        int n = hostfragstat_line_(buf, sizeof(buf), &s, i);
+        worst = n > worst ? n : worst;
+    }
+    (void)argc;
+    printf("%s %d/%u\n", worst + 1 <= (int)size ? "ok" : "short", worst + 1, size);
+    return 0;
+}
+EOF2
+fit48=""
+if [ -n "$size48" ] && ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then
+  fit48=$("$T/t" "$size48")
+fi
+rm -rf "$T"
+fill48=$(awk '/^static void cmd_hostfragstat\(void\)/,/^}/' "$A" | tr -d ' \n')
+DD=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/datapath
+for c in hostfrag_msdu hostfrag_frags hostfrag_by_thresh hostfrag_by_chip hostfrag_by_rate hostfrag_many hostfrag_pool \
+         hostfrag_seal hostfrag_drv hostfrag_acked hostfrag_noack hostfrag_unsent hostfrag_agg hostfrag_ok hostfrag_fail \
+         hostfrag_wait hostfrag_mgmt hostfrag_stale hostfrag_overlap hostfrag_trim hostfrag_chippn hostfrag_ba_end \
+         hostfrag_nodelba hostfrag_ba_wait hostfrag_ba_late hostfrag_hold hostfrag_held hostfrag_hold_ms hostfrag_last_n \
+         hostfrag_last_len hostfrag_last_lim hostfrag_last_rate hostfrag_cap_trim hostfrag_cap_sub hostfrag_clamp \
+         sealfit_trim sealfit_sub sealfit_nofit sealfit_ba grpfit_trim grpfit_sub grpfit_nofit hostfrag_ba_rcpt \
+         hostfrag_delba_noack; do
+  case "$fill48" in *"g_warthog_$c"*) ;; *) fit48="cmd_hostfragstat does not read g_warthog_$c"; break ;; esac
+  grep -q "^volatile uint32_t .*g_warthog_$c = " "$A" || { fit48="at.c has no storage for g_warthog_$c"; break; }
+  cat "$DD/umac_datapath.c" "$DD/umac_datapath_mesh.c" | grep -Eq "g_warthog_$c(\+\+| = | \+= )|&g_warthog_$c;" || \
+    { fit48="morselib never writes g_warthog_$c"; break; }
+done
+case "$fill48" in *'.mode=hostfrag_rule_()!=0u?g_warthog_hostfrag:0u,'*'.stored=warthog_cfg_get_mesh_hostfrag(),.chip=s_frag_threshold'*) ;; *) fit48="cmd_hostfragstat does not fill mode (as applied), stored and chip" ;; esac
+case "$fill48" in *'for(inti=0;i<4;i++){hostfragstat_line_(line,sizeof(line),&s,i);cdc_write(line);}'*) ;; *) fit48="cmd_hostfragstat does not print all four lines" ;; esac
+case "$fill48" in *'.rule=hostfrag_rule_(),'*'.sealfit=g_warthog_sealfit,'*'.txparm=g_warthog_ba_txparm,'*) ;; *) fit48="cmd_hostfragstat does not fill the rule, sealfit and tidparams" ;; esac
+awk '/strcasecmp\(verb, "HOSTFRAG"\) == 0 && terminator == .\?./ {getline; print}' "$A" | grep -q 'cmd_hostfragstat();' || \
+  fit48="AT+HOSTFRAG? is not dispatched to cmd_hostfragstat"
+# Every key= of every line is named, in backticks, in the AT+HOSTFRAG row of the AT reference.
+keys48=$(awk '/^static int hostfragstat_line_\(/,/^}/' "$A" | grep '"' | sed -n 's/^[^"]*"\(.*\)".*$/\1/p' |
+  tr ' ' '\n' | sed -n 's/^\([a-z_][a-z_0-9]*\)=.*/\1/p' | sort -u)
+row48=$(grep '^| `AT+HOSTFRAG=' ../../../wiki/AT-Command-Reference.md)
+[ "$(printf '%s\n' "$keys48" | grep -c .)" -ge 36 ] || fit48="the AT+HOSTFRAG? keys were not found ($keys48)"
+hold48=$(sed -n 's/^#define UMAC_MESH_FRAG_BA_HOLD_MS \([0-9]*\)u$/\1/p' ../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh_frag.h)
+grep -q "^volatile uint32_t g_warthog_hostfrag_held = 0, g_warthog_hostfrag_hold_ms = ${hold48:-x};" "$A" || \
+  fit48="hold_ms does not read the hold-off (${hold48:-none}) before the mesh runs"
+[ -n "$row48" ] || fit48="no AT+HOSTFRAG row in the AT reference"
+for k in $keys48; do
+  case "$row48" in *"\`$k\`"*) ;; *) fit48="the AT reference row does not name \`$k\`" ;; esac
+done
+case "$fit48" in
+  ok*) ok "AT+HOSTFRAG? names its mode, prints every counter in its slot, is filled from morselib's storage and each line fits line[$size48] (${fit48#ok })" ;;
+  *)   bad "AT+HOSTFRAG?: ${fit48:-did not build or run}" ;;
+esac
+
+# 49. AT+HOSTFRAG=<0|auto|n>: the parser is compiled out of main/at.c and run (n even, 256..2346, as
+#     cfg80211 takes a threshold); the command persists the mode and applies it live, boot restores it
+#     before the first data frame, NVS holds only a value the parser could give; cfg.c's getter, run
+#     against a fake NVS with each build's flags, gives a value never stored as auto on SAE builds
+#     with chip keys and off on the rest (host CCMP, no chip key, no SAE) and a stored one as
+#     stored, and at.c boots with that default (the host tests' storage is generated from at.c and
+#     cfg.h, and the simnode builds are SAE builds); the transmit path
+#     reads it once a frame and enters fragmentation only when it is not off, for unicast data that
+#     is not EAPOL, and asks rate control exactly once either way; the Block Ack check runs once a
+#     frame, on that path after the cut decision (which may end the session) and before any cut.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^static bool hostfrag_parse_\(/,/^}/' "$A" > "$T/fn.c"
+cat > "$T/t.c" <<'EOF2'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include "fn.c"
+static int check(const char *in, bool want_ok, uint32_t want)
+{
+    uint32_t v = 77;
+    bool got = hostfrag_parse_(in, &v);
+    if (got != want_ok || (got && v != want)) { printf("'%s' parsed as %d/%lu", in, (int)got, (unsigned long)v); return 1; }
+    return 0;
+}
+int main(void)
+{
+    return check("0", true, 0) || check("auto", true, 1) || check("AUTO", true, 1) ||
+           check("256", true, 256) || check("257", true, 256) || check("512", true, 512) ||
+           check("2346", true, 2346) || check("2347", false, 0) || check("255", false, 0) ||
+           check("1", false, 0) || check("", false, 0) || check("512 ", false, 0) ||
+           check(" 512", false, 0) || check("-512", false, 0) || check("+512", false, 0) ||
+           check("autox", false, 0) || check("0x200", false, 0) ||
+           check("99999999999999999999", false, 0) || hostfrag_parse_(NULL, NULL);
+}
+EOF2
+why=""
+if ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null && why=$("$T/t"); then
+  ok "AT+HOSTFRAG= accepts 0, auto or an even 256..2346 (an odd n rounded down) as the whole argument and rejects the rest"
+else
+  bad "hostfrag_parse_ against its cases: ${why:-did not build or run}"
+fi
+rm -rf "$T"
+CF=../../../main/cfg.c
+why49=""
+awk '/"HOSTFRAG"\) == 0 && terminator == .=./ {on=1} on && /warthog_cfg_set_mesh_hostfrag\(/ {p=1}
+     on && p && /g_warthog_hostfrag = v;/ {l=1} on && /reply_ok\(\);/ {exit}
+     END {exit (p && l) ? 0 : 1}' "$A" || why49="AT+HOSTFRAG= does not both persist and apply the mode"
+grep -q 'g_warthog_hostfrag = warthog_cfg_get_mesh_hostfrag();' ../../../main/mesh.c || why49="${why49:-boot does not restore it}"
+grep -q '"mesh_hfrag"' "$CF" && awk '/^static bool hostfrag_valid_\(/,/^}/' "$CF" | tr -d ' \n' | \
+  grep -q 'returnv==0u||v==1u||(v>=256u&&v<=2346u&&(v&1u)==0u);' || why49="${why49:-NVS takes values the parser cannot give}"
+grep -q '^volatile uint32_t g_warthog_hostfrag = WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT;' "$A" || \
+  why49="${why49:-at.c does not boot with the NVS default}"
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^#if/ {b=""; on=1} on {b=b $0 "\n"} on && /^#endif/ {on=0; if (b ~ /WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT/) printf "%s", b}' \
+  ../../../main/cfg.h > "$T/def.h"
+for f in hostfrag_valid_ warthog_cfg_get_mesh_hostfrag warthog_cfg_set_mesh_hostfrag; do
+  awk -v f="$f" '$0 ~ ("^[a-z_0-9 ]+[ *]" f "\\(") && !/;$/ {p=1} p {print} p && /^}/ {exit}' "$CF"
+done > "$T/cfg_fn.c"
+cat > "$T/t.c" <<'EOF2'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "def.h"
+typedef int esp_err_t;
+typedef int nvs_handle_t;
+#define ESP_OK 0
+#define ESP_ERR_INVALID_ARG 0x102
+#define ESP_ERR_NVS_NOT_FOUND 0x1102
+enum { NVS_READONLY, NVS_READWRITE };
+static const char *NS = "warthog";
+static int have;
+static uint16_t val;
+static esp_err_t nvs_open(const char *ns, int m, nvs_handle_t *h) { (void)ns; (void)m; *h = 1; return ESP_OK; }
+static void nvs_close(nvs_handle_t h) { (void)h; }
+static esp_err_t nvs_commit(nvs_handle_t h) { (void)h; return ESP_OK; }
+static esp_err_t nvs_get_u16(nvs_handle_t h, const char *k, uint16_t *v)
+{ (void)h; if (strcmp(k, "mesh_hfrag") != 0 || !have) return ESP_ERR_NVS_NOT_FOUND; *v = val; return ESP_OK; }
+static esp_err_t nvs_set_u16(nvs_handle_t h, const char *k, uint16_t v)
+{ (void)h; if (strcmp(k, "mesh_hfrag") != 0) return ESP_ERR_INVALID_ARG; have = 1; val = v; return ESP_OK; }
+#include "cfg_fn.c"
+int main(void)
+{
+    const uint32_t def = WANT;
+    if (WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT != def) { printf("default %u", (unsigned)WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT); return 0; }
+    if (warthog_cfg_get_mesh_hostfrag() != def) { printf("never stored: %lu", (unsigned long)warthog_cfg_get_mesh_hostfrag()); return 0; }
+    static const uint32_t stored[] = { 0, 1, 512, 2346 };
+    for (unsigned i = 0; i < 4; i++) {
+        if (warthog_cfg_set_mesh_hostfrag(stored[i]) != ESP_OK || warthog_cfg_get_mesh_hostfrag() != stored[i]) {
+            printf("stored %lu read %lu", (unsigned long)stored[i], (unsigned long)warthog_cfg_get_mesh_hostfrag()); return 0;
+        }
+    }
+    have = 1; val = 513;
+    if (warthog_cfg_get_mesh_hostfrag() != def) { printf("invalid stored: %lu", (unsigned long)warthog_cfg_get_mesh_hostfrag()); return 0; }
+    printf("ok");
+    return 0;
+}
+EOF2
+# Each build's flags (platformio.ini) and the default it must boot with.
+for d49 in "1 -DWARTHOG_MESH_SAE=1" "1 -DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_CHIP_VIF_MESH=1" \
+           "0 -DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1" \
+           "0 -DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1" "0 -DWARTHOG_MESH_SMOKE=1" "0 -DWARTHOG_REGION_US=1"; do
+  r49=""
+  ${CC:-cc} -std=gnu11 -w -DWANT=${d49%% *} ${d49#* } -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null && r49=$("$T/t")
+  [ "$r49" = ok ] || why49="${why49:-the NVS default (${d49#* }, want ${d49%% *}): ${r49:-did not build or run}}"
+done
+# The simnode builds are SAE builds: their storage boots with the default of the build each models.
+grep -q '^$(SIMNODE_TESTS): CFLAGS += -DWARTHOG_MESH_SAE=1$' Makefile || \
+  why49="${why49:-the simnode builds do not define WARTHOG_MESH_SAE}"
+rm -rf "$T"
+PT=$(awk '/^enum mmwlan_status umac_datapath_process_tx_frame\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c")
+[ "$(printf '%s\n' "$PT" | grep -cE 'g_warthog_hostfrag([^_]|$)')" = 0 ] && \
+  [ "$(printf '%s\n' "$PT" | grep -c 'umac_datapath_mesh_hostfrag_mode()')" = 1 ] && \
+  printf '%s\n' "$PT" | grep -q 'const uint32_t hostfrag = umac_datapath_mesh_hostfrag_mode();' || why49="${why49:-the transmit path does not read the mode in force once}"
+printf '%s\n' "$PT" | tr -d ' \n' | grep -q 'constboolcut_path=hostfrag!=UMAC_MESH_FRAG_OFF&&data->ops==&datapath_ops_mesh&&!is_multicast&&!is_eapol;' && \
+  printf '%s\n' "$PT" | tr -d ' \n' | grep -q 'if(cut_path){' || \
+  why49="${why49:-fragmentation is entered off, or for group, EAPOL or non-mesh frames}"
+[ "$(printf '%s\n' "$PT" | grep -c 'umac_datapath_aggr_check(')" = 2 ] && \
+  printf '%s\n' "$PT" | tr -d ' \n' | grep -q 'if(!is_multicast&&!is_eapol&&!cut_path){umac_datapath_aggr_check(' && \
+  printf '%s\n' "$PT" | awk '/umac_datapath_mesh_frag_plan\(/ && !p {p=NR} /umac_datapath_aggr_check\(/ {a=NR}
+    /umac_datapath_tx_mesh_frags\(/ && !f {f=NR} END {exit (p && a && f && p < a && a < f) ? 0 : 1}' || \
+  why49="${why49:-the Block Ack check is not once a frame, after the cut decision and before the cut}"
+[ "$(printf '%s\n' "$PT" | grep -c 'umac_rc_init_rate_table_data(')" = 1 ] && \
+  printf '%s\n' "$PT" | tr -d ' \n' | grep -q 'else{if(!rc_done){MMOSAL_DEV_ASSERT(stad!=NULL);umac_rc_init_rate_table_data(' || \
+  why49="${why49:-rate control is not asked exactly once a frame}"
+if [ -z "$why49" ]; then
+  ok "AT+HOSTFRAG= persists the mode and applies it live, boot restores it, NVS holds only valid modes; never stored it is auto on SAE builds with chip keys and off on the rest, a stored value wins, at.c boots with it; off never enters fragmentation, and rate control is asked once a frame"
+else
+  bad "AT+HOSTFRAG wiring: $why49"
+fi
+
+# 50. AT+TXRATE=<mcs>,<bw>|off: the parser is compiled out of main/at.c and run (MCS 0-9; 1, 2, 4 or 8
+#     MHz); the command hands it to mmwlan_ate_override_rate_control, off as no override.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^static bool txrate_parse_\(/,/^}/' "$A" > "$T/fn.c"
+cat > "$T/t.c" <<'EOF2'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include "fn.c"
+static int check(const char *in, bool want_ok, int wm, int wb)
+{
+    int m = 77, b = 77;
+    bool got = txrate_parse_(in, &m, &b);
+    if (got != want_ok || (got && (m != wm || b != wb))) { printf("'%s' parsed as %d/%d,%d", in, (int)got, m, b); return 1; }
+    return 0;
+}
+int main(void)
+{
+    return check("0,1", true, 0, 1) || check("9,8", true, 9, 8) || check("7,2", true, 7, 2) ||
+           check("off", true, -1, -1) || check("OFF", true, -1, -1) || check("10,1", false, 0, 0) ||
+           check("0,3", false, 0, 0) || check("0,16", false, 0, 0) || check("0", false, 0, 0) ||
+           check("0,", false, 0, 0) || check(",1", false, 0, 0) || check("0,1 ", false, 0, 0) ||
+           check("-1,1", false, 0, 0) || check("0,-1", false, 0, 0) || check("", false, 0, 0) ||
+           txrate_parse_(NULL, NULL, NULL);
+}
+EOF2
+why=""
+if ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null && why=$("$T/t"); then
+  ok "AT+TXRATE= accepts <0-9>,<1|2|4|8> or off as the whole argument and rejects the rest"
+else
+  bad "txrate_parse_ against its cases: ${why:-did not build or run}"
+fi
+rm -rf "$T"
+if awk '/"TXRATE"\) == 0 && terminator == .=./ {on=1} on && /mmwlan_ate_override_rate_control\(\(enum mmwlan_mcs\)mcs, \(enum mmwlan_bw\)bw,/ {c=1}
+        on && c && /MMWLAN_GI_NONE\)/ {g=1} on && /reply_ok\(\);/ {exit} END {exit (c && g) ? 0 : 1}' "$A" && \
+   grep -q 'strcasecmp(verb, "TXRATE") == 0 && terminator == .?.' "$A"; then
+  ok "AT+TXRATE= sets the rate override (off clears it) and AT+TXRATE? reports it"
+else
+  bad "AT+TXRATE is not wired to mmwlan_ate_override_rate_control, or has no query"
+fi
+
+# 51. Host fragmentation's invariants the simulator cannot see: umac_mesh_frag.c is in the firmware
+#     build and the simulator's; a fragmented MSDU's buffers are all taken, and every fragment built,
+#     before the first reaches the chip; host CCMP's PNs come from one reservation, whose increment
+#     runs inside the critical section path selection's does; no fragment carries the A-MPDU flag,
+#     and a frame over its limit ends its TID's originator session before it is counted cut, sent
+#     whole or cut; one call site.
+DM=$DD/umac_datapath_mesh.c
+why51=""
+grep -q '/src/umac/mesh/umac_mesh_frag.c' ../../halow/components/morselib/CMakeLists.txt || why51="umac_mesh_frag.c is not in the firmware build"
+grep -q 'umac_mesh_bip.c umac_mesh_frag.c)' Makefile || why51="${why51:-umac_mesh_frag.c is not in SIMNODE_REAL}"
+FR=$(awk '/^static int umac_datapath_tx_mesh_frags\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c")
+FH=$(awk '/^int umac_datapath_mesh_frags_to_chip\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c")
+order51=$(printf '%s\n' "$FR" | awk '/umac_datapath_alloc_raw_tx_mmpkt\(/ && !a {a=NR} /umac_datapath_mesh_take_tx_pns\(/ && !p {p=NR}
+  /umac_mesh_tx_host_ccmp\(stad,/ && !s {s=NR} /umac_datapath_mesh_ba_park\(stad, tid, frag, plan->n, chip\)/ && !k {k=NR}
+  /return umac_datapath_mesh_frags_to_chip\(stad, tid, frag, plan->n, chip\);/ && !t {t=NR}
+  END { if (a && p && s && k && t && a < p && p < s && s < k && k < t) print "ok"; else printf "alloc %d, pns %d, seal %d, park %d, tx %d\n", a, p, s, k, t }')
+[ "$order51" = ok ] || why51="${why51:-fragment order: $order51}"
+[ "$(printf '%s\n' "$FR" | grep -c 'mmdrv_tx_frame(')" = 0 ] && [ "$(printf '%s\n' "$FH" | grep -c 'mmdrv_tx_frame(')" = 1 ] && \
+  [ "$(grep -c 'umac_datapath_mesh_frags_to_chip(' "$DD/umac_datapath.c")" = 2 ] || \
+  why51="${why51:-more than one hand-off to the chip}"
+printf '%s\n%s\n' "$FR" "$FH" | grep -q 'AMPDU' && why51="${why51:-the flags of a fragment mention A-MPDU}"
+printf '%s\n' "$FR" | grep -q 'md->flags = (key_id >= 0 && !host_seal) ? MMDRV_TX_FLAG_HW_ENC : 0u;' || why51="${why51:-the flags of a fragment are not HW_ENC or nothing}"
+awk '/^uint64_t umac_datapath_mesh_take_tx_pns\(/,/^}/' "$DM" | tr -d ' \n' | \
+  grep -q 'MMOSAL_TASK_ENTER_CRITICAL();if(kd->keys\[key_id\]!=NULL){pn=kd->keys\[key_id\]->tx_seq;kd->keys\[key_id\]->tx_seq+=n;}MMOSAL_TASK_EXIT_CRITICAL();' || \
+  why51="${why51:-the PN reservation is not one step under the critical section}"
+awk '/^uint64_t umac_datapath_mesh_take_tx_pn\(/,/^}/' "$DM" | grep -q 'return umac_datapath_mesh_take_tx_pns(stad, key_id, 1u);' || \
+  why51="${why51:-path selection does not reserve from the same allocator}"
+PL=$(awk '/^static void umac_datapath_mesh_frag_plan\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c")
+printf '%s\n' "$PL" | awk '/if \(plan->n == 1u\)/ && !o {o=NR} /umac_datapath_mesh_ba_cut\(stad, md->tid\);/ && !b {b=NR}
+  /g_warthog_hostfrag_many\+\+/ && !m {m=NR} /g_warthog_hostfrag_pool\+\+/ && !q {q=NR} /g_warthog_hostfrag_by_/ && !c {c=NR}
+  END {exit (o && b && m && q && c && o < b && b < m && b < q && b < c) ? 0 : 1}' && \
+  ! printf '%s\n' "$PL" | grep -q 'umac_ba_is_ampdu_permitted' || \
+  why51="${why51:-a frame over its limit does not end its Block Ack session before it is cut or sent whole}"
+[ "$(grep -c 'umac_datapath_tx_mesh_frags(' "$DD/umac_datapath.c")" = 2 ] || why51="${why51:-umac_datapath_tx_mesh_frags has other than one call site}"
+if [ -z "$why51" ]; then
+  ok "host fragmentation: in both builds; every buffer taken and fragment built before the first reaches the chip; one PN reservation under the critical section; no A-MPDU; one call site"
+else
+  bad "host fragmentation invariants: $why51"
+fi
+
+# 52. A host fragment's TX status always comes back (the driver is not in the simulator): skbq.c's
+#     release without a chip status (bus write failed, page invalid, 15 s stale) strips the
+#     driver's header and reports a host fragment untried instead of freeing it; the datapath
+#     queues such a status, and takes an untried host fragment before rate control sees it; every
+#     fragment is marked, a whole frame never is.
+SQ=../../halow/components/mm-iot-sdk/framework/morselib/src/driver/morse_driver/skbq.c
+why52=""
+# The second such line is the definition; the first, its prototype.
+TF=$(awk '/^static int __skbq_data_tx_finish\(struct mmpkt_list \*skbq,$/ {n++} n == 2 && /^{/ {on=1} on {print} on && /^}/ {exit}' "$SQ" |
+  sed 's:/\*[^*]*\*/::g' | tr -d ' \n')
+case "$TF" in
+  *'elseif(tx_metadata->mesh.host_frag!=0||tx_metadata->mesh.ba_wait!=0){structmmpktview*view=mmpkt_open(mmpkt);if(mmwlan_cap_mode[MMWLAN_CAP_TX]!=MMWLAN_CAP_OFF){conststructmorse_buff_skb_header*h=(conststructmorse_buff_skb_header*)mmpkt_get_data_start(view);mmwlan_cap_tx_untried(h->tx_info.pkt_id,h->tx_info.tid);}morse_skb_remove_padding_after_sent_to_chip(view);mmpkt_close(&view);tx_metadata->attempts=0;tx_metadata->status_flags=0;}else{mmpkt_release(mmpkt);return0;}mmdrv_host_process_tx_status(mmpkt);'*) ;;
+  *) why52="skbq.c frees a host fragment or a waited-on DELBA it has no chip status for" ;;
+esac
+HS=$(awk '/^void umac_datapath_handle_tx_status\(/,/^}/' "$DD/umac_datapath.c" | tr -d ' \n')
+case "$HS" in *'if(tx_metadata->attempts!=0||tx_metadata->mesh.own_group!=0||tx_metadata->mesh.host_frag!=0||tx_metadata->mesh.ba_wait!=0)'*) ;; *) why52="${why52:-the status of an untried host fragment or waited-on DELBA is released unread}" ;; esac
+awk '/^static inline void umac_datapath_process_tx_status_queue\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c" | \
+  awk '/tx_metadata->mesh.host_frag != 0 && tx_metadata->attempts == 0/ && !h {h=NR}
+       /if \(tx_metadata->mesh.ba_wait != 0 && data->ops == &datapath_ops_mesh\)/ && !b {b=NR}
+       /umac_datapath_mesh_ba_delba_status\(/ && !d {d=NR} /umac_rc_feedback\(/ && !r {r=NR}
+       END {exit (h && b && d && r && h < r && b < d && d < r) ? 0 : 1}' || why52="${why52:-an untried host fragment or DELBA reaches rate control, or the status of a DELBA is not read first}"
+FR=$(awk '/^static int umac_datapath_tx_mesh_frags\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c")
+printf '%s\n' "$FR" | grep -q 'md->mesh.host_frag = 1;' || why52="${why52:-a fragment is not marked}"
+awk '/^enum mmwlan_status umac_datapath_process_tx_frame\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c" | \
+  grep -q 'tx_metadata->mesh.host_frag = 0;' || why52="${why52:-a whole frame may carry the mark}"
+if [ -z "$why52" ]; then
+  ok "a host fragment's or waited-on DELBA's TX status always returns: the driver reports one it never got a chip status for untried, and the datapath reads it before rate control"
+else
+  bad "host fragment TX status: $why52"
+fi
+
+# 53. A fragment run the chip seals cannot be broken by a frame the host hands it: its fragments go
+#     back to back under the run lock (run_begin before the first, run_end after the last); the
+#     mesh dequeue asks umac_datapath_mesh_frag_wait before it pops a peer's next frame; every
+#     chip-sealed management frame (path selection, the datapath's robust frames) goes through
+#     umac_datapath_mesh_tx_chip_mgmt, which hands or holds it under that lock; held frames are
+#     handed when a run ends and on the tick, which also clears a run 16 s without its statuses.
+MS=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh.c
+why53=""
+printf '%s\n' "$FH" | awk '/umac_datapath_mesh_frag_run_begin\(/ && !b {b=NR} /mmdrv_tx_frame\(/ && !t {t=NR}
+  /umac_datapath_mesh_frag_run_end\(/ && !e {e=NR} END {exit (b && t && e && b < t && t < e) ? 0 : 1}' || \
+  why53="fragments are not handed between run_begin and run_end"
+awk '/^void umac_datapath_mesh_frag_run_begin\(/,/^}/' "$DM" | grep -q 'mesh_frag_lock_();' && \
+  awk '/^void umac_datapath_mesh_frag_run_end\(/,/^}/' "$DM" | tr -d ' \n' | grep -q 'mesh_frag_drain_locked_();mesh_frag_unlock_();}$' || \
+  why53="${why53:-the run lock is not held from run_begin to run_end}"
+awk '/^int umac_datapath_mesh_tx_chip_mgmt\(/,/^}/' "$DM" | tr -d ' \n' | \
+  grep -q 'mesh_frag_lock_();if(mesh_frag_blocks_(slot,true,0)&&mmpkt_list_length(&s_frag_held)<MESH_FRAG_HOLD_MAX){mmpkt_list_append(&s_frag_held,pkt);.*ret=mmdrv_tx_frame(pkt,true);}mesh_frag_unlock_();umac_datapath_mesh_read_end(side);returnret;}$' || \
+  why53="${why53:-a chip-sealed management frame is not handed or held under the run lock}"
+awk '/^static bool mesh_dequeue_tx_frame\(/,/^}/' "$DM" | tr -d ' \n' | \
+  grep -q 'umac_datapath_mesh_frag_wait(stad,umac_sta_data_peek_pkt(stad))){continue;}structmmpkt\*txbuf=umac_sta_data_pop_pkt(stad);' || \
+  why53="${why53:-the mesh dequeue pops a frame without asking the run gate}"
+awk '/^static int mesh_tx_hwmp_now_\(/,/^}/' "$MS" | tr -d ' \n' | \
+  grep -q 'intrc=k.how==UMAC_MESH_HWMP_PROT_CHIP?umac_datapath_mesh_tx_chip_mgmt(frm):mmdrv_tx_frame(frm,/\*is_mgmt=\*/true);' || \
+  why53="${why53:-chip-sealed path selection bypasses the run gate}"
+awk '/^enum mmwlan_status umac_datapath_tx_mgmt_frame\(/,/^}/' "$DD/umac_datapath.c" | tr -d ' \n' | \
+  grep -q 'constintret=(data->ops==&datapath_ops_mesh&&key_id>=0)?umac_datapath_mesh_tx_chip_mgmt(txbuf):mmdrv_tx_frame(txbuf,true);' || \
+  why53="${why53:-a chip-sealed robust frame bypasses the run gate}"
+awk '/^void umac_datapath_mesh_frag_status\(/,/^}/' "$DM" | tr -d ' \n' | \
+  grep -q 'if(s_frag\[slot\].inflight==0u){mesh_frag_drain_locked_();}mesh_frag_unlock_();}$' || \
+  why53="${why53:-the end of a run does not hand what it held}"
+awk '/^void umac_datapath_mesh_frag_tick\(/,/^}/' "$DM" | grep -q 'MESH_FRAG_STALE_MS' && \
+  grep -q 'umac_datapath_mesh_frag_tick();' "$MS" && \
+  awk '/^static inline bool umac_datapath_process_tx\(/,/^}/' "$DD/umac_datapath.c" | grep -q 'umac_datapath_mesh_frag_tick();' || \
+  why53="${why53:-the tick does not clear stale runs on the service tick and each TX pass}"
+grep -q '^#define MESH_FRAG_STALE_MS 16000u$' "$DM" && grep -q 'static uint32_t tx_status_lifetime_ms = (15 \* 1000);' "$SQ" || \
+  why53="${why53:-the stale limit is not above the 15 s status lifetime of the driver}"
+if [ -z "$why53" ]; then
+  ok "a chip-sealed fragment run: handed back to back under its lock; the dequeue and every chip-sealed management frame wait for it; held frames go when it ends; stale after 16 s"
+else
+  bad "fragment run gate: $why53"
+fi
+
+# 54. Whole frames and the TX pool: on the mesh the host counts a whole unicast frame the chip seals
+#     as every PN the chip could draw cutting it (umac_datapath_chip_pns), after its rate table is
+#     filled and before it is handed; elsewhere one, as the vendor did. The pool's pause and unpause
+#     thresholds less the reserve the frag tick asks for while AT+HOSTFRAG is on.
+PK=../../halow/components/mm-iot-sdk/framework/src/mmpktmem/mmpktmem_heap.c
+DRV=../../halow/components/mm-iot-sdk/framework/morselib/src/driver/driver.c
+why54=""
+awk '/^enum mmwlan_status umac_datapath_process_tx_frame\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c" | \
+  awk '/if \(!rc_done\)/ && !r {r=NR} /umac_datapath_chip_pns\(umacd, &tx_metadata->rc_data,/ && !p {p=NR}
+       /umac_datapath_mesh_take_tx_pns\(stad, \(uint8_t\)key_id, pns\);/ && !t {t=NR} /mmdrv_tx_frame\(txbuf, false\)/ && !h {h=NR}
+       END {exit (r && p && t && h && r < p && p < t && t < h) ? 0 : 1}' || why54="the PNs of whole frames are not counted after the rates and before the hand-off"
+awk '/^enum mmwlan_status umac_datapath_process_tx_frame\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c" | tr -d ' \n' | \
+  grep -q 'elseif(!host_encrypted&&data->ops==&datapath_ops_mesh&&!is_multicast){chip_pns=true;' || \
+  why54="${why54:-the own cut of the chip is not counted for mesh unicast}"
+awk '/^static uint32_t umac_datapath_chip_pns\(/,/^}/' "$DD/umac_datapath.c" | tr -d ' \n' | \
+  grep -q 'returnumac_mesh_frag_chip_pns(mpdu,over,lim);' || why54="${why54:-the PN bound is not umac_mesh_frag_chip_pns}"
+grep -q 'TX_DATA_POOL_UNPAUSE_THRESHOLD \\' "$PK" && grep -q '((int_least32_t)MMPKTMEM_TX_POOL_N_BLOCKS - 2 - (int_least32_t)pktmem.tx_reserve)' "$PK" && \
+  grep -q '((int_least32_t)MMPKTMEM_TX_POOL_N_BLOCKS - 1 - (int_least32_t)pktmem.tx_reserve)' "$PK" || \
+  why54="${why54:-the pool thresholds do not keep the reserve}"
+awk '/^uint32_t mmdrv_tx_pool_free\(/,/^}/' "$DRV" | grep -q 'return mmhal_wlan_pktmem_tx_free();' && \
+  awk '/^void mmdrv_set_tx_pool_reserve\(/,/^}/' "$DRV" | grep -q 'mmhal_wlan_pktmem_set_tx_reserve(blocks);' || \
+  why54="${why54:-the driver does not pass the pool query and reserve through}"
+awk '/^void umac_datapath_mesh_frag_tick\(/,/^}/' "$DM" | tr -d ' \n' | \
+  grep -q 'constuint32_twant=umac_datapath_mesh_hostfrag_mode()!=0u?UMAC_DATAPATH_MESH_FRAG_RESERVE:0u;if(want!=s_frag_reserve){mmdrv_set_tx_pool_reserve(want);s_frag_reserve=want;}' || \
+  why54="${why54:-the reserve does not follow AT+HOSTFRAG}"
+if [ -z "$why54" ]; then
+  ok "whole frames: the chip's possible cut counted in the PN floor after the rates; the TX pool keeps its reserve while AT+HOSTFRAG is on"
+else
+  bad "whole-frame PNs / TX pool: $why54"
+fi
+
+# 55. AT+RXCHAN? (rxchan_line_ in main/at.c), compiled out and run: every counter in its slot, and
+#     the line within buf[] with every field at its extreme (it needs 468 bytes; buf was 460);
+#     cmd_rxchan fills it from at.c's storage, and it is dispatched.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{ awk '/^struct rxchanstat \{/,/^};/' "$A"
+  awk '/^static int rxchan_line_\(/,/^}/' "$A"; } > "$T/fn.c"
+size55=$(awk '/^static void cmd_rxchan\(void\)/ {on=1} on && /char buf\[[0-9]+\];/ {match($0, /\[[0-9]+\]/); print substr($0, RSTART + 1, RLENGTH - 2); exit}' "$A")
+cat > "$T/t.c" <<'EOF2'
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fn.c"
+int main(int argc, char **argv)
+{
+    unsigned size = (unsigned)atoi(argv[1]);
+    char buf[2048];
+    struct rxchanstat s = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+                            { 0xa1, 0xa2, 0xa3 }, { 0xb1, 0xb2, 0xb3 } };
+    rxchan_line_(buf, sizeof(buf), &s);
+    if (strcmp(buf, "+RXCHAN: pages=1 data=2 beacon=3 mgmt=4 cmd=5 txstat=6 last=0x07 | shim=8 notrunning=9 "
+                    "rxframe=10 filter=11 meshctrl=12 ae=13 fwdcand=14(a1a2a3) | rxdrop=15 reason=16 ccmp_key=17 "
+                    "blank=18 replay=19 pn=20 | nodec grp=21 uni=22 last(grp=23 fc=0018 key=25 ta=b1b2b3)\r\n") != 0) {
+        printf("fields: %s", buf);
+        return 0;
+    }
+    memset(&s, 0xff, sizeof(s));
+    int n = rxchan_line_(buf, sizeof(buf), &s);
+    (void)argc;
+    printf("%s %d/%u\n", n + 1 <= (int)size ? "ok" : "short", n + 1, size);
+    return 0;
+}
+EOF2
+fit55=""
+if [ -n "$size55" ] && ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then
+  fit55=$("$T/t" "$size55")
+fi
+rm -rf "$T"
+fill55=$(awk '/^static void cmd_rxchan\(void\)/,/^}/' "$A" | tr -d ' \n')
+for f in .pages=g_warthog_rxchan_pages, .data=g_warthog_rxchan_data, .beacon=g_warthog_rxchan_beacon, \
+         .mgmt=g_warthog_rxchan_mgmt, .cmd=g_warthog_rxchan_cmd, .txstat=g_warthog_rxchan_txstat, \
+         .last=g_warthog_rxchan_last, .shim=g_warthog_shim_rx, .notrunning=g_warthog_shim_rx_notrunning, \
+         .rxframe=g_warthog_rxframe_entry, .filter=g_warthog_filter_entry, \
+         .meshctrl=g_warthog_rx_meshctrl_stripped, .ae=g_warthog_rx_meshctrl_ae, \
+         .fwdcand=g_warthog_rx_fwd_candidate, \
+         '.fwd_da={g_warthog_rx_fwd_last_da[3],g_warthog_rx_fwd_last_da[4],g_warthog_rx_fwd_last_da[5]},' \
+         .rxdrop=g_warthog_rxdrop_count, .reason=g_warthog_rxdrop_reason, .ccmp_key=g_warthog_ccmp_last_keyid, \
+         .blank=g_warthog_ccmp_blank, .replay=g_warthog_ccmp_replay, .pn=g_warthog_ccmp_last_pn, \
+         .nodec_grp=g_warthog_nodec_group_n, .nodec_uni=g_warthog_nodec_uni_n, \
+         .nodec_last_grp=g_warthog_nodec_group, .nodec_fc=g_warthog_nodec_fc, .nodec_key=g_warthog_nodec_keyid, \
+         '.nodec_ta={g_warthog_nodec_ta[3],g_warthog_nodec_ta[4],g_warthog_nodec_ta[5]},' \
+         'rxchan_line_(buf,sizeof(buf),&s);cdc_write(buf);'; do
+  case "$fill55" in *"$f"*) ;; *) fit55="cmd_rxchan does not set $f"; break ;; esac
+done
+awk '/strcasecmp\(verb, "RXCHAN"\) == 0 && terminator == .\?./ {getline; print}' "$A" | grep -q 'cmd_rxchan();' || \
+  fit55="AT+RXCHAN? is not dispatched to cmd_rxchan"
+case "$fit55" in
+  ok*) ok "AT+RXCHAN? prints every counter in its slot, is filled from at.c's storage and fits buf[$size55] (${fit55#ok })" ;;
+  *)   bad "AT+RXCHAN?: ${fit55:-did not build or run}" ;;
+esac
+
+# 56. AT+CHIPRESTART and AT+CHIPRESTART? (chiprestart_line_ in main/at.c): the line compiled out and
+#     run, every counter in its slot and within line[] at its extreme; filled from at.c's storage,
+#     which morselib writes (the shim's handler, the health task, the mesh restore and its retry);
+#     the trigger is mmwlan_force_chip_restart, a request the loop drops (counted dropped) when the
+#     driver is stopped; both are dispatched; every key is named in the AT reference row.
+SH=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/umac_mmdrv_shim.c
+DH=../../halow/components/mm-iot-sdk/framework/morselib/src/driver/health/driver_health.c
+DM=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/datapath/umac_datapath_mesh.c
+MM=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh.c
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{ awk '/^struct chiprestartstat \{/,/^};/' "$A"
+  awk '/^static int chiprestart_line_\(/,/^}/' "$A"; } > "$T/fn.c"
+size56=$(awk '/^static void cmd_chiprestart_query\(void\)/ {on=1} on && /char line\[[0-9]+\];/ {match($0, /\[[0-9]+\]/); print substr($0, RSTART + 1, RLENGTH - 2); exit}' "$A")
+cat > "$T/t.c" <<'EOF2'
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fn.c"
+int main(int argc, char **argv)
+{
+    unsigned size = (unsigned)atoi(argv[1]);
+    char buf[1024];
+    struct chiprestartstat s = { 1, 2, 12, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    chiprestart_line_(buf, sizeof(buf), &s);
+    if (strcmp(buf, "+CHIPRESTART: restarts=1 forced=2 dropped=12 mesh=3 | sta=4 stafail=5 keys=6 "
+                    "keyfail=7 cmdfail=8 | retried=9 pending=10 | last_ms=11\r\n") != 0) {
+        printf("fields: %s", buf);
+        return 0;
+    }
+    memset(&s, 0xff, sizeof(s));
+    int n = chiprestart_line_(buf, sizeof(buf), &s);
+    (void)argc;
+    printf("%s %d/%u\n", n + 1 <= (int)size ? "ok" : "short", n + 1, size);
+    return 0;
+}
+EOF2
+fit56=""
+if [ -n "$size56" ] && ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then
+  fit56=$("$T/t" "$size56")
+fi
+rm -rf "$T"
+fill56=$(awk '/^static void cmd_chiprestart_query\(void\)/,/^}/' "$A" | tr -d ' \n')
+for pair in "n:$SH" "forced:$DH" "dropped:$SH" "mesh:$SH" "sta:$DM" "stafail:$DM" "keys:$DM" "keyfail:$DM" \
+            "cmdfail:$MM" "retried:$DM" "pending:$DM" "ms:$SH"; do
+  c=${pair%%:*}; src=${pair#*:}
+  case "$fill56" in *".$c=g_warthog_chiprestart_$c,"*) ;; *) fit56="cmd_chiprestart_query does not set .$c"; break ;; esac
+  grep -q "^volatile uint32_t .*g_warthog_chiprestart_$c = 0" "$A" || { fit56="at.c has no storage for g_warthog_chiprestart_$c"; break; }
+  grep -Eq "g_warthog_chiprestart_$c(\+\+| = | \+= )" "$src" || { fit56="${src##*/} never writes g_warthog_chiprestart_$c"; break; }
+done
+case "$fill56" in *'chiprestart_line_(line,sizeof(line),&s);cdc_write(line);'*) ;; *) fit56="cmd_chiprestart_query does not print its line" ;; esac
+awk '/^static void cmd_chiprestart\(void\)/,/^}/' "$A" | grep -q 'mmwlan_force_chip_restart()' || \
+  fit56="AT+CHIPRESTART does not call mmwlan_force_chip_restart"
+awk '/^static void chip_restart_request_evt_handler\(/,/^}/' "$SH" | tr -d ' \n' | \
+  grep -q 'if(mmdrv_force_health_check_fail()!=0){g_warthog_chiprestart_dropped++;' || \
+  fit56="a request the loop cannot pass to a stopped driver is not counted dropped"
+awk '/strcasecmp\(verb, "CHIPRESTART"\) == 0 && terminator == .\\0./ {getline; print}' "$A" | grep -q 'cmd_chiprestart();' || \
+  fit56="AT+CHIPRESTART is not dispatched to cmd_chiprestart"
+awk '/strcasecmp\(verb, "CHIPRESTART"\) == 0 && terminator == .\?./ {getline; print}' "$A" | grep -q 'cmd_chiprestart_query();' || \
+  fit56="AT+CHIPRESTART? is not dispatched to cmd_chiprestart_query"
+row56=$(grep '^| `AT+CHIPRESTART`' ../../../wiki/AT-Command-Reference.md)
+[ -n "$row56" ] || fit56="no AT+CHIPRESTART row in the AT reference"
+for k in restarts forced dropped mesh sta stafail keys keyfail cmdfail retried pending last_ms; do
+  case "$row56" in *"\`$k\`"*) ;; *) fit56="the AT reference row does not name \`$k\`"; break ;; esac
+done
+case "$fit56" in
+  ok*) ok "AT+CHIPRESTART triggers through mmwlan_force_chip_restart; ? prints every counter in its slot from storage morselib writes and fits line[$size56] (${fit56#ok })" ;;
+  *)   bad "AT+CHIPRESTART: ${fit56:-did not build or run}" ;;
+esac
+
+# 57. A chip restart under the mesh: the shim's handler reloads the chip before it looks at what
+#     can go back, hands the mesh to umac_mesh_handle_hw_restarted, counts mesh only for a complete
+#     restore and asserts only when that fails (and on an AP, as upstream); the STA path runs only
+#     without a mesh. mmdrv_deinit stops the host beacon timer before it clears what the timer
+#     points at. The health task's failure path, which AT+CHIPRESTART takes, pauses TX before it
+#     posts the restart; a driver that starts again has no forced failure armed. Every other task
+#     reaches the driver through the event loop the restart runs on: the probe burst and the mesh
+#     service tick only post (AT+CRYPTOHOST is served on the loop), AT+CHIPRESTART posts its request
+#     and the shim's handler fails the check, and AT+FRAG='s threshold is set from the loop.
+DRV=../../halow/components/mm-iot-sdk/framework/morselib/src/driver/driver.c
+UM=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/umac.c
+MW=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/mmwlan_mesh.c
+why57=""
+awk '/^static void hw_restart_evt_handler\(/,/^}/' "$SH" | \
+  awk '/UMAC_INTERFACE_AP\) != UMAC_INTERFACE_VIF_ID_INVALID/ {ap=NR} /MMOSAL_ASSERT\(false\);/ {a++; if (!f) f=NR}
+       /mmdrv_deinit\(\);/ {d=NR} /MMOSAL_ASSERT\(mmdrv_init\(NULL, country_code\) == 0\);/ {i=NR}
+       /umac_datapath_mesh_chip_booted\(true\);/ {b=NR} /if \(!mesh\)/ {s=NR} /umac_connection_handle_hw_restarted\(umacd\);/ {c=NR}
+       /else if \(umac_mesh_handle_hw_restarted\(umacd, &complete\) == MMWLAN_SUCCESS\)/ {m=NR}
+       /g_warthog_chiprestart_mesh \+= complete \? 1u : 0u;/ {k=NR} /mmdrv_hw_restart_completed\(\);/ {r=NR}
+       END {exit (a == 2 && ap < f && f < d && d < i && i < b && b < s && s < c && c < m && m < k && k < r) ? 0 : 1}' || \
+  why57="the handler does not reload, then hand the mesh to umac_mesh_handle_hw_restarted (counting only a complete restore, asserting only on its failure), in that order"
+awk '/^void mmdrv_deinit\(/,/^}/' "$DRV" | \
+  awk '/driver_data.started = false;/ {s=NR} /morse_beacon_teardown\(&driver_data\);/ {t=NR} /driver_task_stop\(/ {k=NR}
+       /memset\(&driver_data, 0, sizeof\(driver_data\)\);/ {m=NR} END {exit (s && t && k && m && s < t && t < k && k < m) ? 0 : 1}' || \
+  why57="${why57:-mmdrv_deinit does not stop the host beacon timer before it clears the driver}"
+awk '/^static void morse_reset_chip\(/,/^}/' "$DH" | \
+  awk '/mmdrv_host_set_tx_paused\(MMDRV_PAUSE_SOURCE_MASK_HW_RESTART, true\);/ {p=NR} /mmdrv_host_hw_restart_required\(\);/ {r=NR}
+       END {exit (p && r && p < r) ? 0 : 1}' || why57="${why57:-the failure path of the health task no longer pauses TX before it posts the restart}"
+grep -q '^            morse_reset_chip();' "$DH" || why57="${why57:-a failed check no longer restarts the chip}"
+awk '/^int driver_health_init\(/,/^}/' "$DH" | grep -q 'driverd->health_check.force_fail = false;' || \
+  why57="${why57:-driver_health_init leaves a forced failure armed}"
+for fn in '^int umac_mesh_tx_broadcast_probe\(' '^void umac_mesh_service_tick\(' ; do
+  body=$(awk "/$fn/,/^}/" "$MM")
+  [ -n "$body" ] || { why57="${why57:-$fn is gone}"; break; }
+  case "$body" in *mmdrv_*) why57="${why57:-$fn calls the driver from the probe task}" ;; esac
+  case "$body" in *'umac_core_evt_queue(s_mesh_umacd, &evt)'*) ;; *) why57="${why57:-$fn does not post to the event loop}" ;; esac
+done
+awk '/^static void mesh_probe_evt_\(/,/^}/' "$MM" | grep -q 'mmdrv_tx_frame(probe' || \
+  why57="${why57:-the probe request is not sent from the event loop}"
+awk '/^static void mesh_service_evt_\(/,/^}/' "$MM" | grep -q 'mesh_service_cryptohost_();' || \
+  why57="${why57:-AT+CRYPTOHOST is not served on the event loop}"
+mw=$(awk '/^enum mmwlan_status mmwlan_force_chip_restart\(/,/^}/' "$MW")
+case "$mw" in *mmdrv_*) why57="${why57:-AT+CHIPRESTART reaches the driver from the AT task}" ;; esac
+case "$mw" in *'umac_chip_restart_request(umacd)'*) ;; *) why57="${why57:-AT+CHIPRESTART is not posted to the event loop}" ;; esac
+awk '/^enum mmwlan_status umac_chip_restart_request\(/,/^}/' "$SH" | grep -q 'umac_core_evt_queue(umacd, &evt)' && \
+  awk '/^static void chip_restart_request_evt_handler\(/,/^}/' "$SH" | grep -q 'mmdrv_force_health_check_fail()' || \
+  why57="${why57:-the AT+CHIPRESTART request does not reach the driver from the event loop}"
+fr=$(awk '/^enum mmwlan_status mmwlan_set_fragment_threshold\(/,/^}/' "$UM")
+case "$fr" in *mmdrv_set_frag_threshold*) why57="${why57:-AT+FRAG= sets the threshold from the AT task}" ;; esac
+case "$fr" in *'UMAC_QUEUE_EVT_AND_WAIT(umac_set_frag_threshold_evt_handler'*) ;; *) why57="${why57:-AT+FRAG= is not sent through the event loop}" ;; esac
+awk '/^static void umac_set_frag_threshold_evt_handler\(/,/^}/' "$UM" | grep -q 'mmdrv_set_frag_threshold(threshold)' || \
+  why57="${why57:-the AT+FRAG= event handler does not set the threshold}"
+if [ -z "$why57" ]; then
+  ok "a chip restart reloads the chip, then the mesh puts back what it held (an AP or a failed restore reset the board); the beacon timer stops before the driver is cleared; the probe burst, AT+CRYPTOHOST, AT+CHIPRESTART and AT+FRAG= reach the driver only from the event loop"
+else
+  bad "chip restart: $why57"
+fi
+
+# 58. AT+AMPDU=<0|1> and AT+AMPDU? (ampdu_line_ in main/at.c, compiled out and run): the line names
+#     the setting in force and in NVS (on/off) and every counter (the sessions =0 ended and those
+#     whose DELBA it could not send; the Block Ack frames umac_ba.c sends, the DELBAs by reason;
+#     the peer's DELBAs for our sessions), within line[] at their extreme,
+#     filled from at.c's storage, which morselib writes; =0 and =1 only, persisted in NVS
+#     (mesh_ampdu, default 1, nothing else read back) and applied live; boot restores it before the
+#     first data frame; both are dispatched; every key is named in the AT reference row.
+MD=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/datapath/umac_datapath_mesh.c
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{ awk '/^struct ampdustat \{/,/^};/' "$A"
+  awk '/^static int ampdu_line_\(/,/^}/' "$A"; } > "$T/fn.c"
+size58=$(awk '/^static void cmd_ampdu_query\(void\)/ {on=1} on && /char line\[[0-9]+\];/ {match($0, /\[[0-9]+\]/); print substr($0, RSTART + 1, RLENGTH - 2); exit}' "$A")
+cat > "$T/t.c" <<'EOF2'
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fn.c"
+int main(int argc, char **argv)
+{
+    unsigned size = (unsigned)atoi(argv[1]);
+    char buf[512];
+    struct ampdustat s = { 0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 38 };
+    ampdu_line_(buf, sizeof(buf), &s);
+    if (strcmp(buf, "+AMPDU: mode=off stored=on | orig=3 ended=4 unsent=5 | addba_tx=6 delba_to=7 "
+                    "delba_end=8 delba_other=9 | rx_delba=10 rx_reason=38\r\n") != 0) { printf("fields: %s", buf); return 0; }
+    memset(&s, 0xff, sizeof(s));
+    int n = ampdu_line_(buf, sizeof(buf), &s);
+    if (strncmp(buf, "+AMPDU: mode=on stored=on ", 26) != 0) { printf("on: %s", buf); return 0; }
+    (void)argc;
+    printf("%s %d/%u\n", n + 1 <= (int)size ? "ok" : "short", n + 1, size);
+    return 0;
+}
+EOF2
+fit58=""
+if [ -n "$size58" ] && ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then
+  fit58=$("$T/t" "$size58")
+fi
+rm -rf "$T"
+fill58=$(awk '/^static void cmd_ampdu_query\(void\)/,/^}/' "$A" | tr -d ' \n')
+case "$fill58" in *'.mode=g_warthog_ampdu,.stored=warthog_cfg_get_mesh_ampdu(),.orig=g_warthog_ampdu_orig,.ended=g_warthog_ampdu_ended,.unsent=g_warthog_ampdu_unsent,'*) ;;
+  *) fit58="cmd_ampdu_query does not fill mode, stored, orig, ended and unsent" ;; esac
+grep -q '^volatile uint32_t g_warthog_ampdu = 1;' "$A" || fit58="the default is not on"
+grep -q '^volatile uint32_t g_warthog_ampdu_orig = 0, g_warthog_ampdu_ended = 0, g_warthog_ampdu_unsent = 0;' "$A" || fit58="at.c has no storage for orig, ended and unsent"
+grep -q 'g_warthog_ampdu_orig = orig;' "$MD" && grep -q 'g_warthog_ampdu_ended += ended > 0 ? 1u : 0u;' "$MD" && \
+  grep -q 'g_warthog_ampdu_unsent += ended < 0 ? 1u : 0u;' "$MD" || fit58="morselib does not write orig, ended and unsent"
+BA=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/ba/umac_ba.c
+for c in addba_tx delba_to delba_end delba_other rx_delba rx_reason; do
+  case "$fill58" in *".$c=g_warthog_ba_$c"*) ;; *) fit58="cmd_ampdu_query does not set .$c"; break ;; esac
+  grep -q "^volatile uint32_t .*g_warthog_ba_$c = 0" "$A" || { fit58="at.c has no storage for g_warthog_ba_$c"; break; }
+  grep -Eq "g_warthog_ba_$c(\+\+| = )|&g_warthog_ba_$c( |;)" "$BA" || { fit58="umac_ba.c never writes g_warthog_ba_$c"; break; }
+done
+awk '/^static enum mmwlan_status umac_ba_tx_delba\(/,/^}/' "$BA" | tr -d ' \n' | \
+  grep -q 'if(st==MMWLAN_SUCCESS){volatileuint32_t\*n=reason==DOT11_REASON_INACTIVITY?&g_warthog_ba_delba_to:reason==DOT11_REASON_END_TS_BS?&g_warthog_ba_delba_end:&g_warthog_ba_delba_other;(\*n)++;}returnst;' || \
+  fit58="a DELBA is counted other than once, by its reason, when handed to the chip"
+awk '/^static void umac_ba_rx_delba\(/,/^}/' "$BA" | \
+  awk '/session = &data->sessions.originator\[tid\];/ {o=NR} /g_warthog_ba_rx_delba\+\+;/ {c=NR} /session->status == UMAC_BA_DISABLED/ {d=NR}
+       END {exit (o && c && d && o < c && c < d) ? 0 : 1}' || fit58="a peer's DELBA for our session is not counted before the ended-session return"
+DA=$(awk '/strcasecmp\(verb, "AMPDU"\) == 0 && terminator == .=./ {on=1} on {print} on && /reply_ok\(\);/ {exit}' "$A" | tr -d ' \n')
+case "$DA" in *'if(strcmp(a,"0")!=0&&strcmp(a,"1")!=0){reply_error('*'}elseif(warthog_cfg_set_mesh_ampdu((uint8_t)(a[0]-'"'"'0'"'"'))!=ESP_OK){'*'g_warthog_ampdu=(uint32_t)(a[0]-'"'"'0'"'"');'*) ;;
+  *) fit58="AT+AMPDU= does not take exactly 0 or 1, persist it and apply it live" ;; esac
+awk '/strcasecmp\(verb, "AMPDU"\) == 0 && terminator == .\?./ {getline; print}' "$A" | grep -q 'cmd_ampdu_query();' || \
+  fit58="AT+AMPDU? is not dispatched to cmd_ampdu_query"
+CF=../../../main/cfg.c
+awk '/^uint8_t warthog_cfg_get_mesh_ampdu\(/,/^}/' "$CF" | tr -d ' \n' | \
+  grep -q 'uint8_ton=1;.*nvs_get_u8(h,"mesh_ampdu",&v)==ESP_OK&&v<=1' || fit58="NVS reads back something other than 0 or 1, or the default is not on"
+awk '/^esp_err_t warthog_cfg_set_mesh_ampdu\(/,/^}/' "$CF" | tr -d ' \n' | grep -q 'if(on>1){returnESP_ERR_INVALID_ARG;}' || \
+  fit58="NVS stores values other than 0 or 1"
+grep -q 'g_warthog_ampdu = warthog_cfg_get_mesh_ampdu();' ../../../main/mesh.c || fit58="boot does not restore AT+AMPDU"
+row58=$(grep '^| `AT+AMPDU=' ../../../wiki/AT-Command-Reference.md)
+[ -n "$row58" ] || fit58="no AT+AMPDU row in the AT reference"
+for k in mode stored orig ended unsent addba_tx delba_to delba_end delba_other rx_delba rx_reason; do
+  case "$row58" in *"\`$k\`"*) ;; *) fit58="the AT reference row does not name \`$k\`"; break ;; esac
+done
+case "$fit58" in
+  ok*) ok "AT+AMPDU= takes 0 or 1, persists and applies it, boot restores it; ? prints every counter from morselib's storage and fits line[$size58] (${fit58#ok })" ;;
+  *)   bad "AT+AMPDU: ${fit58:-did not build or run}" ;;
+esac
+
+# 59. Block Ack under host fragmentation, as the simulator cannot see it: the ADDBA gate sits in
+#     umac_datapath_aggr_check after the configuration and capability checks and before the
+#     session starts, mesh only; umac_ba_originator_stop acts on a requested or agreed session only,
+#     cancels its ADDBA retry, sends a DELBA as originator with reason 37 (mac80211's
+#     WLAN_REASON_QSTA_NOT_USE for its own stop) and clears the session whether or not that DELBA
+#     could go, keeping its ADDBA backoff; ba_end and ended count only a DELBA handed to the chip;
+#     the hold-off is 15 s (mac80211's HT_AGG_RETRIES_PERIOD), re-armed by each frame that needed
+#     cutting, counted once a re-arm for the ADDBA it keeps back, and off with AT+HOSTFRAG=0;
+#     AT+AMPDU=0 closes the gate and ends every session once, from the tick after it releases the
+#     run lock a DELBA it sends may take; a peer added or removed starts with no hold.
+BA=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/ba/umac_ba.c
+why59=""
+awk '/^static void umac_datapath_aggr_check\(/,/^}/' "$DD/umac_datapath.c" | \
+  awk '/umac_config_is_ampdu_enabled\(umacd\)/ {c=NR} /if \(data->ops == &datapath_ops_mesh && !umac_datapath_mesh_ba_may_start\(stad, tid\)\)/ {g=NR}
+       /umac_ba_session_init\(/ {i=NR} END {exit (c && g && i && c < g && g < i) ? 0 : 1}' || \
+  why59="the ADDBA gate is not between the capability check and the session start"
+ST=$(awk '/^int umac_ba_originator_stop\(/,/^}/' "$BA" | tr -d ' \n' | sed 's:/\*[^*]*\*/::g')
+case "$ST" in *'if(session->status!=UMAC_BA_REQUESTED&&session->status!=UMAC_BA_SUCCESS){return0;}(void)umac_core_cancel_timeout(umac_sta_data_get_umacd(stad),umac_ba_addba_req_timeout_handler,stad,session);constenummmwlan_statusst=umac_ba_tx_delba(stad,DOT11_DELBA_INITIATOR_ORIGINATOR,tid,DOT11_REASON_END_TS_BS);constuint32_tbackoff=session->attempt_backoff;memset(session,0,sizeof(*session));session->attempt_backoff=backoff;'*'returnst==MMWLAN_SUCCESS?1:-1;}'*) ;;
+  *) why59="${why59:-umac_ba_originator_stop does not cancel the retry, send a DELBA as originator and clear the session, its backoff kept}" ;; esac
+grep -q 'DOT11_REASON_END_TS_BS = 37,' ../../halow/components/mm-iot-sdk/framework/morselib/src/dot11/dot11.h || \
+  why59="${why59:-DOT11_REASON_END_TS_BS is not 37}"
+grep -q '^#define UMAC_MESH_FRAG_BA_HOLD_MS 15000u$' ../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh_frag.h || \
+  why59="${why59:-the hold-off is not 15 s}"
+awk '/^static bool mesh_ba_holds_\(/,/^}/' "$MD" | tr -d ' \n' | \
+  grep -q 'return(s_ba_held\[slot\]&(1u<<tid))!=0u&&umac_datapath_mesh_hostfrag_mode()!=UMAC_MESH_FRAG_OFF&&(uint32_t)(now-s_ba_hold_at\[slot\]\[tid\])<UMAC_MESH_FRAG_BA_HOLD_MS;' || \
+  why59="${why59:-the hold-off is not bounded by its period, or applies with AT+HOSTFRAG=0}"
+awk '/^void umac_datapath_mesh_ba_cut\(/,/^}/' "$MD" | \
+  awk '/umac_ba_originator_stop\(stad, tid\)/ {s=NR} /s_ba_hold_at\[slot\]\[tid\] = now;/ {a=NR} END {exit (s && a && s < a) ? 0 : 1}' || \
+  why59="${why59:-a frame that needs cutting does not end the session and re-arm the hold}"
+awk '/^void umac_datapath_mesh_ba_cut\(/,/^}/' "$MD" | tr -d ' \n' | \
+  grep -q 'if(ended>0){g_warthog_hostfrag_ba_end++;.*}elseif(ended<0){g_warthog_hostfrag_nodelba++;}s_ba_held\[slot\]|=(uint8_t)(1u<<tid);s_ba_hold_counted\[slot\]&=(uint8_t)~(1u<<tid);' || \
+  why59="${why59:-ba_end counts a DELBA not sent, or a re-arm does not start a new hold count}"
+awk '/^bool umac_datapath_mesh_ba_may_start\(/,/^}/' "$MD" | tr -d ' \n' | \
+  grep -q 'if(g_warthog_ampdu==0u){returnfalse;}.*if(umac_ba_originator_idle(stad,tid)&&(s_ba_hold_counted\[slot\]&(1u<<tid))==0u){s_ba_hold_counted\[slot\]|=(uint8_t)(1u<<tid);g_warthog_hostfrag_hold++;' || \
+  why59="${why59:-AT+AMPDU=0 does not close the gate, or hold counts more than the ADDBA kept back a re-arm}"
+awk '/^void umac_datapath_mesh_frag_tick\(/,/^}/' "$MD" | \
+  awk '/mesh_frag_unlock_\(\);/ {u=NR} /mesh_ba_tick_\(now\);/ {b=NR} END {exit (u && b && u < b) ? 0 : 1}' || \
+  why59="${why59:-the tick ends sessions under the run lock}"
+awk '/^static void mesh_ba_tick_\(/,/^}/' "$MD" | tr -d ' \n' | \
+  grep -q 'constintended=want==0u&&s_ampdu_applied!=0u?umac_ba_originator_stop(stad,t):0;' || \
+  why59="${why59:-AT+AMPDU=0 does not end every session once}"
+[ "$(grep -c '    mesh_ba_clear_(slot);\|            mesh_ba_clear_(i);' "$MD")" = 2 ] || \
+  why59="${why59:-a peer added or removed may inherit a hold}"
+if [ -z "$why59" ]; then
+  ok "Block Ack: the ADDBA gate before the session start; a session ends as mac80211's own stop (retry cancelled, DELBA reason 37, cleared, backoff kept); counted only with its DELBA sent; 15 s hold re-armed per cut frame, its kept-back ADDBA counted once a re-arm; AT+AMPDU=0 ends sessions once, outside the run lock"
+else
+  bad "Block Ack under host fragmentation: $why59"
+fi
+
+# 60. Readers and keys of chip-sealed management frames: umac_datapath_mesh_tx_chip_mgmt and
+#     umac_datapath_mesh_hwmp_tx_key run on any task, so each resolves the peer between read_begin
+#     and read_end, and hwmp_tx_key uses the record its address matched, never the slot again; a
+#     held or new one whose peer's key a chip restart still owes is dropped (counted nokey), on the
+#     flag the data path reads; a chip boot asks the TX pool's reserve again once; the firmware
+#     links mmpktmem_heap.c, the only pool that defines the reserve and the free count
+#     (mmpktmem_static.c is as Morse ships it).
+why60=""
+for fn in '^int umac_datapath_mesh_tx_chip_mgmt\(' '^void umac_datapath_mesh_hwmp_tx_key\('; do
+  awk "/$fn/,/^}/" "$MD" | awk '/umac_datapath_mesh_read_begin\(\)/ && !b {b=NR} /mesh_slot_of_\(|mesh_hwmp_tx_key_\(/ && !l {l=NR}
+       /umac_datapath_mesh_read_end\(side\);/ {e=NR} /return ret;|^}/ {r=NR} END {exit (b && l && e && b < l && l < e) ? 0 : 1}' || \
+    { why60="$fn does not resolve the peer between read_begin and read_end"; break; }
+done
+HK=$(awk '/^static void mesh_hwmp_tx_key_\(/,/^}/' "$MD" | tr -d ' \n')
+case "$HK" in *'structumac_sta_data*stad=NULL;constintslot=mesh_slot_rec_of_(da,&stad);if(!mesh_stad_mfp_(slot,stad)){return;}'*) ;;
+  *) why60="${why60:-hwmp_tx_key does not take the record its address matched}" ;; esac
+case "$HK" in *'s_peers['*|*'mesh_slot_mfp_('*) why60="${why60:-hwmp_tx_key loads the record of the slot again}" ;; esac
+awk '/^static bool mesh_chip_mgmt_keyless_\(/,/^}/' "$MD" | grep -q 'return slot >= 0 && (s_restore\[slot\] & MESH_RESTORE_MTK) != 0u;' && \
+  awk '/^bool umac_datapath_mesh_chip_key_missing\(/,/^}/' "$MD" | grep -q '(s_restore\[slot\] & MESH_RESTORE_MTK) != 0u' || \
+  why60="${why60:-management frames and data read different key-owed flags}"
+awk '/^static void mesh_frag_drain_locked_\(/,/^}/' "$MD" | tr -d ' \n' | \
+  grep -q 'elseif(mesh_chip_mgmt_keyless_(slot)){mmpkt_release(pkt);g_warthog_tx_nokey++;}else{(void)mmdrv_tx_frame(pkt,true);}' || \
+  why60="${why60:-a held management frame goes to a chip that lacks its key}"
+awk '/^int umac_datapath_mesh_tx_chip_mgmt\(/,/^}/' "$MD" | tr -d ' \n' | \
+  grep -q 'elseif(mesh_chip_mgmt_keyless_(slot)){mmpkt_release(pkt);g_warthog_tx_nokey++;ret=-1;}' || \
+  why60="${why60:-a new management frame goes to a chip that lacks its key}"
+awk '/^void umac_datapath_mesh_chip_booted\(/,/^}/' "$MD" | \
+  awk '/s_frag_reserve = UINT32_MAX;/ {n++; r=NR} /for \(int i = 0; i < MESH_MAX_PEERS; i\+\+\)/ && !f {f=NR}
+       END {exit (n == 1 && r < f) ? 0 : 1}' || why60="${why60:-a chip boot asks the pool reserve again more than once}"
+PM=../../halow/components/mm-iot-sdk/framework/src/mmpktmem
+grep -q 'mmpktmem_heap.c' ../../halow/components/mmpktmem/CMakeLists.txt && \
+  ! grep -q 'mmpktmem_static.c' ../../halow/components/mmpktmem/CMakeLists.txt && \
+  grep -q '^uint32_t mmhal_wlan_pktmem_tx_free(void)' "$PM/mmpktmem_heap.c" && \
+  ! grep -q 'tx_reserve\|mmhal_wlan_pktmem_tx_free' "$PM/mmpktmem_static.c" || \
+  why60="${why60:-the TX pool reserve is not in exactly the pool the firmware links}"
+if [ -z "$why60" ]; then
+  ok "chip-sealed management frames: the peer read as a reader on any task, its record used as matched; dropped (nokey) while a chip restart owes the key, held or new; the pool reserve asked once a boot, in the one pool built"
+else
+  bad "chip-sealed management frames / pool: $why60"
+fi
+
+# 61. The wait for a cut's DELBA (AT+HOSTFRAG), as the simulator cannot see it: only the DELBA
+#     umac_datapath_mesh_ba_cut sends while it stops a session is marked (the peer named around that
+#     one call, the frame a Block Ack DELBA), on the frame handed to the chip after host CCMP; the
+#     dequeue holds the peer while it waits; it is released only on a TX pass the datapath is not
+#     paused, never into a run it could break, under the data path's key check; the guard is 20 ms
+#     and the limit 500 ms; a chip boot makes it due; a peer added or removed starts with none.
+why61=""
+CB=$(awk '/^void umac_datapath_mesh_ba_cut\(/,/^}/' "$MD" | tr -d ' \n')
+case "$CB" in *'s_ba_delba_to=stad;constintended=umac_ba_originator_stop(stad,tid);s_ba_delba_to=NULL;'*) ;;
+  *) why61="the DELBA is not marked around the one stop that sends it" ;; esac
+[ "$(grep -c 's_ba_delba_to = ' "$MD")" = 2 ] || why61="${why61:-the marked peer is set elsewhere}"
+awk '/^bool umac_datapath_mesh_ba_delba_tagged\(/,/^}/' "$MD" | tr -d ' \n' | \
+  grep -q 'returnstad!=NULL&&stad==s_ba_delba_to&&mmpkt_get_data_length(view)>=26u&&d\[24\]==DOT11_ACTION_CATEGORY_BLOCK_ACK&&d\[25\]==DOT11_BA_ACTION_NDP_DELBA;' || \
+  why61="${why61:-a frame other than that DELBA can be marked}"
+awk '/^enum mmwlan_status umac_datapath_tx_mgmt_frame\(/,/^}/' "$DD/umac_datapath.c" | \
+  awk '/const bool ba_wait = umac_datapath_mesh_ba_delba_tagged\(stad, txbufview\);/ {t=NR}
+       /txbuf = umac_datapath_mesh_protect_mgmt\(txbuf, &key_id\);/ {p=NR}
+       /tx_metadata->mesh.ba_wait = ba_wait \? 1u : 0u;/ {m=NR} END {exit (t && p && m && t < p && p < m) ? 0 : 1}' || \
+  why61="${why61:-the mark is not read before host CCMP and set on the frame that goes}"
+awk '/^bool umac_datapath_mesh_frag_wait\(/,/^}/' "$MD" | tr -d ' \n' | grep -q 'if(s_ba_wait\[slot\].active){returntrue;' || \
+  why61="${why61:-the dequeue does not hold a waiting peer}"
+awk '/^static inline bool umac_datapath_process_tx\(/,/^}/' "$DD/umac_datapath.c" | tr -d ' \n' | \
+  grep -q 'if(!umac_datapath_tx_is_paused(data,~MMDRV_PAUSE_SOURCE_MASK_PKTMEM)){umac_datapath_mesh_ba_release();' || \
+  why61="${why61:-a wait is released while the datapath is paused}"
+[ "$(grep -c 'umac_datapath_mesh_ba_release();' "$DD/umac_datapath.c")" = 1 ] || why61="${why61:-a wait is released from elsewhere}"
+RL=$(awk '/^void umac_datapath_mesh_ba_release\(/,/^}/' "$MD" | tr -d ' \n')
+case "$RL" in *'mesh_frag_blocks_(i,false,mesh_tid_ac_(s_ba_wait[i].tid))'*'if(n!=0u&&s_ba_wait[i].chip&&umac_datapath_mesh_chip_key_missing(s_peers[i],false)){'*'g_warthog_tx_nokey++;'*'umac_datapath_mesh_frags_to_chip('*) ;;
+  *) why61="${why61:-a released MSDU may break a run in the chip or go under a key the chip lacks}" ;; esac
+FH61=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh_frag.h
+grep -q '^#define UMAC_MESH_FRAG_BA_GUARD_MS 20u$' "$FH61" && grep -q '^#define UMAC_MESH_FRAG_BA_WAIT_MAX_MS 500u$' "$FH61" || \
+  why61="${why61:-the guard is not 20 ms or the limit not 500 ms}"
+awk '/^void umac_datapath_mesh_chip_booted\(/,/^}/' "$MD" | grep -q 'mesh_ba_wait_lost_(i);' || \
+  why61="${why61:-a chip boot leaves a wait on a DELBA it purged}"
+awk '/^static void mesh_ba_clear_\(/,/^}/' "$MD" | grep -q 'mesh_ba_wait_end_(slot);' && \
+  awk '/^static void mesh_ba_wait_end_\(/,/^}/' "$MD" | grep -q 'mmpkt_list_clear(&s_ba_wait\[slot\].frags);' || \
+  why61="${why61:-a peer added or removed may inherit a wait, or its waiting fragments leak}"
+if [ -z "$why61" ]; then
+  ok "the DELBA wait: only the cut's own DELBA is marked, on the frame that goes; the dequeue holds the peer; released on an unpaused TX pass, never into a run it could break or under a missing key; 20 ms guard, 500 ms limit; a chip boot makes it due; peers start with none"
+else
+  bad "DELBA wait: $why61"
+fi
+
+# 62. An MMOSAL_ASSERT ends in the panic path (shims/mmosal_shim_freertos_esp32.c): mmosal_impl_assert
+#     calls esp_system_abort and nothing that prints, sleeps, reaches the scheduler or runs esp_restart's
+#     shutdown handlers (TinyUSB owns the console's USB PHY; an ISR or a critical section can assert);
+#     nothing in the shim prints to the ROM console or dumps records at boot; mmosal.h logs the record
+#     before the handler runs; the records are in .noinit and a record's pc is its call site where
+#     mmport.h reads none. Compiled out and run: the reason the core dump keeps, formatted without libc
+#     (its exact text, and at its longest within its buffer), and AT+ASSERT?'s read of the records
+#     (oldest first, numbered from the count, none without the magic, AT+ASSERT=0 clears them).
+#     sdkconfig.defaults keeps the silent reboot and the ELF core dump in flash, with the core-dump
+#     writer's logs off (they print to the same console) and the dump on its own stack of at least
+#     1792 bytes (with 0 it runs on the stack that asserted, which need not have room for it);
+#     every generated sdkconfig.warthog-* that dumps to flash says the same, deprecated alias
+#     included, since PlatformIO does not re-apply the defaults to an existing one.
+SHIM=../../halow/components/shims/mmosal_shim_freertos_esp32.c
+MO=../../halow/components/mm-iot-sdk/framework/morselib/include/mmosal.h
+why62=""
+IA=$(awk '/^void mmosal_impl_assert\(void\)/,/^}/' "$SHIM")
+case "$IA" in *'esp_system_abort(assert_reason_());'*) ;; *) why62="mmosal_impl_assert does not end in esp_system_abort" ;; esac
+for no62 in printf esp_backtrace mmosal_task_sleep vTaskDelay mmhal_reset esp_restart mmhal_log_flush while \
+            MMPORT_BREAKPOINT mmosal_disable_interrupts; do
+  case "$IA" in *"$no62"*) why62="${why62:-mmosal_impl_assert calls $no62}" ;; esac
+done
+grep -Eq 'ets_printf|esp_rom_printf|esp_backtrace_print|ESP_SYSTEM_INIT_FN|HALT_ON_ASSERT|ESP_EARLY_LOG' "$SHIM" && \
+  why62="${why62:-the shim prints to the ROM console, dumps records at boot or halts on an assert}"
+{ awk '/^static const char \*assert_reason_\(void\)/,/^}/' "$SHIM"; awk '/^static char \*assert_put/,/^}/' "$SHIM"; } | \
+  grep -Eq '(printf|str(len|n?cpy|n?cat|chr)|mem(cpy|set|move)|[a-z]toa)\(' && why62="${why62:-the reason is formatted with libc}"
+awk '/^#define MMOSAL_ASSERT\(expr\)/,/^#endif/' "$MO" | \
+  awk '/MMOSAL_LOG_FAILURE_INFO\(0\);/ {l=NR} /mmosal_impl_assert\(\);/ {a=NR} END {exit (l && a && l < a) ? 0 : 1}' || \
+  why62="${why62:-MMOSAL_ASSERT no longer logs the record before the handler}"
+grep -q '^struct mmosal_preserved_failure_info preserved_failure_info __attribute__((section(".noinit")));$' "$SHIM" || \
+  why62="${why62:-the records are not in .noinit}"
+awk '/^void mmosal_log_failure_info\(/,/^}/' "$SHIM" | tr -d ' \n' | \
+  grep -q 'if(info->pc==0){preserved_failure_info.info\[record_num\].pc=(uint32_t)(uintptr_t)__builtin_return_address(0);}' || \
+  why62="${why62:-a record keeps pc 0 where mmport.h reads none}"
+for k62 in '^CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y$' '^CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y$' '^CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y$' \
+           '^# CONFIG_ESP_COREDUMP_LOGS is not set$'; do
+  grep -q "$k62" ../../../sdkconfig.defaults || why62="${why62:-sdkconfig.defaults lacks $k62}"
+done
+# The dump on its own stack, not the asserting task's; generated sdkconfigs keep old values.
+for g62 in ../../../sdkconfig.defaults ../../../sdkconfig.warthog-*; do
+  [ -f "$g62" ] && grep -q '^CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y$' "$g62" || continue
+  s62=$(sed -n 's/^CONFIG_ESP_COREDUMP_STACK_SIZE=\([0-9][0-9]*\)$/\1/p' "$g62")
+  d62=$(sed -n 's/^CONFIG_ESP32_CORE_DUMP_STACK_SIZE=\([0-9][0-9]*\)$/\1/p' "$g62")
+  if [ "${s62:-0}" -lt 1792 ] || { [ -n "$d62" ] && [ "$d62" != "$s62" ]; }; then
+    why62="${why62:-${g62##*/}: the core dump runs on the asserting stack (CONFIG_ESP_COREDUMP_STACK_SIZE ${s62:-unset}${d62:+, ESP32_CORE_DUMP_STACK_SIZE $d62})}"
+  fi
+  case "$g62" in *defaults) ;; *)
+    grep -q '^# CONFIG_ESP_COREDUMP_LOGS is not set$' "$g62" || why62="${why62:-${g62##*/}: the core-dump writer prints to the console}" ;;
+  esac
+done
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{ grep '^#define MAX_FAILURE_RECORDS ' "$SHIM"
+  grep '^#define FAST_MOD(' "$SHIM"
+  awk '/^struct mmosal_preserved_failure_info$/,/^};/' "$SHIM"
+  grep '^#define ASSERT_INFO_MAGIC ' "$SHIM"
+  echo 'static struct mmosal_preserved_failure_info preserved_failure_info;'
+  grep '^static char s_assert_reason\[' "$SHIM"
+  awk '/^uint32_t warthog_assert_records\(/,/^}/' "$SHIM"
+  awk '/^void warthog_assert_clear\(void\)/,/^}/' "$SHIM"
+  awk '/^static char \*assert_put_\(/,/^}/' "$SHIM"
+  awk '/^static char \*assert_put_hex_\(/,/^}/' "$SHIM"
+  awk '/^static const char \*assert_reason_\(void\)/,/^}/' "$SHIM"; } > "$T/fn.c"
+cat > "$T/t.c" <<'EOF2'
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+struct mmosal_failure_info { uint32_t pc, lr, fileid, line, platform_info[4]; };
+#include "fn.c"
+int main(void)
+{
+    struct mmosal_failure_info out[4];
+    uint32_t kept = 9;
+    if (strcmp(assert_reason_(), "MMOSAL_ASSERT") != 0) { printf("no record: %s\n", s_assert_reason); return 0; }
+    if (warthog_assert_records(out, 4, &kept) != 0 || kept != 0) { printf("no magic: kept %u\n", kept); return 0; }
+    preserved_failure_info.magic = ASSERT_INFO_MAGIC;
+    preserved_failure_info.failure_count = 6;
+    for (uint32_t i = 0; i < 4; i++) { preserved_failure_info.info[i].line = 100 + i; }
+    preserved_failure_info.info[1].pc = 0x4200abcd;
+    preserved_failure_info.info[1].fileid = 0xf9d51701;
+    preserved_failure_info.info[1].line = 186;
+    if (strcmp(assert_reason_(), "MMOSAL_ASSERT pc=0x4200abcd fileid=0xf9d51701 line=186") != 0) {
+        printf("newest: %s\n", s_assert_reason); return 0;
+    }
+    if (warthog_assert_records(out, 4, &kept) != 6 || kept != 4 || out[0].line != 102 || out[1].line != 103 ||
+        out[2].line != 100 || out[3].line != 186) { printf("order: kept %u\n", kept); return 0; }
+    if (warthog_assert_records(out, 2, &kept) != 6 || kept != 2 || out[0].line != 100 || out[1].line != 186) {
+        printf("max 2: kept %u\n", kept); return 0;
+    }
+    preserved_failure_info.info[1].pc = preserved_failure_info.info[1].fileid = preserved_failure_info.info[1].line = 0xffffffffu;
+    size_t n = strlen(assert_reason_());
+    if (n + 1 > sizeof(s_assert_reason) || strcmp(s_assert_reason, "MMOSAL_ASSERT pc=0xffffffff fileid=0xffffffff line=4294967295") != 0) {
+        printf("longest: %s\n", s_assert_reason); return 0;
+    }
+    warthog_assert_clear();
+    if (warthog_assert_records(out, 4, &kept) != 0 || kept != 0) { printf("cleared: kept %u\n", kept); return 0; }
+    printf("ok %u/%u\n", (unsigned)n + 1, (unsigned)sizeof(s_assert_reason));
+    return 0;
+}
+EOF2
+run62=""
+if ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then
+  run62=$("$T/t")
+fi
+rm -rf "$T"
+case "$run62" in ok*) ;; *) why62="${why62:-the reason or the record read: ${run62:-did not build or run}}" ;; esac
+if [ -z "$why62" ]; then
+  ok "an assert ends in esp_system_abort with nothing printed, slept or shut down on the way; no boot dump; the record is logged first, in .noinit, its pc the call site; the core dump's reason exact and within its buffer (${run62#ok }); AT+ASSERT? reads the records oldest first; silent reboot, ELF core dump on its own stack, no core-dump log, in sdkconfig.defaults and every generated sdkconfig"
+else
+  bad "assert path: $why62"
+fi
+
+# 63. AT+ASSERT?, AT+ASSERT=0 and AT+ASSERTTEST (main/at.c): assert_line_ compiled out and run, every
+#     field in its slot and within line[] at its extreme; ? prints the count line, then each kept record
+#     numbered from the count; =0 clears; AT+ASSERTTEST=at, =crit and =hang reply, wait, then assert on
+#     the AT task (=crit inside a critical section, =hang right after arming the boot hang), each with
+#     its own marker; =loop posts through mmwlan_assert_test, and the loop asserts from a timeout
+#     MMWLAN_ASSERT_TEST_DELAY_MS later; all dispatched. MMOSAL_FILEID: the CMake recipe and
+#     tools/assert_fileid.py hash the same path the same way, for every library that asserts, main/ and
+#     components/halow (mmhalow.c), and, derived from the tree, every firmware .c that asserts outside
+#     the SDK tree and the shims has a nearest CMakeLists.txt that applies it; AT+COREDUMP? prints the
+#     abort's reason; the AT reference and Troubleshooting name the keys and the method, and the two
+#     AT rows say what was measured on air on 2026-10-03 (at and loop) and what is not (crit, hang,
+#     safe mode).
+SHM=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/umac_mmdrv_shim.c
+MWH=../../halow/components/mm-iot-sdk/framework/morselib/include/mmwlan_mesh.h
+why63=""
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^static int assert_line_\(/,/^}/' "$A" > "$T/fn.c"
+size63=$(awk '/^static void cmd_assert_query\(void\)/ {on=1} on && /char line\[[0-9]+\];/ {match($0, /\[[0-9]+\]/); print substr($0, RSTART + 1, RLENGTH - 2); exit}' "$A")
+cat > "$T/t.c" <<'EOF2'
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+struct mmosal_failure_info { uint32_t pc, lr, fileid, line, platform_info[4]; };
+#include "fn.c"
+int main(int argc, char **argv)
+{
+    unsigned size = (unsigned)atoi(argv[1]);
+    char buf[512];
+    struct mmosal_failure_info r = { 0x4200abcd, 0x42001234, 0xf9d51701, 186, { 0x7e570002, 6, 7, 8 } };
+    assert_line_(buf, sizeof(buf), 3, &r);
+    if (strcmp(buf, "+ASSERT: #3 pc=0x4200abcd lr=0x42001234 line=186 fileid=0xf9d51701 "
+                    "info=0x7e570002,0x00000006,0x00000007,0x00000008\r\n") != 0) { printf("fields: %s", buf); return 0; }
+    memset(&r, 0xff, sizeof(r));
+    int n = assert_line_(buf, sizeof(buf), 0xffffffffu, &r);
+    (void)argc;
+    printf("%s %d/%u\n", n + 1 <= (int)size ? "ok" : "short", n + 1, size);
+    return 0;
+}
+EOF2
+run63=""
+if [ -n "$size63" ] && ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then
+  run63=$("$T/t" "$size63")
+fi
+rm -rf "$T"
+case "$run63" in ok*) ;; *) why63="the record line: ${run63:-did not build or run}" ;; esac
+AQ=$(awk '/^static void cmd_assert_query\(void\)/,/^}/' "$A" | tr -d ' \n')
+case "$AQ" in *'constuint32_tcount=warthog_assert_records(rec,WARTHOG_ASSERT_RECORDS_MAX,&kept);'*'for(uint32_ti=0;i<kept;i++){assert_line_(line,sizeof(line),count-kept+i,&rec[i]);cdc_write(line);}reply_ok();'*) ;;
+  *) why63="${why63:-AT+ASSERT? does not print every kept record numbered from the count}" ;; esac
+case "$AQ" in *'reset_reason_name_(esp_reset_reason())'*) ;; *) why63="${why63:-AT+ASSERT? does not name the last reset}" ;; esac
+awk '/strcasecmp\(verb, "ASSERT"\) == 0 && terminator == .\?./ {getline; print}' "$A" | grep -q 'cmd_assert_query();' || \
+  why63="${why63:-AT+ASSERT? is not dispatched}"
+awk '/strcasecmp\(verb, "ASSERT"\) == 0 && terminator == .=./,/strcasecmp\(verb, "ASSERTTEST"\)/' "$A" | tr -d ' \n' | \
+  grep -q 'if(strcmp(trim(args),"0")!=0){reply_error("usage:AT+ASSERT=0");}else{warthog_assert_clear();' || \
+  why63="${why63:-AT+ASSERT=0 does not clear, or clears on another argument}"
+awk '/strcasecmp\(verb, "ASSERTTEST"\) == 0 && terminator == .=./ {getline; print}' "$A" | grep -q 'cmd_asserttest(trim(args));' || \
+  why63="${why63:-AT+ASSERTTEST= is not dispatched}"
+AT63=$(awk '/^static void cmd_asserttest\(const char \*a\)/,/^}/' "$A")
+printf '%s\n' "$AT63" | awk '/mmwlan_assert_test\(\)/ {m=NR} /reply_ok\(\);/ {o[++no]=NR} /vTaskDelay\(pdMS_TO_TICKS\(MMWLAN_ASSERT_TEST_DELAY_MS\)\);/ {d=NR}
+     /MMOSAL_TASK_ENTER_CRITICAL\(\);/ {c=NR} /MMOSAL_ASSERT_LOG_DATA\(false, MMWLAN_ASSERT_TEST_CRIT\);/ {x=NR}
+     /warthog_boot_arm_hang\(\);/ {h=NR} /MMOSAL_ASSERT_LOG_DATA\(false, MMWLAN_ASSERT_TEST_HANG\);/ {hx=NR}
+     /MMOSAL_ASSERT_LOG_DATA\(false, MMWLAN_ASSERT_TEST_AT\);/ {t=NR}
+     END {exit (m && no == 2 && m < o[1] && o[2] < d && d < c && c < x && x < h && h + 1 == hx && hx < t) ? 0 : 1}' || \
+  why63="${why63:-AT+ASSERTTEST does not reply, wait, then assert (=crit in a critical section, =hang after arming the boot hang, =loop through mmwlan_assert_test)}"
+printf '%s\n' "$AT63" | grep -q 'strcasecmp(a, "hang") == 0' || why63="${why63:-AT+ASSERTTEST=hang is not parsed}"
+awk '/^static void assert_test_evt_handler\(/,/^}/' "$SHM" | grep -q 'umac_core_register_timeout(umacd, MMWLAN_ASSERT_TEST_DELAY_MS, assert_test_fire_, NULL, NULL)' && \
+  awk '/^static void assert_test_fire_\(/,/^}/' "$SHM" | grep -q 'MMOSAL_ASSERT_LOG_DATA(false, MMWLAN_ASSERT_TEST_LOOP);' || \
+  why63="${why63:-the loop variant does not assert from a timeout with its marker}"
+[ "$(sed -n 's/^#define MMWLAN_ASSERT_TEST_[A-Z]* *\(0x[0-9a-f]*u\)$/\1/p' "$MWH" | sort -u | wc -l | tr -d ' ')" = 4 ] || \
+  why63="${why63:-the four AT+ASSERTTEST markers are not distinct}"
+FC=../../halow/components/mmosal_fileid.cmake
+tr -d ' \n' < "$FC" | grep -q 'file(RELATIVE_PATHrel"${CMAKE_SOURCE_DIR}""${abs}")string(SHA256hash"${rel}")string(SUBSTRING"${hash}"08id)set_property(SOURCE"${abs}"TARGET_DIRECTORY${target}APPENDPROPERTYCOMPILE_DEFINITIONS"MMOSAL_FILEID=0x${id}")' || \
+  why63="${why63:-the CMake fileid is not the first 8 hex of SHA-256 of the path from the project root}"
+grep -q '^foreach(t libmorse mmhostap shims mmpktmem mmutils)$' ../../halow/components/CMakeLists.txt && \
+  grep -q '^warthog_mmosal_fileid(${COMPONENT_LIB} ASSERTING)$' ../../../main/CMakeLists.txt && \
+  grep -q '^warthog_mmosal_fileid(${COMPONENT_LIB})$' ../../halow/CMakeLists.txt || \
+  why63="${why63:-a library that asserts, main/ or components/halow (mmhalow.c), is built without MMOSAL_FILEID}"
+# ASSERTING picks the sources that assert; pioarduino puts main/'s first source's defines on every
+# source, so that first source must not assert (else 29 'MMOSAL_FILEID redefined' warnings return).
+tr -d ' \n' < "$FC" | grep -q 'if(FID_ASSERTING)file(STRINGS"${abs}"hitsREGEX"MMOSAL_ASSERT|MMOSAL_LOG_FAILURE_INFO")if(NOThits)continue()endif()endif()' || \
+  why63="${why63:-ASSERTING does not pick the sources that assert}"
+first63=$(awk '/^idf_component_register\(/ {on=1} on && /^        "[^"]*\.c"$/ {gsub(/[ "]/, ""); print; exit}' ../../../main/CMakeLists.txt)
+[ -n "$first63" ] && ! grep -Eq 'MMOSAL_ASSERT|MMOSAL_LOG_FAILURE_INFO' "../../../main/$first63" || \
+  why63="${why63:-the first main/ source (${first63:-none}) asserts: pioarduino would put its fileid on every main/ source}"
+# Derived: a firmware .c that asserts outside the SDK tree and the shims (the foreach) has a nearest
+# CMakeLists.txt that applies it.
+nf63=$(find ../../../main ../../halow .. -name '*.c' -not -path '*/mm-iot-sdk/*' -not -path '*/shims/*' \
+         -not -path '*/test/*' 2>/dev/null | xargs grep -l -E 'MMOSAL_ASSERT|MMOSAL_LOG_FAILURE_INFO' 2>/dev/null | \
+       while read -r f63; do
+         d63=$(dirname "$f63")
+         while [ ! -f "$d63/CMakeLists.txt" ] && [ "$d63" != "." ] && [ "$d63" != "/" ]; do d63=$(dirname "$d63"); done
+         grep -Eq '^warthog_mmosal_fileid\(\$\{COMPONENT_LIB\}( ASSERTING)?\)$' "$d63/CMakeLists.txt" 2>/dev/null || echo "$f63" | sed 's#^\(\.\./\)*##'
+       done)
+[ -z "$nf63" ] || why63="${why63:-built without MMOSAL_FILEID: $(echo $nf63)}"
+printf '%s\n' "$(find ../../../main ../../halow -name '*.c' -not -path '*/mm-iot-sdk/*' -not -path '*/shims/*' | \
+  xargs grep -l 'MMOSAL_ASSERT' 2>/dev/null)" | grep -q 'mmhalow.c$' || why63="${why63:-the fileid coverage scan no longer sees mmhalow.c}"
+grep -q "hashlib.sha256(rel.encode()).hexdigest()\[:8\]" ../../../tools/assert_fileid.py || \
+  why63="${why63:-tools/assert_fileid.py hashes otherwise}"
+if command -v python3 >/dev/null 2>&1; then
+  if command -v sha256sum >/dev/null 2>&1; then H63="sha256sum"; else H63="shasum -a 256"; fi
+  for f63 in main/at.c components/halow/components/mm-iot-sdk/framework/morselib/src/umac/umac_mmdrv_shim.c; do
+    id63=$(printf '%s' "$f63" | $H63 | cut -c1-8)
+    python3 ../../../tools/assert_fileid.py "fileid=0x$id63" | grep -qx "0x$id63 $f63" || \
+      why63="${why63:-tools/assert_fileid.py does not name $f63 for 0x$id63}"
+  done
+fi
+awk '/^static void cmd_coredump\(void\)/,/^}/' "$A" | grep -q 'esp_core_dump_get_panic_reason(reason, sizeof(reason)) == ESP_OK' || \
+  why63="${why63:-AT+COREDUMP? does not print the abort reason}"
+row63=$(grep '^| `AT+ASSERT?`' ../../../wiki/AT-Command-Reference.md)
+for k63 in count kept reset up_s crash_boots safe pc lr line fileid info tools/assert_fileid.py addr2line 'AT+ASSERT=0' \
+           'Measured on air on 2026-10-03' 'not measured on air'; do
+  case "$row63" in *"\`$k63\`"*|*"$k63"*) ;; *) why63="${why63:-the AT+ASSERT? row does not name $k63}" ;; esac
+done
+row63t=$(grep '^| `AT+ASSERTTEST=' ../../../wiki/AT-Command-Reference.md)
+for k63 in '`at`' '`loop`' '`crit`' '`hang`' 0x7e570001 0x7e570002 0x7e570003 0x7e570004 'Measured on air on 2026-10-03' \
+           'not measured on air'; do
+  case "$row63t" in *"$k63"*) ;; *) why63="${why63:-the AT+ASSERTTEST row does not name $k63}" ;; esac
+done
+TS63=../../../wiki/Troubleshooting.md
+grep -q '^## The board drops off USB$' "$TS63" && grep -q 'AT+ASSERT?' "$TS63" && grep -q 'AT+COREDUMP?' "$TS63" && \
+  grep -q 'tools/assert_fileid.py' "$TS63" || why63="${why63:-Troubleshooting does not say how to read the records}"
+if [ -z "$why63" ]; then
+  ok "AT+ASSERT? prints every kept record in its slot within line[$size63] (${run63#ok }), =0 clears; AT+ASSERTTEST replies, then asserts on the AT task (=crit in a critical section) or on the loop from a timeout; the build and tools/assert_fileid.py hash fileids alike; documented"
+else
+  bad "AT+ASSERT / AT+ASSERTTEST: $why63"
+fi
+
+# 64. A request to the umac event loop that is not posted says why (AT+CHIPRESTART, AT+ASSERTTEST=loop):
+#     the shim answers NO_MEM only with the loop running and not stopping (its queue full), else
+#     UNAVAILABLE; at.c's text, compiled out and run with mmwlan.h's statuses: NO_MEM "event queue
+#     full, try again", every other one "chip not running"; both commands use it; the AT reference
+#     names both.
+why64=""
+LP=$(awk '/^static enum mmwlan_status loop_post_failed_\(/,/^}/' "$SHM" | tr -d ' \n')
+case "$LP" in *'return(core->evtloop_task!=NULL&&!core->evtloop_shutting_down)?MMWLAN_NO_MEM:MMWLAN_UNAVAILABLE;'*) ;;
+  *) why64="the shim does not tell a full queue from a loop down or stopping" ;; esac
+for fn64 in umac_chip_restart_request umac_assert_test_request; do
+  awk "/^enum mmwlan_status $fn64\\(/,/^}/" "$SHM" | grep -q 'return umac_core_evt_queue(umacd, &evt) ? MMWLAN_SUCCESS : loop_post_failed_(umacd);' || \
+    why64="${why64:-$fn64 does not say why a post failed}"
+done
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{ awk '/^enum mmwlan_status$/,/^};/' ../../halow/components/mm-iot-sdk/framework/morselib/include/mmwlan.h
+  awk '/^static const char \*loop_post_error_\(/,/^}/' "$A"; } > "$T/fn.c"
+cat > "$T/t.c" <<'EOF2'
+#include <stdio.h>
+#include <string.h>
+#include "fn.c"
+int main(void)
+{
+    if (strcmp(loop_post_error_(MMWLAN_NO_MEM), "event queue full, try again") != 0) { printf("no_mem\n"); return 0; }
+    for (int s = MMWLAN_ERROR; s <= MMWLAN_VIF_ERROR; s++) {
+        if (s != MMWLAN_NO_MEM && strcmp(loop_post_error_((enum mmwlan_status)s), "chip not running") != 0) {
+            printf("status %d: %s\n", s, loop_post_error_((enum mmwlan_status)s)); return 0;
+        }
+    }
+    printf("ok\n");
+    return 0;
+}
+EOF2
+run64=""
+if ${CC:-cc} -std=gnu11 -w -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then
+  run64=$("$T/t")
+fi
+rm -rf "$T"
+[ "$run64" = ok ] || why64="${why64:-the AT text: ${run64:-did not build or run}}"
+for fn64 in cmd_chiprestart cmd_asserttest; do
+  awk "/^static void $fn64\\(/,/^}/" "$A" | grep -q 'snprintf(why, sizeof(why), "%s (%d)", loop_post_error_(st), (int)st);' || \
+    why64="${why64:-$fn64 does not say why its request was not posted}"
+done
+row64=$(grep '^| `AT+CHIPRESTART`' ../../../wiki/AT-Command-Reference.md)
+case "$row64" in
+  *'+ERR: chip not running (<status>)'*'+ERR: event queue full, try again (<status>)'*) ;;
+  *) why64="${why64:-the AT+CHIPRESTART row does not name both errors}" ;; esac
+if [ -z "$why64" ]; then
+  ok "a request the umac event loop did not take says why: event queue full (NO_MEM) or chip not running (the loop down or stopping, or morselib not up), for AT+CHIPRESTART and AT+ASSERTTEST=loop"
+else
+  bad "loop requests: $why64"
+fi
+
+# 65. A boot that cannot reach USB reboots, and a crash loop stops (main/boot_guard.c, main/main.c,
+#     main/halow.c). CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE=y keeps the bootloader's RTC watchdog
+#     armed into app_main (sdkconfig.defaults, and every generated sdkconfig.warthog-* with the flash
+#     core dump; the rest predate it); warthog_boot_guard_start(), app_main's first call, re-arms it
+#     for WARTHOG_BOOT_WDT_S with a system reset (keeps .noinit and the reset reason; no flashboot) and
+#     warthog_boot_guard_usb_up() turns it off right after warthog_usb_net_start() succeeds, or in
+#     safe mode; a USB start that fails in a normal boot goes to warthog_boot_guard_usb_failed().
+#     boot_guard.c compiled and run against stub IDF headers across simulated boots: a panic or
+#     watchdog reset is one more consecutive crash boot (from 0 without the magic, saturating), any
+#     other reset clears the count; WARTHOG_BOOT_SAFE_AFTER (3) start safe mode, which keeps
+#     counting, clears the boot hang AT+ASSERTTEST=hang arms (also cleared by a count of 0 or a lost
+#     magic); a normal boot clears the count after WARTHOG_BOOT_OK_S only once the watchdog is off
+#     (a tick past it with the watchdog armed keeps it: the watchdog runs on the RC clock from
+#     app_main), safe mode never; a failed USB start leaves the watchdog armed for
+#     WARTHOG_BOOT_USB_RETRIES (2) resets that do not count as crash boots (a panic after one does,
+#     and so does a watchdog reset with no failed USB start), then turns it off with no USB; a crash
+#     reset keeps the spent retries, a clean reset or USB up restores them; the watchdog is armed at
+#     exactly WARTHOG_BOOT_WDT_S of slow clock with RESET_SYSTEM and off after USB. app_main: safe mode runs
+#     warthog_halow_start_safe() (event loop, netif, link bit; no chip) in place of the HaLow start,
+#     the link wait and the bridge; the armed hang stops a normal boot before the HaLow start; the
+#     loop ticks the guard. AT+ASSERT? prints crash_boots and safe; AT+COREDUMP=0 erases the dump (any
+#     other argument refused); the AT reference and Troubleshooting say so.
+BG=../../../main/boot_guard.c
+MN=../../../main/main.c
+HL=../../../main/halow.c
+why65=""
+for g65 in ../../../sdkconfig.defaults ../../../sdkconfig.warthog-*; do
+  [ -f "$g65" ] || continue
+  case "$g65" in *defaults) ;; *) grep -q '^CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y$' "$g65" || continue ;; esac
+  grep -q '^CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE=y$' "$g65" || \
+    why65="${why65:-${g65##*/}: IDF turns the boot watchdog off before app_main}"
+done
+if [ ! -f "$BG" ]; then
+  why65="${why65:-main/boot_guard.c is missing}"
+else
+  grep -q '^static __NOINIT_ATTR struct' "$BG" || why65="${why65:-the crash-boot count is not in .noinit}"
+  awk '/^static void boot_wdt_arm_\(/,/^}/' "$BG" | grep -q 'WDT_STAGE_ACTION_RESET_SYSTEM' || \
+    why65="${why65:-the boot watchdog does not reset the system}"
+  grep -q 'flashboot' "$BG" && why65="${why65:-the boot watchdog touches flashboot}"
+  T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+  mkdir -p "$T/hal" "$T/soc"
+  cat > "$T/esp_system.h" <<'EOF2'
+#pragma once
+typedef enum { ESP_RST_UNKNOWN, ESP_RST_POWERON, ESP_RST_EXT, ESP_RST_SW, ESP_RST_PANIC, ESP_RST_INT_WDT,
+               ESP_RST_TASK_WDT, ESP_RST_WDT, ESP_RST_DEEPSLEEP, ESP_RST_BROWNOUT, ESP_RST_SDIO, ESP_RST_USB,
+               ESP_RST_JTAG, ESP_RST_EFUSE, ESP_RST_PWR_GLITCH, ESP_RST_CPU_LOCKUP } esp_reset_reason_t;
+esp_reset_reason_t esp_reset_reason(void);
+EOF2
+  printf '#pragma once\n#define __NOINIT_ATTR\n' > "$T/esp_attr.h"
+  printf '#pragma once\n#include <stdint.h>\nint64_t esp_timer_get_time(void);\n' > "$T/esp_timer.h"
+  printf '#pragma once\n#include <stdint.h>\nuint32_t rtc_clk_slow_freq_get_hz(void);\n' > "$T/soc/rtc.h"
+  cat > "$T/hal/wdt_hal.h" <<'EOF2'
+#pragma once
+#include <stdbool.h>
+#include <stdint.h>
+typedef enum { WDT_RWDT, WDT_MWDT0, WDT_MWDT1 } wdt_inst_t;
+typedef enum { WDT_STAGE0, WDT_STAGE1, WDT_STAGE2, WDT_STAGE3 } wdt_stage_t;
+typedef enum { WDT_STAGE_ACTION_OFF, WDT_STAGE_ACTION_INT, WDT_STAGE_ACTION_RESET_CPU,
+               WDT_STAGE_ACTION_RESET_SYSTEM, WDT_STAGE_ACTION_RESET_RTC } wdt_stage_action_t;
+typedef struct { wdt_inst_t inst; } wdt_hal_context_t;
+#define RWDT_HAL_CONTEXT_DEFAULT() { .inst = WDT_RWDT }
+void wdt_hal_init(wdt_hal_context_t *h, wdt_inst_t i, uint32_t p, bool e);
+void wdt_hal_write_protect_disable(wdt_hal_context_t *h);
+void wdt_hal_write_protect_enable(wdt_hal_context_t *h);
+void wdt_hal_config_stage(wdt_hal_context_t *h, wdt_stage_t s, uint32_t t, wdt_stage_action_t a);
+void wdt_hal_enable(wdt_hal_context_t *h);
+void wdt_hal_disable(wdt_hal_context_t *h);
+EOF2
+  cat > "$T/t.c" <<'EOF2'
+#include <stdio.h>
+#include <string.h>
+#include "boot_guard.c"
+static esp_reset_reason_t rr;
+static int64_t now_us;
+static int wdt_on, wdt_unlocked, wdt_stage, wdt_action;
+static uint32_t wdt_ticks;
+esp_reset_reason_t esp_reset_reason(void) { return rr; }
+int64_t esp_timer_get_time(void) { return now_us; }
+uint32_t rtc_clk_slow_freq_get_hz(void) { return 136000; }
+void wdt_hal_init(wdt_hal_context_t *h, wdt_inst_t i, uint32_t p, bool e)
+{ (void)p; (void)e; h->inst = i; if (i == WDT_RWDT) { wdt_on = 0; wdt_ticks = 0; } }
+void wdt_hal_write_protect_disable(wdt_hal_context_t *h) { (void)h; wdt_unlocked = 1; }
+void wdt_hal_write_protect_enable(wdt_hal_context_t *h) { (void)h; wdt_unlocked = 0; }
+void wdt_hal_config_stage(wdt_hal_context_t *h, wdt_stage_t s, uint32_t t, wdt_stage_action_t a)
+{ if (h->inst == WDT_RWDT && wdt_unlocked) { wdt_stage = s; wdt_ticks = t; wdt_action = a; } }
+void wdt_hal_enable(wdt_hal_context_t *h) { if (h->inst == WDT_RWDT && wdt_unlocked) wdt_on = 1; }
+void wdt_hal_disable(wdt_hal_context_t *h) { if (h->inst == WDT_RWDT && wdt_unlocked) wdt_on = 0; }
+/* One boot: RAM but .noinit as a reset leaves it. */
+static int boot(esp_reset_reason_t r)
+{
+    rr = r; now_us = 0; s_safe = false; s_cleared = false; s_wdt_off = false;
+    return warthog_boot_guard_start();
+}
+#define CHECK(c, ...) do { if (!(c)) { printf(__VA_ARGS__); printf("\n"); return 0; } } while (0)
+int main(void)
+{
+    static const esp_reset_reason_t crash[] = { ESP_RST_PANIC, ESP_RST_INT_WDT, ESP_RST_TASK_WDT, ESP_RST_WDT };
+    static const esp_reset_reason_t clean[] = { ESP_RST_UNKNOWN, ESP_RST_POWERON, ESP_RST_EXT, ESP_RST_SW,
+        ESP_RST_DEEPSLEEP, ESP_RST_BROWNOUT, ESP_RST_SDIO, ESP_RST_USB, ESP_RST_JTAG, ESP_RST_EFUSE,
+        ESP_RST_PWR_GLITCH, ESP_RST_CPU_LOCKUP };
+    for (unsigned i = 0; i < 4; i++) {
+        CHECK(warthog_boot_next_count(5, true, crash[i]) == 6, "crash %u counts", i);
+        CHECK(warthog_boot_next_count(7, false, crash[i]) == 1, "crash %u without magic", i);
+        CHECK(warthog_boot_next_count(255, true, crash[i]) == 255, "crash %u saturates", i);
+    }
+    for (unsigned i = 0; i < sizeof(clean) / sizeof(clean[0]); i++) {
+        CHECK(warthog_boot_next_count(5, true, clean[i]) == 0, "reset %d clears", (int)clean[i]);
+    }
+    CHECK(WARTHOG_BOOT_SAFE_AFTER == 3, "safe after %u", (unsigned)WARTHOG_BOOT_SAFE_AFTER);
+    memset(&s_boot, 0x5a, sizeof(s_boot)); /* power-on RAM */
+    CHECK(!boot(ESP_RST_POWERON) && warthog_boot_crash_count() == 0 && !warthog_boot_hang_armed(), "power on");
+    CHECK(wdt_on && wdt_action == WDT_STAGE_ACTION_RESET_SYSTEM && wdt_stage == WDT_STAGE0 &&
+          wdt_ticks == WARTHOG_BOOT_WDT_S * 136000u && !wdt_unlocked, "watchdog: on %d action %d ticks %u",
+          wdt_on, wdt_action, (unsigned)wdt_ticks);
+    warthog_boot_guard_usb_up();
+    CHECK(!wdt_on && !wdt_unlocked, "watchdog off after USB");
+    warthog_boot_arm_hang();
+    CHECK(!boot(ESP_RST_PANIC) && warthog_boot_crash_count() == 1 && warthog_boot_hang_armed(), "hang armed");
+    CHECK(!boot(ESP_RST_WDT) && warthog_boot_crash_count() == 2 && warthog_boot_hang_armed(), "hang kept");
+    CHECK(boot(ESP_RST_WDT) && warthog_boot_safe() && warthog_boot_crash_count() == 3 &&
+          !warthog_boot_hang_armed(), "safe mode at 3");
+    now_us = (int64_t)WARTHOG_BOOT_OK_S * 1000000;
+    warthog_boot_guard_tick();
+    CHECK(warthog_boot_crash_count() == 3, "safe mode keeps the count");
+    warthog_boot_arm_hang();
+    CHECK(boot(ESP_RST_PANIC) && warthog_boot_crash_count() == 4 && !warthog_boot_hang_armed(), "safe mode clears the hang");
+    CHECK(!boot(ESP_RST_SW) && warthog_boot_crash_count() == 0 && !warthog_boot_safe(), "software reset leaves safe mode");
+    warthog_boot_arm_hang();
+    CHECK(!boot(ESP_RST_SW) && !warthog_boot_hang_armed(), "a clean reset clears the hang");
+    CHECK(!boot(ESP_RST_PANIC) && warthog_boot_crash_count() == 1, "one crash");
+    /* A tick past OK_S while the watchdog runs (it fires on the uncalibrated RC clock, after app_main). */
+    now_us = (int64_t)WARTHOG_BOOT_OK_S * 1000000 + 300000;
+    warthog_boot_guard_tick();
+    CHECK(warthog_boot_crash_count() == 1 && wdt_on, "cleared while the boot watchdog runs");
+    CHECK(!boot(ESP_RST_WDT) && warthog_boot_crash_count() == 2, "the watchdog reset after that tick did not count");
+    warthog_boot_guard_usb_up();
+    now_us = (int64_t)WARTHOG_BOOT_OK_S * 1000000 - 1;
+    warthog_boot_guard_tick();
+    CHECK(warthog_boot_crash_count() == 2, "cleared early");
+    now_us++;
+    warthog_boot_guard_tick();
+    CHECK(warthog_boot_crash_count() == 0, "not cleared after WARTHOG_BOOT_OK_S with USB up");
+    s_boot.magic ^= 1u; s_boot.crash_boots = 2; s_boot.hang = s_boot.magic ^ 1u;
+    CHECK(!boot(ESP_RST_PANIC) && warthog_boot_crash_count() == 1 && !warthog_boot_hang_armed(), "lost magic");
+    /* A failed USB start: WARTHOG_BOOT_USB_RETRIES watchdog resets that are not crash boots, then no USB. */
+    CHECK(WARTHOG_BOOT_USB_RETRIES == 2, "USB retries %u", (unsigned)WARTHOG_BOOT_USB_RETRIES);
+    CHECK(warthog_boot_guard_usb_failed() && wdt_on, "a failed USB start does not leave the watchdog to retry");
+    now_us = (int64_t)WARTHOG_BOOT_OK_S * 1000000 + 300000;
+    warthog_boot_guard_tick();
+    CHECK(warthog_boot_crash_count() == 1, "cleared before the USB retry's watchdog reset");
+    CHECK(!boot(ESP_RST_WDT) && warthog_boot_crash_count() == 1, "the USB retry counted as a crash boot");
+    CHECK(warthog_boot_guard_usb_failed() && wdt_on, "no second USB retry");
+    CHECK(!boot(ESP_RST_WDT) && warthog_boot_crash_count() == 1, "the second USB retry counted");
+    CHECK(!warthog_boot_guard_usb_failed() && !wdt_on && !wdt_unlocked, "retries spent: the watchdog not off");
+    now_us = (int64_t)WARTHOG_BOOT_OK_S * 1000000;
+    warthog_boot_guard_tick();
+    CHECK(warthog_boot_crash_count() == 0, "a boot running without USB, the watchdog off, kept the count after a minute");
+    CHECK(!boot(ESP_RST_PANIC) && !warthog_boot_guard_usb_failed() && !wdt_on, "a crash boot restored the retries");
+    CHECK(!boot(ESP_RST_SW) && warthog_boot_guard_usb_failed(), "a clean reset did not restore the retries");
+    CHECK(!boot(ESP_RST_PANIC) && warthog_boot_crash_count() == 1, "a panic after a failed USB start not counted");
+    CHECK(!boot(ESP_RST_WDT) && warthog_boot_crash_count() == 2, "a watchdog reset with no USB failure not counted");
+    printf("ok\n");
+    return 0;
+}
+EOF2
+  run65=""
+  if ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -I"$T" -I../../../main -o "$T/t" "$T/t.c" 2>"$T/err"; then
+    run65=$("$T/t")
+  else
+    run65="build: $(head -3 "$T/err" | tr '\n' ' ')"
+  fi
+  rm -rf "$T"
+  [ "$run65" = ok ] || why65="${why65:-the boot guard: ${run65:-did not run}}"
+fi
+AM=$(awk '/^void app_main\(void\)/,/^}/' "$MN")
+printf '%s\n' "$AM" | awk '/const bool safe = warthog_boot_guard_start\(\);/ {g=NR} /nvs_flash_init\(\)/ && !n {n=NR}
+     /if \(safe\) \{/ {s=NR} /ESP_ERROR_CHECK\(warthog_halow_start_safe\(\)\);/ {hs=NR}
+     /warthog_boot_hang_armed\(\)/ {h=NR} /ESP_ERROR_CHECK\(warthog_halow_start\(\)\);/ {hn=NR}
+     /warthog_halow_wait_link\(/ {w=NR} /const bool usb = warthog_usb_net_start\(\) != NULL;/ {u=NR}
+     /if \(usb \|\| safe\) \{/ {uc=NR} /warthog_boot_guard_usb_up\(\);/ {ud=NR}
+     /\} else if \(warthog_boot_guard_usb_failed\(\)\) \{/ {uf=NR}
+     /!safe && warthog_cfg_get_mesh_bridge\(\)/ {b=NR} /while \(1\) \{/ {l=NR} /warthog_boot_guard_tick\(\);/ {t=NR}
+     END {exit (g && g < n && n < s && s < hs && hs < h && h < hn && hn < w && w < u && uc == u + 1 && ud > uc && ud <= uc + 2 && uf == ud + 1 && u < b && b < l && l < t) ? 0 : 1}' || \
+  why65="${why65:-app_main does not count the boot first, start safe mode without the chip, stop an armed hang before the HaLow start, end the watchdog right after USB starts (or in safe mode), report a failed USB start to the guard, keep the bridge out of safe mode, or tick the guard}"
+grep -q '"boot_guard.c"' ../../../main/CMakeLists.txt || why65="${why65:-main/boot_guard.c is not built}"
+HS=$(awk '/^esp_err_t warthog_halow_start_safe\(void\)/,/^}/' "$HL")
+case "$HS" in *'halow_base_start_()'*'xEventGroupSetBits(s_halow_events, HALOW_LINK_BIT);'*) ;; *) why65="${why65:-safe mode does not start the event loop and netif, or leaves the link bit clear}" ;; esac
+case "$HS" in *mmhalow_*|*mmwlan_*|*warthog_mesh_*) why65="${why65:-safe mode starts the chip}" ;; esac
+awk '/^esp_err_t warthog_halow_start\(void\)/,/^}/' "$HL" | grep -q 'halow_base_start_()' || \
+  why65="${why65:-warthog_halow_start does not share the base start}"
+awk '/^static void cmd_assert_query\(void\)/,/^}/' "$A" | tr -d ' \n' | \
+  grep -q 'crash_boots=%lusafe=%u\\r\\n",.*(unsignedlong)warthog_boot_crash_count(),(unsigned)warthog_boot_safe());' || \
+  why65="${why65:-AT+ASSERT? does not print crash_boots and safe}"
+awk '/strcasecmp\(verb, "COREDUMP"\) == 0 && terminator == .=./,/strcasecmp\(verb, "ASSERT"\)/' "$A" | tr -d ' \n' | \
+  grep -q 'if(strcmp(trim(args),"0")!=0){reply_error("usage:AT+COREDUMP=0");}else{cmd_coredump_erase();}' || \
+  why65="${why65:-AT+COREDUMP=0 is not dispatched, or erases on another argument}"
+awk '/^static void cmd_coredump_erase\(void\)/,/^}/' "$A" | grep -q 'esp_core_dump_image_erase()' || \
+  why65="${why65:-AT+COREDUMP=0 does not erase the dump}"
+grep '^| `AT+COREDUMP?`' ../../../wiki/AT-Command-Reference.md | grep -q 'AT+COREDUMP=0' || \
+  why65="${why65:-the AT reference does not name AT+COREDUMP=0}"
+for k65 in 'safe mode' 'AT+COREDUMP=0' 'crash_boots' 'reset=WDT' "$(sed -n 's/^#define WARTHOG_BOOT_WDT_S \([0-9]*\)u.*/\1/p' ../../../main/boot_guard.h 2>/dev/null) s"; do
+  grep -q "$k65" "$TS63" || why65="${why65:-Troubleshooting does not name $k65}"
+done
+if [ -z "$why65" ]; then
+  ok "the boot watchdog stays armed into app_main, re-armed with a system reset until USB starts; three crash boots in a row start safe mode (no HaLow start, no hang), counted in .noinit and cleared by a clean reset or a minute up; AT+ASSERT? shows it, AT+COREDUMP=0 erases the dump; documented"
+else
+  bad "boot guard: $why65"
+fi
+
+# 66. The chip's GPIO interrupts and RESET_N across a CPU-only reset (esp_restart_noos keeps the GPIO
+#     matrix, its interrupt types and output levels): warthog_chip_hold_reset() (shims/mmhal_os.c)
+#     drives RESET_N and WAKE low as outputs and sets every pin the shims give an ISR to no interrupt,
+#     installing nothing; mmhal_init calls it before gpio_install_isr_service, and so do safe mode
+#     (warthog_halow_start_safe) and the AT+ASSERTTEST=hang stop before their own work, so a chip a
+#     panic left out of reset is held there (a chip held in reset holds SPI_IRQ low: a level
+#     interrupt storm, then INT_WDT; measured on air 2026-10-03). Across main/ and components/
+#     (tests and managed components aside) gpio_install_isr_service and gpio_isr_register appear
+#     only after warthog_chip_hold_reset() in the same function, and a file outside the shims that
+#     attaches a GPIO ISR sets no level interrupt type. SPI_IRQ and BUSY are disabled in
+#     mmhal_wlan_deinit before RESET_N goes low. Task stacks with a printf in their failure path:
+#     health and spi_irq at 1024 words or more; AT+STACKS? names every task morselib creates and
+#     reads those through the shim, which keeps each name's least free stack as an instance exits
+#     (a chip restart ends drv, spi_irq and health) and reads a live one only under the lock that
+#     exit takes; the table compiled and run on stubs.
+SH66=../../halow/components/shims
+why66=""
+HO66=$(awk '/^void warthog_chip_hold_reset\(void\)/,/^}/' "$SH66/mmhal_os.c")
+[ -n "$HO66" ] || why66="no warthog_chip_hold_reset() in shims/mmhal_os.c"
+for pin66 in $(sed -n 's/.*gpio_isr_handler_add(\(CONFIG_[A-Z_]*\),.*/\1/p' "$SH66"/*.c | sort -u); do
+  printf '%s\n' "$HO66" | grep -qF "gpio_set_intr_type($pin66, GPIO_INTR_DISABLE);" || \
+    why66="${why66:-warthog_chip_hold_reset does not disable the interrupt of $pin66}"
+done
+[ -n "$(sed -n 's/.*gpio_isr_handler_add(\(CONFIG_[A-Z_]*\),.*/\1/p' "$SH66"/*.c)" ] || why66="${why66:-no ISR pins found in the shims}"
+ho66=$(printf '%s\n' "$HO66" | tr -d ' \n')
+case "$ho66" in *'io_conf.mode=GPIO_MODE_OUTPUT;'*'(1ull<<CONFIG_MM_RESET_N)|(1ull<<CONFIG_MM_WAKE)'*'gpio_set_level(CONFIG_MM_RESET_N,0);gpio_set_level(CONFIG_MM_WAKE,0);gpio_config(&io_conf);'*) ;;
+  *) why66="${why66:-warthog_chip_hold_reset does not drive RESET_N and WAKE low as outputs}" ;; esac
+case "$ho66" in *gpio_install_isr_service*|*gpio_isr_register*|*gpio_isr_handler_add*) why66="${why66:-warthog_chip_hold_reset installs an ISR}" ;; esac
+grep -q '^void warthog_chip_hold_reset(void);' "$SH66/warthog_shim.h" 2>/dev/null || why66="${why66:-warthog_shim.h does not declare warthog_chip_hold_reset}"
+awk '/^void mmhal_init\(void\)/,/^}/' "$SH66/mmhal_os.c" | awk '/warthog_chip_hold_reset\(\);/ && !h {h=NR}
+    /gpio_install_isr_service\(0\);/ {i=NR} END {exit (h && i && h < i) ? 0 : 1}' || \
+  why66="${why66:-mmhal_init does not hold the chip in reset before installing the ISR service}"
+awk '/^esp_err_t warthog_halow_start_safe\(void\)/,/^}/' ../../../main/halow.c | awk 'NR > 1 && /[a-z_]+\(/ && !f {f=$0} END {exit f ~ /warthog_chip_hold_reset\(\);/ ? 0 : 1}' || \
+  why66="${why66:-safe mode does not hold the chip in reset first}"
+awk '/^void app_main\(void\)/,/^}/' ../../../main/main.c | awk '/if \(warthog_boot_hang_armed\(\)\) \{/ {a=NR}
+    a && /warthog_chip_hold_reset\(\);/ && !h {h=NR} a && /for \(;;\) \{/ && !l {l=NR} END {exit (a && h > a && l > h) ? 0 : 1}' || \
+  why66="${why66:-the AT+ASSERTTEST=hang stop does not hold the chip in reset before it spins}"
+for f66 in $(grep -rlE 'gpio_install_isr_service\(|gpio_isr_register\(|gpio_isr_handler_add\(' ../../../main ../.. --include='*.c' 2>/dev/null | \
+             grep -v -e '/test/' -e '/managed_components/' -e '/platforms/'); do
+  awk '/^[A-Za-z_][A-Za-z0-9_ *]*\(/ {h=0} /warthog_chip_hold_reset\(\);/ {h=1}
+       /^[^\/]*(gpio_install_isr_service|gpio_isr_register)\(/ && !h {bad=1} END {exit bad ? 1 : 0}' "$f66" || \
+    why66="${why66:-${f66#../../../} installs a GPIO ISR without holding the chip in reset first}"
+  case "$f66" in "$SH66"/*) ;; *)
+    grep -qE 'GPIO_INTR_(LOW|HIGH)_LEVEL' "$f66" && why66="${why66:-${f66#../../../} attaches a GPIO ISR with a level interrupt}" ;; esac
+done
+awk '/^void mmhal_wlan_deinit\(void\)/,/^}/' "$SH66/mmhal_wlan.c" | awk '/gpio_set_intr_type\(CONFIG_MM_SPI_IRQ, GPIO_INTR_DISABLE\);/ && !s {s=NR}
+    /gpio_set_intr_type\(CONFIG_MM_BUSY, GPIO_INTR_DISABLE\);/ && !b {b=NR} /gpio_set_level\(CONFIG_MM_RESET_N, 0\);/ && !r {r=NR}
+    END {exit (s && b && r && s < r && b < r) ? 0 : 1}' || \
+  why66="${why66:-mmhal_wlan_deinit lowers RESET_N before the SPI_IRQ and BUSY interrupts are off}"
+DRV66=../../halow/components/mm-iot-sdk/framework/morselib/src/driver
+hs66=$(sed -n 's/^#define HEALTH_CHECK_TASK_STACK_SIZE_WORDS \([0-9]*\).*/\1/p' "$DRV66/health/driver_health.c")
+si66=$(sed -n 's/^#define SPI_IRQ_TASK_STACK *(\([0-9]*\)).*/\1/p' "$DRV66/transport/sdio.c")
+[ "${hs66:-0}" -ge 1024 ] && [ "${si66:-0}" -ge 1024 ] || why66="${why66:-health ($hs66) or spi_irq ($si66) under 1024 words}"
+ST66=$(awk '/^static void cmd_stacks\(void\)/,/^}/' "$A")
+n66=0
+for t66 in $(grep -rhoE 'mmosal_task_create\([^;]*"[a-z_]+"\)' ../../halow/components/mm-iot-sdk/framework/morselib/src 2>/dev/null | \
+             sed -n 's/.*"\([a-z_]*\)")$/\1/p'; \
+           grep -rh -A5 'mmosal_task_create(' "$DRV66" ../../halow/components/mm-iot-sdk/framework/morselib/src/umac/core | \
+             sed -n 's/^ *"\([a-z_]*\)");$/\1/p'); do
+  n66=$((n66 + 1))
+  printf '%s\n' "$ST66" | grep -q "\"$t66\"" || why66="${why66:-AT+STACKS? does not name the morselib task $t66}"
+done
+[ "$n66" -ge 4 ] || why66="${why66:-only $n66 morselib tasks found (evtloop, drv, spi_irq, health expected)}"
+printf '%s\n' "$ST66" | grep -q 'uxTaskGetStackHighWaterMark(h)' || why66="${why66:-AT+STACKS? does not read the high-water mark}"
+# A chip restart ends and restarts drv, spi_irq and health: the shim keeps each name's least free
+# stack as an instance exits and reads a live one only under the lock its exit takes (no freed TCB).
+OS66="$SH66/mmosal_shim_freertos_esp32.c"
+awk '/^void mmosal_task_main\(void \*arg\)/,/^}/' "$OS66" | tr -d ' \n' | \
+  grep -q 'task_stack_enter_();task_arg.task_fn(task_arg.task_fn_arg);task_stack_exit_();mmosal_task_delete(NULL);' || \
+  why66="${why66:-mmosal_task_main does not record the stack of its task as it starts and exits}"
+grep -q '^bool warthog_task_stack(const char \*name, uint32_t \*live, uint32_t \*exit_min);' "$SH66/warthog_shim.h" 2>/dev/null || \
+  why66="${why66:-warthog_shim.h does not declare warthog_task_stack}"
+printf '%s\n' "$ST66" | tr -d ' \n' | grep -q 'warthog_task_stack(shim_names\[i\],&live,&min)' || \
+  why66="${why66:-AT+STACKS? does not read the morselib tasks through the shim}"
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^#define WARTHOG_TASK_SLOTS/ {on=1} on {print} on && /^bool warthog_task_stack\(/ {f=1} f && /^}/ {exit}' "$OS66" > "$T/fn.c"
+cat > "$T/t.c" <<'EOF2'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef void *TaskHandle_t;
+typedef int portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED 0
+static int crit, bad_read;
+#define portENTER_CRITICAL(m) ((void)(m), crit++)
+#define portEXIT_CRITICAL(m) ((void)(m), crit--)
+static intptr_t cur;
+static const char *cur_name;
+static uint32_t hwm[16];
+TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (TaskHandle_t)cur; }
+char *pcTaskGetName(TaskHandle_t h) { return h == NULL ? (char *)cur_name : (char *)"?"; }
+unsigned uxTaskGetStackHighWaterMark(TaskHandle_t h)
+{
+    if (h != NULL && (intptr_t)h != cur && crit != 1) { bad_read = 1; }
+    return hwm[h == NULL ? cur : (intptr_t)h];
+}
+#include "fn.c"
+static void run_(intptr_t h, const char *name, uint32_t at_start) { cur = h; cur_name = name; hwm[h] = at_start; task_stack_enter_(); }
+static void exit_(intptr_t h, uint32_t at_exit) { cur = h; hwm[h] = at_exit; task_stack_exit_(); cur = 0; }
+#define CHECK(c, ...) do { if (!(c)) { printf(__VA_ARGS__); printf("\n"); return 0; } } while (0)
+int main(void)
+{
+    uint32_t live = 0, min = 0;
+    CHECK(!warthog_task_stack("health", &live, &min), "a task never run is found");
+    run_(1, "health", 3000);
+    cur = 9;
+    CHECK(warthog_task_stack("health", &live, &min) && live == 3000u && min == UINT32_MAX, "first instance: %u %u", (unsigned)live, (unsigned)min);
+    exit_(1, 1200);
+    CHECK(warthog_task_stack("health", &live, &min) && live == UINT32_MAX && min == 1200u, "exited: %u %u", (unsigned)live, (unsigned)min);
+    run_(2, "health", 3900);
+    cur = 9;
+    CHECK(warthog_task_stack("health", &live, &min) && live == 3900u && min == 1200u, "restarted: %u %u", (unsigned)live, (unsigned)min);
+    exit_(2, 3500);
+    run_(3, "health", 3950);
+    cur = 9;
+    CHECK(warthog_task_stack("health", &live, &min) && live == 3950u && min == 1200u, "the least kept: %u", (unsigned)min);
+    run_(4, "drv", 2000);
+    cur = 9;
+    CHECK(warthog_task_stack("drv", &live, &min) && live == 2000u && warthog_task_stack("health", &live, &min) && live == 3950u, "two names");
+    static const char *more[] = { "a", "b", "c", "d", "e", "f", "g" };
+    for (unsigned i = 0; i < 7; i++) { run_(5 + (intptr_t)i, more[i], 100); }
+    cur = 9;
+    CHECK(!warthog_task_stack("g", &live, &min) && warthog_task_stack("f", &live, &min), "slots: 8 names kept, the 9th not");
+    CHECK(crit == 0 && !bad_read, "a live stack read outside the lock (%d %d)", crit, bad_read);
+    printf("ok\n");
+    return 0;
+}
+EOF2
+run66=""
+if ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -I"$T" -o "$T/t" "$T/t.c" 2>"$T/err"; then run66=$("$T/t"); else run66="build: $(head -2 "$T/err" | tr '\n' ' ')"; fi
+rm -rf "$T"
+[ "$run66" = ok ] || why66="${why66:-the task stack table: ${run66:-did not run}}"
+awk '/strcasecmp\(verb, "STACKS"\) == 0 && terminator == .\?./ {getline; print}' "$A" | grep -q 'cmd_stacks();' || \
+  why66="${why66:-AT+STACKS? is not dispatched}"
+grep -q '^| `AT+STACKS?`' ../../../wiki/AT-Command-Reference.md || why66="${why66:-no AT+STACKS? row in the AT reference}"
+if [ -z "$why66" ]; then
+  ok "the chip held in reset with its GPIO interrupts off before any ISR service attaches (mmhal_init, safe mode, the hang stop) and before mmhal_wlan_deinit lowers RESET_N; no level-interrupt ISR elsewhere; health and spi_irq stacks 1024 words; AT+STACKS? reads every morselib task, the shim keeping each least free stack across chip restarts"
+else
+  bad "GPIO interrupt reset / task stacks: $why66"
+fi
+
+# 67. AT+RXCAP and AT+TXCAP (mmwlan_cap.h, umac_mesh_cap.c, skbq.c): the module is in the firmware build
+#     and freestanding; each hook in skbq.c runs only behind its mode (a load and a branch when off):
+#     RX in morse_skbq_process_rx after the rx_status is read and before mmdrv_host_process_rx_frame,
+#     TX in morse_skbq_tx under the queue lock right after the packet id is set (the bytes the chip
+#     will read), only for a frame the queue took; TX status in __skbq_data_tx_finish, and a frame
+#     released there untried marked so before its header goes; writers never wait on the ring; a
+#     status that finds it busy is counted (st_lost, on the AT+TXCAP? line); the AT argument parser
+#     compiled out of main/at.c and run; dispatched; in the AT reference.
+SQ67=../../halow/components/mm-iot-sdk/framework/morselib/src/driver/morse_driver/skbq.c
+CM67=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh_cap.c
+why67=""
+grep -q '/src/umac/mesh/umac_mesh_cap.c' ../../halow/components/morselib/CMakeLists.txt || why67="umac_mesh_cap.c is not in the firmware build"
+${CC:-cc} -std=gnu11 -Wall -Werror -fsyntax-only -I../../halow/components/mm-iot-sdk/framework/morselib/include "$CM67" 2>/dev/null || \
+  why67="${why67:-umac_mesh_cap.c is not freestanding}"
+RX67=$(awk '/^void morse_skbq_process_rx\(/,/^}/' "$SQ67" | tr -d ' \n')
+case "$RX67" in *'rx_metadata->vif_id=MORSE_RX_STATUS_FLAGS_VIF_ID_GET(hdr->rx_status.flags);if(mmwlan_cap_mode[MMWLAN_CAP_RX]!=MMWLAN_CAP_OFF){'*'mmwlan_cap_rx(mmpkt_get_data_start(view),mmpkt_get_data_length(view),'*'}mmpkt_close(&view);mmdrv_host_process_rx_frame(mmpkt,channel);'*) ;;
+  *) why67="${why67:-the RX capture is not behind its mode, after the rx_status and before the frame goes up}" ;; esac
+TX67=$(awk '/^static int morse_skbq_tx\(/,/^}/' "$SQ67" | tr -d ' \n')
+case "$TX67" in *'__morse_skbq_pkt_id(mq,mmpkt);if(mmwlan_cap_mode[MMWLAN_CAP_TX]!=MMWLAN_CAP_OFF&&rc==0&&'*'skbq_cap_tx_(mmpkt);}spin_unlock(&mq->lock);'*) ;;
+  *) why67="${why67:-the TX capture is not behind its mode, of a frame queued, under the queue lock right after the packet id}" ;; esac
+TS67=$(awk '/^static int __skbq_data_tx_finish\(struct mmpkt_list \*skbq,$/ {n++} n == 2 && /^{/ {on=1} on {print} on && /^}/ {exit}' "$SQ67" | tr -d ' \n')
+case "$TS67" in *'if(mmwlan_cap_mode[MMWLAN_CAP_TX]!=MMWLAN_CAP_OFF){'*'mmwlan_cap_tx_status(tx_sts->pkt_id,tx_sts->tid,'*) ;;
+  *) why67="${why67:-the TX status is not recorded behind the TX mode}" ;; esac
+case "$TS67" in *'elseif(tx_metadata->mesh.host_frag!=0||tx_metadata->mesh.ba_wait!=0){'*'if(mmwlan_cap_mode[MMWLAN_CAP_TX]!=MMWLAN_CAP_OFF){'*'mmwlan_cap_tx_untried(h->tx_info.pkt_id,h->tx_info.tid);}morse_skb_remove_padding_after_sent_to_chip(view);'*) ;;
+  *) why67="${why67:-a frame released untried is not recorded as such, behind the TX mode, before its header goes}" ;; esac
+awk '/^static void cap_tx_done_\(/,/^}/' "$CM67" | tr -d ' \n' | \
+  grep -q 'if(!cap_trylock_(r)){__atomic_fetch_add(&r->st_lost,1u,__ATOMIC_RELAXED);return;}' || \
+  why67="${why67:-a TX status that finds the ring busy is not counted}"
+awk '/^static void cmd_cap_query\(unsigned dir\)/,/^}/' "$A" | tr -d ' \n' | grep -q 'if(dir==MMWLAN_CAP_TX){w+=snprintf(line+w,sizeof(line)-(size_t)w,"st_lost=%lu",(unsignedlong)mmwlan_cap_st_lost());}' || \
+  why67="${why67:-AT+TXCAP? does not print st_lost}"
+grep -q 'while (!cap_trylock_' "$CM67" && why67="${why67:-a capture writer or the AT task spins on the ring}"
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^static bool cap_args_parse_\(/,/^}/' "$A" > "$T/fn.c"
+cat > "$T/t.c" <<'EOF2'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "fn.c"
+int main(void)
+{
+    uint32_t m = 9; bool h = true; uint8_t mac[6];
+    if (!cap_args_parse_("1", 1, &m, &h, mac) || m != 1 || h) { printf("plain\n"); return 0; }
+    if (!cap_args_parse_("2,02:00:00:00:00:0A", 2, &m, &h, mac) || m != 2 || !h || mac[5] != 0x0a || mac[0] != 2) { printf("colons\n"); return 0; }
+    if (!cap_args_parse_("0,0200000000ff", 1, &m, &h, mac) || m != 0 || mac[5] != 0xff) { printf("bare\n"); return 0; }
+    static const char *bad[] = { "2", "", "1,", "1,02:00:00:00:00", "1,02:00:00:00:00:0a:", "x", "11", "1,0200000000fg" };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        if (cap_args_parse_(bad[i], 1, &m, &h, mac)) { printf("took %s\n", bad[i]); return 0; }
+    }
+    printf("ok\n");
+    return 0;
+}
+EOF2
+run67=""
+if ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then run67=$("$T/t"); fi
+rm -rf "$T"
+[ "$run67" = ok ] || why67="${why67:-the AT+RXCAP/TXCAP parser: ${run67:-did not build or run}}"
+for v67 in RXCAP TXCAP; do
+  awk -v v="$v67" '$0 ~ "strcasecmp\\(verb, \"" v "\"\\) == 0 && terminator == .=." {getline; print}' "$A" | grep -q "cmd_cap_set(MMWLAN_CAP_${v67%CAP}, args);" || \
+    why67="${why67:-AT+$v67= is not dispatched}"
+  awk -v v="$v67" '$0 ~ "strcasecmp\\(verb, \"" v "\"\\) == 0 && terminator == .\\?." {getline; print}' "$A" | grep -q "cmd_cap_query(MMWLAN_CAP_${v67%CAP});" || \
+    why67="${why67:-AT+$v67? is not dispatched}"
+  grep -q "^| \`AT+$v67=" ../../../wiki/AT-Command-Reference.md || why67="${why67:-no AT+$v67 row in the AT reference}"
+done
+if [ -z "$why67" ]; then
+  ok "AT+RXCAP/AT+TXCAP: built and freestanding; each hook behind its mode, where the chip's bytes are (RX before anything parses them, TX under the queue lock after the packet id, its status on it); writers never wait; parser run; dispatched; documented"
+else
+  bad "frame capture: $why67"
+fi
+
+# 68. AT+TIDPARAMS as the simulator cannot see it: both unicast data sites take the reorder size
+#     from umac_datapath_tx_reorder_size, which keeps morselib's rule unless the switch is on, the
+#     frame is mesh, and AT+HOSTFRAG is in force or AT+AMPDU=0; a fragment's flags are re-populated
+#     from the connection after they are set; AT+AMPDU? prints each peer's sessions; AT+TIDPARAMS and
+#     AT+SEALFIT dispatched, RAM only.
+why68=""
+UD68=$(cat "$DD/umac_datapath.c")
+[ "$(printf '%s\n' "$UD68" | grep -c 'tid_max_reorder_buf_size = umac_datapath_tx_reorder_size(data, stad,')" = 2 ] && \
+  ! printf '%s\n' "$UD68" | grep -q 'tid_max_reorder_buf_size = umac_ba_get_reorder_buffer_size' || \
+  why68="reorder sizes do not all come from umac_datapath_tx_reorder_size"
+awk '/^static uint8_t umac_datapath_tx_reorder_size\(/,/^}/' "$DD/umac_datapath.c" | tr -d ' \n' | \
+  grep -q 'if(data->ops==&datapath_ops_mesh&&g_warthog_ba_txparm!=0u&&(umac_datapath_mesh_hostfrag_mode()!=UMAC_MESH_FRAG_OFF||g_warthog_ampdu==0u)){returnumac_ba_get_originator_buffer_size(stad,tid);}returnumac_ba_get_reorder_buffer_size(stad,tid);' || \
+  why68="${why68:-umac_datapath_tx_reorder_size changes the morselib rule outside AT+TIDPARAMS=1 with AT+HOSTFRAG in force or AT+AMPDU=0}"
+awk '/^static int umac_datapath_tx_mesh_frags\(/,/^}/' "$DD/umac_datapath.c" | tr -d ' \n' | \
+  grep -q 'md->flags=(key_id>=0&&!host_seal)?MMDRV_TX_FLAG_HW_ENC:0u;umac_connection_populate_tx_metadata(umacd,md);' || \
+  why68="${why68:-the flags of a fragment are not re-populated from the connection}"
+awk '/^static void cmd_ampdu_query\(void\)/,/^}/' "$A" | tr -d ' \n' | \
+  grep -q 'if((g_warthog_ampdu_peer_mac\[i\]&0x1000000u)!=0u){ampdu_peer_line_(line,sizeof(line),g_warthog_ampdu_peer_mac\[i\],g_warthog_ampdu_peer_ba\[i\]);cdc_write(line);}' || \
+  why68="${why68:-AT+AMPDU? does not print the sessions of each peer}"
+for v68 in TIDPARAMS SEALFIT; do
+  grep -q "strcasecmp(verb, \"$v68\") == 0 && terminator == '='" "$A" && grep -q "strcasecmp(verb, \"$v68\") == 0 && terminator == '?'" "$A" || \
+    why68="${why68:-AT+$v68 is not dispatched}"
+  grep -q "^| \`AT+$v68=" ../../../wiki/AT-Command-Reference.md || why68="${why68:-no AT+$v68 row in the AT reference}"
+done
+grep -qi 'nvs.*sealfit\|nvs.*tidparams' ../../../main/cfg.c && why68="${why68:-AT+SEALFIT or AT+TIDPARAMS persists}"
+if [ -z "$why68" ]; then
+  ok "AT+TIDPARAMS changes the reorder size only on the mesh with AT+HOSTFRAG in force or AT+AMPDU=0; fragments keep the connection's flags; AT+AMPDU? lists each peer's sessions; AT+TIDPARAMS and AT+SEALFIT dispatched, RAM only"
+else
+  bad "Block Ack fields glue: $why68"
+fi
+
+# 69. The fragment rule of chip firmware 1.17.6 (measured on air 2026-10-03), as the simulator cannot
+#     see it: AT+HOSTFRAG is off with host CCMP and cuts in at most 2 otherwise, unless
+#     WARTHOG_MESH_HOSTFRAG_ANY, which no env sets and the host tests' ANY builds alone define;
+#     at.c's rule names the same three cases; the plan asks for that cap and, when the rate is what
+#     needs more, recuts once on rates that need no more; AT+SEALFIT runs on every sealed unicast
+#     mesh frame the host does not cut (whole when host-sealed, or chip-sealed under this node's
+#     requested or agreed Block Ack session on its TID or before the DELBA a cut sent the peer is
+#     through, counted seal_ba; else, and when AT+FRAG leaves no rate whole, at most the cap when
+#     chip-sealed; AT+FRAG counted) after its rate table and before its PN count, and on mesh group
+#     frames (whole, no threshold) after theirs; a head the trim puts in keeps the old head's RTS;
+#     the pool reserve is one extra fragment per peer and a DELBA; the LED task's stack is 3072 bytes.
+why69=""
+PV=$(awk '/^static inline uint32_t umac_datapath_mesh_hostfrag_mode\(void\)/,/^}/' "$DD/umac_datapath_private.h" | tr -d ' \n')
+case "$PV" in *'#ifdefined(WARTHOG_MESH_HOST_CCMP)&&!defined(WARTHOG_MESH_HOSTFRAG_ANY)returnUMAC_MESH_FRAG_OFF;#elsereturng_warthog_hostfrag;#endif}') ;;
+  *) why69="the mode in force is not off with host CCMP" ;; esac
+tr -d ' \n' < "$DD/umac_datapath_private.h" | \
+  grep -q '#ifdefWARTHOG_MESH_HOSTFRAG_ANY#defineUMAC_DATAPATH_MESH_FRAG_MAXUMAC_MESH_FRAG_MAX#else#defineUMAC_DATAPATH_MESH_FRAG_MAXUMAC_MESH_FRAG_CHIP_MAX#endif' || \
+  why69="${why69:-the cap is not what the chip delivers}"
+grep -q '^#define UMAC_MESH_FRAG_CHIP_MAX 2u$' ../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh_frag.h || \
+  why69="${why69:-UMAC_MESH_FRAG_CHIP_MAX is not 2}"
+grep -n 'WARTHOG_MESH_HOSTFRAG_ANY' ../../../platformio.ini ../../../main/CMakeLists.txt ../../halow/components/morselib/CMakeLists.txt 2>/dev/null | \
+  grep -v ':[[:space:]]*;' | grep -q . && why69="${why69:-a firmware build sets WARTHOG_MESH_HOSTFRAG_ANY}"
+[ "$(grep -c 'HOSTFRAG_ANY)' Makefile)" = 4 ] || why69="${why69:-other than the 4 ANY host builds define WARTHOG_MESH_HOSTFRAG_ANY}"
+RU=$(awk '/^static uint32_t hostfrag_rule_\(void\)/,/^}/' "$A" | tr -d ' \n')
+case "$RU" in *'#ifdefined(WARTHOG_MESH_HOSTFRAG_ANY)return16u;#elifdefined(WARTHOG_MESH_HOST_CCMP)return0u;#elsereturn2u;#endif}') ;;
+  *) why69="${why69:-the rule AT+HOSTFRAG? prints does not name the three cases}" ;; esac
+PL69=$(awk '/^static void umac_datapath_mesh_frag_plan\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c")
+printf '%s\n' "$PL69" | grep -q '\.max_frags = UMAC_DATAPATH_MESH_FRAG_MAX,' || why69="${why69:-the plan does not ask for the cap}"
+printf '%s\n' "$PL69" | tr -d ' \n' | \
+  grep -q 'if(plan->n==0u&&plan->lim==UMAC_MESH_FRAG_LIM_RATE){.*umac_datapath_cap_rates(&md->rc_data,hdr_len+sec_len+DOT11_FCS_FIELD_LEN,body_len,plan->thr,req.max_frags);if(r>0){.*req.rate_cap=umac_datapath_chain_cap(&md->rc_data,2u,&slow);umac_mesh_frag_plan(&req,plan);}}' || \
+  why69="${why69:-a frame the rate would cut beyond the cap is not recut on rates that need no more}"
+[ "$(grep -c 'umac_datapath_seal_fit(' "$DD/umac_datapath.c")" = 2 ] || why69="${why69:-AT+SEALFIT has other than one call site}"
+awk '/^enum mmwlan_status umac_datapath_process_tx_frame\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c" | \
+  awk '/umac_rc_init_rate_table_data\(stad,/ && !r {r=NR} /if \(key_id >= 0 && data->ops == &datapath_ops_mesh && g_warthog_sealfit != 0u\)/ && !f {f=NR}
+       /const bool ba = !host_encrypted && \(umac_ba_originator_held\(stad, \(uint8_t\)tid\) \|\|$/ && !b {b=NR}
+       /^ *umac_datapath_mesh_ba_waiting\(stad\)\);$/ && b && NR == b + 1 {w=NR}
+       /umac_datapath_seal_fit\(umacd, &tx_metadata->rc_data, over,/ && !c {c=NR} /host_encrypted \? 1u : UMAC_MESH_FRAG_CHIP_MAX, ba\);/ && !m {m=NR}
+       /umac_datapath_chip_pns\(umacd, &tx_metadata->rc_data,/ && !p {p=NR} /mmdrv_tx_frame\(txbuf, false\)/ && !h {h=NR}
+       END {exit (r && f && b && w && c && m && p && h && r < f && f < b && b < c && c < m && m < p && p < h) ? 0 : 1}' || \
+  why69="${why69:-AT+SEALFIT does not run on every sealed unicast mesh frame, whole under a Block Ack session or its DELBA wait, after the rate table and before its PN count}"
+awk '/^bool umac_datapath_mesh_ba_waiting\(/,/^}/' "$DD/umac_datapath_mesh.c" | tr -d ' \n' | \
+  grep -q 'returnslot>=0&&s_ba_wait\[slot\].active;}' || why69="${why69:-the DELBA wait is not the open wait of the peer}"
+awk '/^bool umac_ba_originator_held\(/,/^}/' ../../halow/components/mm-iot-sdk/framework/morselib/src/umac/ba/umac_ba.c | tr -d ' \n' | \
+  grep -q 'returntid<UMAC_BA_MAX_SESSIONS&&(data->sessions.originator\[tid\].status==UMAC_BA_REQUESTED||data->sessions.originator\[tid\].status==UMAC_BA_SUCCESS);' || \
+  why69="${why69:-a session is held other than while requested or agreed}"
+awk '/^enum mmwlan_status umac_datapath_process_tx_frame\(/ {on=1} on && /^}/ {exit} on' "$DD/umac_datapath.c" | \
+  awk '/else if \(is_multicast\)/ && !g {g=NR} /umac_rc_init_rate_table_mgmt\(umacd, &tx_metadata->rc_data, false\);/ && g && !t {t=NR}
+       /if \(data->ops == &datapath_ops_mesh && g_warthog_sealfit != 0u\)/ && !f {f=NR}
+       /umac_datapath_group_fit\(&tx_metadata->rc_data, over,/ && !c {c=NR} /if \(!rc_done\)/ && !u {u=NR}
+       END {exit (g && t && f && c && u && g < t && t < f && f < c && c < u) ? 0 : 1}' || \
+  why69="${why69:-AT+SEALFIT does not run on mesh group frames after their rate table}"
+[ "$(grep -c 'umac_datapath_group_fit(' "$DD/umac_datapath.c")" = 2 ] || why69="${why69:-the group fit has other than one call site}"
+SF69=$(awk '/^static void umac_datapath_seal_fit\(/,/^}/' "$DD/umac_datapath.c" | sed 's:/\*.*\*/::g' | tr -d ' \n')
+case "$SF69" in *'constuint32_tthr=umac_config_get_frag_threshold(umacd);if(ba){constintw=umac_datapath_cap_rates(t,over,body,thr,1u);if(w>=0){g_warthog_sealfit_ba+=w>0?1u:0u;return;}g_warthog_sealfit_nofit++;}constintr=umac_datapath_cap_rates(t,over,body,thr,max);if(r==1)'*'elseif(r<0&&!ba){g_warthog_sealfit_nofit++;}}') ;;
+  *) why69="${why69:-AT+SEALFIT does not count AT+FRAG, a Block Ack fit as seal_ba, or fall back to the cap when no rate is whole}" ;; esac
+awk '/^static void umac_datapath_group_fit\(/,/^}/' "$DD/umac_datapath.c" | tr -d ' \n' | \
+  grep -q 'constintr=umac_datapath_cap_rates(t,over,body,0u,1u);' || why69="${why69:-a group frame is not fitted whole}"
+CR69=$(awk '/^static int umac_datapath_cap_rates\(/,/^}/' "$DD/umac_datapath.c" | tr -d ' \n')
+case "$CR69" in *'constunsignedhead_rts=t->rates[0].flags&rts;'*'kept[0].flags=(uint8_t)(((unsigned)kept[0].flags&~rts)|head_rts);'*'for(unsignedi=0;i<MMRC_MAX_CHAIN_LENGTH;i++){if(i<keep)'*) ;;
+  *) why69="${why69:-a head the trim puts in does not keep the RTS of the old head}" ;; esac
+tr -d ' \n' < "$DD/umac_datapath_private.h" | \
+  grep -q '#ifdefWARTHOG_MESH_HOSTFRAG_ANY#defineUMAC_DATAPATH_MESH_FRAG_RESERVEUMAC_MESH_FRAG_POOL_RESERVE#else#defineUMAC_DATAPATH_MESH_FRAG_RESERVE((UMAC_MESH_FRAG_CHIP_MAX-1u)\*UMAC_DATAPATH_MESH_MAX_PEERS+1u)#endif' || \
+  why69="${why69:-the pool reserve is not one extra fragment per peer and a DELBA}"
+grep -q '^volatile uint32_t g_warthog_sealfit = 1;' "$A" || why69="${why69:-AT+SEALFIT is not on by default}"
+grep -q '"warthog_led", 3072,' ../../../main/led.c || why69="${why69:-the LED task stack is not 3072}"
+if [ -z "$why69" ]; then
+  ok "1.17.6's fragment rule: AT+HOSTFRAG off with host CCMP and at most 2 fragments otherwise (ANY in host tests only); AT+HOSTFRAG? names it; a rate that needs more is replaced; AT+SEALFIT on sealed unicast (whole under a Block Ack session or its DELBA wait, else the cap; AT+FRAG counted) and group frames, after the rates and before the PN count; a new head keeps the old RTS; the pool reserve follows the cap; the LED task has 3072 bytes"
+else
+  bad "fragment rule / stacks: $why69"
+fi
+
+# 70. IP fragments (measured on air 2026-10-03: a Pi at MTU 1460 fragments a 1472-byte ping and IDF's
+#     default lwIP drops every fragment to it). sdkconfig.defaults turns on IPv4 reassembly with
+#     IP_REASS_MAX_PBUFS 10 (Kconfig's floor) and leaves IPv6 reassembly off (IDF's default IPv6 input
+#     hook drops all IPv6 while no netif has a link-local address), and every generated
+#     sdkconfig.warthog-* says the same, since PlatformIO does not re-apply the defaults to an existing
+#     one; no defaults overlay an env names turns IPv4 reassembly off. What the host test (lwip_napt.mk,
+#     which runs IDF's own lwIP) cannot see: main/CMakeLists.txt builds nat_frag.c and hands lwIP
+#     warthog_lwip_hooks.h as ESP_IDF_LWIP_HOOK_FILENAME (from a directory holding only that header);
+#     the header defines LWIP_HOOK_IP4_INPUT as warthog_ip4_input_hook; the hook holds heap copies
+#     (pbuf_clone with link-header room), gives a whole datagram back through tcpip_inpkt, never
+#     ip4_input on the tcpip task's stack, and refuses to build without reassembly or with core-locked
+#     input. Whole packets go through cut_short_ first: stock NAPT reads and, on a session match,
+#     rewrites a TCP, UDP or ICMP header past a short packet's end (ASan in test_lwip_napt_frag).
+#     Its napt_recv_ is ip4_input's whole condition for ip_napt_recv (inp at 0.0.0.0 or down too), checked
+#     against the package's ip4.c when present; a UDP packet without its destination port is dropped
+#     wherever it goes, as ip4_input reads that port for DHCP, which the host test's lwIP has on.
+#     make all runs lwip-napt, and CI runs it (plain and SAN=1) after the PlatformIO build with
+#     LWIP_NAPT_REQUIRED=1. AT+MTU? prints the hook's counts, ip_short_drop among them; the AT reference,
+#     Troubleshooting, OpenMANET Interop, napt-notes and the fork inventory say so.
+why70=""
+for k70 in '^CONFIG_LWIP_IP4_REASSEMBLY=y$' '^CONFIG_LWIP_IP_REASS_MAX_PBUFS=10$' '^CONFIG_LWIP_IPV4_NAPT=y$' \
+           '^CONFIG_LWIP_IP_FORWARD=y$'; do
+  grep -q "$k70" ../../../sdkconfig.defaults || why70="${why70:-sdkconfig.defaults lacks $k70}"
+done
+grep -q '^CONFIG_LWIP_IP6_REASSEMBLY=y$' ../../../sdkconfig.defaults && why70="${why70:-sdkconfig.defaults turns on IPv6 reassembly, which no IPv6 packet reaches}"
+n70=0
+for g70 in ../../../sdkconfig.warthog-*; do
+  [ -f "$g70" ] || continue
+  n70=$((n70 + 1))
+  for k70 in '^CONFIG_LWIP_IP4_REASSEMBLY=y$' '^# CONFIG_LWIP_IP6_REASSEMBLY is not set$' '^CONFIG_LWIP_IP_REASS_MAX_PBUFS=10$' \
+             '^CONFIG_LWIP_HOOK_IP6_INPUT_DEFAULT=y$'; do
+    grep -q "$k70" "$g70" || why70="${why70:-${g70##*/}: no $k70 (PlatformIO keeps a generated sdkconfig)}"
+  done
+done
+for o70 in $(sed -n 's/.*SDKCONFIG_DEFAULTS="\([^"]*\)".*/\1/p' ../../../platformio.ini | tr ';' ' '); do
+  [ -f "../../../$o70" ] || continue
+  grep -Eq '^# CONFIG_LWIP_IP4_REASSEMBLY is not set$|^CONFIG_LWIP_IP4_REASSEMBLY=n$' "../../../$o70" && \
+    why70="${why70:-$o70 turns reassembly off}"
+done
+MCM=../../../main/CMakeLists.txt
+grep -q '^        "nat_frag.c"$' "$MCM" || why70="${why70:-main/CMakeLists.txt does not build nat_frag.c}"
+tr -d ' \n' < "$MCM" | grep -q 'idf_component_get_property(lwiplwipCOMPONENT_LIB)target_compile_definitions(${lwip}PRIVATE"ESP_IDF_LWIP_HOOK_FILENAME=\\"warthog_lwip_hooks.h\\"")target_include_directories(${lwip}PRIVATE"${CMAKE_CURRENT_LIST_DIR}/lwip_hooks")' || \
+  why70="${why70:-main/CMakeLists.txt does not hand lwIP the hook file and its directory}"
+[ "$(ls ../../../main/lwip_hooks)" = warthog_lwip_hooks.h ] || why70="${why70:-main/lwip_hooks holds more than the hook header}"
+grep -q '^#define LWIP_HOOK_IP4_INPUT(p, inp) warthog_ip4_input_hook((p), (inp))$' ../../../main/lwip_hooks/warthog_lwip_hooks.h || \
+  why70="${why70:-warthog_lwip_hooks.h does not define LWIP_HOOK_IP4_INPUT as warthog_ip4_input_hook}"
+NF=../../../main/nat_frag.c
+HK70=$(awk '/^int warthog_ip4_input_hook\(/,/^}/' "$NF")
+case "$HK70" in *'tcpip_inpkt(p, inp, ip4_input)'*) ;; *) why70="${why70:-the hook does not give the datagram back through tcpip_inpkt}" ;; esac
+case "$HK70" in *'pbuf_clone(PBUF_LINK, PBUF_RAM, p)'*) ;; *) why70="${why70:-the hook does not hold heap copies with link-header room}" ;; esac
+printf '%s\n' "$HK70" | grep -q 'ip4_input(p' && why70="${why70:-the hook calls ip4_input on the tcpip stack}"
+printf '%s\n' "$HK70" | awk '/cut_short_\(p, inp\)/ {c=NR} /to_\(h, inp\);/ {f=NR} END {exit (c && f > c) ? 0 : 1}' || \
+  why70="${why70:-the hook does not check whole packets for a short transport header before its fragment path}"
+grep -q '^#if !IP_NAPT || !IP_REASSEMBLY$' "$NF" && grep -q '^#if LWIP_TCPIP_CORE_LOCKING_INPUT$' "$NF" || \
+  why70="${why70:-nat_frag.c builds without reassembly or with core-locked input}"
+awk '/^static int napt_recv_\(/,/^}/' "$NF" | grep -q '^    return !inp->napt && ip4_addr_eq(dst, netif_ip4_addr(inp));$' || \
+  why70="${why70:-napt_recv_ is not the condition ip4_input calls ip_napt_recv on}"
+CS70=$(awk '/^static int cut_short_\(/,/^}/' "$NF")
+case "$CS70" in *'proto == IP_PROTO_UDP && have < hlen + 4'*'return napt_recv_(&dst, inp) || to_(h, inp) == TO_OURS;'*) ;;
+  *) why70="${why70:-cut_short_ does not drop UDP without its port, then whatever napt_recv_ or to_ says NAPT reads}" ;; esac
+I70="${IDF_LWIP:-$HOME/.platformio/packages/framework-espidf/components/lwip}/lwip/src/core/ipv4/ip4.c"
+if [ -f "$I70" ]; then
+  [ "$(grep -c 'ip_napt_recv(' "$I70")" = 1 ] && \
+    grep -A1 -x '  if (!inp->napt && ip4_addr_cmp(&iphdr->dest, netif_ip4_addr(inp)))' "$I70" | grep -qx '    ip_napt_recv(p, iphdr);' || \
+    why70="${why70:-ip4.c in the IDF package calls ip_napt_recv on another condition than napt_recv_ copies}"
+fi
+grep -q '^#define LWIP_DHCP 1$' lwip_napt/lwipopts.h && grep -q 'dhcp.c' lwip_napt.mk || \
+  why70="${why70:-the host test builds lwIP without DHCP, so the UDP port read of ip4_input never runs}"
+grep -q '^all:.* lwip-napt' Makefile && grep -q '^include lwip_napt.mk$' Makefile || why70="${why70:-make all does not run lwip-napt}"
+grep -q 'make -C components/halow_mesh_compat/test lwip-napt LWIP_NAPT_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
+  grep -q 'make -C components/halow_mesh_compat/test clean lwip-napt SAN=1 LWIP_NAPT_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
+  awk '/run: pio run -e warthog-us$/ {b=NR} /lwip-napt LWIP_NAPT_REQUIRED=1$/ && !l {l=NR} END {exit (b && l > b) ? 0 : 1}' ../../../.github/workflows/ci.yml || \
+  why70="${why70:-CI does not run lwip-napt after its PlatformIO build}"
+awk '/^static void cmd_mtu\(void\)/,/^}/' ../../../main/at.c | grep -q '"+MTU: ip_reass=%lu ip_reass_drop=%lu ip_short_drop=%lu\\r\\n"' || \
+  why70="${why70:-AT+MTU? does not print the counts of the hook}"
+for w70 in ip_reass_drop ip_short_drop; do
+  grep '^| `AT+MTU?`' ../../../wiki/AT-Command-Reference.md | grep -q "$w70" || why70="${why70:-the AT+MTU? row does not name $w70}"
+done
+grep -q 'ip_short_drop' ../../../docs/napt-notes.md || why70="${why70:-napt-notes does not cover short packets}"
+grep -q 'CONFIG_LWIP_IP4_REASSEMBLY' ../../../wiki/Troubleshooting.md || why70="${why70:-Troubleshooting does not name CONFIG_LWIP_IP4_REASSEMBLY}"
+grep -q 'ip_reass' ../../../wiki/OpenMANET-Interop.md || why70="${why70:-OpenMANET Interop does not cover fragments to bat0-MTU nodes}"
+grep -q 'nat_frag.c' ../../../docs/napt-notes.md || why70="${why70:-napt-notes does not cover fragments}"
+grep -q 'ESP_IDF_LWIP_HOOK_FILENAME' ../../../docs/fork-inventory.md || why70="${why70:-the fork inventory does not list the lwIP hook}"
+if [ -z "$why70" ]; then
+  ok "IP fragments: IPv4 reassembly on (IPv6 off), 10 pbufs, in sdkconfig.defaults and all $n70 generated sdkconfigs; the input hook wired into lwIP, dropping short whole packets on ip4_input's own NAPT condition, holding heap copies and handing datagrams back through the mailbox; lwip-napt (lwIP with DHCP) in make all and CI; AT+MTU? counts; documented"
+else
+  bad "IP fragments: $why70"
+fi
+
+# 71. The USB network class: every generated sdkconfig.warthog-* builds CDC-NCM, sdkconfig.defaults'
+#     choice, except warthog-us-ecm (sdkconfig.ecm). PlatformIO keeps an explicit line of an existing
+#     generated file over the defaults, so one written before NCM became the default (1b3e608) builds
+#     ECM until it is edited or deleted (warthog-eu/jp/kr/au did until 2026-10-03). sdkconfig.ecm must
+#     be tracked: .gitignore's sdkconfig.* hid it, and IDF stops at CMake configure when a file named
+#     in SDKCONFIG_DEFAULTS is missing, so warthog-us-ecm built only on the machine that had it.
+#     esp_tinyusb's default configuration descriptor has CDC and NCM functions only, so under ECM
+#     usb_net.c must hand it its own CDC + ECM one (until 2026-10-03 it passed NULL and the ECM image
+#     enumerated a console and no network). CI builds warthog-us-ecm and checks its ELF holds that
+#     descriptor (154 bytes: TinyUSB's TUD_CDC_ECM_DESC_LEN is 79, not the 71 its comment says).
+why71=""
+grep -q '^CONFIG_TINYUSB_NET_MODE_NCM=y$' ../../../sdkconfig.defaults || why71="sdkconfig.defaults does not choose NCM"
+grep -q '^  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ecm"$' ../../../platformio.ini || \
+  why71="${why71:-platformio.ini does not give warthog-us-ecm sdkconfig.ecm}"
+if [ ! -f ../../../sdkconfig.ecm ]; then
+  why71="${why71:-sdkconfig.ecm is missing; warthog-us-ecm names it in SDKCONFIG_DEFAULTS}"
+elif ! grep -q '^CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=y$' ../../../sdkconfig.ecm; then
+  why71="${why71:-sdkconfig.ecm does not choose ECM}"
+fi
+grep -qx '!sdkconfig.ecm' ../../../.gitignore || why71="${why71:-.gitignore does not re-include sdkconfig.ecm, so a clean checkout lacks it}"
+if git -C ../../.. rev-parse --is-inside-work-tree >/dev/null 2>&1 && git -C ../../.. check-ignore -q sdkconfig.ecm; then
+  why71="${why71:-git ignores sdkconfig.ecm}"
+fi
+grep -q '^ *pio run -e warthog-us-ecm$' ../../../.github/workflows/ci.yml || why71="${why71:-CI does not build warthog-us-ecm}"
+grep -qF "xtensa-esp32s3-elf-nm -S .pio/build/warthog-us-ecm/firmware.elf | grep ' 0000009a [dr] s_desc_fs_config\$'" ../../../.github/workflows/ci.yml || \
+  why71="${why71:-CI does not check that the ECM image holds the usb_net.c configuration descriptor}"
+U71=../../../main/usb_net.c
+awk '/^#if CFG_TUD_ECM_RNDIS$/,/^#endif$/' "$U71" | tr -d '\n' | \
+  grep -q 'static const uint8_t s_desc_fs_config\[\] = {.*TUD_CDC_DESCRIPTOR(.*TUD_CDC_ECM_DESCRIPTOR(.*#define USB_NET_FS_CONFIG s_desc_fs_config#else#define USB_NET_FS_CONFIG NULL#endif' || \
+  why71="${why71:-usb_net.c has no CDC + ECM configuration descriptor under CFG_TUD_ECM_RNDIS}"
+grep -q '^            \.full_speed_config = USB_NET_FS_CONFIG,$' "$U71" || why71="${why71:-usb_net.c does not hand esp_tinyusb the ECM descriptor}"
+n71=0
+for g71 in ../../../sdkconfig.warthog-*; do
+  [ -f "$g71" ] || continue
+  n71=$((n71 + 1))
+  case "${g71##*/}" in sdkconfig.warthog-us-ecm) w71=ECM_RNDIS ;; *) w71=NCM ;; esac
+  grep -q "^CONFIG_TINYUSB_NET_MODE_$w71=y$" "$g71" || \
+    why71="${why71:-${g71##*/}: not CONFIG_TINYUSB_NET_MODE_$w71 (PlatformIO keeps a generated sdkconfig)}"
+done
+if [ -z "$why71" ]; then
+  ok "USB network class: NCM in all $n71 generated sdkconfigs but warthog-us-ecm's ECM; sdkconfig.ecm not gitignored; under ECM usb_net.c hands esp_tinyusb a CDC + ECM descriptor; CI builds warthog-us-ecm and checks its ELF holds it"
+else
+  bad "USB network class: $why71"
+fi
+
+# 72. One owner of the USB network class (measured on air 2026-10-03: the USB link wedged after a
+#     few fragmented pings). TinyUSB's class driver runs only in the TinyUSB task: lwIP's linkoutput
+#     (l2_transmit) only queues (usbnet_tx); tud_network_can_xmit, _xmit and _recv_renew are called
+#     only from usb_net.c's port one-liners, which only usbnet_core.c's pump and receive path call
+#     (test_usbnet.c runs those against TinyUSB's own NCM and ECM drivers); tud_network_link_state
+#     only from the TinyUSB event callback. What the host test cannot see: main/CMakeLists.txt
+#     builds usbnet_core.c and links with -Wl,--wrap=netd_xfer_cb; __wrap_netd_xfer_cb runs the
+#     driver's callback, then usbnet_xfer_done with whether the driver armed that endpoint again
+#     (tx_busy_ms); the kick is usbd_defer_func(un_kicked_, NULL, false),
+#     the only usbd_defer_func in main/ (at most one queued); the receive callback is usbnet_rx and
+#     the port is NCM's under CFG_TUD_NCM; un_input_ never frees after esp_netif_receive (it frees on
+#     every failure); detach flushes the queue. The test's TinyUSB config matches the NTB counts and
+#     sizes sdkconfig.defaults pins (esp_tinyusb's Kconfig defaults, which a package bump could move),
+#     which no other SDKCONFIG_DEFAULTS file overrides, and every generated sdkconfig's; CI re-runs
+#     this guard after its builds, since a fresh checkout has no generated sdkconfig. make all runs
+#     usbnet, CI runs it with USBNET_REQUIRED=1 (plain and SAN=1) after the PlatformIO build;
+#     AT+STATUS? prints +USBNET with tx_stall_ms, tx_busy_ms and rx_idle_ms; documented.
+why72=""
+U72=../../../main/usb_net.c
+grep -q '"usbnet_core.c"' ../../../main/CMakeLists.txt || why72="main/CMakeLists.txt does not build usbnet_core.c"
+grep -q '^target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=netd_xfer_cb")$' ../../../main/CMakeLists.txt || \
+  why72="${why72:-main/CMakeLists.txt does not link with --wrap=netd_xfer_cb}"
+awk '/^bool __wrap_netd_xfer_cb\(/,/^}/' "$U72" | awk '/__real_netd_xfer_cb\(/ {r=NR}
+  /usbnet_xfer_done\(&s_usbnet, ep_addr, usbd_edpt_busy\(rhport, ep_addr\)\);/ {d=NR} END {exit (r && d > r) ? 0 : 1}' || \
+  why72="${why72:-__wrap_netd_xfer_cb does not run the driver callback, then usbnet_xfer_done with the endpoint busy state}"
+awk '/^static esp_err_t l2_transmit\(/,/^}/' "$U72" | grep -q 'usbnet_tx(&s_usbnet, buffer, len)' || \
+  why72="${why72:-l2_transmit does not queue through usbnet_tx}"
+awk '/^static esp_err_t l2_transmit\(/,/^}/' "$U72" | grep -Eq 'tud_|usbd_|vTaskDelay' && \
+  why72="${why72:-l2_transmit calls TinyUSB or waits on the lwIP thread}"
+for f72 in tud_network_can_xmit tud_network_xmit tud_network_recv_renew; do
+  n72=$(grep -c "$f72(" "$U72")
+  [ "$n72" = 1 ] && grep -Eq "^static [a-z]+ un_[a-z_]+\(.*\) \{ (return )?$f72\(" "$U72" || \
+    why72="${why72:-$f72 is called outside its usb_net.c port one-liner ($n72 calls)}"
+done
+awk '/tud_network_link_state\(0, (true|false)\)/ && fn != "on_tinyusb_event" {print NR}
+  /^[a-z].*\(/ && !/;$/ { if (match($0, /[a-z_0-9]+\(/)) fn = substr($0, RSTART, RLENGTH - 1) }' "$U72" | grep -q . && \
+  why72="${why72:-tud_network_link_state is called outside the TinyUSB event callback}"
+for o72 in ../../../main/*.c ../../../main/bat/*.c; do
+  [ "$o72" = "$U72" ] && continue
+  grep -Eq 'tud_network_(can_xmit|xmit|recv_renew|link_state)\(|usbd_defer_func\(|netd_xfer_cb' "$o72" && \
+    why72="${why72:-${o72##*/} calls the USB network class or the TinyUSB defer queue}"
+done
+[ "$(grep -c 'usbd_defer_func(' "$U72")" = 1 ] && grep -q '^static void un_kick_(void) { usbd_defer_func(un_kicked_, NULL, false); }$' "$U72" || \
+  why72="${why72:-the kick is not the one usbd_defer_func(un_kicked_, NULL, false)}"
+grep -q '^static void un_kicked_(void \*arg) { (void)arg; usbnet_kicked(&s_usbnet); }$' "$U72" || why72="${why72:-un_kicked_ does not run usbnet_kicked}"
+grep -q '^bool tud_network_recv_cb(const uint8_t \*src, uint16_t size) { return usbnet_rx(&s_usbnet, src, size); }$' "$U72" || \
+  why72="${why72:-tud_network_recv_cb is not usbnet_rx}"
+awk '/^static const struct usbnet_port s_usbnet_port/,/^};/' "$U72" | tr '\n' ' ' | \
+  grep -q '#if defined(CFG_TUD_NCM) && CFG_TUD_NCM *\.ncm = true, *#endif' || why72="${why72:-the port is not the NCM one under CFG_TUD_NCM}"
+awk '/^static int un_input_\(/,/^}/' "$U72" | awk '/esp_netif_receive\(/ {r=NR} /free\(/ {f++; if (r) late=1}
+  END {exit (r && f == 1 && !late) ? 0 : 1}' || why72="${why72:-un_input_ frees a frame esp_netif_receive already freed}"
+awk '/case TINYUSB_EVENT_DETACHED:/,/break;/' "$U72" | grep -q 'usbnet_flush(&s_usbnet);' || why72="${why72:-detach does not flush the queue}"
+for k72 in 'NCM_OUT_NTB_N 3' 'NCM_IN_NTB_N 3' 'NCM_OUT_NTB_MAX_SIZE 3200' 'NCM_IN_NTB_MAX_SIZE 3200'; do
+  grep -q "^#define CFG_TUD_$k72$" usbnet_tusb/tusb_config.h || why72="${why72:-usbnet_tusb/tusb_config.h lacks CFG_TUD_$k72}"
+done
+for k72 in 'OUT_NTB_BUFFS_COUNT=3' 'IN_NTB_BUFFS_COUNT=3' 'OUT_NTB_BUFF_MAX_SIZE=3200' 'IN_NTB_BUFF_MAX_SIZE=3200'; do
+  grep -q "^CONFIG_TINYUSB_NCM_$k72$" ../../../sdkconfig.defaults || \
+    why72="${why72:-sdkconfig.defaults does not pin CONFIG_TINYUSB_NCM_$k72, which the host test models}"
+done
+for d72 in $(sed -n 's/^ *-DSDKCONFIG_DEFAULTS="\(.*\)"$/\1/p' ../../../platformio.ini | tr ';' '\n' | sort -u); do
+  [ "$d72" = sdkconfig.defaults ] && continue
+  grep -q '^CONFIG_TINYUSB_NCM_' "../../../$d72" 2>/dev/null && \
+    why72="${why72:-$d72 overrides the NCM buffers sdkconfig.defaults pins}"
+done
+for g72 in ../../../sdkconfig.warthog-*; do
+  [ -f "$g72" ] || continue
+  case "${g72##*/}" in sdkconfig.warthog-us-ecm) continue ;; esac
+  for k72 in 'OUT_NTB_BUFFS_COUNT=3' 'IN_NTB_BUFFS_COUNT=3' 'OUT_NTB_BUFF_MAX_SIZE=3200' 'IN_NTB_BUFF_MAX_SIZE=3200'; do
+    grep -q "^CONFIG_TINYUSB_NCM_$k72$" "$g72" || why72="${why72:-${g72##*/}: not CONFIG_TINYUSB_NCM_$k72, which the host test models}"
+  done
+done
+grep -q '^all:.* usbnet$' Makefile || why72="${why72:-make all does not run usbnet}"
+grep -q 'make -C components/halow_mesh_compat/test usbnet USBNET_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
+  grep -q 'make -C components/halow_mesh_compat/test clean usbnet SAN=1 USBNET_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
+  awk '/run: pio run -e warthog-us$/ {b=NR} /usbnet USBNET_REQUIRED=1$/ && !l {l=NR} END {exit (b && l > b) ? 0 : 1}' ../../../.github/workflows/ci.yml || \
+  why72="${why72:-CI does not run usbnet after its PlatformIO build}"
+awk '/run: pio run -e warthog-us$/ {b=NR} /run: make -C components\/halow_mesh_compat\/test glueguard$/ {g=NR}
+  END {exit (b && g > b) ? 0 : 1}' ../../../.github/workflows/ci.yml || why72="${why72:-CI does not re-run the glue guard after its builds}"
+awk '/^static void cmd_status\(void\)/,/^}/' ../../../main/at.c | grep -q '"+USBNET: tx_queued=%lu txq=%lu/%u txq_hw=%lu tx_stall_ms=%lu tx_busy_ms=%lu' && \
+  awk '/^static void cmd_status\(void\)/,/^}/' ../../../main/at.c | grep -q 'rx_idle_ms=%lu' || \
+  why72="${why72:-AT+STATUS? does not print +USBNET with all three stall indicators}"
+for w72 in '+USBNET:' tx_stall_ms tx_busy_ms rx_idle_ms; do
+  grep -qF -- "$w72" ../../../wiki/AT-Command-Reference.md || why72="${why72:-the AT reference does not document $w72}"
+done
+for w72 in tx_stall_ms tx_busy_ms rx_idle_ms; do
+  grep -qF -- "$w72" ../../../wiki/Troubleshooting.md || why72="${why72:-Troubleshooting does not cover $w72}"
+done
+grep -q 'wrap=netd_xfer_cb' ../../../docs/fork-inventory.md || why72="${why72:-the fork inventory does not list the netd_xfer_cb wrap}"
+if [ -z "$why72" ]; then
+  ok "USB network class: one owner (the TinyUSB task), lwIP only queues, the --wrap completion pump with the endpoint's busy state, one kick at most, NCM renews per datagram; host test config matches sdkconfig.defaults' pinned NTBs and every NCM sdkconfig; usbnet in make all and CI, glue guard re-run after the builds; +USBNET documented"
+else
+  bad "USB network class: $why72"
 fi
 
 [ $fail -eq 0 ] && echo "GLUE INVARIANTS OK" || echo "GLUE INVARIANTS FAILED"

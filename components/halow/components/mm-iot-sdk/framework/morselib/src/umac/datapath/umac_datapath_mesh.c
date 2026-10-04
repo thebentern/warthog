@@ -39,6 +39,7 @@
 #include "umac/stats/umac_stats.h"
 #include "umac/rc/umac_rc.h"
 #include "umac/ba/umac_ba.h"
+#include "umac/core/umac_core.h"
 #include "umac/keys/umac_keys.h"
 #include "umac/keys/umac_keys_data.h"
 #include "umac/keys/connection_keys.h"
@@ -48,6 +49,7 @@
 #include "umac/mesh/umac_mesh.h"
 #include "umac/mesh/umac_mesh_bip.h"
 #include "umac/mesh/umac_mesh_ccmp_hdr.h"
+#include "umac/mesh/umac_mesh_frag.h"
 #include "umac/mesh/umac_mesh_ies.h"
 #include "umac/frames/frames_common.h" /* frame_is_robust_mgmt */
 #include "mmwlan_mesh.h"
@@ -363,17 +365,27 @@ static struct umac_sta_data *mesh_find_peer_(const uint8_t *addr)
     return NULL;
 }
 
-static int mesh_slot_of_(const uint8_t *addr)
+/* The slot of the peer at @p addr, -1 if none; the record it matched in @p rec if non-NULL. */
+static int mesh_slot_rec_of_(const uint8_t *addr, struct umac_sta_data **rec)
 {
     for (int i = 0; addr != NULL && i < MESH_MAX_PEERS; i++)
     {
         struct umac_sta_data *p = s_peers[i];
         if (p != NULL && umac_sta_data_matches_peer_addr(p, addr))
         {
+            if (rec != NULL)
+            {
+                *rec = p;
+            }
             return i;
         }
     }
     return -1;
+}
+
+static int mesh_slot_of_(const uint8_t *addr)
+{
+    return mesh_slot_rec_of_(addr, NULL);
 }
 
 /* ---- Readers off the event loop ------------------------------------------- *
@@ -477,9 +489,16 @@ static struct
     uint64_t ipn; /* last IPN used; the next frame takes ipn + 1 */
 } s_own_igtk;
 
-static bool mesh_slot_mfp_(int slot)
+static void mesh_frag_reset_(int slot);
+static void mesh_frag_forget_held_(const uint8_t *addr);
+static void mesh_ba_clear_(int slot);
+static void mesh_ba_wait_lost_(int slot);
+/* The TX pool reserve last asked for (umac_datapath_mesh_frag_tick); UINT32_MAX: ask again. */
+static uint32_t s_frag_reserve = UINT32_MAX;
+
+/* Whether @p stad, the record at @p slot, runs MFP. */
+static bool mesh_stad_mfp_(int slot, struct umac_sta_data *stad)
 {
-    struct umac_sta_data *stad = (slot >= 0) ? s_peers[slot] : NULL;
     if (stad == NULL || !umac_mesh_sae_active() ||
         umac_sta_data_get_security_type(stad) == MMWLAN_OPEN ||
         umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE) < 0)
@@ -487,6 +506,11 @@ static bool mesh_slot_mfp_(int slot)
         return false;
     }
     return g_warthog_mesh_pmf != 0u || s_peer_mfp[slot];
+}
+
+static bool mesh_slot_mfp_(int slot)
+{
+    return mesh_stad_mfp_(slot, (slot >= 0) ? s_peers[slot] : NULL);
 }
 
 bool umac_datapath_mesh_peer_mfp(const uint8_t *addr)
@@ -516,7 +540,12 @@ static const uint8_t k_mesh_p1_mtk[UMAC_KEY_AES_128_LEN] = {
 };
 /* The group key goes into the chip once, VIF-wide. */
 static bool s_group_key_in_chip;
+/* It was in the chip at a chip restart and has not gone back yet: every install is above its PNs. */
+static bool s_group_key_restore;
 static uint32_t s_mesh_key_epoch; /* written only by mesh_next_pn_base_ */
+/* The AID 0 group key: the highest TX PN it went in at, and group frames handed to the chip under
+ * it since boot. Every PN it drew is at or below their sum. */
+static uint64_t s_grp_pn_hi, s_grp_noted;
 
 /* Our own TX MGTK under SAE. hostap delivers it once, at mesh start and before
  * any peer exists, and this file only learns the mesh VIF from a peer -- so it
@@ -814,18 +843,18 @@ static bool mesh_peer_gtk_put_(int slot, struct umac_sta_data *stad, uint8_t key
     return true;
 }
 
-/* Put a peer's current MGTK back in the chip at its AID (a survivor, AT+REKEY, AT+GTKPERSTA),
- * where this build and VIF keep peers' MGTKs there. */
-static void mesh_peer_gtk_restore_(struct umac_sta_data *stad)
+/* Put a peer's current MGTK back in the chip at its AID (a survivor, AT+REKEY, AT+GTKPERSTA, a
+ * chip restart), where this build and VIF keep peers' MGTKs there: 1 put, 0 failed, -1 none. */
+static int mesh_peer_gtk_restore_(struct umac_sta_data *stad)
 {
     const int slot = mesh_slot_of_stad_(stad);
     const int kid = stad != NULL ? umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_GROUP) : -1;
     if (slot < 0 || kid < 0 || !mesh_peer_gtk_wanted_(stad))
     {
-        return;
+        return -1;
     }
     const struct mesh_peer_gtk old = mesh_peer_gtk_take_(slot);
-    (void)mesh_peer_gtk_put_(slot, stad, (uint8_t)kid, &old);
+    return mesh_peer_gtk_put_(slot, stad, (uint8_t)kid, &old) ? 1 : 0;
 }
 
 bool umac_datapath_mesh_peer_gtk_opened(struct umac_sta_data *stad, uint8_t key_id, uint32_t read_seq)
@@ -856,19 +885,51 @@ bool umac_datapath_mesh_peer_gtk_opened(struct umac_sta_data *stad, uint8_t key_
     return ok;
 }
 
-void umac_datapath_mesh_chip_booted(void)
+/* Per slot, what a chip restart could not put back yet; the service tick retries it. */
+#define MESH_RESTORE_STA 0x1u
+#define MESH_RESTORE_MTK 0x2u
+#define MESH_RESTORE_GTK 0x4u
+static uint8_t s_restore[MESH_MAX_PEERS];
+static uint16_t s_restore_vif;
+
+/* AT+CHIPRESTART? (storage in main/at.c). */
+extern volatile uint32_t g_warthog_chiprestart_sta, g_warthog_chiprestart_stafail;
+extern volatile uint32_t g_warthog_chiprestart_keys, g_warthog_chiprestart_keyfail;
+extern volatile uint32_t g_warthog_chiprestart_retried, g_warthog_chiprestart_pending;
+
+static void mesh_restore_publish_(void)
+{
+    uint32_t n = s_group_key_restore ? 1u : 0u;
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        for (uint8_t b = s_restore[i]; b != 0u; b &= (uint8_t)(b - 1u))
+        {
+            n++;
+        }
+    }
+    g_warthog_chiprestart_pending = n;
+}
+
+void umac_datapath_mesh_chip_booted(bool restart)
 {
     MMOSAL_TASK_ENTER_CRITICAL();
     memset(s_peer_aid, 0, sizeof(s_peer_aid));
     memset(s_peer_gtk, 0, sizeof(s_peer_gtk));
+    memset(s_restore, 0, sizeof(s_restore));
     MMOSAL_TASK_EXIT_CRITICAL();
+    s_frag_reserve = UINT32_MAX;
     for (int i = 0; i < MESH_MAX_PEERS; i++)
     {
+        mesh_frag_reset_(i); /* the fragments it held are gone */
+        mesh_ba_wait_lost_(i); /* and any DELBA a cut frame waits on */
         g_warthog_peer_gtk[i] = 0u;
         g_warthog_peer_gtk_mac[i] = 0u;
     }
     mesh_peer_gtk_publish_taint_();
     s_peer_gtk_applied = g_warthog_peer_gtk_mode;
+    s_group_key_restore = restart && (s_group_key_restore || s_group_key_in_chip);
+    s_group_key_in_chip = false;
+    mesh_restore_publish_();
 }
 
 void umac_datapath_mesh_service_peer_gtk(void)
@@ -904,19 +965,48 @@ void umac_datapath_mesh_service_peer_gtk(void)
         }
         else
         {
-            mesh_peer_gtk_restore_(stad);
+            (void)mesh_peer_gtk_restore_(stad);
         }
     }
 }
 
-/* Our own MGTK into the chip's group slot: at TX PN 0, or with WARTHOG_MESH_MGTK_PN_BASE
- * at a fresh base above every earlier install and every PN our MGTK has used. */
+void umac_datapath_mesh_group_tx_note(void)
+{
+    MMOSAL_TASK_ENTER_CRITICAL();
+    s_grp_noted++;
+    MMOSAL_TASK_EXIT_CRITICAL();
+}
+
+static void mesh_grp_installed_(uint64_t pn)
+{
+    MMOSAL_TASK_ENTER_CRITICAL();
+    s_grp_pn_hi = pn > s_grp_pn_hi ? pn : s_grp_pn_hi;
+    MMOSAL_TASK_EXIT_CRITICAL();
+}
+
+/* After a chip restart: a TX PN epoch above every PN the AID 0 group key drew before it. */
+static uint64_t mesh_grp_restart_pn_(void)
+{
+    MMOSAL_TASK_ENTER_CRITICAL();
+    const uint64_t used = s_grp_pn_hi + s_grp_noted;
+    MMOSAL_TASK_EXIT_CRITICAL();
+    const uint64_t top = mesh_own_group_pn_top_();
+    return mesh_next_pn_base_(used > top ? used : top);
+}
+
+/* Our own MGTK into the chip's group slot: at TX PN 0, at a fresh base under
+ * WARTHOG_MESH_MGTK_PN_BASE, and above every PN it drew while a chip restart owes it back. */
 static enum mmwlan_status mesh_put_own_mgtk_(uint16_t vif_id)
 {
+    const bool restart = s_group_key_restore;
     uint64_t pn = 0;
 #ifdef WARTHOG_MESH_MGTK_PN_BASE
-    pn = mesh_next_pn_base_(mesh_own_group_pn_top_());
+    pn = restart ? 0 : mesh_next_pn_base_(mesh_own_group_pn_top_());
 #endif
+    if (restart)
+    {
+        pn = mesh_grp_restart_pn_();
+    }
     struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = s_own_mgtk.id,
                                  .length = UMAC_KEY_AES_128_LEN, .tx_pn = pn };
     memcpy(kc.key, s_own_mgtk.key, sizeof(s_own_mgtk.key));
@@ -928,8 +1018,11 @@ static enum mmwlan_status mesh_put_own_mgtk_(uint16_t vif_id)
 #ifdef WARTHOG_MESH_MGTK_PN_BASE
     mesh_own_pn_store_(pn);
 #endif
+    mesh_grp_installed_(pn);
     s_own_mgtk.vif_id = vif_id;
     s_group_key_in_chip = true;
+    s_group_key_restore = false;
+    mesh_restore_publish_();
     return MMWLAN_SUCCESS;
 }
 
@@ -952,6 +1045,7 @@ int umac_datapath_mesh_own_group_key_id(void)
 
 void umac_datapath_mesh_own_group_tx_note(void)
 {
+    umac_datapath_mesh_group_tx_note();
 #ifdef WARTHOG_MESH_MGTK_PN_BASE
     MMOSAL_TASK_ENTER_CRITICAL();
     s_own_mgtk.sent++;
@@ -1032,6 +1126,25 @@ static const uint8_t k_mesh_p1_mgtk[UMAC_KEY_AES_128_LEN] = {
     0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0
 };
 
+/* The keyed non-SAE mesh's shared group key (key id 1) into the chip at AID 0: at TX PN 0, or
+ * while a chip restart's restore is pending above every PN it drew. */
+static bool mesh_p1_group_key_to_chip_(uint16_t vif_id)
+{
+    const uint64_t tx_pn = s_group_key_restore ? mesh_grp_restart_pn_() : 0u;
+    struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = 1,
+                                 .length = UMAC_KEY_AES_128_LEN, .tx_pn = tx_pn };
+    memcpy(kc.key, k_mesh_p1_mgtk, sizeof(k_mesh_p1_mgtk));
+    if (!mesh_chip_install_key_(vif_id, 0, &kc))
+    {
+        return false;
+    }
+    mesh_grp_installed_(tx_pn);
+    s_group_key_in_chip = true;
+    s_group_key_restore = false;
+    mesh_restore_publish_();
+    return true;
+}
+
 /* Every peer shares ONE pairwise key, because this chip firmware's mesh
  * interface (mm6108.mbin rel_1_17_6) holds exactly one.
  *
@@ -1061,13 +1174,17 @@ static const uint8_t k_mesh_p1_mgtk[UMAC_KEY_AES_128_LEN] = {
  * stays behind the flag as the seam where a real per-link key lands once that
  * exists.
  */
-/* One SET_STA_STATE; a refusal (its status, which morse_cmd_tx does not return) is counted
- * by state, and the station carries on as before. Returns the transport result. */
+/* One SET_STA_STATE, a refusal (a status morse_cmd_tx does not return) counted by state: the
+ * transport result, and in @p refused (may be NULL) whether the chip refused it. */
 static int mesh_chip_sta_state_(uint16_t vif_id, uint16_t aid, const uint8_t *peer_addr,
-                                enum morse_sta_state state)
+                                enum morse_sta_state state, bool *refused)
 {
     int32_t st = 0;
     int r = mmdrv_update_sta_state_status(vif_id, aid, peer_addr, state, &st);
+    if (refused != NULL)
+    {
+        *refused = r == 0 && st != 0;
+    }
     if (r == 0 && st != 0)
     {
         if ((unsigned)state < sizeof(g_warthog_chipcmd_sta_refused) / sizeof(g_warthog_chipcmd_sta_refused[0]))
@@ -1082,22 +1199,26 @@ static int mesh_chip_sta_state_(uint16_t vif_id, uint16_t aid, const uint8_t *pe
 }
 
 /* Walk a station up to AUTHORIZED in the chip. Same sequence umac_ap_update_sta()
- * uses; AID is 1-based (0 means "no station" to the chip). */
-static void mesh_chip_register_sta_(uint16_t vif_id, uint16_t aid, const uint8_t *peer_addr)
+ * uses; AID is 1-based (0 means "no station" to the chip). True if the chip took every step. */
+static bool mesh_chip_register_sta_(uint16_t vif_id, uint16_t aid, const uint8_t *peer_addr)
 {
     static const enum morse_sta_state seq[] = {
         MORSE_STA_AUTHENTICATED, MORSE_STA_ASSOCIATED, MORSE_STA_AUTHORIZED
     };
+    bool all = true;
     for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
     {
-        int r = mesh_chip_sta_state_(vif_id, aid, peer_addr, seq[i]);
+        bool refused = false;
+        int r = mesh_chip_sta_state_(vif_id, aid, peer_addr, seq[i], &refused);
         if (r != 0)
         {
             MMLOG_WRN("mesh: chip sta_state %d for " MM_MAC_ADDR_FMT " -> %d\n",
                       (int)seq[i], MM_MAC_ADDR_VAL(peer_addr), r);
             g_warthog_mesh_chip_sta_fail++;
         }
+        all = all && r == 0 && !refused;
     }
+    return all;
 }
 
 static void mesh_derive_mtk_(uint8_t out[UMAC_KEY_AES_128_LEN], const uint8_t *a, const uint8_t *b)
@@ -1224,17 +1345,10 @@ static enum mmwlan_status umac_datapath_mesh_install_peer_keys(struct umac_sta_d
         return MMWLAN_ERROR;
     }
 
-    if (!s_group_key_in_chip)
+    if (!s_group_key_in_chip && !mesh_p1_group_key_to_chip_(vif_id))
     {
-        struct mmdrv_key_conf kc = { .is_pairwise = false, .key_idx = mgtk.key_id,
-                                     .length = mgtk.key_len, .tx_pn = 0 };
-        memcpy(kc.key, mgtk.key_data, mgtk.key_len);
-        if (!mesh_chip_install_key_(vif_id, 0, &kc))
-        {
-            MMLOG_WRN("mesh: MGTK chip install failed\n");
-            return MMWLAN_ERROR;
-        }
-        s_group_key_in_chip = true;
+        MMLOG_WRN("mesh: MGTK chip install failed\n");
+        return MMWLAN_ERROR;
     }
     return st;
 }
@@ -1260,7 +1374,7 @@ static bool mesh_restore_peer_key_(struct umac_sta_data *stad, uint16_t vif_id)
 #endif
         if (kid >= 0)
         {
-            mesh_peer_gtk_restore_(stad); /* nothing where peers' MGTKs stay host-only */
+            (void)mesh_peer_gtk_restore_(stad); /* nothing where peers' MGTKs stay host-only */
         }
         return ok;
     }
@@ -1365,7 +1479,7 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
      * walks; AID is 1-based and per-peer (0 means "no station" to the chip). */
     uint16_t aid = (uint16_t)(slot + 1);
     umac_sta_data_set_aid(stad, aid);
-    mesh_chip_register_sta_(vif_id, aid, peer_addr);
+    (void)mesh_chip_register_sta_(vif_id, aid, peer_addr);
 
     /* Keys on a keyed non-SAE mesh: a fixed shared MTK (pairwise, key 0) and
      * MGTK (group, key 1), identical on every node -- the same "static/shared"
@@ -1392,6 +1506,9 @@ enum mmwlan_status umac_datapath_mesh_add_peer(struct umac_data *umacd, uint16_t
     s_peer_estab[slot] = !sae;
     s_peer_mfp[slot] = false;
     (void)mesh_peer_gtk_take_(slot); /* del_peer cleared it; nothing of a former peer's counts */
+    mesh_frag_reset_(slot);
+    mesh_ba_clear_(slot);
+    s_restore[slot] = 0;
     s_peers[slot] = stad;
     MMLOG_INF("mesh: peer " MM_MAC_ADDR_FMT " added (slot %d)\n", MM_MAC_ADDR_VAL(peer_addr), slot);
     return MMWLAN_SUCCESS;
@@ -1649,6 +1766,11 @@ enum mmwlan_status umac_datapath_mesh_set_igtk(const uint8_t *addr, const uint8_
 
 uint64_t umac_datapath_mesh_take_tx_pn(struct umac_sta_data *stad, uint8_t key_id)
 {
+    return umac_datapath_mesh_take_tx_pns(stad, key_id, 1u);
+}
+
+uint64_t umac_datapath_mesh_take_tx_pns(struct umac_sta_data *stad, uint8_t key_id, uint32_t n)
+{
     uint64_t pn = 0;
     if (stad == NULL || key_id >= UMAC_KEYS_NUM_KEY_IDS)
     {
@@ -1658,13 +1780,640 @@ uint64_t umac_datapath_mesh_take_tx_pn(struct umac_sta_data *stad, uint8_t key_i
     MMOSAL_TASK_ENTER_CRITICAL();
     if (kd->keys[key_id] != NULL)
     {
-        pn = kd->keys[key_id]->tx_seq++;
+        pn = kd->keys[key_id]->tx_seq;
+        kd->keys[key_id]->tx_seq += n;
     }
     MMOSAL_TASK_EXIT_CRITICAL();
     return pn;
 }
 
+/* Host TX fragmentation (AT+HOSTFRAG), per slot: a run is the fragments in the chip whose TX
+ * statuses have not come back. Written under s_frag_lock; the event loop also reads it bare. */
+extern volatile uint32_t g_warthog_hostfrag_acked, g_warthog_hostfrag_noack, g_warthog_hostfrag_unsent;
+extern volatile uint32_t g_warthog_hostfrag_agg;
+extern volatile uint32_t g_warthog_hostfrag_ok, g_warthog_hostfrag_fail, g_warthog_hostfrag_overlap;
+extern volatile uint32_t g_warthog_hostfrag_wait, g_warthog_hostfrag_mgmt, g_warthog_hostfrag_stale;
+extern volatile uint32_t g_warthog_tx_nokey;
+static struct
+{
+    uint16_t inflight;
+    uint8_t ac;
+    bool chip;     /* sealed by the chip, drawing its PNs as it sends */
+    bool shared;   /* on a STA chip VIF: one pairwise PN counter for every link */
+    uint8_t need;  /* TX pool blocks the last MSDU's fragments took beyond its own */
+    uint32_t since;
+    bool open;
+    uint8_t tid;
+    uint16_t seq;
+    uint16_t seen; /* fragment numbers reported, one bit each */
+    int8_t last;   /* the last fragment's number once reported, else -1 */
+    bool failed;
+} s_frag[MESH_MAX_PEERS];
+static struct mmosal_mutex *s_frag_lock;
+/* Chip-sealed management frames waiting for a run they would break; at most MESH_FRAG_HOLD_MAX. */
+static struct mmpkt_list s_frag_held;
+#define MESH_FRAG_HOLD_MAX 8u
+/* The driver gives up on a TX status at 15 s (skbq.c tx_status_lifetime_ms). */
+#define MESH_FRAG_STALE_MS 16000u
+/* Per slot, event loop only: a peer's frames held behind the DELBA that ended a session to cut one
+ * (umac_datapath_mesh_ba_cut), with that MSDU's fragments if it was cut. */
+static struct
+{
+    struct mmpkt_list frags;
+    uint32_t since; /* the DELBA handed */
+    uint32_t done;  /* its TX status read */
+    uint8_t tid;
+    bool active;
+    bool status;
+    bool chip;
+} s_ba_wait[MESH_MAX_PEERS];
+
+static void mesh_frag_lock_(void)
+{
+    if (s_frag_lock != NULL)
+    {
+        (void)mmosal_mutex_get(s_frag_lock, UINT32_MAX);
+    }
+}
+
+static void mesh_frag_unlock_(void)
+{
+    if (s_frag_lock != NULL)
+    {
+        (void)mmosal_mutex_release(s_frag_lock);
+    }
+}
+
+/* The access category a TID's frames queue in (802.1D user priority), as the driver maps it. */
+static uint8_t mesh_tid_ac_(uint8_t tid)
+{
+    static const uint8_t ac[8] = { 1, 0, 0, 1, 2, 2, 3, 3 }; /* BK 0, BE 1, VI 2, VO 3 */
+    return ac[tid & 7u];
+}
+
+static void mesh_frag_reset_(int slot)
+{
+    if (slot >= 0 && slot < MESH_MAX_PEERS)
+    {
+        mesh_frag_lock_();
+        memset(&s_frag[slot], 0, sizeof(s_frag[slot]));
+        mesh_frag_unlock_();
+    }
+}
+
+/* True if a frame the chip seals to @p slot (-1: no peer), management or on access category
+ * @p ac, could take a PN between two fragments of a run in the chip. */
+static bool mesh_frag_blocks_(int slot, bool mgmt, uint8_t ac)
+{
+    for (int s = 0; s < MESH_MAX_PEERS; s++)
+    {
+        if (s_frag[s].inflight == 0u || !s_frag[s].chip)
+        {
+            continue;
+        }
+        if (s == slot ? (mgmt || s_frag[s].ac != ac) : s_frag[s].shared)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* As data (umac_datapath_mesh_chip_key_missing): the chip would seal it under a key a chip restart
+ * has not put back, so it is dropped (counted nokey). */
+static bool mesh_chip_mgmt_keyless_(int slot)
+{
+    return slot >= 0 && (s_restore[slot] & MESH_RESTORE_MTK) != 0u;
+}
+
+/* Under s_frag_lock, on the event loop: hand the held management frames no run blocks any more. */
+static void mesh_frag_drain_locked_(void)
+{
+    struct mmpkt *pkt = mmpkt_list_dequeue_all(&s_frag_held);
+    while (pkt != NULL)
+    {
+        struct mmpkt *next = mmpkt_get_next(pkt);
+        struct mmpktview *v = mmpkt_open(pkt);
+        const int slot = mesh_slot_of_(mmpkt_get_data_start(v) + 4);
+        mmpkt_close(&v);
+        if (mesh_frag_blocks_(slot, true, 0))
+        {
+            mmpkt_list_append(&s_frag_held, pkt);
+        }
+        else if (mesh_chip_mgmt_keyless_(slot))
+        {
+            mmpkt_release(pkt);
+            g_warthog_tx_nokey++;
+        }
+        else
+        {
+            (void)mmdrv_tx_frame(pkt, true);
+        }
+        pkt = next;
+    }
+}
+
+/* A peer gone: its held frames go with it. */
+static void mesh_frag_forget_held_(const uint8_t *addr)
+{
+    mesh_frag_lock_();
+    struct mmpkt *pkt = mmpkt_list_dequeue_all(&s_frag_held);
+    while (pkt != NULL)
+    {
+        struct mmpkt *next = mmpkt_get_next(pkt);
+        struct mmpktview *v = mmpkt_open(pkt);
+        const bool his = memcmp(mmpkt_get_data_start(v) + 4, addr, 6) == 0;
+        mmpkt_close(&v);
+        if (his)
+        {
+            mmpkt_release(pkt);
+        }
+        else
+        {
+            mmpkt_list_append(&s_frag_held, pkt);
+        }
+        pkt = next;
+    }
+    mesh_frag_unlock_();
+}
+
+void umac_datapath_mesh_frag_run_begin(struct umac_sta_data *stad, uint8_t tid, unsigned n,
+                                       bool chip, unsigned need)
+{
+    mesh_frag_lock_();
+    const int slot = mesh_slot_of_stad_(stad);
+    if (slot >= 0)
+    {
+        s_frag[slot].inflight = (uint16_t)(s_frag[slot].inflight + n);
+        s_frag[slot].ac = mesh_tid_ac_(tid);
+        s_frag[slot].chip = chip;
+        s_frag[slot].shared = !umac_interface_chip_vif_is_mesh(umac_sta_data_get_umacd(stad));
+        s_frag[slot].need = (uint8_t)need;
+        s_frag[slot].since = mmosal_get_time_ms();
+    }
+}
+
+void umac_datapath_mesh_frag_run_end(struct umac_sta_data *stad, unsigned unhanded)
+{
+    const int slot = mesh_slot_of_stad_(stad);
+    if (slot >= 0)
+    {
+        s_frag[slot].inflight = (uint16_t)(s_frag[slot].inflight > unhanded ?
+                                               s_frag[slot].inflight - unhanded : 0u);
+    }
+    mesh_frag_drain_locked_();
+    mesh_frag_unlock_();
+}
+
+bool umac_datapath_mesh_frag_wait(struct umac_sta_data *stad, const struct mmpkt *head)
+{
+    const int slot = mesh_slot_of_stad_(stad);
+    if (slot < 0 || head == NULL)
+    {
+        return false;
+    }
+    if (s_ba_wait[slot].active)
+    {
+        return true; /* behind a DELBA (umac_datapath_mesh_ba_release) */
+    }
+    const struct mmdrv_tx_metadata *md = mmdrv_get_tx_metadata((struct mmpkt *)head);
+    const bool wait = mesh_frag_blocks_(slot, false, mesh_tid_ac_(md->tid)) ||
+                      (s_frag[slot].inflight != 0u && s_frag[slot].need != 0u &&
+                       mmdrv_tx_pool_free() < s_frag[slot].need);
+    if (wait)
+    {
+        g_warthog_hostfrag_wait++;
+    }
+    return wait;
+}
+
+void umac_datapath_mesh_frag_overlap_note(struct umac_sta_data *stad, bool mgmt, uint8_t tid)
+{
+    if (mesh_frag_blocks_(mesh_slot_of_stad_(stad), mgmt, mesh_tid_ac_(tid)))
+    {
+        g_warthog_hostfrag_overlap++;
+    }
+}
+
+int umac_datapath_mesh_tx_chip_mgmt(struct mmpkt *pkt)
+{
+    const uint8_t side = umac_datapath_mesh_read_begin(); /* any task: the peers are read */
+    struct mmpktview *v = mmpkt_open(pkt);
+    const int slot = mmpkt_get_data_length(v) >= 10u ? mesh_slot_of_(mmpkt_get_data_start(v) + 4) : -1;
+    mmpkt_close(&v);
+    int ret = 0;
+    mesh_frag_lock_();
+    if (mesh_frag_blocks_(slot, true, 0) && mmpkt_list_length(&s_frag_held) < MESH_FRAG_HOLD_MAX)
+    {
+        mmpkt_list_append(&s_frag_held, pkt);
+        g_warthog_hostfrag_mgmt++;
+    }
+    else if (mesh_chip_mgmt_keyless_(slot))
+    {
+        mmpkt_release(pkt);
+        g_warthog_tx_nokey++;
+        ret = -1;
+    }
+    else
+    {
+        if (mesh_frag_blocks_(slot, true, 0))
+        {
+            g_warthog_hostfrag_overlap++; /* cannot wait: sent, and may break the run */
+        }
+        ret = mmdrv_tx_frame(pkt, true);
+    }
+    mesh_frag_unlock_();
+    umac_datapath_mesh_read_end(side);
+    return ret;
+}
+
+static void mesh_ba_tick_(uint32_t now);
+
+void umac_datapath_mesh_frag_tick(void)
+{
+    const uint32_t now = mmosal_get_time_ms();
+    mesh_frag_lock_();
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        if (s_frag[i].inflight != 0u && (uint32_t)(now - s_frag[i].since) > MESH_FRAG_STALE_MS)
+        {
+            s_frag[i].inflight = 0;
+            s_frag[i].open = false;
+            g_warthog_hostfrag_stale++;
+        }
+    }
+    mesh_frag_drain_locked_();
+    mesh_frag_unlock_();
+    const uint32_t want = umac_datapath_mesh_hostfrag_mode() != 0u ? UMAC_DATAPATH_MESH_FRAG_RESERVE : 0u;
+    if (want != s_frag_reserve)
+    {
+        mmdrv_set_tx_pool_reserve(want);
+        s_frag_reserve = want;
+    }
+    mesh_ba_tick_(now);
+}
+
+/* Block Ack as originator (AT+HOSTFRAG, AT+AMPDU), per slot: the TIDs whose ADDBA is held off,
+ * each since the last frame on it that needed cutting. Event loop only. */
+extern volatile uint32_t g_warthog_ampdu, g_warthog_ampdu_orig, g_warthog_ampdu_ended;
+extern volatile uint32_t g_warthog_ampdu_unsent;
+extern volatile uint32_t g_warthog_hostfrag_ba_end, g_warthog_hostfrag_nodelba;
+extern volatile uint32_t g_warthog_hostfrag_ba_wait, g_warthog_hostfrag_ba_late;
+extern volatile uint32_t g_warthog_hostfrag_hold, g_warthog_hostfrag_held, g_warthog_hostfrag_hold_ms;
+/* Cuts while the peer's reorder size to us on that TID was set (its session, or one it ended since);
+ * waited-on DELBAs the chip gave up on unacked; each peer's sessions, AT+AMPDU?. */
+extern volatile uint32_t g_warthog_hostfrag_ba_rcpt, g_warthog_hostfrag_delba_noack;
+extern volatile uint32_t g_warthog_ampdu_peer_mac[UMAC_DATAPATH_MESH_MAX_PEERS];
+extern volatile uint32_t g_warthog_ampdu_peer_ba[UMAC_DATAPATH_MESH_MAX_PEERS];
+#define MESH_BA_TIDS (UMAC_BA_MAX_AGGR_TID + 1)
+static uint8_t s_ba_held[MESH_MAX_PEERS];
+static uint8_t s_ba_hold_counted[MESH_MAX_PEERS]; /* held TIDs whose kept-back ADDBA is counted */
+static uint32_t s_ba_hold_at[MESH_MAX_PEERS][MESH_BA_TIDS];
+static uint32_t s_ampdu_applied = 1u;
+/* The peer a cut's DELBA is being handed to, while umac_ba_originator_stop runs. */
+static const struct umac_sta_data *s_ba_delba_to;
+
+static bool mesh_ba_holds_(int slot, uint8_t tid, uint32_t now)
+{
+    return (s_ba_held[slot] & (1u << tid)) != 0u && umac_datapath_mesh_hostfrag_mode() != UMAC_MESH_FRAG_OFF &&
+           (uint32_t)(now - s_ba_hold_at[slot][tid]) < UMAC_MESH_FRAG_BA_HOLD_MS;
+}
+
+/* Expired holds cleared; the peer TIDs still held published. */
+static void mesh_ba_publish_held_(uint32_t now)
+{
+    uint32_t held = 0;
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        for (uint8_t t = 0; t < MESH_BA_TIDS; t++)
+        {
+            if (mesh_ba_holds_(i, t, now))
+            {
+                held++;
+            }
+            else
+            {
+                s_ba_held[i] &= (uint8_t)~(1u << t);
+                s_ba_hold_counted[i] &= (uint8_t)~(1u << t);
+            }
+        }
+    }
+    g_warthog_hostfrag_held = held;
+    g_warthog_hostfrag_hold_ms = UMAC_MESH_FRAG_BA_HOLD_MS;
+}
+
+/* A slot's wait timer only wakes the loop: the next TX pass releases what is due. */
+static void mesh_ba_wait_wake_(void *arg1, void *arg2)
+{
+    (void)arg2;
+    umac_core_evt_wake((struct umac_data *)arg1);
+}
+
+/* (Re)arm @p slot's wait timer @p ms from now; UINT32_MAX only cancels it. */
+static void mesh_ba_wait_timer_(int slot, uint32_t ms)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    (void)umac_core_cancel_timeout(umacd, mesh_ba_wait_wake_, umacd, &s_ba_wait[slot]);
+    if (ms != UINT32_MAX)
+    {
+        (void)umac_core_register_timeout(umacd, ms, mesh_ba_wait_wake_, umacd, &s_ba_wait[slot]);
+    }
+}
+
+static void mesh_ba_wait_end_(int slot)
+{
+    if (s_ba_wait[slot].active)
+    {
+        mesh_ba_wait_timer_(slot, UINT32_MAX);
+    }
+    mmpkt_list_clear(&s_ba_wait[slot].frags);
+    s_ba_wait[slot].active = false;
+}
+
+/* The chip restarted: a DELBA a cut frame waits on is gone, so it is due at the next TX pass. */
+static void mesh_ba_wait_lost_(int slot)
+{
+    if (s_ba_wait[slot].active && !s_ba_wait[slot].status)
+    {
+        s_ba_wait[slot].status = true;
+        s_ba_wait[slot].done = mmosal_get_time_ms() - UMAC_MESH_FRAG_BA_GUARD_MS;
+    }
+}
+
+static void mesh_ba_clear_(int slot)
+{
+    if (slot >= 0 && slot < MESH_MAX_PEERS)
+    {
+        s_ba_held[slot] = 0;
+        s_ba_hold_counted[slot] = 0;
+        mesh_ba_wait_end_(slot);
+    }
+}
+
+bool umac_datapath_mesh_ba_delba_tagged(const struct umac_sta_data *stad, struct mmpktview *view)
+{
+    const uint8_t *d = mmpkt_get_data_start(view);
+    return stad != NULL && stad == s_ba_delba_to && mmpkt_get_data_length(view) >= 26u &&
+           d[24] == DOT11_ACTION_CATEGORY_BLOCK_ACK && d[25] == DOT11_BA_ACTION_NDP_DELBA;
+}
+
+void umac_datapath_mesh_ba_cut(struct umac_sta_data *stad, uint8_t tid)
+{
+    const int slot = mesh_slot_of_stad_(stad);
+    if (slot < 0 || tid >= MESH_BA_TIDS)
+    {
+        return;
+    }
+    if (umac_ba_get_reorder_buffer_size(stad, tid) != 0u)
+    {
+        g_warthog_hostfrag_ba_rcpt++; /* what morselib's rule (AT+TIDPARAMS=0) puts in tid_params */
+    }
+    s_ba_delba_to = stad;
+    const int ended = umac_ba_originator_stop(stad, tid);
+    s_ba_delba_to = NULL;
+    const uint32_t now = mmosal_get_time_ms();
+    if (ended > 0)
+    {
+        g_warthog_hostfrag_ba_end++;
+        s_ba_wait[slot].active = true;
+        s_ba_wait[slot].status = false;
+        s_ba_wait[slot].since = now;
+        mesh_ba_wait_timer_(slot, UMAC_MESH_FRAG_BA_WAIT_MAX_MS);
+    }
+    else if (ended < 0)
+    {
+        g_warthog_hostfrag_nodelba++;
+    }
+    s_ba_held[slot] |= (uint8_t)(1u << tid);
+    s_ba_hold_counted[slot] &= (uint8_t)~(1u << tid);
+    s_ba_hold_at[slot][tid] = now;
+    mesh_ba_publish_held_(now);
+}
+
+bool umac_datapath_mesh_ba_park(struct umac_sta_data *stad, uint8_t tid, struct mmpkt *const *frag,
+                                unsigned n, bool chip)
+{
+    const int slot = mesh_slot_of_stad_(stad);
+    if (slot < 0 || !s_ba_wait[slot].active || !mmpkt_list_is_empty(&s_ba_wait[slot].frags))
+    {
+        return false;
+    }
+    for (unsigned i = 0; i < n; i++)
+    {
+        mmpkt_list_append(&s_ba_wait[slot].frags, frag[i]);
+    }
+    s_ba_wait[slot].tid = tid;
+    s_ba_wait[slot].chip = chip;
+    g_warthog_hostfrag_ba_wait++;
+    return true;
+}
+
+bool umac_datapath_mesh_ba_waiting(struct umac_sta_data *stad)
+{
+    const int slot = mesh_slot_of_stad_(stad);
+    return slot >= 0 && s_ba_wait[slot].active;
+}
+
+void umac_datapath_mesh_ba_delba_status(const uint8_t *ra, bool no_ack)
+{
+    const int slot = mesh_slot_of_(ra);
+    if (slot < 0 || !s_ba_wait[slot].active || s_ba_wait[slot].status)
+    {
+        return;
+    }
+    g_warthog_hostfrag_delba_noack += no_ack ? 1u : 0u; /* the recipient may still hold its session */
+    s_ba_wait[slot].status = true;
+    s_ba_wait[slot].done = mmosal_get_time_ms();
+    mesh_ba_wait_timer_(slot, UMAC_MESH_FRAG_BA_GUARD_MS);
+}
+
+void umac_datapath_mesh_ba_release(void)
+{
+    const uint32_t now = mmosal_get_time_ms();
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        const bool due = s_ba_wait[i].status
+                             ? (uint32_t)(now - s_ba_wait[i].done) >= UMAC_MESH_FRAG_BA_GUARD_MS
+                             : (uint32_t)(now - s_ba_wait[i].since) >= UMAC_MESH_FRAG_BA_WAIT_MAX_MS;
+        if (!s_ba_wait[i].active || !due ||
+            (!mmpkt_list_is_empty(&s_ba_wait[i].frags) &&
+             mesh_frag_blocks_(i, false, mesh_tid_ac_(s_ba_wait[i].tid))))
+        {
+            continue;
+        }
+        g_warthog_hostfrag_ba_late += s_ba_wait[i].status ? 0u : 1u;
+        mesh_ba_wait_timer_(i, UINT32_MAX);
+        s_ba_wait[i].active = false;
+        struct mmpkt *frag[UMAC_MESH_FRAG_MAX];
+        unsigned n = 0;
+        while (n < UMAC_MESH_FRAG_MAX && (frag[n] = mmpkt_list_dequeue(&s_ba_wait[i].frags)) != NULL)
+        {
+            n++;
+        }
+        mmpkt_list_clear(&s_ba_wait[i].frags);
+        if (n != 0u && s_ba_wait[i].chip && umac_datapath_mesh_chip_key_missing(s_peers[i], false))
+        {
+            for (unsigned k = 0; k < n; k++)
+            {
+                mmpkt_release(frag[k]);
+            }
+            g_warthog_tx_nokey++; /* as data: the chip lost the key in a restart */
+        }
+        else if (n != 0u)
+        {
+            (void)umac_datapath_mesh_frags_to_chip(s_peers[i], s_ba_wait[i].tid, frag, n,
+                                                   s_ba_wait[i].chip);
+        }
+    }
+}
+
+bool umac_datapath_mesh_ba_may_start(struct umac_sta_data *stad, uint8_t tid)
+{
+    if (g_warthog_ampdu == 0u)
+    {
+        return false;
+    }
+    const int slot = mesh_slot_of_stad_(stad);
+    if (slot < 0 || tid >= MESH_BA_TIDS || !mesh_ba_holds_(slot, tid, mmosal_get_time_ms()))
+    {
+        return true;
+    }
+    if (umac_ba_originator_idle(stad, tid) && (s_ba_hold_counted[slot] & (1u << tid)) == 0u)
+    {
+        s_ba_hold_counted[slot] |= (uint8_t)(1u << tid);
+        g_warthog_hostfrag_hold++; /* the ADDBA it keeps back, once a re-arm */
+    }
+    return false;
+}
+
+/* AT+AMPDU=0 ends every originator session once; sessions agreed now are published. */
+static void mesh_ba_tick_(uint32_t now)
+{
+    const uint32_t want = g_warthog_ampdu != 0u ? 1u : 0u;
+    uint32_t orig = 0;
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        struct umac_sta_data *stad = s_peers[i];
+        uint32_t ba = 0;
+        for (uint8_t t = 0; stad != NULL && t < MESH_BA_TIDS; t++)
+        {
+            const int ended =
+                want == 0u && s_ampdu_applied != 0u ? umac_ba_originator_stop(stad, t) : 0;
+            g_warthog_ampdu_ended += ended > 0 ? 1u : 0u;
+            g_warthog_ampdu_unsent += ended < 0 ? 1u : 0u;
+            const bool agreed = umac_ba_is_ampdu_permitted(stad, t);
+            orig += agreed ? 1u : 0u;
+            /* Per TID: ours agreed, ours asked or refused, the peer's to us, the hold-off. */
+            ba |= (agreed ? 1u : 0u) << t;
+            ba |= (!agreed && !umac_ba_originator_idle(stad, t) ? 1u : 0u) << (8 + t);
+            ba |= (umac_ba_recipient_agreed(stad, t) ? 1u : 0u) << (16 + t);
+            ba |= (mesh_ba_holds_(i, t, now) ? 1u : 0u) << (24 + t);
+        }
+        const uint8_t *a = stad != NULL ? umac_sta_data_peek_peer_addr(stad) : NULL;
+        g_warthog_ampdu_peer_mac[i] = a != NULL ? (0x1000000u | ((uint32_t)a[3] << 16) |
+                                                   ((uint32_t)a[4] << 8) | a[5]) : 0u;
+        g_warthog_ampdu_peer_ba[i] = ba;
+    }
+    s_ampdu_applied = want;
+    g_warthog_ampdu_orig = orig;
+    mesh_ba_publish_held_(now);
+}
+
+void umac_datapath_mesh_frag_status(struct umac_sta_data *stad, const uint8_t *frame, uint32_t len,
+                                    uint8_t status_flags, uint8_t attempts)
+{
+    const int slot = mesh_slot_of_stad_(stad);
+    if (slot < 0 || frame == NULL || len < sizeof(struct dot11_hdr))
+    {
+        return;
+    }
+    const struct dot11_hdr *h = (const struct dot11_hdr *)frame;
+    const uint8_t fragno = (uint8_t)dot11_sequence_control_get_fragment_number(h->sequence_control);
+    const bool more = dot11_frame_control_get_more_fragments(h->frame_control) != 0u;
+    if (dot11_frame_control_get_type(h->frame_control) != DOT11_FC_TYPE_DATA || (!more && fragno == 0u))
+    {
+        return;
+    }
+    const uint32_t qos_off = dot11_is_4addr_hdr(h->frame_control) ? sizeof(struct dot11_data_hdr)
+                                                                   : sizeof(struct dot11_hdr);
+    const uint8_t tid = len > qos_off ? (uint8_t)(frame[qos_off] & 0x0fu) : 0u;
+    const uint16_t seq = dot11_sequence_control_get_sequence_number(h->sequence_control);
+    const bool unsent = attempts == 0u ||
+                        (status_flags & (MMDRV_TX_STATUS_FLAG_PS_FILTERED |
+                                         MMDRV_TX_STATUS_DUTY_CYCLE_CANT_SEND)) != 0u;
+    const bool acked = !unsent && (status_flags & MMDRV_TX_STATUS_FLAG_NO_ACK) == 0u;
+    mesh_frag_lock_();
+    if (!unsent && (status_flags & MMDRV_TX_STATUS_WAS_AGGREGATED) != 0u)
+    {
+        g_warthog_hostfrag_agg++; /* the chip aggregated a fragment, which the host never allows */
+    }
+    if (unsent)
+    {
+        g_warthog_hostfrag_unsent++;
+    }
+    else if (acked)
+    {
+        g_warthog_hostfrag_acked++;
+    }
+    else
+    {
+        g_warthog_hostfrag_noack++;
+    }
+    if (s_frag[slot].inflight == 0u)
+    {
+        mesh_frag_unlock_(); /* of no run in the chip: one from before a chip restart or a stale clear */
+        return;
+    }
+    s_frag[slot].inflight--;
+    if (!s_frag[slot].open || s_frag[slot].tid != tid || s_frag[slot].seq != seq)
+    {
+        if (s_frag[slot].open)
+        {
+            g_warthog_hostfrag_fail++; /* an MSDU not every fragment of which was reported */
+        }
+        s_frag[slot].open = true;
+        s_frag[slot].tid = tid;
+        s_frag[slot].seq = seq;
+        s_frag[slot].seen = 0;
+        s_frag[slot].last = -1;
+        s_frag[slot].failed = false;
+    }
+    s_frag[slot].seen |= (uint16_t)(1u << (fragno & 0x0fu));
+    s_frag[slot].failed = s_frag[slot].failed || !acked;
+    if (!more)
+    {
+        s_frag[slot].last = (int8_t)fragno;
+    }
+    if (s_frag[slot].last >= 0 &&
+        s_frag[slot].seen == (uint16_t)((1u << (s_frag[slot].last + 1)) - 1u))
+    {
+        if (s_frag[slot].failed)
+        {
+            g_warthog_hostfrag_fail++;
+        }
+        else
+        {
+            g_warthog_hostfrag_ok++;
+        }
+        s_frag[slot].open = false;
+    }
+    if (s_frag[slot].inflight == 0u)
+    {
+        mesh_frag_drain_locked_();
+    }
+    mesh_frag_unlock_();
+}
+
+static void mesh_hwmp_tx_key_(const uint8_t *da, struct umac_mesh_hwmp_txkey *out);
+
 void umac_datapath_mesh_hwmp_tx_key(const uint8_t *da, struct umac_mesh_hwmp_txkey *out)
+{
+    const uint8_t side = umac_datapath_mesh_read_begin(); /* any task: a peer's keys are read */
+    mesh_hwmp_tx_key_(da, out);
+    umac_datapath_mesh_read_end(side);
+}
+
+static void mesh_hwmp_tx_key_(const uint8_t *da, struct umac_mesh_hwmp_txkey *out)
 {
     memset(out, 0, sizeof(*out));
     if (da == NULL || !umac_mesh_sae_active())
@@ -1685,12 +2434,13 @@ void umac_datapath_mesh_hwmp_tx_key(const uint8_t *da, struct umac_mesh_hwmp_txk
         }
         return;
     }
-    const int slot = mesh_slot_of_(da);
-    if (!mesh_slot_mfp_(slot))
+    /* The record is loaded once, by the address match: del_peer may empty the slot meanwhile. */
+    struct umac_sta_data *stad = NULL;
+    const int slot = mesh_slot_rec_of_(da, &stad);
+    if (!mesh_stad_mfp_(slot, stad))
     {
         return;
     }
-    struct umac_sta_data *stad = s_peers[slot];
     const int kid = umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE);
     if (kid < 0)
     {
@@ -1912,12 +2662,17 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
             for (size_t k = 0; k < n_down; k++)
             {
                 (void)mesh_chip_sta_state_(umac_sta_data_get_vif_id(stad), umac_sta_data_get_aid(stad),
-                                           umac_sta_data_peek_peer_addr(stad), down[k]);
+                                           umac_sta_data_peek_peer_addr(stad), down[k], NULL);
                 if (k == 0)
                 {
                     mesh_peer_gtk_disable_(i, stad, &gtk);
                 }
             }
+            mesh_frag_reset_(i);
+            mesh_frag_forget_held_(umac_sta_data_peek_peer_addr(stad));
+            mesh_ba_clear_(i);
+            s_restore[i] = 0;
+            mesh_restore_publish_();
             umac_rc_stop(stad);
             /* Loop timeouts point into the record (ADDBA retry, RX reorder, defrag): stop them. */
             umac_ba_deinit(stad);
@@ -1949,12 +2704,151 @@ void umac_datapath_mesh_del_peer(const uint8_t *peer_addr)
                 {
                     uint8_t survivor[MMWLAN_MAC_ADDR_LEN];
                     umac_sta_data_get_peer_addr(s_peers[j], survivor);
-                    mesh_chip_register_sta_(vif_id, umac_sta_data_get_aid(s_peers[j]), survivor);
+                    (void)mesh_chip_register_sta_(vif_id, umac_sta_data_get_aid(s_peers[j]), survivor);
                 }
                 (void)mesh_restore_peer_key_(s_peers[j], vif_id); /* its MGTK too, where held */
             }
         }
     }
+}
+
+static void mesh_restart_count_(bool ok)
+{
+    if (ok)
+    {
+        g_warthog_chiprestart_keys++;
+    }
+    else
+    {
+        g_warthog_chiprestart_keyfail++;
+    }
+}
+
+/* The AID 0 group key back in the chip, above every PN it drew: true if it went in. */
+static bool mesh_group_key_restore_(uint16_t vif_id)
+{
+    if (umac_mesh_sae_active())
+    {
+        return s_own_mgtk.valid && mesh_put_own_mgtk_(vif_id) == MMWLAN_SUCCESS;
+    }
+    return mesh_p1_group_key_to_chip_(vif_id);
+}
+
+/* @p stad's pairwise key back in the chip at a fresh TX PN epoch: 1 put, 0 failed, -1 none here. */
+static int mesh_restore_mtk_(struct umac_sta_data *stad, uint16_t vif_id)
+{
+    const int kid = umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE);
+#ifdef WARTHOG_MESH_AMPE_NO_CHIP_KEY
+    if (umac_mesh_sae_active())
+    {
+        return -1;
+    }
+#endif
+    if (kid < 0)
+    {
+        return -1;
+    }
+    return umac_keys_reinstall_key(stad, vif_id, (uint8_t)kid,
+                                   mesh_next_pn_base_(mesh_own_group_pn_top_())) == MMWLAN_SUCCESS ? 1 : 0;
+}
+
+/* A keyed peer's MGTK back in the chip at its AID where kept there: 1 put, 0 failed, -1 none here. */
+static int mesh_restore_gtk_(struct umac_sta_data *stad)
+{
+    if (umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE) < 0)
+    {
+        return -1;
+    }
+    return mesh_peer_gtk_restore_(stad);
+}
+
+bool umac_datapath_mesh_chip_restored(uint16_t vif_id)
+{
+    bool all = true;
+    s_restore_vif = vif_id;
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        if (s_peers[i] == NULL)
+        {
+            continue;
+        }
+        if (mesh_chip_register_sta_(vif_id, umac_sta_data_get_aid(s_peers[i]),
+                                    umac_sta_data_peek_peer_addr(s_peers[i])))
+        {
+            g_warthog_chiprestart_sta++;
+        }
+        else
+        {
+            g_warthog_chiprestart_stafail++;
+            s_restore[i] |= MESH_RESTORE_STA;
+            all = false;
+        }
+    }
+    if (s_group_key_restore)
+    {
+        const bool ok = mesh_group_key_restore_(vif_id);
+        mesh_restart_count_(ok);
+        all = all && ok;
+    }
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        if (s_peers[i] == NULL)
+        {
+            continue;
+        }
+        const int mtk = mesh_restore_mtk_(s_peers[i], vif_id);
+        const int gtk = mesh_restore_gtk_(s_peers[i]);
+        if (mtk >= 0)
+        {
+            mesh_restart_count_(mtk == 1);
+        }
+        if (gtk >= 0)
+        {
+            mesh_restart_count_(gtk == 1);
+        }
+        s_restore[i] |= (uint8_t)((mtk == 0 ? MESH_RESTORE_MTK : 0u) | (gtk == 0 ? MESH_RESTORE_GTK : 0u));
+        all = all && mtk != 0 && gtk != 0;
+    }
+    mesh_restore_publish_();
+    return all;
+}
+
+void umac_datapath_mesh_service_restore(void)
+{
+    if (s_group_key_restore && mesh_group_key_restore_(s_restore_vif))
+    {
+        g_warthog_chiprestart_retried++;
+    }
+    for (int i = 0; i < MESH_MAX_PEERS; i++)
+    {
+        struct umac_sta_data *stad = s_peers[i];
+        if (stad == NULL || s_restore[i] == 0u)
+        {
+            continue;
+        }
+        const uint16_t vif_id = umac_sta_data_get_vif_id(stad);
+        if ((s_restore[i] & MESH_RESTORE_STA) != 0u &&
+            mesh_chip_register_sta_(vif_id, umac_sta_data_get_aid(stad), umac_sta_data_peek_peer_addr(stad)))
+        {
+            s_restore[i] &= (uint8_t)~MESH_RESTORE_STA;
+            g_warthog_chiprestart_retried++;
+        }
+        const int mtk = (s_restore[i] & MESH_RESTORE_MTK) != 0u ? mesh_restore_mtk_(stad, vif_id) : 0;
+        const int gtk = (s_restore[i] & MESH_RESTORE_GTK) != 0u ? mesh_restore_gtk_(stad) : 0;
+        s_restore[i] &= (uint8_t)~((mtk != 0 ? MESH_RESTORE_MTK : 0u) | (gtk != 0 ? MESH_RESTORE_GTK : 0u));
+        g_warthog_chiprestart_retried += (mtk == 1 ? 1u : 0u) + (gtk == 1 ? 1u : 0u);
+    }
+    mesh_restore_publish_();
+}
+
+bool umac_datapath_mesh_chip_key_missing(struct umac_sta_data *stad, bool group)
+{
+    if (group)
+    {
+        return s_group_key_restore;
+    }
+    const int slot = mesh_slot_of_stad_(stad);
+    return slot >= 0 && (s_restore[slot] & MESH_RESTORE_MTK) != 0u;
 }
 
 uint8_t umac_datapath_mesh_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max)
@@ -2251,7 +3145,8 @@ static bool mesh_dequeue_tx_frame(struct umac_data *umacd,
     {
         int i = (rr + n) % MESH_MAX_PEERS;
         struct umac_sta_data *stad = s_peers[i];
-        if (stad == NULL || umac_sta_data_is_paused(stad))
+        if (stad == NULL || umac_sta_data_is_paused(stad) ||
+            umac_datapath_mesh_frag_wait(stad, umac_sta_data_peek_pkt(stad)))
         {
             continue;
         }
@@ -2404,6 +3299,10 @@ const struct umac_datapath_ops datapath_ops_mesh = {
 void umac_datapath_configure_mesh_mode(struct umac_data *umacd)
 {
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    if (s_frag_lock == NULL)
+    {
+        s_frag_lock = mmosal_mutex_create("mesh_frag");
+    }
     data->ops = &datapath_ops_mesh;
     umac_mesh_ies_capacity_fn = mesh_capacity_;
     MMLOG_INF("Datapath configured for mesh mode\n");

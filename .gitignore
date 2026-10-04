@@ -12,6 +12,7 @@ sdkconfig
 sdkconfig.old
 sdkconfig.*
 !sdkconfig.defaults
+!sdkconfig.ecm
 
 # Per-developer overrides
 platformio_override.ini

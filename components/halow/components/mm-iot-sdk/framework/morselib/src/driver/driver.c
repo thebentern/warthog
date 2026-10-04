@@ -386,6 +386,7 @@ void mmdrv_deinit(void)
     MMOSAL_ASSERT(driver_data.started);
 
     driver_data.started = false;
+    morse_beacon_teardown(&driver_data); /* warthog: its timer points at what is cleared below */
 
     driver_health_deinit(&driver_data);
     morse_stale_tx_status_timer_finish(&driver_data);
@@ -1349,6 +1350,16 @@ struct mmpkt *mmdrv_alloc_mmpkt_for_tx(uint8_t pkt_class,
         sizeof(struct mmdrv_tx_metadata));
 }
 
+uint32_t mmdrv_tx_pool_free(void)
+{
+    return mmhal_wlan_pktmem_tx_free();
+}
+
+void mmdrv_set_tx_pool_reserve(uint32_t blocks)
+{
+    mmhal_wlan_pktmem_set_tx_reserve(blocks);
+}
+
 struct mmpkt *mmdrv_alloc_mmpkt_for_defrag(uint32_t min_capacity, uint32_t max_capacity)
 {
 
@@ -1640,6 +1651,17 @@ void mmdrv_unset_health_check_veto(enum mmdrv_health_check_veto_id veto_id)
     MMOSAL_ASSERT(veto_id < 32);
     atomic_fetch_and(&driver_data.health_check.periodic_check_vetoes, ~(1ul << veto_id));
     driver_health_request_check(&driver_data);
+}
+
+int mmdrv_force_health_check_fail(void)
+{
+    if (!driver_data.started)
+    {
+        return -ENODEV;
+    }
+    driver_data.health_check.force_fail = true;
+    driver_health_demand_check(&driver_data);
+    return 0;
 }
 
 void mmdrv_hw_restart_completed(void)

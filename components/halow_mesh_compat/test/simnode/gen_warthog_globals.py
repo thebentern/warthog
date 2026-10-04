@@ -11,8 +11,10 @@ differently.
 Scraping at.c is the only form that stays true as at.c changes; a hand-copied
 list goes stale silently, and in a test harness that reads as a pass.
 
-Usage: gen_warthog_globals.py <path-to-at.c>   (writes warthog_globals.c)
+Usage: gen_warthog_globals.py <path-to-at.c>   (writes warthog_globals.c; reads cfg.h beside it
+for the build defaults at.c's initialisers name)
 """
+import os
 import re
 import sys
 
@@ -89,6 +91,35 @@ def statements(text):
         i += 1
 
 
+def cfg_macros(path, names):
+    """cfg.h's definitions of @p names verbatim: a lone #define, or a whole #if block of #defines."""
+    lines = open(path).read().split('\n')
+    out, i = [], 0
+    while i < len(lines):
+        if re.match(r'\s*#\s*if', lines[i]):
+            depth, j = 0, i
+            while j < len(lines):
+                depth += 1 if re.match(r'\s*#\s*if', lines[j]) else 0
+                depth -= 1 if re.match(r'\s*#\s*endif', lines[j]) else 0
+                j += 1
+                if depth == 0:
+                    break
+            block = lines[i:j]
+            defs = set(re.findall(r'#\s*define\s+(WARTHOG_[A-Z0-9_]+)', '\n'.join(block)))
+            if defs and defs <= names and all(re.match(r'\s*#', b) for b in block):
+                out.append('\n'.join(b.strip() for b in block))
+            i = j
+            continue
+        m = re.match(r'\s*#\s*define\s+(WARTHOG_[A-Z0-9_]+)\s', lines[i])
+        if m and m.group(1) in names:
+            out.append(lines[i].strip())
+        i += 1
+    missing = names - set(re.findall(r'#\s*define\s+(WARTHOG_[A-Z0-9_]+)', '\n'.join(out)))
+    if missing:
+        sys.exit('initialisers use %s, defined in neither at.c nor cfg.h' % ', '.join(sorted(missing)))
+    return out
+
+
 def main():
     at = sys.argv[1] if len(sys.argv) > 1 else '../../../../main/at.c'
     src = open(at).read()
@@ -115,10 +146,14 @@ def main():
         seen += re.findall(r'\bg_warthog_[A-Za-z0-9_]+', decl)
 
     # Macros the initialisers reference, so this file stands alone.
-    macros = []
+    macros, local = [], set()
     for m in re.finditer(r'^[ \t]*#[ \t]*define[ \t]+(WARTHOG_[A-Z0-9_]+)[ \t]+(.+)$',
                          open(at).read(), flags=re.M):
+        local.add(m.group(1))
         macros.append('#ifndef %s\n#define %s %s\n#endif' % (m.group(1), m.group(1), m.group(2).strip()))
+    # Those from cfg.h (a build's defaults), with the #if around them, so this file follows the flags.
+    used = set(re.findall(r'\b(WARTHOG_[A-Z0-9_]+)\b', ' '.join(o.split('=', 1)[1] for o in out if '=' in o)))
+    macros += cfg_macros(os.path.join(os.path.dirname(at), 'cfg.h'), used - local)
 
     body = HEADER + '\n'.join(macros) + '\n\n' + '\n'.join(out) + '\n'
     open('warthog_globals.c', 'w').write(body)

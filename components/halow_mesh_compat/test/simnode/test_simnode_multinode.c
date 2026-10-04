@@ -945,6 +945,7 @@ static void scenario_weak_link_peers(void)
     air_reset();
     CHECK(nd[A].peer_count() == 0 && nd[W].peer_count() == 0, "A and W start with no peer");
     CHECK(nd[W].tx_probe() >= 0, "W sends its periodic probe request");
+    nd[W].pump(); /* its event loop sends it */
     CHECK(air_settle() != 0, "the exchange settles");
     CHECK(nd[A].peer_count() == 1 && nd[W].peer_count() == 1,
           "A opened on W's probe and both ends are established (%u / %u)",

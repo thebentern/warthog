@@ -20,6 +20,7 @@ extern volatile uint32_t g_warthog_rxchan_pages, g_warthog_rxchan_data, g_wartho
 #include "dot11/dot11_frames.h"
 #include "driver/driver.h"
 #include "mmhal_wlan.h"
+#include "mmwlan_cap.h"
 
 #ifdef ENABLE_SKBQ_TRACE
 #include "mmtrace.h"
@@ -370,6 +371,14 @@ void morse_skbq_process_rx(struct driver_data *driverd, struct mmpkt *mmpkt)
                                   0);
         rx_metadata->noise_dbm = hdr->rx_status.noise_dbm;
         rx_metadata->vif_id = MORSE_RX_STATUS_FLAGS_VIF_ID_GET(hdr->rx_status.flags);
+        if (mmwlan_cap_mode[MMWLAN_CAP_RX] != MMWLAN_CAP_OFF)
+        {
+            /* warthog: AT+RXCAP: as the chip delivered it, before anything parses or decrypts it. */
+            mmwlan_cap_rx(mmpkt_get_data_start(view), mmpkt_get_data_length(view),
+                          le32toh(hdr->rx_status.flags),
+                          morse_ratecode_mcs_index_get(hdr->rx_status.morse_rc),
+                          rx_metadata->bw_mhz, rx_metadata->rssi, mmosal_get_time_ms());
+        }
         mmpkt_close(&view);
         mmdrv_host_process_rx_frame(mmpkt, channel);
     }
@@ -506,6 +515,33 @@ int morse_skbq_enq_prepend(struct morse_skbq *mq, struct mmpkt_list *skbq)
     return count;
 }
 
+/* warthog: AT+TXCAP, mq locked: the descriptor and frame head exactly as the chip will read them. */
+static void skbq_cap_tx_(struct mmpkt *mmpkt)
+{
+    struct mmpktview *v = mmpkt_open(mmpkt);
+    const struct morse_buff_skb_header *hdr =
+        (const struct morse_buff_skb_header *)mmpkt_get_data_start(v);
+    uint16_t rate[4];
+    for (unsigned i = 0; i < 4u; i++)
+    {
+        const morse_rate_code_t rc = hdr->tx_info.rates[i].morse_rc;
+        const unsigned mhz = morse_ratecode_bw_index_to_s1g_bw_mhz(morse_ratecode_bw_index_get(rc));
+        unsigned lg = 0;
+        while ((1u << lg) < mhz && lg < 4u)
+        {
+            lg++;
+        }
+        rate[i] = (uint16_t)(morse_ratecode_mcs_index_get(rc) | (lg << 4) |
+                             ((hdr->tx_info.rates[i].count & 0x0fu) << 8) |
+                             (morse_ratecode_rts_get(rc) ? 0x1000u : 0u));
+    }
+    mmwlan_cap_tx((const uint8_t *)hdr + sizeof(*hdr) + hdr->offset, le16toh(hdr->len),
+                  le32toh(hdr->tx_info.flags), hdr->tx_info.tid, hdr->tx_info.tid_params, rate,
+                  hdr->tx_info.pkt_id, mmdrv_get_tx_metadata(mmpkt)->mesh.host_frag != 0u,
+                  mmosal_get_time_ms());
+    mmpkt_close(&v);
+}
+
 static int morse_skbq_tx(struct morse_skbq *mq, struct mmpkt *mmpkt, uint8_t channel)
 {
     struct driver_data *driverd = mq->driverd;
@@ -520,6 +556,11 @@ static int morse_skbq_tx(struct morse_skbq *mq, struct mmpkt *mmpkt, uint8_t cha
 
 
     __morse_skbq_pkt_id(mq, mmpkt);
+    if (mmwlan_cap_mode[MMWLAN_CAP_TX] != MMWLAN_CAP_OFF && rc == 0 &&
+        (channel == MORSE_SKB_CHAN_DATA || channel == MORSE_SKB_CHAN_DATA_NOACK))
+    {
+        skbq_cap_tx_(mmpkt);
+    }
 
     spin_unlock(&mq->lock);
 
@@ -725,6 +766,27 @@ static int __skbq_data_tx_finish(struct mmpkt_list *skbq,
                  MMDRV_TX_STATUS_DUTY_CYCLE_CANT_SEND :
                  0) |
             ((tx_sts_flags & MORSE_TX_STATUS_WAS_AGGREGATED) ? MMDRV_TX_STATUS_WAS_AGGREGATED : 0);
+        if (mmwlan_cap_mode[MMWLAN_CAP_TX] != MMWLAN_CAP_OFF)
+        {
+            /* warthog: AT+TXCAP: the status, on that frame's capture. */
+            mmwlan_cap_tx_status(tx_sts->pkt_id, tx_sts->tid, tx_sts_flags, tx_metadata->attempts,
+                                 le16toh(tx_sts->ampdu_info));
+        }
+    }
+    else if (tx_metadata->mesh.host_frag != 0 || tx_metadata->mesh.ba_wait != 0)
+    {
+        /* warthog: a host fragment, or a DELBA a cut frame waits on, reports untried. */
+        struct mmpktview *view = mmpkt_open(mmpkt);
+        if (mmwlan_cap_mode[MMWLAN_CAP_TX] != MMWLAN_CAP_OFF)
+        {
+            const struct morse_buff_skb_header *h =
+                (const struct morse_buff_skb_header *)mmpkt_get_data_start(view);
+            mmwlan_cap_tx_untried(h->tx_info.pkt_id, h->tx_info.tid);
+        }
+        morse_skb_remove_padding_after_sent_to_chip(view);
+        mmpkt_close(&view);
+        tx_metadata->attempts = 0;
+        tx_metadata->status_flags = 0;
     }
     else
     {

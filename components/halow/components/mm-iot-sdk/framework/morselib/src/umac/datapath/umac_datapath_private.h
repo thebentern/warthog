@@ -4,6 +4,7 @@
  */
 
 #include "umac/datapath/umac_datapath.h"
+#include "umac/mesh/umac_mesh_frag.h"
 #include "dot11/dot11_frames.h"
 
 #pragma once
@@ -99,8 +100,19 @@ int umac_datapath_mesh_own_group_key_id(void);
  *  frame was read after that key went in (the fence) and no refused DISABLE_KEY leaves a stale
  *  key at the AID (the taint). False everywhere else, where the chip's only group key is our own. */
 bool umac_datapath_mesh_peer_gtk_opened(struct umac_sta_data *stad, uint8_t key_id, uint32_t read_seq);
-/** The chip booted: it holds no key, so no AID is tainted and no peer MGTK is in it. */
-void umac_datapath_mesh_chip_booted(void);
+/** The chip booted: it holds no key, so no AID is tainted and no peer MGTK is in it. After a
+ *  hardware restart (@p restart) the AID 0 group key it held is owed back. */
+void umac_datapath_mesh_chip_booted(bool restart);
+/** After a chip restart, event loop only: stations, the AID 0 group key and peers' keys back on
+ *  @p vif_id above every PN they drew. True if all went in; the rest is retried by the service tick. */
+bool umac_datapath_mesh_chip_restored(uint16_t vif_id);
+/** Service tick: what a chip restart could not put back goes in now. Event loop only. */
+void umac_datapath_mesh_service_restore(void);
+/** True if the chip would seal this frame (a group one: @p group) under a key a chip restart could
+ *  not put back yet. */
+bool umac_datapath_mesh_chip_key_missing(struct umac_sta_data *stad, bool group);
+/** One group frame went to the chip for encryption under the AID 0 group key. */
+void umac_datapath_mesh_group_tx_note(void);
 /** Service tick: retire old fences; carry out an AT+GTKPERSTA change. Event loop only. */
 void umac_datapath_mesh_service_peer_gtk(void);
 /** One frame went to the chip for encryption under our own TX MGTK. */
@@ -112,6 +124,70 @@ struct umac_sta_data *umac_datapath_mesh_first_peer_except(const uint8_t *excl);
  *  the frame to send (a new one under host CCMP, @p txbuf released), NULL if it could not be
  *  sealed (released, counted); @p key_id is the key the chip encrypts under, else -1. */
 struct mmpkt *umac_datapath_mesh_protect_mgmt(struct mmpkt *txbuf, int *key_id);
+/** AT+HOSTFRAG, event loop only: @p n fragments to @p stad on @p tid (@p chip seals them, @p need
+ *  pool blocks beyond the MSDU's) go to the chip under the run lock, which run_end releases. */
+void umac_datapath_mesh_frag_run_begin(struct umac_sta_data *stad, uint8_t tid, unsigned n,
+                                       bool chip, unsigned need);
+void umac_datapath_mesh_frag_run_end(struct umac_sta_data *stad, unsigned unhanded);
+/** True if @p stad's next frame @p head must wait: behind a DELBA a cut waits on, or (counted) a
+ *  fragment run it could break or the TX pool short of the last cut's blocks. Event loop only. */
+bool umac_datapath_mesh_frag_wait(struct umac_sta_data *stad, const struct mmpkt *head);
+/** A data frame's TX status (@p frame its 802.11 header, @p attempts 0 untried): a host fragment
+ *  is counted, and its MSDU once every fragment is reported. Event loop only. */
+void umac_datapath_mesh_frag_status(struct umac_sta_data *stad, const uint8_t *frame, uint32_t len,
+                                    uint8_t status_flags, uint8_t attempts);
+/** A frame the chip encrypts under @p stad's pairwise key, management or data on @p tid, handed
+ *  while a fragment run it could break is in the chip: counted (overlap). */
+void umac_datapath_mesh_frag_overlap_note(struct umac_sta_data *stad, bool mgmt, uint8_t tid);
+/** Clears runs whose statuses never came, hands held management frames, keeps the TX pool's
+ *  reserve, the ADDBA hold-off and AT+AMPDU. Event loop only. */
+void umac_datapath_mesh_frag_tick(void);
+/** A frame to @p stad on @p tid must be cut: its originator Block Ack session ends (the peer's
+ *  frames then wait for that DELBA) and ADDBA on that TID is held off. Event loop only. */
+void umac_datapath_mesh_ba_cut(struct umac_sta_data *stad, uint8_t tid);
+/** True if this management frame to @p stad is the DELBA umac_datapath_mesh_ba_cut is sending. */
+bool umac_datapath_mesh_ba_delba_tagged(const struct umac_sta_data *stad, struct mmpktview *view);
+/** True (counted ba_wait, fragments taken) if @p stad's frames wait for a DELBA: the @p n fragments
+ *  on @p tid go once it is through. Event loop only. */
+bool umac_datapath_mesh_ba_park(struct umac_sta_data *stad, uint8_t tid, struct mmpkt *const *frag,
+                                unsigned n, bool chip);
+/** True while @p stad's frames wait for the DELBA umac_datapath_mesh_ba_cut sent it. Event loop only. */
+bool umac_datapath_mesh_ba_waiting(struct umac_sta_data *stad);
+/** The TX status of the DELBA umac_datapath_mesh_ba_cut sent to @p ra came back, @p no_ack: tried and
+ *  never acked. Event loop only. */
+void umac_datapath_mesh_ba_delba_status(const uint8_t *ra, bool no_ack);
+/** Each TX pass the datapath is not paused: frames whose DELBA is through go on. Event loop only. */
+void umac_datapath_mesh_ba_release(void);
+/** @p n fragments of one MSDU to @p stad on @p tid (@p chip seals them) handed back to back under
+ *  the run lock: 0 all handed, -1 the driver refused one (the rest released). Event loop only. */
+int umac_datapath_mesh_frags_to_chip(struct umac_sta_data *stad, uint8_t tid,
+                                     struct mmpkt *const *frag, unsigned n, bool chip);
+/** AT+HOSTFRAG as this build applies it: off with host CCMP, whose fragments after the first chip
+ *  firmware 1.17.6 re-encapsulates (on air 2026-10-03); WARTHOG_MESH_HOSTFRAG_ANY lifts that. */
+static inline uint32_t umac_datapath_mesh_hostfrag_mode(void)
+{
+    extern volatile uint32_t g_warthog_hostfrag;
+#if defined(WARTHOG_MESH_HOST_CCMP) && !defined(WARTHOG_MESH_HOSTFRAG_ANY)
+    return UMAC_MESH_FRAG_OFF;
+#else
+    return g_warthog_hostfrag;
+#endif
+}
+/** Most fragments AT+HOSTFRAG cuts an MSDU into: what the chip delivers sealing them, or 16. */
+#ifdef WARTHOG_MESH_HOSTFRAG_ANY
+#define UMAC_DATAPATH_MESH_FRAG_MAX UMAC_MESH_FRAG_MAX
+#else
+#define UMAC_DATAPATH_MESH_FRAG_MAX UMAC_MESH_FRAG_CHIP_MAX
+#endif
+/** TX pool blocks kept back while AT+HOSTFRAG is in force: one cut's extra fragments for each peer
+ *  and the DELBA that ends its session first; 16 fragments keep UMAC_MESH_FRAG_POOL_RESERVE. */
+#ifdef WARTHOG_MESH_HOSTFRAG_ANY
+#define UMAC_DATAPATH_MESH_FRAG_RESERVE UMAC_MESH_FRAG_POOL_RESERVE
+#else
+#define UMAC_DATAPATH_MESH_FRAG_RESERVE ((UMAC_MESH_FRAG_CHIP_MAX - 1u) * UMAC_DATAPATH_MESH_MAX_PEERS + 1u)
+#endif
+/** False while AT+AMPDU=0 or that TID's ADDBA hold-off runs (counted hold). Event loop only. */
+bool umac_datapath_mesh_ba_may_start(struct umac_sta_data *stad, uint8_t tid);
 /** Around every use of mesh peer records off the event loop: a record found in between is
  *  not freed before read_end, which takes the value read_begin returned. Never blocks. */
 uint8_t umac_datapath_mesh_read_begin(void);

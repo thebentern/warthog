@@ -24,17 +24,26 @@ HAND_WRITTEN = re.compile(r'^(mmosal_|mmdrv_|mmhal_|umac_config_get_channel_list
 # what the firmware handed the supplicant, not only that it called it. The
 # snippet runs after the hit count; RECORD_API is emitted once, after the stubs.
 RECORD = {
+    'umac_interface_set_channel_from_regdb':
+        '    if (s_set_channel_status != 0) { return (enum mmwlan_status)s_set_channel_status; }\n',
     'umac_supp_mesh_new_peer':
         '    if (addr != NULL) { memcpy(s_new_peer_addr, addr, sizeof(s_new_peer_addr)); }\n'
         '    s_new_peer_len = (ies != NULL && ies_len <= sizeof(s_new_peer_ies)) ? ies_len : 0u;\n'
         '    if (s_new_peer_len != 0u) { memcpy(s_new_peer_ies, ies, s_new_peer_len); }\n',
+    'umac_connection_populate_tx_metadata':
+        '    if (tx_metadata != NULL) { tx_metadata->flags |= s_populate_flags; }\n',
 }
-RECORD_STATE = '''static uint8_t s_new_peer_addr[6];
+RECORD_STATE = '''static int s_set_channel_status;
+static uint8_t s_new_peer_addr[6];
 static uint8_t s_new_peer_ies[256];
 static size_t s_new_peer_len;
+static uint8_t s_populate_flags;
 
 '''
 RECORD_API = '''
+/* What umac_interface_set_channel_from_regdb returns from now on (a chip that loses its channel). */
+void simnode_set_channel_status(int status) { s_set_channel_status = status; }
+
 /* The last candidate offered to umac_supp_mesh_new_peer: its address and IEs. */
 size_t simnode_last_new_peer(uint8_t addr[6], const uint8_t **ies)
 {
@@ -42,6 +51,10 @@ size_t simnode_last_new_peer(uint8_t addr[6], const uint8_t **ies)
     if (ies != NULL) { *ies = s_new_peer_ies; }
     return s_new_peer_len;
 }
+
+/* The flags umac_connection_populate_tx_metadata adds to every frame (traveling pilots, 1 MHz
+ * control responses), as a connection that negotiated them would. */
+void simnode_set_populate_flags(uint8_t flags) { s_populate_flags = flags; }
 '''
 
 HEADER = '''/*

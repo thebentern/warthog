@@ -240,6 +240,10 @@ void mmhal_wlan_init(void)
 
 void mmhal_wlan_deinit(void)
 {
+    /* warthog: a chip held in reset leaves SPI_IRQ low, so the level interrupt must go off first. */
+    gpio_set_intr_type(CONFIG_MM_SPI_IRQ, GPIO_INTR_DISABLE);
+    gpio_set_intr_type(CONFIG_MM_BUSY, GPIO_INTR_DISABLE);
+
     /* Lower the RESET_N line to disable the WLAN transceiver. This will put the transceiver in its
      * lowest power state. */
     gpio_set_level(CONFIG_MM_RESET_N, 0);

@@ -26,7 +26,7 @@ static esp_netif_t *get_netif(const char *key)
 /* ESP-IDF's lwIP NAPT is *inverted* from the conventional "WAN-facing NAT"
  * model: ip_napt_forward() in ip4_napt.c keys on inp->napt (the *input*
  * netif) and rewrites source to outp->ip_addr. So NAPT goes on the inside
- * netifs (USB ECM, Wi-Fi AP), NOT on the outside (HaLow STA). We bypass
+ * netifs (USB, Wi-Fi AP), NOT on the outside (HaLow STA). We bypass
  * esp_netif_napt_enable()'s single-netif exclusivity check via the lwIP
  * direct API so both downstream surfaces get NAT. Full diagnosis +
  * tcpdump evidence in docs/napt-notes.md. */

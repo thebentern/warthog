@@ -36,8 +36,14 @@
 #include "tusb.h"
 #include "ping/ping_sock.h"
 #include "mmwlan_mesh.h"
+#include "mmwlan_cap.h"     /* AT+RXCAP, AT+TXCAP */
+#include "mmosal.h"
+#include "warthog_assert.h" /* AT+ASSERT? */
+#include "warthog_shim.h"  /* AT+STACKS? */
+#include "boot_guard.h"     /* AT+ASSERT? crash_boots, AT+ASSERTTEST=hang */
 #include "mudp.h"
 #include "mesh_bridge.h"
+#include "nat_frag.h"       /* AT+MTU? ip_reass */
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "esp_timer.h"
@@ -127,6 +133,54 @@ static bool gtkpersta_parse_(const char *a, uint32_t *out)
     return true;
 }
 
+/* AT+HOSTFRAG=<0|auto|n>: the whole argument; n 256..2346, made even as cfg80211 does. The glue
+ * guard runs it. */
+static bool hostfrag_parse_(const char *a, uint32_t *out)
+{
+    if (a == NULL || out == NULL || a[0] == '\0') {
+        return false;
+    }
+    if (strcasecmp(a, "auto") == 0) {
+        *out = 1u;
+        return true;
+    }
+    char *end = NULL;
+    unsigned long v = strtoul(a, &end, 10);
+    if (end == a || *end != '\0' || a[0] < '0' || a[0] > '9' ||
+        (v != 0u && (v < 256u || v > 2346u))) {
+        return false;
+    }
+    *out = (uint32_t)v & ~1u;
+    return true;
+}
+
+/* AT+TXRATE=<mcs>,<bw MHz> or off: the whole argument; MCS 0-9, 1/2/4/8 MHz. The glue guard runs it. */
+static bool txrate_parse_(const char *a, int *mcs, int *bw)
+{
+    if (a == NULL || mcs == NULL || bw == NULL) {
+        return false;
+    }
+    if (strcasecmp(a, "off") == 0) {
+        *mcs = -1;
+        *bw = -1;
+        return true;
+    }
+    char *end = NULL;
+    long m = strtol(a, &end, 10);
+    if (end == a || *end != ',' || a[0] < '0' || a[0] > '9' || m < 0 || m > 9) {
+        return false;
+    }
+    const char *b0 = end + 1;
+    long b = strtol(b0, &end, 10);
+    if (end == b0 || *end != '\0' || b0[0] < '0' || b0[0] > '9' ||
+        (b != 1 && b != 2 && b != 4 && b != 8)) {
+        return false;
+    }
+    *mcs = (int)m;
+    *bw = (int)b;
+    return true;
+}
+
 /* Case-insensitive prefix check. */
 static bool starts_with_i(const char *s, const char *prefix)
 {
@@ -140,15 +194,9 @@ static bool starts_with_i(const char *s, const char *prefix)
     return true;
 }
 
-/* USB network transmit, counted because the deferred path can drop.
- * sent/dropped are per frame; a rising dropped count means every NCM transmit
- * buffer was busy when the frame arrived, which is a throughput ceiling rather
- * than a fault. */
-volatile uint32_t g_warthog_usb_tx_sent = 0, g_warthog_usb_tx_dropped = 0;
-
 static void cmd_status(void)
 {
-    char buf[160];
+    char buf[320]; /* +USBNET: at most 312 */
 
     /* HaLow STA netif (driven by morsemicro/halow, key WIFI_STA_DEF) */
     esp_netif_t *halow = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -166,9 +214,21 @@ static void cmd_status(void)
     if (usb) {
         esp_netif_get_ip_info(usb, &usb_ip);
     }
+    struct usbnet_stats un;
+    warthog_usb_net_stats(&un);
     snprintf(buf, sizeof(buf), "+USB: ip=" IPSTR " mounted=%d tx=%lu drop=%lu\r\n",
-             IP2STR(&usb_ip.ip), tud_mounted() ? 1 : 0,
-             (unsigned long)g_warthog_usb_tx_sent, (unsigned long)g_warthog_usb_tx_dropped);
+             IP2STR(&usb_ip.ip), tud_mounted() ? 1 : 0, (unsigned long)un.tx_sent,
+             (unsigned long)(un.drop_full + un.drop_nolink + un.drop_nomem + un.drop_bad));
+    cdc_write(buf);
+    snprintf(buf, sizeof(buf),
+             "+USBNET: tx_queued=%lu txq=%lu/%u txq_hw=%lu tx_stall_ms=%lu tx_busy_ms=%lu drop_full=%lu "
+             "drop_nolink=%lu drop_nomem=%lu drop_bad=%lu | rx=%lu rx_xfer=%lu rx_nomem=%lu rx_err=%lu "
+             "rx_idle_ms=%lu | kicks=%lu\r\n",
+             (unsigned long)un.tx_queued, (unsigned long)un.txq, USBNET_TXQ_N, (unsigned long)un.txq_hw,
+             (unsigned long)un.tx_stall_ms, (unsigned long)un.tx_busy_ms, (unsigned long)un.drop_full,
+             (unsigned long)un.drop_nolink, (unsigned long)un.drop_nomem, (unsigned long)un.drop_bad,
+             (unsigned long)un.rx, (unsigned long)un.rx_xfer, (unsigned long)un.rx_nomem,
+             (unsigned long)un.rx_err, (unsigned long)un.rx_idle_ms, (unsigned long)un.kicks);
     cdc_write(buf);
 
     /* Wi-Fi AP netif */
@@ -622,7 +682,8 @@ volatile uint32_t g_warthog_txst_noack = 0;
 volatile uint32_t g_warthog_txst_unsent = 0;
 volatile uint32_t g_warthog_txst_last_flags = 0;
 volatile uint32_t g_warthog_tx_protected = 0;  /* frames sent with Protected bit + HW key */
-volatile uint32_t g_warthog_tx_nokey = 0;      /* keyed stad but no active key found     */
+/* Keyed peer, no active key; or the chip lacks it after a restart (data, management frames). */
+volatile uint32_t g_warthog_tx_nokey = 0;
 volatile uint32_t g_warthog_tx_last_key = 0;
 /* TX status for DATA frames only (aid != 0). */
 volatile uint32_t g_warthog_txst_data_total = 0;
@@ -760,6 +821,80 @@ volatile uint32_t g_warthog_defrag_amsdu = 0, g_warthog_defrag_oversize = 0, g_w
 volatile uint32_t g_warthog_defrag_mcast = 0, g_warthog_defrag_plain = 0, g_warthog_defrag_shape = 0;
 volatile uint32_t g_warthog_defrag_expired = 0, g_warthog_defrag_restart = 0, g_warthog_defrag_flush = 0;
 volatile uint32_t g_warthog_defrag_evict = 0;
+
+/* Host TX fragmentation (AT+HOSTFRAG): 0 off, 1 auto, else a threshold in octets; seeded from NVS
+ * at mesh start. MSDUs cut and fragments handed to the chip, by the limit that cut each. */
+volatile uint32_t g_warthog_hostfrag = WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT;
+volatile uint32_t g_warthog_hostfrag_msdu = 0, g_warthog_hostfrag_frags = 0;
+volatile uint32_t g_warthog_hostfrag_by_thresh = 0, g_warthog_hostfrag_by_chip = 0;
+volatile uint32_t g_warthog_hostfrag_by_rate = 0;
+/* Over a limit but sent whole: more fragments than the build cuts (2; 16 in the host tests' ANY
+ * builds), or no TX buffer for them. Dropped: host CCMP or the driver refused a fragment. */
+volatile uint32_t g_warthog_hostfrag_many = 0, g_warthog_hostfrag_pool = 0;
+volatile uint32_t g_warthog_hostfrag_seal = 0, g_warthog_hostfrag_drv = 0;
+/* Originator Block Ack sessions ended to cut a frame, their DELBA handed to the chip or not; cut
+ * MSDUs held for that DELBA's TX status; waits that ended at the limit without it. */
+volatile uint32_t g_warthog_hostfrag_ba_end = 0, g_warthog_hostfrag_nodelba = 0;
+volatile uint32_t g_warthog_hostfrag_ba_wait = 0, g_warthog_hostfrag_ba_late = 0;
+/* ADDBAs the hold-off kept back (one an episode); peer TIDs held now, and for how long after the
+ * last frame that needed cutting. */
+volatile uint32_t g_warthog_hostfrag_hold = 0;
+volatile uint32_t g_warthog_hostfrag_held = 0, g_warthog_hostfrag_hold_ms = 15000;
+/* Fragment TX statuses, those sent in an A-MPDU (agg); MSDUs every fragment of which was acked,
+ * or not; chip-sealed frames handed while a run they could break was in the chip (overlap). */
+volatile uint32_t g_warthog_hostfrag_acked = 0, g_warthog_hostfrag_noack = 0;
+volatile uint32_t g_warthog_hostfrag_unsent = 0, g_warthog_hostfrag_agg = 0;
+volatile uint32_t g_warthog_hostfrag_ok = 0, g_warthog_hostfrag_fail = 0, g_warthog_hostfrag_overlap = 0;
+/* Held while a run is in the chip: a peer's next frame (wait), chip-sealed management (mgmt); runs
+ * whose statuses never came (stale); PNs counted beyond one for frames the chip may cut (chippn). */
+volatile uint32_t g_warthog_hostfrag_wait = 0, g_warthog_hostfrag_mgmt = 0;
+volatile uint32_t g_warthog_hostfrag_stale = 0, g_warthog_hostfrag_chippn = 0;
+/* Frames whose later retry rates could not carry them whole, folded into a rate that can. */
+volatile uint32_t g_warthog_hostfrag_trim = 0;
+/* The last MSDU cut: fragments, body octets, the MPDU limit, the rate (MHz << 8 | MCS, 0xffff none). */
+volatile uint32_t g_warthog_hostfrag_last_n = 0, g_warthog_hostfrag_last_len = 0;
+volatile uint32_t g_warthog_hostfrag_last_lim = 0, g_warthog_hostfrag_last_rate = 0xffff;
+/* MSDUs whose chain was cut to rates needing at most 2 fragments, or replaced by one such rate;
+ * AT+HOSTFRAG=n raised to cut in 2. */
+volatile uint32_t g_warthog_hostfrag_cap_trim = 0, g_warthog_hostfrag_cap_sub = 0;
+volatile uint32_t g_warthog_hostfrag_clamp = 0;
+/* AT+SEALFIT: 1 a sealed unicast frame goes only at rates where the chip sends it as 1.17.6 delivers
+ * it (RAM only): chains cut, replaced by one such rate, or left (no rate does); group frames too. */
+volatile uint32_t g_warthog_sealfit = 1;
+volatile uint32_t g_warthog_sealfit_trim = 0, g_warthog_sealfit_sub = 0, g_warthog_sealfit_nofit = 0;
+volatile uint32_t g_warthog_grpfit_trim = 0, g_warthog_grpfit_sub = 0, g_warthog_grpfit_nofit = 0;
+/* Chip-sealed chains cut or replaced to send the frame whole under this node's Block Ack session. */
+volatile uint32_t g_warthog_sealfit_ba = 0;
+/* Frames cut while the peer's reorder size to us on that TID was set (its session, or one it ended);
+ * waited-on DELBAs the chip gave up on unacked. */
+volatile uint32_t g_warthog_hostfrag_ba_rcpt = 0, g_warthog_hostfrag_delba_noack = 0;
+/* AT+TIDPARAMS: 1 a descriptor carries Block Ack fields only under our own agreed session and a host
+ * fragment none (morse_driver's rule), 0 morselib's; applies while AT+HOSTFRAG is in force or AT+AMPDU=0. */
+volatile uint32_t g_warthog_ba_txparm = 1;
+
+/* AT+AMPDU: 1 the mesh starts originator Block Ack sessions, 0 never; seeded from NVS at mesh start.
+ * Originator sessions agreed now; those AT+AMPDU=0 ended, their DELBA handed to the chip or not. */
+volatile uint32_t g_warthog_ampdu = 1;
+volatile uint32_t g_warthog_ampdu_orig = 0, g_warthog_ampdu_ended = 0, g_warthog_ampdu_unsent = 0;
+/* Each peer slot: its MAC's last 3 octets (bit 24 set while the slot is in use), and per TID 0-5
+ * our session agreed (bits 0-5), ours asked or refused (8-13), its session to us (16-21), held (24-29). */
+volatile uint32_t g_warthog_ampdu_peer_mac[4] = { 0 }, g_warthog_ampdu_peer_ba[4] = { 0 };
+/* Block Ack frames handed to the chip: ADDBA Requests; DELBAs by reason (4 the ADDBA timed out,
+ * 37 a session stopped, any other). Recipient DELBAs a peer sent us, and the last one's reason. */
+volatile uint32_t g_warthog_ba_addba_tx = 0, g_warthog_ba_delba_to = 0;
+volatile uint32_t g_warthog_ba_delba_end = 0, g_warthog_ba_delba_other = 0;
+volatile uint32_t g_warthog_ba_rx_delba = 0, g_warthog_ba_rx_reason = 0;
+
+/* AT+CHIPRESTART?: restarts handled, forced, with the mesh put back in full; requests dropped
+ * because the driver was stopped. */
+volatile uint32_t g_warthog_chiprestart_n = 0, g_warthog_chiprestart_forced = 0;
+volatile uint32_t g_warthog_chiprestart_mesh = 0, g_warthog_chiprestart_dropped = 0;
+/* Station records and keys put back and not; other restore commands failed; put back by a retry,
+ * still waiting; the last restart's duration. */
+volatile uint32_t g_warthog_chiprestart_sta = 0, g_warthog_chiprestart_stafail = 0;
+volatile uint32_t g_warthog_chiprestart_keys = 0, g_warthog_chiprestart_keyfail = 0;
+volatile uint32_t g_warthog_chiprestart_cmdfail = 0, g_warthog_chiprestart_retried = 0;
+volatile uint32_t g_warthog_chiprestart_pending = 0, g_warthog_chiprestart_ms = 0;
 
 /* RX frame-filter drop accounting.
  *
@@ -1420,7 +1555,7 @@ static void cmd_macstats(uint32_t core, bool reset)
 }
 
 /* AT+FRAG=<n> / AT+FRAG?: the chip's TX fragmentation threshold (0 off, else >= 256). Not kept
- * across a reboot or a chip restart. */
+ * across a reboot; a chip restart puts it back. */
 static unsigned s_frag_threshold;
 static void cmd_frag_set(const char *args)
 {
@@ -1481,6 +1616,149 @@ static void cmd_rxreord(void)
     cdc_write(buf);
     reply_ok();
 }
+/* Why a request to the umac event loop was not posted (mmwlan_force_chip_restart, mmwlan_assert_test). */
+static const char *loop_post_error_(enum mmwlan_status st)
+{
+    return st == MMWLAN_NO_MEM ? "event queue full, try again" : "chip not running";
+}
+
+/* AT+CHIPRESTART: the event loop fails the next chip health check, so the chip restarts as after a
+ * real failure; with the driver stopped the loop drops the request (dropped in AT+CHIPRESTART?). */
+static void cmd_chiprestart(void)
+{
+    const enum mmwlan_status st = mmwlan_force_chip_restart();
+    if (st != MMWLAN_SUCCESS) {
+        char why[48];
+        snprintf(why, sizeof(why), "%s (%d)", loop_post_error_(st), (int)st);
+        reply_error(why);
+        return;
+    }
+    cdc_write("+CHIPRESTART: requested; AT+CHIPRESTART? reads the outcome\r\n");
+    reply_ok();
+}
+
+static const char *reset_reason_name_(esp_reset_reason_t rr)
+{
+    switch (rr) {
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_SW: return "SW";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_USB: return "USB";
+    default: return "OTHER";
+    }
+}
+
+/* AT+ASSERT?: one MMOSAL_ASSERT record kept in .noinit; tools/assert_fileid.py names fileid's file,
+ * addr2line on the build's ELF names pc (the assert) and lr (its caller). */
+static int assert_line_(char *buf, size_t len, uint32_t num, const struct mmosal_failure_info *r)
+{
+    return snprintf(buf, len,
+                    "+ASSERT: #%lu pc=0x%08lx lr=0x%08lx line=%lu fileid=0x%08lx "
+                    "info=0x%08lx,0x%08lx,0x%08lx,0x%08lx\r\n",
+                    (unsigned long)num, (unsigned long)r->pc, (unsigned long)r->lr,
+                    (unsigned long)r->line, (unsigned long)r->fileid,
+                    (unsigned long)r->platform_info[0], (unsigned long)r->platform_info[1],
+                    (unsigned long)r->platform_info[2], (unsigned long)r->platform_info[3]);
+}
+
+static void cmd_assert_query(void)
+{
+    struct mmosal_failure_info rec[WARTHOG_ASSERT_RECORDS_MAX];
+    uint32_t kept = 0;
+    const uint32_t count = warthog_assert_records(rec, WARTHOG_ASSERT_RECORDS_MAX, &kept);
+    char line[160];
+    snprintf(line, sizeof(line), "+ASSERT: count=%lu kept=%lu reset=%s up_s=%lu crash_boots=%lu safe=%u\r\n",
+             (unsigned long)count, (unsigned long)kept, reset_reason_name_(esp_reset_reason()),
+             (unsigned long)(esp_timer_get_time() / 1000000),
+             (unsigned long)warthog_boot_crash_count(), (unsigned)warthog_boot_safe());
+    cdc_write(line);
+    for (uint32_t i = 0; i < kept; i++) {
+        assert_line_(line, sizeof(line), count - kept + i, &rec[i]);
+        cdc_write(line);
+    }
+    reply_ok();
+}
+
+/* AT+ASSERTTEST=<at|loop|crit|hang>: an MMOSAL_ASSERT on the AT task, the umac event loop, or the AT task
+ * in a critical section; =hang also stops the next crash boots before the HaLow start (boot watchdog). */
+static void cmd_asserttest(const char *a)
+{
+    if (strcasecmp(a, "loop") == 0) {
+        const enum mmwlan_status st = mmwlan_assert_test();
+        if (st != MMWLAN_SUCCESS) {
+            char why[48];
+            snprintf(why, sizeof(why), "%s (%d)", loop_post_error_(st), (int)st);
+            reply_error(why);
+            return;
+        }
+        char line[64];
+        snprintf(line, sizeof(line), "+ASSERTTEST: the umac event loop asserts in %u ms\r\n",
+                 (unsigned)MMWLAN_ASSERT_TEST_DELAY_MS);
+        cdc_write(line);
+        reply_ok();
+        return;
+    }
+    const bool crit = strcasecmp(a, "crit") == 0;
+    const bool hang = strcasecmp(a, "hang") == 0;
+    if (!crit && !hang && strcasecmp(a, "at") != 0) {
+        reply_error("usage: AT+ASSERTTEST=<at|loop|crit|hang>");
+        return;
+    }
+    cdc_write(crit ? "+ASSERTTEST: the AT task asserts in a critical section\r\n"
+              : hang ? "+ASSERTTEST: the AT task asserts; the next boots stop before the HaLow start\r\n"
+                     : "+ASSERTTEST: the AT task asserts\r\n");
+    reply_ok();
+    vTaskDelay(pdMS_TO_TICKS(MMWLAN_ASSERT_TEST_DELAY_MS)); /* the reply reaches the host first */
+    if (crit) {
+        MMOSAL_TASK_ENTER_CRITICAL();
+        MMOSAL_ASSERT_LOG_DATA(false, MMWLAN_ASSERT_TEST_CRIT);
+        MMOSAL_TASK_EXIT_CRITICAL();
+    }
+    if (hang) {
+        warthog_boot_arm_hang();
+        MMOSAL_ASSERT_LOG_DATA(false, MMWLAN_ASSERT_TEST_HANG);
+    }
+    MMOSAL_ASSERT_LOG_DATA(false, MMWLAN_ASSERT_TEST_AT);
+}
+
+/* AT+CHIPRESTART?: restarts handled, forced, put back in full; what they put back and not. */
+struct chiprestartstat {
+    uint32_t n, forced, dropped, mesh, sta, stafail, keys, keyfail, cmdfail, retried, pending, ms;
+};
+
+static int chiprestart_line_(char *buf, size_t len, const struct chiprestartstat *s)
+{
+    return snprintf(buf, len,
+                    "+CHIPRESTART: restarts=%lu forced=%lu dropped=%lu mesh=%lu | sta=%lu stafail=%lu "
+                    "keys=%lu keyfail=%lu cmdfail=%lu | retried=%lu pending=%lu | last_ms=%lu\r\n",
+                    (unsigned long)s->n, (unsigned long)s->forced, (unsigned long)s->dropped,
+                    (unsigned long)s->mesh, (unsigned long)s->sta, (unsigned long)s->stafail,
+                    (unsigned long)s->keys, (unsigned long)s->keyfail, (unsigned long)s->cmdfail,
+                    (unsigned long)s->retried, (unsigned long)s->pending, (unsigned long)s->ms);
+}
+
+static void cmd_chiprestart_query(void)
+{
+    const struct chiprestartstat s = {
+        .n = g_warthog_chiprestart_n, .forced = g_warthog_chiprestart_forced,
+        .dropped = g_warthog_chiprestart_dropped,
+        .mesh = g_warthog_chiprestart_mesh, .sta = g_warthog_chiprestart_sta,
+        .stafail = g_warthog_chiprestart_stafail, .keys = g_warthog_chiprestart_keys,
+        .keyfail = g_warthog_chiprestart_keyfail, .cmdfail = g_warthog_chiprestart_cmdfail,
+        .retried = g_warthog_chiprestart_retried, .pending = g_warthog_chiprestart_pending,
+        .ms = g_warthog_chiprestart_ms,
+    };
+    char line[256];
+    chiprestart_line_(line, sizeof(line), &s);
+    cdc_write(line);
+    reply_ok();
+}
+
 /* AT+DEFRAG? -- fragment reassembly on the receive path. */
 struct defragstat {
     uint32_t in, ok, nofirst, order, pn, key, prot, hdr, amsdu, oversize, nomem, mcast, plain;
@@ -1518,31 +1796,397 @@ static void cmd_defragstat(void)
     reply_ok();
 }
 
+/* AT+HOSTFRAG? -- host TX fragmentation. */
+struct hostfragstat {
+    uint32_t mode, stored, chip;
+    uint32_t msdu, frags, by_thresh, by_chip, by_rate, many, pool, seal, drv;
+    uint32_t acked, noack, unsent, agg, ok, fail, wait, mgmt, stale, overlap;
+    uint32_t trim, chippn, ba_end, nodelba, ba_wait, ba_late, hold, held, hold_ms;
+    uint32_t last_n, last_len, last_lim, last_rate;
+    uint32_t rule, cap_trim, cap_sub, clamp, sealfit, seal_trim, seal_sub, seal_nofit;
+    uint32_t txparm, ba_rcpt, delba_noack;
+    uint32_t grp_trim, grp_sub, grp_nofit, seal_ba;
+};
+
+/* Most fragments AT+HOSTFRAG cuts a frame into on this build, 0 never (umac_datapath_private.h). */
+static uint32_t hostfrag_rule_(void)
+{
+#if defined(WARTHOG_MESH_HOSTFRAG_ANY)
+    return 16u;
+#elif defined(WARTHOG_MESH_HOST_CCMP)
+    return 0u;
+#else
+    return 2u;
+#endif
+}
+
+static const char *hostfrag_mode_(uint32_t v, char *buf, size_t len)
+{
+    if (v == 0u) {
+        return "off";
+    }
+    if (v == 1u) {
+        return "auto";
+    }
+    snprintf(buf, len, "%lu", (unsigned long)v);
+    return buf;
+}
+
+/* Line @p which (0 to 3) of AT+HOSTFRAG?. */
+static int hostfragstat_line_(char *buf, size_t len, const struct hostfragstat *s, int which)
+{
+    char m[12], st[12], rate[24];
+    if (which == 3) {
+        return snprintf(buf, len,
+                        "+HOSTFRAG: cap_trim=%lu cap_sub=%lu clamp=%lu | sealfit=%lu seal_trim=%lu "
+                        "seal_sub=%lu seal_nofit=%lu seal_ba=%lu grp_trim=%lu grp_sub=%lu grp_nofit=%lu | "
+                        "tidparams=%lu ba_rcpt=%lu delba_noack=%lu\r\n",
+                        (unsigned long)s->cap_trim, (unsigned long)s->cap_sub, (unsigned long)s->clamp,
+                        (unsigned long)s->sealfit, (unsigned long)s->seal_trim, (unsigned long)s->seal_sub,
+                        (unsigned long)s->seal_nofit, (unsigned long)s->seal_ba,
+                        (unsigned long)s->grp_trim, (unsigned long)s->grp_sub,
+                        (unsigned long)s->grp_nofit, (unsigned long)s->txparm, (unsigned long)s->ba_rcpt,
+                        (unsigned long)s->delba_noack);
+    }
+    if (which == 0) {
+        char rule[16] = "off";
+        if (s->rule != 0u) {
+            snprintf(rule, sizeof(rule), "max%lu", (unsigned long)s->rule);
+        }
+        return snprintf(buf, len,
+                        "+HOSTFRAG: mode=%s stored=%s rule=%s atfrag=%lu | msdu=%lu frag=%lu by thresh=%lu "
+                        "chip=%lu rate=%lu | whole many=%lu pool=%lu | drop seal=%lu drv=%lu\r\n",
+                        hostfrag_mode_(s->mode, m, sizeof(m)), hostfrag_mode_(s->stored, st, sizeof(st)),
+                        rule, (unsigned long)s->chip, (unsigned long)s->msdu, (unsigned long)s->frags,
+                        (unsigned long)s->by_thresh, (unsigned long)s->by_chip,
+                        (unsigned long)s->by_rate, (unsigned long)s->many,
+                        (unsigned long)s->pool, (unsigned long)s->seal, (unsigned long)s->drv);
+    }
+    if (which == 1) {
+        return snprintf(buf, len,
+                        "+HOSTFRAG: txst acked=%lu noack=%lu unsent=%lu agg=%lu | msdu ok=%lu fail=%lu | "
+                        "held wait=%lu mgmt=%lu stale=%lu | overlap=%lu\r\n",
+                        (unsigned long)s->acked, (unsigned long)s->noack, (unsigned long)s->unsent,
+                        (unsigned long)s->agg, (unsigned long)s->ok, (unsigned long)s->fail,
+                        (unsigned long)s->wait, (unsigned long)s->mgmt, (unsigned long)s->stale,
+                        (unsigned long)s->overlap);
+    }
+    if (s->last_rate == 0xffffu) {
+        snprintf(rate, sizeof(rate), "none");
+    } else {
+        snprintf(rate, sizeof(rate), "%luM/MCS%lu", (unsigned long)((s->last_rate >> 8) & 0xffffu),
+                 (unsigned long)(s->last_rate & 0xffu));
+    }
+    return snprintf(buf, len,
+                    "+HOSTFRAG: trim=%lu chippn=%lu | ba_end=%lu nodelba=%lu ba_wait=%lu ba_late=%lu "
+                    "hold=%lu held=%lu hold_ms=%lu | last n=%lu len=%lu lim=%lu at=%s\r\n",
+                    (unsigned long)s->trim, (unsigned long)s->chippn, (unsigned long)s->ba_end,
+                    (unsigned long)s->nodelba, (unsigned long)s->ba_wait, (unsigned long)s->ba_late,
+                    (unsigned long)s->hold, (unsigned long)s->held, (unsigned long)s->hold_ms,
+                    (unsigned long)s->last_n, (unsigned long)s->last_len, (unsigned long)s->last_lim, rate);
+}
+
+static void cmd_hostfragstat(void)
+{
+    char line[304];
+    const struct hostfragstat s = {
+        .mode = hostfrag_rule_() != 0u ? g_warthog_hostfrag : 0u, /* as this build applies it */
+        .stored = warthog_cfg_get_mesh_hostfrag(), .chip = s_frag_threshold,
+        .msdu = g_warthog_hostfrag_msdu, .frags = g_warthog_hostfrag_frags,
+        .by_thresh = g_warthog_hostfrag_by_thresh, .by_chip = g_warthog_hostfrag_by_chip,
+        .by_rate = g_warthog_hostfrag_by_rate,
+        .many = g_warthog_hostfrag_many, .pool = g_warthog_hostfrag_pool,
+        .seal = g_warthog_hostfrag_seal, .drv = g_warthog_hostfrag_drv,
+        .acked = g_warthog_hostfrag_acked, .noack = g_warthog_hostfrag_noack,
+        .unsent = g_warthog_hostfrag_unsent, .agg = g_warthog_hostfrag_agg,
+        .ok = g_warthog_hostfrag_ok, .fail = g_warthog_hostfrag_fail,
+        .wait = g_warthog_hostfrag_wait, .mgmt = g_warthog_hostfrag_mgmt,
+        .stale = g_warthog_hostfrag_stale, .overlap = g_warthog_hostfrag_overlap,
+        .trim = g_warthog_hostfrag_trim, .chippn = g_warthog_hostfrag_chippn,
+        .ba_end = g_warthog_hostfrag_ba_end, .nodelba = g_warthog_hostfrag_nodelba,
+        .ba_wait = g_warthog_hostfrag_ba_wait, .ba_late = g_warthog_hostfrag_ba_late,
+        .hold = g_warthog_hostfrag_hold,
+        .held = g_warthog_hostfrag_held, .hold_ms = g_warthog_hostfrag_hold_ms,
+        .last_n = g_warthog_hostfrag_last_n,
+        .last_len = g_warthog_hostfrag_last_len, .last_lim = g_warthog_hostfrag_last_lim,
+        .last_rate = g_warthog_hostfrag_last_rate,
+        .rule = hostfrag_rule_(), .cap_trim = g_warthog_hostfrag_cap_trim,
+        .cap_sub = g_warthog_hostfrag_cap_sub, .clamp = g_warthog_hostfrag_clamp,
+        .sealfit = g_warthog_sealfit, .seal_trim = g_warthog_sealfit_trim,
+        .seal_sub = g_warthog_sealfit_sub, .seal_nofit = g_warthog_sealfit_nofit,
+        .txparm = g_warthog_ba_txparm,
+        .ba_rcpt = g_warthog_hostfrag_ba_rcpt, .delba_noack = g_warthog_hostfrag_delba_noack,
+        .grp_trim = g_warthog_grpfit_trim, .grp_sub = g_warthog_grpfit_sub, .grp_nofit = g_warthog_grpfit_nofit,
+        .seal_ba = g_warthog_sealfit_ba,
+    };
+    for (int i = 0; i < 4; i++) {
+        hostfragstat_line_(line, sizeof(line), &s, i);
+        cdc_write(line);
+    }
+    reply_ok();
+}
+
+/* AT+AMPDU?: the setting in force and in NVS; originator sessions agreed now, and ended by =0;
+ * Block Ack frames sent, and the peer's DELBAs for our sessions. */
+struct ampdustat {
+    uint32_t mode, stored, orig, ended, unsent;
+    uint32_t addba_tx, delba_to, delba_end, delba_other, rx_delba, rx_reason;
+};
+
+static int ampdu_line_(char *buf, size_t len, const struct ampdustat *s)
+{
+    return snprintf(buf, len,
+                    "+AMPDU: mode=%s stored=%s | orig=%lu ended=%lu unsent=%lu | addba_tx=%lu "
+                    "delba_to=%lu delba_end=%lu delba_other=%lu | rx_delba=%lu rx_reason=%lu\r\n",
+                    s->mode != 0u ? "on" : "off", s->stored != 0u ? "on" : "off",
+                    (unsigned long)s->orig, (unsigned long)s->ended, (unsigned long)s->unsent,
+                    (unsigned long)s->addba_tx, (unsigned long)s->delba_to, (unsigned long)s->delba_end,
+                    (unsigned long)s->delba_other, (unsigned long)s->rx_delba,
+                    (unsigned long)s->rx_reason);
+}
+
+/* TIDs 0-7 of bitmap @p m as a list ("0,5"), "-" for none. */
+static void tid_list_(char *buf, size_t len, uint32_t m)
+{
+    size_t w = 0;
+    buf[0] = '\0';
+    for (unsigned t = 0; t < 8u && w + 3u < len; t++) {
+        if ((m & (1u << t)) != 0u) {
+            w += (size_t)snprintf(buf + w, len - w, w != 0u ? ",%u" : "%u", t);
+        }
+    }
+    if (w == 0u) {
+        snprintf(buf, len, "-");
+    }
+}
+
+/* One AT+AMPDU? peer line: @p mac as published (bit 24 in use), @p ba its sessions per TID. */
+static int ampdu_peer_line_(char *buf, size_t len, uint32_t mac, uint32_t ba)
+{
+    char ours[16], asked[16], theirs[16], held[16];
+    tid_list_(ours, sizeof(ours), ba & 0xffu);
+    tid_list_(asked, sizeof(asked), (ba >> 8) & 0xffu);
+    tid_list_(theirs, sizeof(theirs), (ba >> 16) & 0xffu);
+    tid_list_(held, sizeof(held), (ba >> 24) & 0xffu);
+    return snprintf(buf, len, "+AMPDU: peer=%02lx:%02lx:%02lx ours=%s asked=%s theirs=%s held=%s\r\n",
+                    (unsigned long)((mac >> 16) & 0xffu), (unsigned long)((mac >> 8) & 0xffu),
+                    (unsigned long)(mac & 0xffu), ours, asked, theirs, held);
+}
+
+static void cmd_ampdu_query(void)
+{
+    const struct ampdustat s = {
+        .mode = g_warthog_ampdu, .stored = warthog_cfg_get_mesh_ampdu(),
+        .orig = g_warthog_ampdu_orig, .ended = g_warthog_ampdu_ended, .unsent = g_warthog_ampdu_unsent,
+        .addba_tx = g_warthog_ba_addba_tx, .delba_to = g_warthog_ba_delba_to,
+        .delba_end = g_warthog_ba_delba_end, .delba_other = g_warthog_ba_delba_other,
+        .rx_delba = g_warthog_ba_rx_delba, .rx_reason = g_warthog_ba_rx_reason,
+    };
+    char line[224];
+    ampdu_line_(line, sizeof(line), &s);
+    cdc_write(line);
+    for (int i = 0; i < 4; i++) {
+        if ((g_warthog_ampdu_peer_mac[i] & 0x1000000u) != 0u) {
+            ampdu_peer_line_(line, sizeof(line), g_warthog_ampdu_peer_mac[i], g_warthog_ampdu_peer_ba[i]);
+            cdc_write(line);
+        }
+    }
+    reply_ok();
+}
+
+/* AT+RXCAP / AT+TXCAP: <mode>[,<mac>], the mac as 12 hex digits with or without ':' or '-'. The glue
+ * guard runs it. */
+static bool cap_args_parse_(const char *a, uint32_t max_mode, uint32_t *mode, bool *has_mac, uint8_t mac[6])
+{
+    if (a == NULL || a[0] < '0' || a[0] > (char)('0' + max_mode) || (a[1] != '\0' && a[1] != ',')) {
+        return false;
+    }
+    *mode = (uint32_t)(a[0] - '0');
+    *has_mac = a[1] == ',';
+    if (!*has_mac) {
+        return true;
+    }
+    const char *p = a + 2;
+    for (unsigned i = 0; i < 6u; i++) {
+        unsigned v = 0;
+        for (unsigned k = 0; k < 2u; k++, p++) {
+            const char c = *p;
+            const int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 :
+                          (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+            if (d < 0) {
+                return false;
+            }
+            v = (v << 4) | (unsigned)d;
+        }
+        mac[i] = (uint8_t)v;
+        if (i < 5u && (*p == ':' || *p == '-')) {
+            p++;
+        }
+    }
+    return *p == '\0';
+}
+
+static void cmd_cap_set(unsigned dir, char *args)
+{
+    uint32_t mode = 0;
+    bool has = false;
+    uint8_t mac[6];
+    if (!cap_args_parse_(trim(args), dir == MMWLAN_CAP_TX ? MMWLAN_CAP_ALL_DATA : MMWLAN_CAP_HOST_FRAG,
+                         &mode, &has, mac)) {
+        reply_error(dir == MMWLAN_CAP_TX ? "usage: AT+TXCAP=<0 off|1 host fragments|2 unicast data>[,<ra>]"
+                                         : "usage: AT+RXCAP=<0 off|1 data frames>[,<ta>]");
+        return;
+    }
+    int r = -1;
+    for (int i = 0; i < 50 && r < 0; i++) {
+        r = mmwlan_cap_arm(dir, mode, has ? mac : NULL);
+        if (r < 0) {
+            vTaskDelay(1);
+        }
+    }
+    if (r <= 0) {
+        reply_error(r == 0 ? "no memory for the capture ring" : "capture ring busy, try again");
+        return;
+    }
+    reply_ok();
+}
+
+/* AT+RXCAP? / AT+TXCAP?: the state, then every kept capture oldest first, one line each. */
+static void cmd_cap_query(unsigned dir)
+{
+    static struct mmwlan_cap_rec rec; /* AT task only */
+    static char line[320];
+    uint32_t seen = 0, lost = 0, after = 0;
+    int n = -1;
+    for (int i = 0; i < 50 && n < 0; i++) {
+        n = mmwlan_cap_read(dir, 0, NULL, 0, &seen, &lost);
+        if (n < 0) {
+            vTaskDelay(1);
+        }
+    }
+    uint8_t mac[6];
+    char who[20] = "any";
+    if (mmwlan_cap_filter(dir, mac)) {
+        snprintf(who, sizeof(who), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3],
+                 mac[4], mac[5]);
+    }
+    int w = snprintf(line, sizeof(line), "+%s: mode=%lu addr=%s seen=%lu lost=%lu",
+                     dir == MMWLAN_CAP_TX ? "TXCAP" : "RXCAP", (unsigned long)mmwlan_cap_mode[dir], who,
+                     (unsigned long)seen, (unsigned long)lost);
+    if (dir == MMWLAN_CAP_TX) {
+        w += snprintf(line + w, sizeof(line) - (size_t)w, " st_lost=%lu", (unsigned long)mmwlan_cap_st_lost());
+    }
+    snprintf(line + w, sizeof(line) - (size_t)w, "\r\n");
+    cdc_write(line);
+    for (unsigned k = 0; k < MMWLAN_CAP_SLOTS; k++) {
+        n = -1;
+        for (int i = 0; i < 50 && n < 0; i++) {
+            n = mmwlan_cap_read(dir, after, &rec, 1, NULL, NULL);
+            if (n < 0) {
+                vTaskDelay(1);
+            }
+        }
+        if (n <= 0) {
+            break;
+        }
+        after = rec.seq;
+        mmwlan_cap_line(line, sizeof(line), dir, &rec);
+        cdc_write(line);
+    }
+    reply_ok();
+}
+
+/* AT+STACKS?: the least free stack each task has had, in bytes; a task not running is left out. */
+static void cmd_stacks(void)
+{
+    /* Started by the shim; drv, spi_irq and health restart with the chip, so _min spans every instance. */
+    static const char *const shim_names[] = { "evtloop", "drv", "spi_irq", "health" };
+    static const char *const names[] = {
+        "tiT", "warthog_at", "warthog_bat", "warthog_mudp",
+        "warthog_nat", "warthog_led", "mesh-probe", "scanloop", "mcast_rx", "TinyUSB", "esp_timer",
+        "Tmr Svc", "sys_evt", "wifi", "main", "ipc0", "ipc1",
+    };
+    static char line[512]; /* AT task only */
+    int w = snprintf(line, sizeof(line), "+STACKS:");
+    for (size_t i = 0; i < sizeof(shim_names) / sizeof(shim_names[0]); i++) {
+        uint32_t live = UINT32_MAX, min = UINT32_MAX;
+        if (!warthog_task_stack(shim_names[i], &live, &min)) {
+            continue;
+        }
+        if (live != UINT32_MAX) {
+            w += snprintf(line + w, sizeof(line) - (size_t)w, " %s=%lu", shim_names[i], (unsigned long)live);
+        }
+        w += snprintf(line + w, sizeof(line) - (size_t)w, " %s_min=%lu", shim_names[i],
+                      (unsigned long)(live < min ? live : min));
+    }
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && w < (int)sizeof(line) - 32; i++) {
+        TaskHandle_t h = xTaskGetHandle(names[i]);
+        if (h == NULL) {
+            continue;
+        }
+        const int k = w + 1;
+        w += snprintf(line + w, sizeof(line) - (size_t)w, " %s=%u", names[i],
+                      (unsigned)uxTaskGetStackHighWaterMark(h));
+        for (int j = k; j < w && line[j] != '='; j++) {
+            line[j] = line[j] == ' ' ? '_' : line[j]; /* "Tmr Svc" as one key */
+        }
+    }
+    snprintf(line + w, sizeof(line) - (size_t)w, "\r\n");
+    cdc_write(line);
+    reply_ok();
+}
+
+/* AT+TXRATE: the rate override (mmwlan_ate_override_rate_control), RAM only; -1 none. */
+static int s_txrate_mcs = -1, s_txrate_bw = -1;
+
+/* AT+RXCHAN?: every counter as the line prints it. */
+struct rxchanstat {
+    uint32_t pages, data, beacon, mgmt, cmd, txstat, last, shim, notrunning, rxframe, filter;
+    uint32_t meshctrl, ae, fwdcand, rxdrop, reason, ccmp_key, blank, replay, pn;
+    uint32_t nodec_grp, nodec_uni, nodec_last_grp, nodec_fc, nodec_key;
+    uint8_t fwd_da[3], nodec_ta[3];
+};
+
+static int rxchan_line_(char *buf, size_t len, const struct rxchanstat *s)
+{
+    return snprintf(buf, len,
+                    "+RXCHAN: pages=%lu data=%lu beacon=%lu mgmt=%lu cmd=%lu txstat=%lu last=0x%02lx "
+                    "| shim=%lu notrunning=%lu rxframe=%lu filter=%lu meshctrl=%lu ae=%lu fwdcand=%lu(%02x%02x%02x) | rxdrop=%lu reason=%lu "
+                    "ccmp_key=%lu blank=%lu replay=%lu pn=%lu | nodec grp=%lu uni=%lu "
+                    "last(grp=%lu fc=%04lx key=%lu ta=%02x%02x%02x)\r\n",
+                    (unsigned long)s->pages, (unsigned long)s->data, (unsigned long)s->beacon,
+                    (unsigned long)s->mgmt, (unsigned long)s->cmd, (unsigned long)s->txstat,
+                    (unsigned long)s->last, (unsigned long)s->shim, (unsigned long)s->notrunning,
+                    (unsigned long)s->rxframe, (unsigned long)s->filter, (unsigned long)s->meshctrl,
+                    (unsigned long)s->ae, (unsigned long)s->fwdcand, s->fwd_da[0], s->fwd_da[1],
+                    s->fwd_da[2], (unsigned long)s->rxdrop, (unsigned long)s->reason,
+                    (unsigned long)s->ccmp_key, (unsigned long)s->blank, (unsigned long)s->replay,
+                    (unsigned long)s->pn, (unsigned long)s->nodec_grp, (unsigned long)s->nodec_uni,
+                    (unsigned long)s->nodec_last_grp, (unsigned long)s->nodec_fc,
+                    (unsigned long)s->nodec_key, s->nodec_ta[0], s->nodec_ta[1], s->nodec_ta[2]);
+}
+
 static void cmd_rxchan(void)
 {
-    char buf[460];
-    snprintf(buf, sizeof(buf),
-             "+RXCHAN: pages=%lu data=%lu beacon=%lu mgmt=%lu cmd=%lu txstat=%lu last=0x%02lx "
-             "| shim=%lu notrunning=%lu rxframe=%lu filter=%lu meshctrl=%lu ae=%lu fwdcand=%lu(%02x%02x%02x) | rxdrop=%lu reason=%lu "
-             "ccmp_key=%lu blank=%lu replay=%lu pn=%lu | nodec grp=%lu uni=%lu "
-             "last(grp=%lu fc=%04lx key=%lu ta=%02x%02x%02x)\r\n",
-             (unsigned long)g_warthog_rxchan_pages, (unsigned long)g_warthog_rxchan_data,
-             (unsigned long)g_warthog_rxchan_beacon, (unsigned long)g_warthog_rxchan_mgmt,
-             (unsigned long)g_warthog_rxchan_cmd, (unsigned long)g_warthog_rxchan_txstat,
-             (unsigned long)g_warthog_rxchan_last, (unsigned long)g_warthog_shim_rx,
-             (unsigned long)g_warthog_shim_rx_notrunning, (unsigned long)g_warthog_rxframe_entry,
-             (unsigned long)g_warthog_filter_entry, (unsigned long)g_warthog_rx_meshctrl_stripped,
-             (unsigned long)g_warthog_rx_meshctrl_ae,
-             (unsigned long)g_warthog_rx_fwd_candidate,
-             g_warthog_rx_fwd_last_da[3], g_warthog_rx_fwd_last_da[4],
-             g_warthog_rx_fwd_last_da[5],
-             (unsigned long)g_warthog_rxdrop_count, (unsigned long)g_warthog_rxdrop_reason,
-             (unsigned long)g_warthog_ccmp_last_keyid, (unsigned long)g_warthog_ccmp_blank,
-             (unsigned long)g_warthog_ccmp_replay, (unsigned long)g_warthog_ccmp_last_pn,
-             (unsigned long)g_warthog_nodec_group_n, (unsigned long)g_warthog_nodec_uni_n,
-             (unsigned long)g_warthog_nodec_group, (unsigned long)g_warthog_nodec_fc,
-             (unsigned long)g_warthog_nodec_keyid, g_warthog_nodec_ta[3], g_warthog_nodec_ta[4],
-             g_warthog_nodec_ta[5]);
+    const struct rxchanstat s = {
+        .pages = g_warthog_rxchan_pages, .data = g_warthog_rxchan_data,
+        .beacon = g_warthog_rxchan_beacon, .mgmt = g_warthog_rxchan_mgmt,
+        .cmd = g_warthog_rxchan_cmd, .txstat = g_warthog_rxchan_txstat,
+        .last = g_warthog_rxchan_last, .shim = g_warthog_shim_rx,
+        .notrunning = g_warthog_shim_rx_notrunning, .rxframe = g_warthog_rxframe_entry,
+        .filter = g_warthog_filter_entry, .meshctrl = g_warthog_rx_meshctrl_stripped,
+        .ae = g_warthog_rx_meshctrl_ae, .fwdcand = g_warthog_rx_fwd_candidate,
+        .fwd_da = { g_warthog_rx_fwd_last_da[3], g_warthog_rx_fwd_last_da[4], g_warthog_rx_fwd_last_da[5] },
+        .rxdrop = g_warthog_rxdrop_count, .reason = g_warthog_rxdrop_reason,
+        .ccmp_key = g_warthog_ccmp_last_keyid, .blank = g_warthog_ccmp_blank,
+        .replay = g_warthog_ccmp_replay, .pn = g_warthog_ccmp_last_pn,
+        .nodec_grp = g_warthog_nodec_group_n, .nodec_uni = g_warthog_nodec_uni_n,
+        .nodec_last_grp = g_warthog_nodec_group, .nodec_fc = g_warthog_nodec_fc,
+        .nodec_key = g_warthog_nodec_keyid,
+        .nodec_ta = { g_warthog_nodec_ta[3], g_warthog_nodec_ta[4], g_warthog_nodec_ta[5] },
+    };
+    static char buf[512]; /* AT task only; 468 at its longest */
+    rxchan_line_(buf, sizeof(buf), &s);
     cdc_write(buf);
     reply_ok();
 }
@@ -1878,6 +2522,12 @@ static void cmd_coredump(void)
     snprintf(buf, sizeof(buf), "+COREDUMP: task=%s pc=0x%08lx\r\n",
              sum->exc_task, (unsigned long)sum->exc_pc);
     cdc_write(buf);
+    /* An abort's text: for an MMOSAL_ASSERT, the pc, fileid and line AT+ASSERT? shows. */
+    char reason[96];
+    if (esp_core_dump_get_panic_reason(reason, sizeof(reason)) == ESP_OK) {
+        snprintf(buf, sizeof(buf), "+COREDUMP: reason=%s\r\n", reason);
+        cdc_write(buf);
+    }
     int n = sum->exc_bt_info.depth;
     if (n > 16) { n = 16; }
     for (int i = 0; i < n; i++)
@@ -1888,6 +2538,24 @@ static void cmd_coredump(void)
         cdc_write(buf);
     }
     free(sum);
+    reply_ok();
+#endif
+}
+
+/* AT+COREDUMP=0: erases the core-dump partition, so the next AT+COREDUMP? shows only a later panic. */
+static void cmd_coredump_erase(void)
+{
+#if !CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
+    reply_error("core dump disabled in this build");
+#else
+    const esp_err_t err = esp_core_dump_image_erase();
+    if (err != ESP_OK) {
+        char why[40];
+        snprintf(why, sizeof(why), "erase failed (0x%x)", err);
+        reply_error(why);
+        return;
+    }
+    cdc_write("+COREDUMP: erased\r\n");
     reply_ok();
 #endif
 }
@@ -2167,6 +2835,11 @@ static void cmd_mtu(void)
         w += snprintf(buf + w, sizeof(buf) - w, " %s=%u", names[i], mtu);
     }
     snprintf(buf + w, sizeof(buf) - w, "\r\n");
+    cdc_write(buf);
+    uint32_t reass = 0, drop = 0, cut = 0;
+    warthog_nat_frag_counts(&reass, &drop, &cut);
+    snprintf(buf, sizeof(buf), "+MTU: ip_reass=%lu ip_reass_drop=%lu ip_short_drop=%lu\r\n", (unsigned long)reass,
+             (unsigned long)drop, (unsigned long)cut);
     cdc_write(buf);
     reply_ok();
 }
@@ -2645,6 +3318,24 @@ static void dispatch(char *line)
         reply_ok();
     } else if (strcasecmp(verb, "COREDUMP") == 0 && terminator == '?') {
         cmd_coredump();
+    } else if (strcasecmp(verb, "COREDUMP") == 0 && terminator == '=') {
+        if (strcmp(trim(args), "0") != 0) {
+            reply_error("usage: AT+COREDUMP=0");
+        } else {
+            cmd_coredump_erase();
+        }
+    } else if (strcasecmp(verb, "ASSERT") == 0 && terminator == '?') {
+        cmd_assert_query();
+    } else if (strcasecmp(verb, "ASSERT") == 0 && terminator == '=') {
+        if (strcmp(trim(args), "0") != 0) {
+            reply_error("usage: AT+ASSERT=0");
+        } else {
+            warthog_assert_clear();
+            cdc_write("+ASSERT: cleared\r\n");
+            reply_ok();
+        }
+    } else if (strcasecmp(verb, "ASSERTTEST") == 0 && terminator == '=') {
+        cmd_asserttest(trim(args));
     } else if (strcasecmp(verb, "SAESTAGE") == 0 && terminator == '?') {
         cmd_saestage();
     } else if (strcasecmp(verb, "SAEBRIDGE") == 0 && terminator == '=') {
@@ -2846,8 +3537,105 @@ static void dispatch(char *line)
         cmd_frag_query();
     } else if (strcasecmp(verb, "RXREORD") == 0 && terminator == '?') {
         cmd_rxreord();
+    } else if (strcasecmp(verb, "CHIPRESTART") == 0 && terminator == '\0') {
+        cmd_chiprestart();
+    } else if (strcasecmp(verb, "CHIPRESTART") == 0 && terminator == '?') {
+        cmd_chiprestart_query();
     } else if (strcasecmp(verb, "DEFRAG") == 0 && terminator == '?') {
         cmd_defragstat();
+    } else if (strcasecmp(verb, "HOSTFRAG") == 0 && terminator == '=') {
+        uint32_t v = 0;
+        char m[12];
+        if (!hostfrag_parse_(trim(args), &v)) {
+            reply_error("usage: AT+HOSTFRAG=<0 off|auto|256..2346>");
+        } else if (warthog_cfg_set_mesh_hostfrag(v) != ESP_OK) {
+            reply_error("nvs write failed");
+        } else {
+            g_warthog_hostfrag = v; /* live: the next frame */
+            char line[80];
+            snprintf(line, sizeof(line), hostfrag_rule_() != 0u ? "+HOSTFRAG: %s, stored, applies now\r\n"
+                                                                : "+HOSTFRAG: %s, stored; off on this build (host CCMP)\r\n",
+                     hostfrag_mode_(v, m, sizeof(m)));
+            cdc_write(line);
+            reply_ok();
+        }
+    } else if (strcasecmp(verb, "HOSTFRAG") == 0 && terminator == '?') {
+        cmd_hostfragstat();
+    } else if (strcasecmp(verb, "AMPDU") == 0 && terminator == '=') {
+        const char *a = trim(args);
+        if (strcmp(a, "0") != 0 && strcmp(a, "1") != 0) {
+            reply_error("usage: AT+AMPDU=<0 never start a Block Ack session|1 start them (default)>");
+        } else if (warthog_cfg_set_mesh_ampdu((uint8_t)(a[0] - '0')) != ESP_OK) {
+            reply_error("nvs write failed");
+        } else {
+            g_warthog_ampdu = (uint32_t)(a[0] - '0'); /* live: the next frame; =0 ends sessions */
+            cdc_write(a[0] == '1' ? "+AMPDU: on, stored, applies now\r\n" : "+AMPDU: off, stored, applies now\r\n");
+            reply_ok();
+        }
+    } else if (strcasecmp(verb, "AMPDU") == 0 && terminator == '?') {
+        cmd_ampdu_query();
+    } else if (strcasecmp(verb, "SEALFIT") == 0 && terminator == '=') {
+        const char *a = trim(args);
+        if (strcmp(a, "0") != 0 && strcmp(a, "1") != 0) {
+            reply_error("usage: AT+SEALFIT=<0 rate control's rates|1 only rates at which chip firmware 1.17.6 delivers a sealed or group frame (default)>");
+        } else {
+            g_warthog_sealfit = (uint32_t)(a[0] - '0'); /* RAM only: the next frame */
+            reply_ok();
+        }
+    } else if (strcasecmp(verb, "SEALFIT") == 0 && terminator == '?') {
+        char line[192];
+        snprintf(line, sizeof(line),
+                 "+SEALFIT: %lu seal_trim=%lu seal_sub=%lu seal_nofit=%lu seal_ba=%lu grp_trim=%lu grp_sub=%lu "
+                 "grp_nofit=%lu\r\n",
+                 (unsigned long)g_warthog_sealfit, (unsigned long)g_warthog_sealfit_trim,
+                 (unsigned long)g_warthog_sealfit_sub, (unsigned long)g_warthog_sealfit_nofit,
+                 (unsigned long)g_warthog_sealfit_ba,
+                 (unsigned long)g_warthog_grpfit_trim, (unsigned long)g_warthog_grpfit_sub,
+                 (unsigned long)g_warthog_grpfit_nofit);
+        cdc_write(line);
+        reply_ok();
+    } else if (strcasecmp(verb, "TIDPARAMS") == 0 && terminator == '=') {
+        const char *a = trim(args);
+        if (strcmp(a, "0") != 0 && strcmp(a, "1") != 0) {
+            reply_error("usage: AT+TIDPARAMS=<0 morselib's|1 morse_driver's (default)>");
+        } else {
+            g_warthog_ba_txparm = (uint32_t)(a[0] - '0'); /* RAM only: the next frame */
+            reply_ok();
+        }
+    } else if (strcasecmp(verb, "TIDPARAMS") == 0 && terminator == '?') {
+        cdc_write(g_warthog_ba_txparm != 0u ? "+TIDPARAMS: 1\r\n" : "+TIDPARAMS: 0\r\n");
+        reply_ok();
+    } else if (strcasecmp(verb, "RXCAP") == 0 && terminator == '=') {
+        cmd_cap_set(MMWLAN_CAP_RX, args);
+    } else if (strcasecmp(verb, "RXCAP") == 0 && terminator == '?') {
+        cmd_cap_query(MMWLAN_CAP_RX);
+    } else if (strcasecmp(verb, "TXCAP") == 0 && terminator == '=') {
+        cmd_cap_set(MMWLAN_CAP_TX, args);
+    } else if (strcasecmp(verb, "TXCAP") == 0 && terminator == '?') {
+        cmd_cap_query(MMWLAN_CAP_TX);
+    } else if (strcasecmp(verb, "STACKS") == 0 && terminator == '?') {
+        cmd_stacks();
+    } else if (strcasecmp(verb, "TXRATE") == 0 && terminator == '=') {
+        int mcs = -1, bw = -1;
+        if (!txrate_parse_(trim(args), &mcs, &bw)) {
+            reply_error("usage: AT+TXRATE=<mcs 0-9>,<1|2|4|8 MHz> or AT+TXRATE=off");
+        } else if (mmwlan_ate_override_rate_control((enum mmwlan_mcs)mcs, (enum mmwlan_bw)bw,
+                                                    MMWLAN_GI_NONE) != MMWLAN_SUCCESS) {
+            reply_error("rate override refused");
+        } else {
+            s_txrate_mcs = mcs;
+            s_txrate_bw = bw;
+            reply_ok();
+        }
+    } else if (strcasecmp(verb, "TXRATE") == 0 && terminator == '?') {
+        char line[48];
+        if (s_txrate_mcs < 0) {
+            snprintf(line, sizeof(line), "+TXRATE: off\r\n");
+        } else {
+            snprintf(line, sizeof(line), "+TXRATE: MCS%d %d MHz\r\n", s_txrate_mcs, s_txrate_bw);
+        }
+        cdc_write(line);
+        reply_ok();
     } else if (strcasecmp(verb, "RXCHAN") == 0 && terminator == '?') {
         cmd_rxchan();
     } else if (strcasecmp(verb, "FCRING") == 0 && terminator == '?') {

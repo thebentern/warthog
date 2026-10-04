@@ -305,8 +305,8 @@ enum mmwlan_status umac_interface_add(struct umac_data *umacd,
         }
         {
             /* warthog: a chip that boots holds no key; the mesh forgets what it held. */
-            extern void umac_datapath_mesh_chip_booted(void);
-            umac_datapath_mesh_chip_booted();
+            extern void umac_datapath_mesh_chip_booted(bool restart);
+            umac_datapath_mesh_chip_booted(false);
         }
 
         data->fw_version.major = chip_info.fw_version.major;
@@ -542,6 +542,50 @@ uint16_t umac_interface_get_vif_type_mask(struct umac_data *umacd, uint16_t vif_
     }
 }
 
+/* After a chip restart, the mesh's chip VIF as it had it (a MESH one as at the start, falling
+ * back to STA) at the same id; the channel the chip lost is forgotten so the mesh sends it again. */
+static enum mmwlan_status umac_interface_reinstall_mesh_vif_(struct umac_data *umacd,
+                                                             struct umac_interface_data *data,
+                                                             uint16_t *vif_id)
+{
+    const uint16_t old_id = data->vif_id;
+    int ret;
+#if WARTHOG_MESH_CHIP_VIF_MESH
+    if (data->chip_vif_type == MMDRV_INTERFACE_TYPE_MESH)
+    {
+        ret = umac_interface_add_mesh_vif_(umacd, data, false);
+        int32_t st = 0;
+        struct morse_caps caps = data->capabilities; /* of the VIF it is now, a fallback's too */
+        if (ret == 0 && mmdrv_get_capabilities_status(data->vif_id, &caps, &st) == 0 && st == 0)
+        {
+            data->capabilities = caps;
+        }
+    }
+    else
+#endif
+    {
+        ret = mmdrv_add_if(&data->vif_id, data->mac_addr, MMDRV_INTERFACE_TYPE_STA);
+        if (ret == 0)
+        {
+            umac_interface_set_chip_vif_type_(data, MMDRV_INTERFACE_TYPE_STA);
+        }
+    }
+    if (ret != 0 || data->vif_id != old_id)
+    {
+        MMLOG_ERR("Mesh VIF not re-added after a chip restart (%d, id %u, was %u)\n", ret,
+                  data->vif_id, old_id);
+        return MMWLAN_ERROR;
+    }
+    memset(&data->current_s1g_operation, 0, sizeof(data->current_s1g_operation));
+    umac_interface_init_vif(umacd, (enum umac_interface_type)data->active_interface_types,
+                            data->vif_id);
+    if (vif_id != NULL)
+    {
+        *vif_id = data->vif_id;
+    }
+    return MMWLAN_SUCCESS;
+}
+
 enum mmwlan_status umac_interface_reinstall_vif(struct umac_data *umacd,
                                                 enum umac_interface_type type,
                                                 uint16_t *vif_id)
@@ -554,8 +598,10 @@ enum mmwlan_status umac_interface_reinstall_vif(struct umac_data *umacd,
         return MMWLAN_UNAVAILABLE;
     }
 
-    /* Only the STA path reinstalls (umac_connection.c): a chip restart under an active mesh
-     * asserts in hw_restart_evt_handler (umac_mmdrv_shim.c), so no mesh VIF is re-added. */
+    if (type == UMAC_INTERFACE_MESH)
+    {
+        return umac_interface_reinstall_mesh_vif_(umacd, data, vif_id);
+    }
     enum mmdrv_interface_type drv_if_type = (type == UMAC_INTERFACE_AP) ? MMDRV_INTERFACE_TYPE_AP :
                                                                           MMDRV_INTERFACE_TYPE_STA;
     int ret = mmdrv_add_if(&data->vif_id, data->mac_addr, drv_if_type);

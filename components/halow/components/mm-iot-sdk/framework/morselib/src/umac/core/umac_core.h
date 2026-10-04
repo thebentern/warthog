@@ -311,6 +311,16 @@ struct umac_evt
 
             volatile enum mmwlan_status *status;
         } set_dynamic_ps_timeout;
+
+        /* warthog: AT+FRAG=, on the loop a chip restart runs on. */
+        struct
+        {
+            uint32_t threshold;
+
+            struct mmosal_semb *semb;
+
+            volatile enum mmwlan_status *status;
+        } set_frag_threshold;
     } args;
 };
 

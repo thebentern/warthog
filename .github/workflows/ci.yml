@@ -66,6 +66,32 @@ jobs:
         # WARTHOG_REGION_XX define and the BCF/country pick that drives.
         run: pio run -e warthog-us
 
+      # The CDC-ECM fallback (sdkconfig.ecm): main/usb_net.c's ECM side compiles only here. esp_tinyusb's
+      # default descriptor has no ECM function, so the ELF must hold usb_net.c's CDC + ECM one.
+      - name: Smoke build (warthog-us-ecm)
+        run: |
+          pio run -e warthog-us-ecm
+          ~/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-nm -S .pio/build/warthog-us-ecm/firmware.elf | grep ' 0000009a [dr] s_desc_fs_config$'
+
+      # The glue guard again: its checks of the generated sdkconfig.warthog-* files found none in a fresh
+      # checkout, and the two builds above have now written warthog-us's and warthog-us-ecm's.
+      - name: Glue guard (generated sdkconfigs)
+        run: make -C components/halow_mesh_compat/test glueguard
+
+      # IDF's own lwIP with main/nat_frag.c (lwip_napt.mk): IP fragments, reassembly and NAPT. The
+      # host tests above skip it, since it builds from the ESP-IDF package the build just fetched.
+      - name: Host tests (IDF lwIP, IP fragments and NAPT)
+        run: |
+          make -C components/halow_mesh_compat/test lwip-napt LWIP_NAPT_REQUIRED=1
+          make -C components/halow_mesh_compat/test clean lwip-napt SAN=1 LWIP_NAPT_REQUIRED=1
+
+      # TinyUSB's own NCM and ECM class drivers with main/usbnet_core.c (usbnet.mk): one owner of the
+      # USB network class. Built from the managed_components/ the build just fetched.
+      - name: Host tests (TinyUSB NCM/ECM, USB network class)
+        run: |
+          make -C components/halow_mesh_compat/test usbnet USBNET_REQUIRED=1
+          make -C components/halow_mesh_compat/test clean usbnet SAN=1 USBNET_REQUIRED=1
+
       # warthog-us compiles the mesh sources too (mesh is a runtime switch). This
       # env adds the code behind its own flags: the RX tap, the build-time
       # channel pin and the USB devloop helpers.

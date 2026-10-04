@@ -100,8 +100,8 @@ struct umac_mesh_hwmp_txkey
     uint8_t key[16];
     uint64_t pn;
 };
-/** Choose the protection for a robust management frame to @p da (HWMP, Block Ack) and
- *  reserve its PN; under our own MGTK the chip draws it. */
+/** Choose the protection for a robust management frame to @p da (HWMP, Block Ack) and reserve its
+ *  PN; under our own MGTK the chip draws it. Any task: reads the peer as a reader (read_begin). */
 void umac_datapath_mesh_hwmp_tx_key(const uint8_t *da, struct umac_mesh_hwmp_txkey *out);
 
 /**
@@ -114,6 +114,11 @@ bool umac_datapath_mesh_hwmp_rx_ok(const uint8_t *frame, uint32_t len);
 /** Reserve the next TX PN of @p stad's key @p key_id: one read-and-increment, so a
  *  host-CCMP frame from any task never shares a PN with another. */
 uint64_t umac_datapath_mesh_take_tx_pn(struct umac_sta_data *stad, uint8_t key_id);
+/** As umac_datapath_mesh_take_tx_pn for @p n consecutive PNs at once; returns the first. */
+uint64_t umac_datapath_mesh_take_tx_pns(struct umac_sta_data *stad, uint8_t key_id, uint32_t n);
+/** A management frame the chip seals: held (0) while a host fragment run it could break is in the
+ *  chip, dropped (-1, nokey) while a chip restart owes its key, else mmdrv_tx_frame's. Any task. */
+int umac_datapath_mesh_tx_chip_mgmt(struct mmpkt *pkt);
 uint8_t umac_datapath_mesh_peer_count(void);
 struct mmwlan_mesh_peer_link;
 /** Every slot's peer, keyed or not, with rate control's expected throughput; event loop only. */

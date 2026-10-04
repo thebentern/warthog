@@ -18,6 +18,10 @@ int morse_beacon_start(struct driver_data *driverd, uint16_t vif_id, uint32_t pe
 
 int morse_beacon_stop(struct driver_data *driverd);
 
+/* warthog: the driver is going away (mmdrv_deinit). Stops the host beacon timer, with no chip
+ * I/O, and keeps it for the next start, so no tick outlives the state it points at. */
+void morse_beacon_teardown(struct driver_data *driverd);
+
 
 int morse_beacon_work(struct driver_data *driverd);
 

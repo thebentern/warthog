@@ -1,0 +1,7 @@
+# USB network class override: CDC-ECM instead of the default CDC-NCM.
+#
+# Kept as a fallback for a host that binds ECM but not NCM. Everything current
+# binds NCM, so this should not be needed; it exists so a regression on some
+# host has a one-flag answer rather than a firmware fork.
+CONFIG_TINYUSB_NET_MODE_NCM=n
+CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=y

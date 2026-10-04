@@ -20,6 +20,7 @@
 #include "umac/mesh/umac_mesh_ctrl.h"
 #include "umac/mesh/umac_mesh_fwd.h"
 #include "umac/mesh/umac_mesh_fwd_glue.h"
+#include "umac/mesh/umac_mesh_frag.h"
 #include "umac/datapath/umac_datapath_private.h"
 #include "umac/data/umac_data.h"
 #include "umac/datapath/datapath_defrag.h"
@@ -140,6 +141,22 @@ extern volatile uint32_t g_warthog_reord_last_seq, g_warthog_reord_last_exp;
 /* Refused before reassembly: fragments group-addressed (rxdrop 7) or in the clear on a keyed link
  * (98); mesh data, whole or not, of a shape mac80211 drops (89). */
 extern volatile uint32_t g_warthog_defrag_mcast, g_warthog_defrag_plain, g_warthog_defrag_shape;
+/* AT+HOSTFRAG (storage and meaning in main/at.c). */
+extern volatile uint32_t g_warthog_hostfrag, g_warthog_hostfrag_msdu, g_warthog_hostfrag_frags;
+extern volatile uint32_t g_warthog_hostfrag_by_thresh, g_warthog_hostfrag_by_chip, g_warthog_hostfrag_by_rate;
+extern volatile uint32_t g_warthog_hostfrag_many, g_warthog_hostfrag_pool;
+extern volatile uint32_t g_warthog_hostfrag_seal, g_warthog_hostfrag_drv, g_warthog_hostfrag_chippn;
+extern volatile uint32_t g_warthog_hostfrag_trim;
+extern volatile uint32_t g_warthog_hostfrag_cap_trim, g_warthog_hostfrag_cap_sub, g_warthog_hostfrag_clamp;
+/* AT+SEALFIT and what it did to host-sealed frames (storage in main/at.c). */
+extern volatile uint32_t g_warthog_sealfit, g_warthog_sealfit_trim, g_warthog_sealfit_sub;
+extern volatile uint32_t g_warthog_sealfit_nofit, g_warthog_sealfit_ba;
+extern volatile uint32_t g_warthog_grpfit_trim, g_warthog_grpfit_sub, g_warthog_grpfit_nofit;
+/* AT+TIDPARAMS (1: Block Ack fields only under our own agreed session, none on a fragment) and
+ * AT+AMPDU, storage in main/at.c. */
+extern volatile uint32_t g_warthog_ba_txparm, g_warthog_ampdu;
+extern volatile uint32_t g_warthog_hostfrag_last_n, g_warthog_hostfrag_last_len;
+extern volatile uint32_t g_warthog_hostfrag_last_lim, g_warthog_hostfrag_last_rate;
 void umac_mesh_handle_s1g_beacon(struct mmpktview *rxbufview);
 extern volatile uint32_t g_warthog_nodec_group, g_warthog_nodec_fc, g_warthog_nodec_keyid;
 extern volatile uint32_t g_warthog_nodec_group_n, g_warthog_nodec_uni_n;
@@ -2399,8 +2416,445 @@ static void umac_datapath_aggr_check(struct umac_data *umacd,
     {
         return;
     }
+    /* warthog: AT+AMPDU=0 and AT+HOSTFRAG's ADDBA hold-off. */
+    if (data->ops == &datapath_ops_mesh && !umac_datapath_mesh_ba_may_start(stad, tid))
+    {
+        return;
+    }
 
     umac_ba_session_init(stad, tid, ssc, DOT11_BLOCK_ACK_TIMEOUT_DISABLED);
+}
+
+/* warthog: a unicast frame's reorder size: upstream's is the peer's session to us; AT+TIDPARAMS=1
+ * (mesh, AT+HOSTFRAG on or AT+AMPDU=0) takes our own agreed session's, as morse_driver does. */
+static uint8_t umac_datapath_tx_reorder_size(const struct umac_datapath_data *data,
+                                             struct umac_sta_data *stad, uint8_t tid)
+{
+    if (data->ops == &datapath_ops_mesh && g_warthog_ba_txparm != 0u &&
+        (umac_datapath_mesh_hostfrag_mode() != UMAC_MESH_FRAG_OFF || g_warthog_ampdu == 0u))
+    {
+        return umac_ba_get_originator_buffer_size(stad, tid);
+    }
+    return umac_ba_get_reorder_buffer_size(stad, tid);
+}
+
+/* warthog: the longest MPDU @p r can carry unfragmented (umac_mesh_frag.h), 0 if no rate. */
+static uint32_t umac_datapath_rate_mpdu_cap(const struct mmrc_rate *r)
+{
+    if (r->rate == MMRC_MCS_UNUSED || r->attempts == 0u || r->bw > MMRC_BW_16MHZ)
+    {
+        return 0;
+    }
+    return umac_mesh_frag_mpdu_cap((uint8_t)(1u << r->bw), (uint8_t)r->rate);
+}
+
+/* warthog: the longest MPDU each of the first @p first used rates of @p t's chain carries whole,
+ * 0 if none is known; the entry that sets it in @p slow. */
+static uint32_t umac_datapath_chain_cap(const struct mmrc_rate_table *t, unsigned first,
+                                        unsigned *slow)
+{
+    uint32_t cap = 0;
+    unsigned used = 0;
+    for (unsigned i = 0; i < MMRC_MAX_CHAIN_LENGTH && used < first; i++)
+    {
+        if (t->rates[i].rate == MMRC_MCS_UNUSED || t->rates[i].attempts == 0u)
+        {
+            continue;
+        }
+        used++;
+        const uint32_t c = umac_datapath_rate_mpdu_cap(&t->rates[i]);
+        if (c != 0u && (cap == 0u || c < cap))
+        {
+            cap = c;
+            *slow = i;
+        }
+    }
+    return cap;
+}
+
+/* warthog: a later rate of @p t that cannot carry @p mpdu octets whole is dropped, its attempts
+ * given to the slowest rate kept, so the chip never cuts it at a retry. True if one was dropped. */
+static bool umac_datapath_fit_rates(struct mmrc_rate_table *t, uint32_t mpdu)
+{
+    unsigned keep = 1, moved = 0;
+    for (unsigned i = 1; i < MMRC_MAX_CHAIN_LENGTH; i++)
+    {
+        const uint32_t cap = umac_datapath_rate_mpdu_cap(&t->rates[i]);
+        if (t->rates[i].rate == MMRC_MCS_UNUSED)
+        {
+            continue;
+        }
+        if (cap == 0u || mpdu <= cap)
+        {
+            t->rates[keep++] = t->rates[i];
+        }
+        else
+        {
+            moved += t->rates[i].attempts;
+        }
+    }
+    for (unsigned i = keep; i < MMRC_MAX_CHAIN_LENGTH; i++)
+    {
+        memset(&t->rates[i], 0, sizeof(t->rates[i]));
+        t->rates[i].rate = MMRC_MCS_UNUSED;
+    }
+    const unsigned tot = t->rates[keep - 1u].attempts + moved;
+    t->rates[keep - 1u].attempts = tot > 7u ? 7u : tot; /* a 3-bit count */
+    return moved != 0u;
+}
+
+/* warthog: drop rates of @p t needing over @p max fragments under @p thr, attempts to the slowest kept,
+ * or with none left use the slowest that does: 0 unchanged, 1 cut, 2 replaced, -1 no such rate. */
+static int umac_datapath_cap_rates(struct mmrc_rate_table *t, uint32_t over, uint32_t body,
+                                   uint32_t thr, uint32_t max)
+{
+    struct mmrc_rate kept[MMRC_MAX_CHAIN_LENGTH];
+    unsigned keep = 0, moved = 0, base = MMRC_MAX_CHAIN_LENGTH;
+    bool replaced = false;
+    const unsigned rts = MMRC_MASK(MMRC_FLAGS_CTS_RTS);
+    const unsigned head_rts = t->rates[0].flags & rts; /* mmrc sets it on every fallback */
+    for (unsigned i = 0; i < MMRC_MAX_CHAIN_LENGTH; i++)
+    {
+        const struct mmrc_rate *r = &t->rates[i];
+        if (r->rate == MMRC_MCS_UNUSED || r->attempts == 0u)
+        {
+            continue;
+        }
+        base = i;
+        uint32_t lim = umac_datapath_rate_mpdu_cap(r);
+        lim = (lim != 0u && thr != 0u && thr < lim) ? thr : lim;
+        const uint32_t n = lim != 0u ? umac_mesh_frag_count(over, body, lim) : 1u;
+        if (n != 0u && n <= max)
+        {
+            kept[keep++] = *r;
+        }
+        else
+        {
+            moved += r->attempts;
+        }
+    }
+    if (moved == 0u)
+    {
+        return 0;
+    }
+    if (keep == 0u)
+    {
+        const int mcs = umac_mesh_frag_slowest_mcs((uint8_t)(1u << t->rates[base].bw), over, body,
+                                                   thr, max);
+        if (mcs < 0)
+        {
+            return -1;
+        }
+        kept[0] = t->rates[base];
+        kept[0].rate = (uint8_t)mcs;
+        kept[0].attempts = 0;
+        keep = 1;
+        replaced = true;
+    }
+    const unsigned tot = kept[keep - 1u].attempts + moved;
+    kept[keep - 1u].attempts = tot > 7u ? 7u : tot; /* a 3-bit count */
+    kept[0].flags = (uint8_t)(((unsigned)kept[0].flags & ~rts) | head_rts); /* a new head: the old's RTS */
+    for (unsigned i = 0; i < MMRC_MAX_CHAIN_LENGTH; i++)
+    {
+        if (i < keep)
+        {
+            t->rates[i] = kept[i];
+        }
+        else
+        {
+            memset(&t->rates[i], 0, sizeof(t->rates[i]));
+            t->rates[i].rate = MMRC_MCS_UNUSED;
+        }
+    }
+    return replaced ? 2 : 1;
+}
+
+/* warthog: AT+SEALFIT, a sealed unicast frame only at rates where the chip sends it in at most @p max
+ * under AT+FRAG too, whole first under a Block Ack session (@p ba, counted seal_ba); none nofit. */
+static void umac_datapath_seal_fit(struct umac_data *umacd, struct mmrc_rate_table *t,
+                                   uint32_t over, uint32_t body, uint32_t max, bool ba)
+{
+    const uint32_t thr = umac_config_get_frag_threshold(umacd);
+    if (ba)
+    {
+        const int w = umac_datapath_cap_rates(t, over, body, thr, 1u);
+        if (w >= 0)
+        {
+            g_warthog_sealfit_ba += w > 0 ? 1u : 0u;
+            return;
+        }
+        g_warthog_sealfit_nofit++; /* over AT+FRAG at every rate: at most @p max, as with no session */
+    }
+    const int r = umac_datapath_cap_rates(t, over, body, thr, max);
+    if (r == 1)
+    {
+        g_warthog_sealfit_trim++;
+    }
+    else if (r == 2)
+    {
+        g_warthog_sealfit_sub++;
+    }
+    else if (r < 0 && !ba)
+    {
+        g_warthog_sealfit_nofit++;
+    }
+}
+
+/* warthog: AT+SEALFIT, a group frame only at a rate that carries it whole: receivers drop group
+ * fragments, and the chip never fragments it at its threshold (802.11). */
+static void umac_datapath_group_fit(struct mmrc_rate_table *t, uint32_t over, uint32_t body)
+{
+    const int r = umac_datapath_cap_rates(t, over, body, 0u, 1u);
+    if (r == 1)
+    {
+        g_warthog_grpfit_trim++;
+    }
+    else if (r == 2)
+    {
+        g_warthog_grpfit_sub++;
+    }
+    else if (r < 0)
+    {
+        g_warthog_grpfit_nofit++;
+    }
+}
+
+/* warthog: TX PNs the chip may draw for a frame it seals whole, rates @p t, the chip's own
+ * threshold too (umac_mesh_frag_chip_pns). */
+static uint32_t umac_datapath_chip_pns(struct umac_data *umacd, const struct mmrc_rate_table *t,
+                                       uint32_t over, uint32_t mpdu)
+{
+    unsigned slow = 0;
+    uint32_t lim = umac_datapath_chain_cap(t, MMRC_MAX_CHAIN_LENGTH, &slow);
+    const uint32_t thr = umac_config_get_frag_threshold(umacd);
+    if (thr != 0u && (lim == 0u || thr < lim))
+    {
+        lim = thr;
+    }
+    return umac_mesh_frag_chip_pns(mpdu, over, lim);
+}
+
+int umac_datapath_mesh_frags_to_chip(struct umac_sta_data *stad, uint8_t tid,
+                                     struct mmpkt *const *frag, unsigned n, bool chip)
+{
+    /* Handed back to back under the run lock: a chip-sealed management frame waits for the run. */
+    umac_datapath_mesh_frag_run_begin(stad, tid, n, chip, n - 1u);
+    unsigned i = 0;
+    for (; i < n; i++)
+    {
+        if (mmdrv_tx_frame(frag[i], false) != 0)
+        {
+            /* The driver took it; the fragments after it never reach the chip. */
+            g_warthog_tx_drv_err++;
+            g_warthog_hostfrag_drv++;
+            break;
+        }
+        g_warthog_tx_drv_ok++;
+        g_warthog_hostfrag_frags++;
+    }
+    for (unsigned j = i + 1u; j < n; j++)
+    {
+        mmpkt_release(frag[j]);
+    }
+    umac_datapath_mesh_frag_run_end(stad, i < n ? n - i - 1u : 0u);
+    return i < n ? -1 : 0;
+}
+
+/* warthog: @p txbufview (at Mesh Control) to the chip as @p plan->n fragments, cut as mac80211's
+ * ieee80211_fragment: 0 sent or waiting, -1 dropped (consumed), 1 no buffer, left whole. */
+static int umac_datapath_tx_mesh_frags(struct umac_data *umacd, struct umac_sta_data *stad,
+                                       struct mmpktview *txbufview,
+                                       const struct dot11_data_hdr *data_hdr, uint32_t data_hdr_len,
+                                       uint16_t qos, int key_id, bool host_seal, uint32_t sec_len,
+                                       const struct umac_mesh_frag_plan *plan)
+{
+    struct mmpkt *txbuf = mmpkt_from_view(txbufview);
+    const struct mmdrv_tx_metadata *md0 = mmdrv_get_tx_metadata(txbuf);
+    const uint8_t tid = md0->tid;
+    const uint8_t *body = mmpkt_get_data_start(txbufview);
+    struct mmpkt *frag[UMAC_MESH_FRAG_MAX] = { NULL };
+    struct mmpktview *view = NULL;
+    volatile uint32_t *drop = NULL;
+    frag[0] = txbuf;
+    for (unsigned i = 1; i < plan->n; i++)
+    {
+        const uint32_t len = (i + 1u < plan->n) ? plan->chunk : plan->last;
+        frag[i] = umac_datapath_alloc_raw_tx_mmpkt(MMDRV_PKT_CLASS_DATA_TID0 + tid,
+                                                   MAX_QOS_DATA_MAC_HEADER_LEN,
+                                                   len + (host_seal ? DOT11_CCMP_128_MIC_LEN : 0u));
+        if (frag[i] == NULL)
+        {
+            for (unsigned j = 1; j < i; j++)
+            {
+                mmpkt_release(frag[j]);
+            }
+            g_warthog_hostfrag_pool++;
+            return 1;
+        }
+        view = mmpkt_open(frag[i]);
+        mmpkt_append_data(view, body + i * (uint32_t)plan->chunk, len);
+        mmpkt_close(&view);
+        *mmdrv_get_tx_metadata(frag[i]) = *md0;
+    }
+    (void)mmpkt_remove_from_end(txbufview, mmpkt_get_data_length(txbufview) - plan->chunk);
+#ifdef WARTHOG_MESH_HOST_CCMP
+    uint64_t pn0 = 0;
+    if (host_seal)
+    {
+        /* One reservation: path selection to this peer on another task draws from this counter. */
+        pn0 = umac_datapath_mesh_take_tx_pns(stad, (uint8_t)key_id, plan->n);
+    }
+#endif
+    for (unsigned i = 0; drop == NULL && i < plan->n; i++)
+    {
+        struct dot11_data_hdr hdr = *data_hdr;
+        DOT11_SEQUENCE_CONTROL_SET_FRAGMENT_NUMBER(hdr.base.sequence_control, i);
+        DOT11_FRAME_CONTROL_SET_MORE_FRAGMENTS(hdr.base.frame_control, (i + 1u < plan->n) ? 1u : 0u);
+        view = (i == 0u) ? txbufview : mmpkt_open(frag[i]);
+        const uint32_t body_len = mmpkt_get_data_length(view);
+#ifdef WARTHOG_MESH_HOST_CCMP
+        if (host_seal)
+        {
+            extern bool umac_mesh_tx_host_ccmp(struct umac_sta_data *stad, uint8_t key_id,
+                                               const uint8_t *mac_hdr, const uint8_t *qos,
+                                               const uint8_t pn[6], struct mmpktview *view);
+            const uint64_t seq = pn0 + i;
+            const uint8_t pn[6] = { (uint8_t)(seq >> 40), (uint8_t)(seq >> 32), (uint8_t)(seq >> 24),
+                                    (uint8_t)(seq >> 16), (uint8_t)(seq >> 8),  (uint8_t)seq };
+            if (!umac_mesh_tx_host_ccmp(stad, (uint8_t)key_id, (const uint8_t *)&hdr,
+                                        (const uint8_t *)&qos, pn, view))
+            {
+                drop = &g_warthog_hostfrag_seal;
+            }
+        }
+#endif
+        if (drop == NULL)
+        {
+            mmpkt_prepend_data(view, (const uint8_t *)&qos, sizeof(qos));
+            mmpkt_prepend_data(view, (const uint8_t *)&hdr, data_hdr_len);
+            struct mmdrv_tx_metadata *md = mmdrv_get_tx_metadata(frag[i]);
+            md->flags = (key_id >= 0 && !host_seal) ? MMDRV_TX_FLAG_HW_ENC : 0u;
+            umac_connection_populate_tx_metadata(umacd, md); /* TP and 1 MHz responses, as whole frames */
+            md->key_idx = (uint8_t)key_id;
+            md->mesh.own_group = 0;
+            md->mesh.host_frag = 1; /* its status comes back even untried */
+            if (umac_datapath_fit_rates(&md->rc_data, data_hdr_len + sizeof(qos) + body_len +
+                                                          sec_len + DOT11_FCS_FIELD_LEN))
+            {
+                g_warthog_hostfrag_trim++;
+            }
+        }
+        if (i != 0u)
+        {
+            mmpkt_close(&view);
+        }
+    }
+    mmpkt_close(&txbufview);
+    if (drop != NULL)
+    {
+        for (unsigned i = 0; i < plan->n; i++)
+        {
+            mmpkt_release(frag[i]);
+        }
+        (*drop)++;
+        umac_stats_increment_datapath_txq_frames_dropped(umacd);
+        return -1;
+    }
+    const bool chip = key_id >= 0 && !host_seal;
+    if (chip)
+    {
+        (void)umac_datapath_mesh_take_tx_pns(stad, (uint8_t)key_id, plan->n); /* the chip seals each */
+    }
+    unsigned slow = 0;
+    (void)umac_datapath_chain_cap(&md0->rc_data, 2u, &slow);
+    g_warthog_hostfrag_msdu++;
+    g_warthog_hostfrag_last_n = plan->n;
+    g_warthog_hostfrag_last_len = (uint32_t)(plan->n - 1u) * plan->chunk + plan->last;
+    g_warthog_hostfrag_last_lim = plan->mpdu_max;
+    g_warthog_hostfrag_last_rate = umac_datapath_rate_mpdu_cap(&md0->rc_data.rates[slow]) != 0u
+        ? ((uint32_t)(1u << md0->rc_data.rates[slow].bw) << 8) | md0->rc_data.rates[slow].rate
+        : 0xffffu;
+    umac_stats_update_last_tx_time(umacd);
+    if (umac_datapath_mesh_ba_park(stad, tid, frag, plan->n, chip))
+    {
+        return 0; /* handed once the DELBA ending its session is through */
+    }
+    return umac_datapath_mesh_frags_to_chip(stad, tid, frag, plan->n, chip);
+}
+
+/* warthog: how to cut a unicast mesh MSDU, for the slower of its chain's first two rates; rate
+ * control is asked here, once per MSDU, as mac80211 asks once before fragmenting. */
+static void umac_datapath_mesh_frag_plan(struct umac_data *umacd, struct umac_sta_data *stad,
+                                         struct mmdrv_tx_metadata *md, uint32_t mode,
+                                         uint32_t hdr_len, uint32_t body_len, uint32_t sec_len,
+                                         uint32_t rc_size, bool rts_required,
+                                         struct umac_mesh_frag_plan *plan)
+{
+    umac_rc_init_rate_table_data(stad, &md->rc_data, rts_required, rc_size);
+    unsigned slow = 0;
+    struct umac_mesh_frag_req req = {
+        .mode = mode,
+        .chip_thresh = umac_config_get_frag_threshold(umacd),
+        .rate_cap = umac_datapath_chain_cap(&md->rc_data, 2u, &slow),
+        .hdr_len = (uint16_t)hdr_len,
+        .sec_len = (uint16_t)sec_len,
+        .body_len = (uint16_t)body_len,
+        .max_frags = UMAC_DATAPATH_MESH_FRAG_MAX,
+    };
+    umac_mesh_frag_plan(&req, plan);
+    if (plan->n == 0u && plan->lim == UMAC_MESH_FRAG_LIM_RATE)
+    {
+        /* More fragments than the chip delivers at the first rates: rates where it needs no more. */
+        const int r = umac_datapath_cap_rates(&md->rc_data, hdr_len + sec_len + DOT11_FCS_FIELD_LEN,
+                                              body_len, plan->thr, req.max_frags);
+        if (r > 0)
+        {
+            if (r == 1)
+            {
+                g_warthog_hostfrag_cap_trim++;
+            }
+            else
+            {
+                g_warthog_hostfrag_cap_sub++;
+            }
+            req.rate_cap = umac_datapath_chain_cap(&md->rc_data, 2u, &slow);
+            umac_mesh_frag_plan(&req, plan);
+        }
+    }
+    if (plan->clamped && plan->n >= 2u)
+    {
+        g_warthog_hostfrag_clamp++; /* AT+HOSTFRAG=n raised to cut it in max_frags */
+    }
+    if (plan->n == 1u)
+    {
+        return;
+    }
+    /* Never under A-MPDU: the session ends first (mac80211 would send it whole). */
+    umac_datapath_mesh_ba_cut(stad, md->tid);
+    if (plan->n == 0u)
+    {
+        g_warthog_hostfrag_many++;
+        plan->n = 1;
+        return;
+    }
+    if (mmdrv_tx_pool_free() < plan->n - 1u)
+    {
+        g_warthog_hostfrag_pool++;
+        plan->n = 1;
+        return;
+    }
+    if (plan->lim == UMAC_MESH_FRAG_LIM_THRESH)
+    {
+        g_warthog_hostfrag_by_thresh++;
+    }
+    else if (plan->lim == UMAC_MESH_FRAG_LIM_CHIP)
+    {
+        g_warthog_hostfrag_by_chip++;
+    }
+    else
+    {
+        g_warthog_hostfrag_by_rate++;
+    }
 }
 
 enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
@@ -2510,13 +2964,32 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
                                                          "??",
                   key_id);
     }
+    if (key_id >= 0 && data->ops == &datapath_ops_mesh)
+    {
+        bool host_seals = false;
+#ifdef WARTHOG_MESH_HOST_CCMP
+        extern volatile uint32_t g_warthog_host_ccmp_on;
+        host_seals = !own_group && g_warthog_host_ccmp_on;
+#endif
+        /* warthog: a chip restart could not put this frame's key back yet, so the chip has none. */
+        if (!host_seals && umac_datapath_mesh_chip_key_missing(stad, is_multicast))
+        {
+            g_warthog_tx_nokey++;
+            status = MMWLAN_ERROR;
+            goto error;
+        }
+    }
 
     size_t seq_num_idx = is_multicast ? MMDRV_SEQ_NUM_BASELINE : tid;
     DOT11_SEQUENCE_CONTROL_SET_SEQUENCE_NUMBER(header->sequence_control,
                                                sta_data->tx_seq_num_spaces[seq_num_idx]++);
 
 
-    if (!is_multicast && !is_eapol)
+    /* warthog: AT+HOSTFRAG; on its path the Block Ack check follows the cut decision (below). */
+    const uint32_t hostfrag = umac_datapath_mesh_hostfrag_mode();
+    const bool cut_path = hostfrag != UMAC_MESH_FRAG_OFF && data->ops == &datapath_ops_mesh &&
+                          !is_multicast && !is_eapol;
+    if (!is_multicast && !is_eapol && !cut_path)
     {
         umac_datapath_aggr_check(umacd, stad, tid, header->sequence_control);
     }
@@ -2569,6 +3042,50 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
         }
     }
 
+    /* warthog: AT+HOSTFRAG cuts a unicast MSDU over its limit here, before any protection; off,
+     * rate control is asked below as it always was. */
+    bool rc_done = false;
+    if (cut_path)
+    {
+        bool host_seal = false;
+#ifdef WARTHOG_MESH_HOST_CCMP
+        extern volatile uint32_t g_warthog_host_ccmp_on;
+        host_seal = key_id >= 0 && !own_group && g_warthog_host_ccmp_on;
+#endif
+        /* Rate control gets the size it would below: the chip's CCMP is not counted. */
+        const uint32_t hdr_len = data_hdr_len + sizeof(qos_ctrl);
+        const uint32_t body_len = mmpkt_get_data_length(txbufview);
+        struct umac_mesh_frag_plan plan;
+        umac_datapath_mesh_frag_plan(umacd, stad, tx_metadata, hostfrag, hdr_len, body_len,
+                                     (uint32_t)ccmp_len,
+                                     hdr_len + body_len + (host_seal ? (uint32_t)ccmp_len : 0u),
+                                     rts_required, &plan);
+        rc_done = true;
+        umac_datapath_aggr_check(umacd, stad, tid, header->sequence_control);
+        if (plan.n >= 2u)
+        {
+            tx_metadata->tid_max_reorder_buf_size = umac_datapath_tx_reorder_size(data, stad, tid);
+            tx_metadata->mesh.own_group = 0;
+            umac_connection_populate_tx_metadata(umacd, tx_metadata);
+            tx_metadata->aid = umac_sta_data_get_aid(stad);
+            const int cut = umac_datapath_tx_mesh_frags(umacd, stad, txbufview, &data_hdr,
+                                                        data_hdr_len, qos_ctrl.field, key_id,
+                                                        host_seal, (uint32_t)ccmp_len, &plan);
+            if (cut <= 0)
+            {
+                return cut == 0 ? MMWLAN_SUCCESS : MMWLAN_ERROR;
+            }
+            /* No buffer for a fragment: whole, below. */
+        }
+        else if (plan.lim == UMAC_MESH_FRAG_LIM_NONE &&
+                 umac_datapath_fit_rates(&tx_metadata->rc_data, hdr_len + body_len +
+                                                                   (uint32_t)ccmp_len +
+                                                                   DOT11_FCS_FIELD_LEN))
+        {
+            g_warthog_hostfrag_trim++; /* whole, and every rate left carries it */
+        }
+    }
+
     bool host_encrypted = false;
 #ifdef WARTHOG_MESH_HOST_CCMP
     /* Encrypt here, before the header goes on, so the CCMP header is a prepend
@@ -2599,6 +3116,9 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 
     tx_metadata->flags = 0;
     tx_metadata->mesh.own_group = 0;
+    tx_metadata->mesh.host_frag = 0;
+    tx_metadata->mesh.ba_wait = 0;
+    bool chip_pns = false;
     if (key_id >= 0)
     {
         /* Asking the chip to encrypt what the host already encrypted would
@@ -2606,6 +3126,10 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
         if (!host_encrypted)
         {
             tx_metadata->flags |= MMDRV_TX_FLAG_HW_ENC;
+        }
+        if (!host_encrypted && !own_group && data->ops == &datapath_ops_mesh)
+        {
+            umac_datapath_mesh_frag_overlap_note(stad, false, (uint8_t)tid);
         }
         /* The chip counts our own group key's PN; the peer's keychain has no say.
          * A host-encrypted frame took its PN already. */
@@ -2615,9 +3139,17 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
             umac_datapath_mesh_own_group_tx_note();
             tx_metadata->mesh.own_group = 1;
         }
+        else if (!host_encrypted && data->ops == &datapath_ops_mesh && !is_multicast)
+        {
+            chip_pns = true; /* counted below, once its rates are known */
+        }
         else if (!host_encrypted)
         {
             umac_keys_increment_tx_seq(stad, key_id);
+            if (is_multicast && data->ops == &datapath_ops_mesh)
+            {
+                umac_datapath_mesh_group_tx_note(); /* drawn from the AID 0 group key */
+            }
         }
     }
 
@@ -2625,7 +3157,7 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 
     if (!is_multicast)
     {
-        tx_metadata->tid_max_reorder_buf_size = umac_ba_get_reorder_buffer_size(stad, tid);
+        tx_metadata->tid_max_reorder_buf_size = umac_datapath_tx_reorder_size(data, stad, (uint8_t)tid);
         if (umac_ba_is_ampdu_permitted(stad, tid))
         {
             tx_metadata->flags |= MMDRV_TX_FLAG_AMPDU_ENABLED;
@@ -2646,14 +3178,47 @@ enum mmwlan_status umac_datapath_process_tx_frame(struct umac_data *umacd,
 
         tx_metadata->flags |= MMDRV_TX_FLAG_NO_ACK;
         umac_rc_init_rate_table_mgmt(umacd, &tx_metadata->rc_data, false);
+        if (data->ops == &datapath_ops_mesh && g_warthog_sealfit != 0u)
+        {
+            /* Never host-sealed: the chip's CCMP, if any, is not in the buffer yet. */
+            const uint32_t over = data_hdr_len + sizeof(qos_ctrl) + (uint32_t)ccmp_len + DOT11_FCS_FIELD_LEN;
+            umac_datapath_group_fit(&tx_metadata->rc_data, over,
+                                    mmpkt_get_data_length(txbufview) + (uint32_t)ccmp_len + DOT11_FCS_FIELD_LEN - over);
+        }
     }
     else
     {
-        MMOSAL_DEV_ASSERT(stad != NULL);
-        umac_rc_init_rate_table_data(stad,
-                                     &tx_metadata->rc_data,
-                                     rts_required,
-                                     mmpkt_get_data_length(txbufview));
+        if (!rc_done)
+        {
+            MMOSAL_DEV_ASSERT(stad != NULL);
+            umac_rc_init_rate_table_data(stad,
+                                         &tx_metadata->rc_data,
+                                         rts_required,
+                                         mmpkt_get_data_length(txbufview));
+        }
+        /* warthog: a frame AT+HOSTFRAG planned to cut but sends whole (pool, many) is fitted too. */
+        if (key_id >= 0 && data->ops == &datapath_ops_mesh && g_warthog_sealfit != 0u)
+        {
+            /* Host-sealed whole; chip-sealed whole under our Block Ack session on this TID or before its
+             * DELBA is through (a Linux recipient drops fragments under it), else in at most 2 (1.17.6). */
+            const uint32_t over = data_hdr_len + sizeof(qos_ctrl) + (uint32_t)ccmp_len + DOT11_FCS_FIELD_LEN;
+            const uint32_t chip_sec = host_encrypted ? 0u : (uint32_t)ccmp_len;
+            const bool ba = !host_encrypted && (umac_ba_originator_held(stad, (uint8_t)tid) ||
+                                                umac_datapath_mesh_ba_waiting(stad));
+            umac_datapath_seal_fit(umacd, &tx_metadata->rc_data, over,
+                                   mmpkt_get_data_length(txbufview) + chip_sec + DOT11_FCS_FIELD_LEN - over,
+                                   host_encrypted ? 1u : UMAC_MESH_FRAG_CHIP_MAX, ba);
+        }
+    }
+    if (chip_pns)
+    {
+        /* warthog: the chip may cut it itself, a PN a fragment; the host's count is a re-install's floor. */
+        const uint32_t sec = (uint32_t)ccmp_len + DOT11_FCS_FIELD_LEN;
+        const uint32_t pns = umac_datapath_chip_pns(umacd, &tx_metadata->rc_data,
+                                                    data_hdr_len + sizeof(qos_ctrl) + sec,
+                                                    mmpkt_get_data_length(txbufview) + sec);
+        (void)umac_datapath_mesh_take_tx_pns(stad, (uint8_t)key_id, pns);
+        g_warthog_hostfrag_chippn += pns - 1u;
     }
 
     MMLOG_DBG("Transmitting frame %p\n", txbuf);
@@ -2840,6 +3405,14 @@ static inline bool umac_datapath_process_tx(struct umac_data *umacd,
         return false;
     }
     bool has_more = false;
+    if (data->ops == &datapath_ops_mesh)
+    {
+        umac_datapath_mesh_frag_tick(); /* AT+HOSTFRAG's runs, held frames and pool reserve */
+        if (!umac_datapath_tx_is_paused(data, ~MMDRV_PAUSE_SOURCE_MASK_PKTMEM))
+        {
+            umac_datapath_mesh_ba_release(); /* cut frames whose DELBA is through */
+        }
+    }
     for (unsigned ii = 0; ii < MAX_TX_PROCESS_PER_LOOP; ii++)
     {
 
@@ -2913,6 +3486,7 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
     {
         /* A mesh peer's MFP is per link (umac_datapath_mesh_peer_mfp), never the record's PMF
          * mode; host CCMP may hand back a new frame, or none (dropped, counted). */
+        const bool ba_wait = umac_datapath_mesh_ba_delba_tagged(stad, txbufview);
         mmpkt_close(&txbufview);
         txbuf = umac_datapath_mesh_protect_mgmt(txbuf, &key_id);
         if (txbuf == NULL)
@@ -2921,6 +3495,7 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
         }
         txbufview = mmpkt_open(txbuf);
         tx_metadata = mmdrv_get_tx_metadata(txbuf);
+        tx_metadata->mesh.ba_wait = ba_wait ? 1u : 0u; /* a cut frame waits on its TX status */
     }
     else if ((data->ops->get_sta_state(stad) == MMWLAN_STA_CONNECTED))
     {
@@ -2987,7 +3562,10 @@ enum mmwlan_status umac_datapath_tx_mgmt_frame(struct umac_sta_data *stad, struc
     umac_stats_update_last_tx_time(umacd);
 
     mmpkt_close(&txbufview);
-    if (mmdrv_tx_frame(txbuf, true) < 0)
+    /* warthog: a mesh frame the chip seals waits for a host fragment run it could break. */
+    const int ret = (data->ops == &datapath_ops_mesh && key_id >= 0) ?
+                        umac_datapath_mesh_tx_chip_mgmt(txbuf) : mmdrv_tx_frame(txbuf, true);
+    if (ret < 0)
     {
         return MMWLAN_ERROR;
     }
@@ -2999,8 +3577,10 @@ void umac_datapath_handle_tx_status(struct umac_data *umacd, struct mmpkt *mmpkt
 {
     struct mmdrv_tx_metadata *tx_metadata = mmdrv_get_tx_metadata(mmpkt);
     struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-    /* One of our own group frames, even unsent, is released from the count on the event loop. */
-    if (tx_metadata->attempts != 0 || tx_metadata->mesh.own_group != 0)
+    /* One of our own group frames, even unsent, is released from the count on the event loop;
+     * a host fragment or a DELBA a cut frame waits on, even unsent, ends its wait there. */
+    if (tx_metadata->attempts != 0 || tx_metadata->mesh.own_group != 0 ||
+        tx_metadata->mesh.host_frag != 0 || tx_metadata->mesh.ba_wait != 0)
     {
         MMOSAL_TASK_ENTER_CRITICAL();
         mmpkt_list_append(&data->tx_status_q, mmpkt);
@@ -3037,6 +3617,37 @@ static inline void umac_datapath_process_tx_status_queue(struct umac_data *umacd
         if (tx_metadata->mesh.own_group != 0)
         {
             umac_datapath_mesh_own_group_tx_done();
+            if (tx_metadata->attempts == 0)
+            {
+                mmpkt_release(mmpkt);
+                continue;
+            }
+        }
+        /* warthog: a host fragment the chip never tried: counted, nothing else. */
+        if (tx_metadata->mesh.host_frag != 0 && tx_metadata->attempts == 0)
+        {
+            struct umac_sta_data *fs = data->ops->lookup_stad_by_aid(umacd, tx_metadata->aid);
+            if (fs != NULL && data->ops == &datapath_ops_mesh)
+            {
+                struct mmpktview *fv = mmpkt_open(mmpkt);
+                umac_datapath_mesh_frag_status(fs, mmpkt_get_data_start(fv), mmpkt_get_data_length(fv),
+                                               tx_metadata->status_flags, 0);
+                mmpkt_close(&fv);
+            }
+            mmpkt_release(mmpkt);
+            continue;
+        }
+        /* warthog: the DELBA a cut frame waits on, sent or not: that wait can end. */
+        if (tx_metadata->mesh.ba_wait != 0 && data->ops == &datapath_ops_mesh)
+        {
+            struct mmpktview *dv = mmpkt_open(mmpkt);
+            if (mmpkt_get_data_length(dv) >= 10u)
+            {
+                const bool no_ack = tx_metadata->attempts != 0 &&
+                                    (tx_metadata->status_flags & MMDRV_TX_STATUS_FLAG_NO_ACK) != 0;
+                umac_datapath_mesh_ba_delba_status(mmpkt_get_data_start(dv) + 4, no_ack);
+            }
+            mmpkt_close(&dv);
             if (tx_metadata->attempts == 0)
             {
                 mmpkt_release(mmpkt);
@@ -3100,6 +3711,15 @@ static inline void umac_datapath_process_tx_status_queue(struct umac_data *umacd
             if (tx_metadata->aid != 0)
             {
                 umac_rc_feedback(stad, tx_metadata);
+            }
+            if (tx_metadata->aid != 0 && data->ops == &datapath_ops_mesh)
+            {
+                /* warthog: a host fragment (AT+HOSTFRAG) is counted, and its MSDU. */
+                struct mmpktview *sv = mmpkt_open(mmpkt);
+                umac_datapath_mesh_frag_status(stad, mmpkt_get_data_start(sv),
+                                               mmpkt_get_data_length(sv), tx_metadata->status_flags,
+                                               tx_metadata->attempts);
+                mmpkt_close(&sv);
             }
 
             if (valid_ack_status)

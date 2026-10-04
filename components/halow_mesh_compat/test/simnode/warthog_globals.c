@@ -22,8 +22,14 @@
 #ifndef WARTHOG_RSSI_PEERS
 #define WARTHOG_RSSI_PEERS 6
 #endif
+#if defined(WARTHOG_MESH_HOST_CCMP) || defined(WARTHOG_MESH_AMPE_NO_CHIP_KEY)
+#define WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT 0u
+#elif defined(WARTHOG_MESH_SAE)
+#define WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT 1u
+#else
+#define WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT 0u
+#endif
 
-volatile uint32_t g_warthog_usb_tx_sent = 0, g_warthog_usb_tx_dropped = 0;
 volatile uint32_t g_warthog_rxtap_total = 0;
 volatile uint32_t g_warthog_rxtap_mgmt = 0;
 volatile uint32_t g_warthog_rxtap_beacon = 0;
@@ -218,6 +224,44 @@ volatile uint32_t g_warthog_defrag_amsdu = 0, g_warthog_defrag_oversize = 0, g_w
 volatile uint32_t g_warthog_defrag_mcast = 0, g_warthog_defrag_plain = 0, g_warthog_defrag_shape = 0;
 volatile uint32_t g_warthog_defrag_expired = 0, g_warthog_defrag_restart = 0, g_warthog_defrag_flush = 0;
 volatile uint32_t g_warthog_defrag_evict = 0;
+volatile uint32_t g_warthog_hostfrag = WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT;
+volatile uint32_t g_warthog_hostfrag_msdu = 0, g_warthog_hostfrag_frags = 0;
+volatile uint32_t g_warthog_hostfrag_by_thresh = 0, g_warthog_hostfrag_by_chip = 0;
+volatile uint32_t g_warthog_hostfrag_by_rate = 0;
+volatile uint32_t g_warthog_hostfrag_many = 0, g_warthog_hostfrag_pool = 0;
+volatile uint32_t g_warthog_hostfrag_seal = 0, g_warthog_hostfrag_drv = 0;
+volatile uint32_t g_warthog_hostfrag_ba_end = 0, g_warthog_hostfrag_nodelba = 0;
+volatile uint32_t g_warthog_hostfrag_ba_wait = 0, g_warthog_hostfrag_ba_late = 0;
+volatile uint32_t g_warthog_hostfrag_hold = 0;
+volatile uint32_t g_warthog_hostfrag_held = 0, g_warthog_hostfrag_hold_ms = 15000;
+volatile uint32_t g_warthog_hostfrag_acked = 0, g_warthog_hostfrag_noack = 0;
+volatile uint32_t g_warthog_hostfrag_unsent = 0, g_warthog_hostfrag_agg = 0;
+volatile uint32_t g_warthog_hostfrag_ok = 0, g_warthog_hostfrag_fail = 0, g_warthog_hostfrag_overlap = 0;
+volatile uint32_t g_warthog_hostfrag_wait = 0, g_warthog_hostfrag_mgmt = 0;
+volatile uint32_t g_warthog_hostfrag_stale = 0, g_warthog_hostfrag_chippn = 0;
+volatile uint32_t g_warthog_hostfrag_trim = 0;
+volatile uint32_t g_warthog_hostfrag_last_n = 0, g_warthog_hostfrag_last_len = 0;
+volatile uint32_t g_warthog_hostfrag_last_lim = 0, g_warthog_hostfrag_last_rate = 0xffff;
+volatile uint32_t g_warthog_hostfrag_cap_trim = 0, g_warthog_hostfrag_cap_sub = 0;
+volatile uint32_t g_warthog_hostfrag_clamp = 0;
+volatile uint32_t g_warthog_sealfit = 1;
+volatile uint32_t g_warthog_sealfit_trim = 0, g_warthog_sealfit_sub = 0, g_warthog_sealfit_nofit = 0;
+volatile uint32_t g_warthog_grpfit_trim = 0, g_warthog_grpfit_sub = 0, g_warthog_grpfit_nofit = 0;
+volatile uint32_t g_warthog_sealfit_ba = 0;
+volatile uint32_t g_warthog_hostfrag_ba_rcpt = 0, g_warthog_hostfrag_delba_noack = 0;
+volatile uint32_t g_warthog_ba_txparm = 1;
+volatile uint32_t g_warthog_ampdu = 1;
+volatile uint32_t g_warthog_ampdu_orig = 0, g_warthog_ampdu_ended = 0, g_warthog_ampdu_unsent = 0;
+volatile uint32_t g_warthog_ampdu_peer_mac[4] = { 0 }, g_warthog_ampdu_peer_ba[4] = { 0 };
+volatile uint32_t g_warthog_ba_addba_tx = 0, g_warthog_ba_delba_to = 0;
+volatile uint32_t g_warthog_ba_delba_end = 0, g_warthog_ba_delba_other = 0;
+volatile uint32_t g_warthog_ba_rx_delba = 0, g_warthog_ba_rx_reason = 0;
+volatile uint32_t g_warthog_chiprestart_n = 0, g_warthog_chiprestart_forced = 0;
+volatile uint32_t g_warthog_chiprestart_mesh = 0, g_warthog_chiprestart_dropped = 0;
+volatile uint32_t g_warthog_chiprestart_sta = 0, g_warthog_chiprestart_stafail = 0;
+volatile uint32_t g_warthog_chiprestart_keys = 0, g_warthog_chiprestart_keyfail = 0;
+volatile uint32_t g_warthog_chiprestart_cmdfail = 0, g_warthog_chiprestart_retried = 0;
+volatile uint32_t g_warthog_chiprestart_pending = 0, g_warthog_chiprestart_ms = 0;
 volatile uint32_t g_warthog_filt_reason = 0, g_warthog_filt_drop = 0;
 volatile uint32_t g_warthog_filt_hist[10] = { 0 };
 volatile uint32_t g_warthog_filt_mgmt_nours = 0;

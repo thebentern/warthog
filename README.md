@@ -29,7 +29,7 @@ Plug it into a laptop and the host gets a USB Ethernet adapter. Join the side-ca
 
 ## Features
 
-- USB **CDC-ECM** network adapter for the host (macOS / Linux native; Windows-RNDIS is a roadmap item)
+- USB **CDC-NCM** network adapter for the host (in-box on macOS, Linux, Windows 10+ and iOS/iPadOS; a CDC-ECM build, `warthog-us-ecm`, for hosts without NCM)
 - Secondary **2.4 GHz Wi-Fi AP** for clients that can't (or shouldn't) be wired
 - **HaLow STA uplink** via Morse Micro MM6108 / Quectel FGH100M-H — kilometer range at low power
 - **lwIP NAPT** bridges both downstream surfaces out HaLow
@@ -52,7 +52,7 @@ Warthog is not one device role. A node runs an **uplink** and presents
 ```
         ┌──────── downstream ────────┐        ┌──── uplink ────┐
 
-  laptop ──USB──▶ CDC-ECM ┐
+  laptop ──USB──▶ CDC-NCM ┐
                           ├─▶ NAPT ─▶ HaLow ─▶  AP  (station mode)
   phone  ──WiFi─▶ 2.4 AP  ┘                or  mesh (802.11s peers)
 ```
@@ -144,6 +144,11 @@ around it:
   not yet measured on air), not a bigger repeater.
 - **Inbound connections need explicit forwarding.** Upstream devices cannot
   reach the tethered host by address, because it is behind NAT.
+- **IP fragments cross NAT whole.** lwIP's NAPT reads ports from every packet
+  and a fragment after the first has none, so Warthog reassembles a fragmented
+  datagram before NAPT and lwIP cuts it again for the outgoing MTU
+  (`main/nat_frag.c`); at most 10 fragments a datagram, IPv4 only
+  ([Troubleshooting](wiki/Troubleshooting.md#large-packets-from-a-node-at-mtu-1460-go-unanswered-ip-fragments)).
 
 If your application depends on layer-2 adjacency or broadcast discovery, this
 is the limitation to design around — use known addresses, a server both sides
@@ -240,8 +245,11 @@ Two caveats that remain:
    with two attached configures only one and the other falls back to a
    link-local address.
 
-If you meet a host that binds ECM and not NCM, `warthog-us-ecm` builds the old
-class as a fallback.
+If you meet a host that binds ECM and not NCM, `warthog-us-ecm` builds CDC-ECM
+instead. esp_tinyusb's default configuration descriptor has no ECM function, so
+that build supplies the CDC-ACM + CDC-ECM descriptor the board shipped with
+before NCM. Built in CI, which checks the ELF holds that descriptor; not
+measured on a host.
 
 ## How Warthog compares
 
@@ -253,7 +261,7 @@ Warthog is for a different audience: people who want to *own* the firmware on a 
 |---|---|---|
 | Firmware | Closed, vendor binary | **Open source** (GPL-3.0); ESP-IDF + TinyUSB + `morsemicro/halow` |
 | Hardware | Pre-built USB stick | XIAO ESP32-S3 + Seeed HaLow add-on (~$30 BOM) — needs a [bulk-cap mod](docs/power-notes.md) on this specific board |
-| Host surface | USB Ethernet only | USB CDC-ECM **+** CDC-ACM console **+** 2.4 GHz Wi-Fi AP |
+| Host surface | USB Ethernet only | USB CDC-NCM **+** CDC-ACM console **+** 2.4 GHz Wi-Fi AP |
 | Runtime config | Vendor app or fixed defaults | **AT commands** over the CDC port (`AT+HALOW=ssid,psk`), NVS-persisted |
 | Secondary clients | Need their own USB host | Join the Wi-Fi AP — no USB required |
 | Region story | Vendor-locked, opaque | Per-region build artifacts; BCF + country code explicit at compile time |
@@ -336,7 +344,7 @@ Other build-time defaults you can override the same way (all live in `[warthog_b
 |---|---|---|
 | `WARTHOG_AP_SSID` | `warthog` | 2.4 GHz AP SSID |
 | `WARTHOG_AP_PSK` | `warthog-default` | 2.4 GHz AP WPA2 passphrase |
-| `WARTHOG_USB_GW_IP` / `_NETMASK` | `192.168.4.1/24` | USB ECM subnet (host gets `.2+`) |
+| `WARTHOG_USB_GW_IP` / `_NETMASK` | `192.168.4.1/24` | USB network subnet (host gets `.2+`) |
 | `WARTHOG_AP_GW_IP` / `_NETMASK` | `192.168.5.1/24` | Wi-Fi AP subnet |
 | `WARTHOG_DOWNSTREAM_DNS` | `1.1.1.1` | DNS handed to USB + AP clients via DHCP option 6. See [Troubleshooting](#troubleshooting) — getting this wrong is what makes `ping 8.8.8.8` work while `curl example.com` hangs. Override with `AT+DNS=` at runtime instead of reflashing. |
 
@@ -519,7 +527,7 @@ The CDC console (`/dev/cu.usbmodemXXXX`) carries all ESP-IDF logs after USB-OTG 
 | 2 | USB net device (CDC-ECM, macOS/Linux) | ✅ DHCP + ping verified on macOS |
 | 3 | 2.4 GHz Wi-Fi AP | ✅ SSID `warthog` visible |
 | 4 | lwIP NAPT bridge | ✅ end-to-end internet verified (host → USB → HaLow → upstream → 8.8.8.8) |
-| 5 | Polish (LEDs, AT, NVS) | ✅ partial — LED state machine, AT commands, NVS persistence shipped. Windows RNDIS, NCM (iOS) and a web UI deferred. |
+| 5 | Polish (LEDs, AT, NVS) | ✅ partial — LED state machine, AT commands, NVS persistence shipped; CDC-NCM replaced ECM as the USB class. Windows RNDIS and a web UI deferred. |
 | 6 | 802.11s mesh over HaLow | ✅ peering, data plane and HWMP path selection; 3-node warthog mesh verified |
 | 7 | OpenMANET / OpenWrt interop | ✅ unencrypted mesh: 0–3% loss, 8–19 ms against OpenMANET 1.8.0. SAE/AMPE peering verified cross-vendor; its data plane on `warthog-mesh-sae-swccmp` only, in batman mode (2026-09-30) — see [`docs/mesh-openmanet.md`](docs/mesh-openmanet.md) |
 | 8 | 802.11s forwarding + L2 bridge | 🧪 implemented, host-tested and simulated (`sim_mesh`: relay, flood, proxy, link loss, TTL); **no forwarded or bridged frame has been on a radio** — see [Mesh Mode](wiki/Mesh-Mode.md#forwarding) |
@@ -590,6 +598,43 @@ registered last, which `warthog-mesh-sae-swccmp-meshvif` fixes, and the chip
 hands the host unicast data addressed to other stations
 ([Batman Mode](wiki/Batman-Mode.md#measured-on-air)).
 
+**Measured on 2026-10-03.** Under a mesh, `AT+CHIPRESTART` reloads the chip
+and puts the mesh back in about 1.1 s with USB and the peer links up, 12 of 12
+in a soak (both `-meshvif` builds, [Mesh Mode](wiki/Mesh-Mode.md#chip-restarts));
+`AT+STACKS?` reads at least 2356 bytes free in the `health` task during a
+restart and 4192-4388 in ESP-IDF's `wifi` task; an assert
+(`AT+ASSERTTEST=at`, `=loop`) reboots the board once in about 6 s with its
+record and core dump ([Troubleshooting](wiki/Troubleshooting.md#the-board-drops-off-usb));
+host TX fragmentation (`AT+HOSTFRAG`) with chip keys delivers frames cut in 2
+to an OpenMANET node and to another Warthog; chip firmware 1.17.6 loses frames
+cut in 3 with chip keys and re-encapsulates every fragment after the first with
+host CCMP ([OpenMANET Interop](wiki/OpenMANET-Interop.md#what-chip-firmware-1176-does-with-fragments)),
+which is why builds cut in at most 2, and not at all with host CCMP. Those
+fragments were read with the capture rings (`AT+TXCAP` on the sender, `AT+RXCAP`
+on the receiver, each frame the same on both but Duration), and the Block Ack
+sessions with `AT+AMPDU?` (`orig`, `addba_tx`). At 1 MHz MCS0 (`AT+TXRATE=0,1`)
+a Pi's 1000- and 1472-byte pings are answered 8/8 with chip keys
+(`warthog-mesh-sae-meshvif`) and `AT+HOSTFRAG=auto`, the default there (the
+session ended by a DELBA, `ba_end`), and 0/8 with `=0`, whose replies the chip
+cut in 2 under the Warthog's Block Ack session; with host CCMP
+(`-swccmp-meshvif`) 8/8 with `AT+SEALFIT=1`, the default, and 0/8 with `=0`.
+Over a two-hour soak, an OpenMANET Pi at MTU 1460 (its `bat0`'s) sent 1452- and
+1472-byte pings as two IP fragments and none was answered (0/5 in each of 24
+rounds, both boards): ESP-IDF's lwIP drops IP fragments addressed to it by
+default. Builds from then on reassemble them
+([Troubleshooting](wiki/Troubleshooting.md#large-packets-from-a-node-at-mtu-1460-go-unanswered-ip-fragments)).
+With such a build, the same day, both boards: the Pi at MTU 1460 and at 1500
+pinged the Warthog with up to 14392 bytes (10 fragments), 5/5; a Mac on the
+Warthog's USB pinged the Pi through NAT with 100, 1472, 1473, 2000 and 6000
+bytes, 3/3 each (one 6000-byte run 2/3), `AT+MTU?` `ip_reass` rising both ways
+and `ip_reass_drop` 0. With the USB link's rewrite (one owner of the network
+class, NCM's receive renewed per datagram) the Mac's pings to the board of 100
+to 6000 bytes went 3/3 with the link up throughout, where before 1473 bytes went
+1/3, 2000 bytes 0/3 and then nothing until a reset; bursts of 100 × 1400 and
+40 × 6000 bytes lost nothing, and `+USBNET` read `rx` above `rx_xfer` (the host
+packing blocks), `drop_full` 0, `tx_stall_ms` 0
+([Troubleshooting](wiki/Troubleshooting.md#usb-networking-stops-after-large-pings)).
+
 **Not measured.** Everything else added from 2026-09-21 on is compiled, reviewed
 and where possible host-tested, but has not run on a radio: receive-side Address
 Extension against a real bridged peer; leaf-mode learning of hosts behind any
@@ -604,10 +649,31 @@ removed; a peer's advertised group-key RSC used as its replay floor; the
 nonzero own-MGTK PN base and its re-install (`-DWARTHOG_MESH_MGTK_PN_BASE`,
 set only on the swccmp bench builds, because it assumes the chip honours an
 installed group key's PN; a relay's or bridge's group path selection on those
-builds depends on it); the board reset on a chip restart while the mesh
-interface is up; peer-capacity signalling at 4 peers (the accepting bit,
-Close(53), the re-announce and the SAE offer gate); PREQ/PREP lifetimes up to
-60 s and the 600 s sweep of lapsed paths and proxy entries; the Meshtastic
+builds depends on it); a chip restart the chip starts itself (a failed health
+check or a bus error) and one in client mode; `AT+ASSERTTEST=crit` and
+`=hang`, the boot watchdog and its two USB retries, safe mode and the chip held
+in reset there and at the hang stop; the 2-fragment rule with chip keys other
+than at 1 MHz MCS0 alone (a frame moved to rates where 2 fragments are enough,
+`clamp`; with `AT+HOSTFRAG=0` too, for frames the chip cuts), a chip-sealed
+frame sent whole under the Warthog's Block Ack session with `AT+HOSTFRAG=0`, or
+before the DELBA that ended one for a cut is through (`seal_ba`), `AT+SEALFIT`
+with host CCMP other than at 1 MHz MCS0 alone, group frames (`AT+MESHGRP=1`)
+sent only at a rate that carries them whole and whether the chip cuts them
+otherwise, the link budget those faster rates cost (derived: about 3 dB at 1 MHz
+MCS1, 5 dB at MCS2), the RTS/CTS choice of a first rate the rule puts in, the TX
+pool reserve of 5, the chip's rate for an A-MPDU whose frames' chains differ,
+host TX fragmentation's Block Ack wait (a cut frame held until the DELBA's TX
+status and 20 ms more, ADDBA held off 15 s, `delba_noack`), `AT+AMPDU=0`,
+`AT+TIDPARAMS` (measured only as making no difference to 3-fragment loss; on by
+default on the chip-key builds, whether the chip aggregates whole frames on it
+is not), the `warthog_led` task's stack at 3072 bytes; bat0's 100 ms wait for
+a transmit slot (host-tested); the drop of whole TCP, UDP and ICMP packets
+shorter than their header ahead of NAPT, which stock NAPT reads and rewrites
+past their end (`AT+MTU?` `ip_short_drop`; host-tested on IDF's own lwIP, under
+ASan); the CDC-ECM build (`warthog-us-ecm`) on a host;
+peer-capacity signalling at 4 peers (the accepting bit, Close(53), the
+re-announce and the SAE offer gate); PREQ/PREP lifetimes up to 60 s and the
+600 s sweep of lapsed paths and proxy entries; the Meshtastic
 repeater's one-socket-per-interface receive and send (the repeater was measured
 on air before that change); AT replies longer than the 512-byte USB FIFO, now
 sent in pieces under a port lock; `AT+MESHPMF=1`; a relay's or bridge's group
@@ -814,6 +880,17 @@ has the check that does. Every other build installs our MGTK at PN 0 and
 advertises RSC 0, so a peer that joins or re-peers can be fed each of our earlier
 group frames under that key once, until the MGTK changes. `AT+MESHPMF=1` has
 never been run on air.
+
+### Short packets through NAT
+
+ESP-IDF's NAPT reads a TCP, UDP or ICMP header without checking the packet holds
+one, and on a session match rewrites its port and checksum past the packet's
+end. Any mesh member or tethered host can send such a packet, also to 0.0.0.0
+while the Warthog has lost its HaLow lease, since NAPT sessions outlive it.
+Warthog's lwIP input hook drops them first, with UDP packets too short for their
+destination port, which lwIP's DHCP check reads (`AT+MTU?` `ip_short_drop`;
+[`docs/napt-notes.md`](docs/napt-notes.md#short-packets)). Host-tested under
+ASan; not measured on a board.
 
 ### For anything that actually needs confidentiality
 

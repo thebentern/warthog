@@ -77,6 +77,18 @@ bool umac_mesh_unopenable_answer_due(const uint8_t *sa);
 /** Forget every peer link; the next beacon re-runs the peering. */
 void umac_mesh_reset_links(void);
 
+/** After a chip restart (umac_mmdrv_shim.c), event loop only: what the mesh held in the chip goes
+ *  back; an error when what cannot fail did. @p complete: all of it went back as at the start. */
+enum mmwlan_status umac_mesh_handle_hw_restarted(struct umac_data *umacd, bool *complete);
+
+/** AT+CHIPRESTART, any mode (umac_mmdrv_shim.c): the event loop fails the next health check
+ *  through the driver. MMWLAN_UNAVAILABLE when the loop is down, MMWLAN_NO_MEM when its queue is full. */
+enum mmwlan_status umac_chip_restart_request(struct umac_data *umacd);
+
+/** AT+ASSERTTEST=loop (umac_mmdrv_shim.c): an MMOSAL_ASSERT on the event loop
+ *  MMWLAN_ASSERT_TEST_DELAY_MS later; fails as umac_chip_restart_request does. */
+enum mmwlan_status umac_assert_test_request(struct umac_data *umacd);
+
 /** Send an HWMP PREQ to @p da, targeting @p da itself. Emitting this is what
  *  makes us reachable: a peer installs a path to a PREQ's originator. */
 int umac_mesh_hwmp_send_preq(const uint8_t *da);

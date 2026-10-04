@@ -122,6 +122,26 @@ enum mmwlan_status mmwlan_mesh_query_peer_links(struct mmwlan_mesh_peer_link *ou
     return umac_mesh_peer_links_snapshot(umac_data_get_umacd(), out, max, count);
 }
 
+enum mmwlan_status mmwlan_force_chip_restart(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    if (!umac_data_is_initialised(umacd))
+    {
+        return MMWLAN_NOT_INITIALIZED;
+    }
+    return umac_chip_restart_request(umacd);
+}
+
+enum mmwlan_status mmwlan_assert_test(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    if (!umac_data_is_initialised(umacd))
+    {
+        return MMWLAN_NOT_INITIALIZED;
+    }
+    return umac_assert_test_request(umacd);
+}
+
 uint8_t mmwlan_mesh_get_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max)
 {
     uint8_t n = 0;

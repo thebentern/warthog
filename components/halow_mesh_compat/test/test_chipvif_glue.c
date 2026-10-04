@@ -23,6 +23,15 @@
  *      the counts, and a host tick yields to a chip that schedules its own TBTT on a
  *      MESH-VIF build only.
  *  (7) umac/ps/umac_ps.c, whole: no CONFIG_PS to a MESH chip VIF; a STA one still gets it.
+ *  (8) beacon.c's teardown, which mmdrv_deinit runs at a chip restart before it clears the driver's
+ *      state: the host beacon timer is stopped (a tick after it beacons nothing) and kept, not
+ *      leaked or freed under a running tick; the next start at the same period takes it back.
+ *  (9) driver/health/driver_health.c, whole: AT+CHIPRESTART (mmdrv_force_health_check_fail,
+ *      extracted from driver.c) wakes the health task, which fails the check without asking the
+ *      chip and restarts it as after a real failure (TX paused, HW_RESTARTED posted), once,
+ *      counted; refused while the driver is stopped. A passing check restarts nothing; a check the
+ *      chip fails twice restarts it the same way. A driver that starts again (driver_health_init)
+ *      has no forced failure armed.
  *
  * Built with WARTHOG_MESH_CHIP_VIF_MESH=1 (test_chipvif_glue) and without (_off).
  */
@@ -39,6 +48,7 @@
 #include "mmwlan.h"
 #include "driver/driver.h"
 #include "driver/morse_driver/command.h"
+#include "driver/health/driver_health.h"
 #include "umac/data/umac_data.h"
 #include "umac/interface/umac_interface.h"
 #include "umac/ps/umac_ps_data.h"
@@ -132,6 +142,7 @@ static unsigned s_notify, s_notify_isr;
 static timer_callback_t s_timer_cb;
 static void *s_timer_arg;
 static int s_timer_obj;
+static unsigned s_timer_creates, s_timer_stops, s_timer_deletes;
 
 void driver_task_notify_event(struct driver_data *driverd, enum driver_task_event evt)
 {
@@ -165,11 +176,13 @@ struct mmosal_timer *mmosal_timer_create(const char *name, uint32_t timer_period
     (void)name; (void)timer_period; (void)auto_reload;
     s_timer_cb = callback;
     s_timer_arg = arg;
+    s_timer_creates++;
     return (struct mmosal_timer *)&s_timer_obj;
 }
 void *mmosal_timer_get_arg(struct mmosal_timer *timer) { (void)timer; return s_timer_arg; }
 bool mmosal_timer_start(struct mmosal_timer *timer) { (void)timer; return true; }
-bool mmosal_timer_stop(struct mmosal_timer *timer) { (void)timer; return true; }
+bool mmosal_timer_stop(struct mmosal_timer *timer) { (void)timer; s_timer_stops++; return true; }
+void mmosal_timer_delete(struct mmosal_timer *timer) { (void)timer; s_timer_deletes++; }
 
 #include "driver/beacon/beacon.c"
 
@@ -202,6 +215,41 @@ int mmdrv_set_chip_power_save_enabled(uint16_t vif_id, bool enabled)
 int mmdrv_set_wake_enabled(bool enabled) { (void)enabled; return 0; }
 
 #include "umac/ps/umac_ps.c"
+
+/* ---- what driver_health.c reaches -------------------------------------- */
+
+volatile uint32_t g_warthog_chiprestart_forced;
+static int s_semb_obj, s_task_obj;
+static unsigned s_waits, s_checks, s_restarts, s_semb_gives;
+static int s_check_ret;
+static uint16_t s_paused_mask;
+
+struct mmosal_semb *mmosal_semb_create(const char *name) { (void)name; return (struct mmosal_semb *)&s_semb_obj; }
+void mmosal_semb_delete(struct mmosal_semb *semb) { (void)semb; }
+bool mmosal_semb_give(struct mmosal_semb *semb) { (void)semb; s_semb_gives++; return true; }
+/* The task's wait: the first returns the demand; the next ends the task, as driver_health_deinit does. */
+bool mmosal_semb_wait(struct mmosal_semb *semb, uint32_t timeout_ms)
+{
+    (void)semb; (void)timeout_ms;
+    if (s_waits++ != 0u) { driver_data.health_check.task_enabled = false; }
+    return true;
+}
+struct mmosal_task *mmosal_task_create(mmosal_task_fn_t task_fn, void *argument, enum mmosal_task_priority priority,
+                                       unsigned stack_size_u32, const char *name)
+{
+    (void)task_fn; (void)argument; (void)priority; (void)stack_size_u32; (void)name;
+    return (struct mmosal_task *)&s_task_obj;
+}
+struct mmosal_task *mmosal_task_get_active(void) { return (struct mmosal_task *)&s_task_obj; }
+void mmosal_task_sleep(uint32_t duration_ms) { (void)duration_ms; }
+int morse_cmd_health_check(struct driver_data *driverd) { (void)driverd; s_checks++; return s_check_ret; }
+void mmdrv_host_set_tx_paused(uint16_t sources_mask, bool paused)
+{
+    s_paused_mask = paused ? (uint16_t)(s_paused_mask | sources_mask) : (uint16_t)(s_paused_mask & ~sources_mask);
+}
+void mmdrv_host_hw_restart_required(void) { s_restarts++; }
+
+#include "driver/health/driver_health.c"
 
 /* ---- the cases ---------------------------------------------------------- */
 
@@ -441,6 +489,80 @@ static void t_ps(void)
           "(7) a STA chip VIF still gets CONFIG_PS (%u sent)", s_ps_cmds);
 }
 
+static void t_beacon_teardown(void)
+{
+    struct driver_data d;
+    memset(&d, 0, sizeof(d));
+    s_timer_creates = s_timer_stops = s_timer_deletes = 0;
+    (void)morse_beacon_start(&d, 0, 102);
+    struct mmosal_timer *t = d.beacon.host_timer;
+    CHECK(t != NULL && s_timer_creates == 1u && d.beacon.enabled, "(8) a start creates the host beacon timer");
+    morse_beacon_teardown(&d);
+    CHECK(!d.beacon.enabled && d.beacon.host_timer == NULL && s_timer_stops == 1u && s_timer_deletes == 0u,
+          "(8) teardown stops it and takes it out of the driver state, not freed under a running tick");
+    s_notify = 0;
+    s_timer_cb((struct mmosal_timer *)&s_timer_obj);
+    CHECK(s_notify == 0u, "(8) a tick after it beacons nothing");
+    memset(&d, 0, sizeof(d)); /* mmdrv_deinit, then mmdrv_init, clear the driver state */
+    (void)morse_beacon_start(&d, 0, 102);
+    CHECK(d.beacon.host_timer == t && s_timer_creates == 1u && s_timer_deletes == 0u,
+          "(8) the next start at that period takes the same timer back (created %u)", s_timer_creates);
+    morse_beacon_teardown(&d);
+    memset(&d, 0, sizeof(d));
+    (void)morse_beacon_start(&d, 0, 204);
+    CHECK(s_timer_deletes == 1u && s_timer_creates == 2u && d.beacon.host_timer != NULL,
+          "(8) a start at another period deletes the kept one and creates its own");
+    morse_beacon_teardown(&d);
+    morse_beacon_teardown(&d);
+    CHECK(s_timer_stops == 3u, "(8) a teardown with no timer does nothing (%u stops)", s_timer_stops);
+}
+
+/* One pass of the health task: the demanded check, then the task ends. */
+static void health_task_once_(void)
+{
+    s_waits = s_checks = s_restarts = 0;
+    s_paused_mask = 0;
+    driver_data.health_check.task_enabled = true;
+    driver_health_task_main(&driver_data);
+}
+
+static void t_health_force(void)
+{
+    memset(&driver_data.health_check, 0, sizeof(driver_data.health_check));
+    driver_data.health_check.pending_semb = (struct mmosal_semb *)&s_semb_obj;
+    driver_data.started = true;
+    g_warthog_chiprestart_forced = 0;
+    s_semb_gives = 0;
+    CHECK(mmdrv_force_health_check_fail() == 0 && driver_data.health_check.force_fail &&
+              driver_data.health_check.check_demanded && s_semb_gives == 1u,
+          "(9) AT+CHIPRESTART marks the next check failed and wakes the health task");
+    s_check_ret = 0;
+    health_task_once_();
+    CHECK(s_checks == 0u && s_restarts == 1u && (s_paused_mask & MMDRV_PAUSE_SOURCE_MASK_HW_RESTART) != 0u,
+          "(9) the task fails it without asking the chip, pauses TX and posts the restart (checks %u, restarts %u)",
+          s_checks, s_restarts);
+    CHECK(!driver_data.health_check.force_fail && g_warthog_chiprestart_forced == 1u,
+          "(9) once, counted forced 1 (%lu)", (unsigned long)g_warthog_chiprestart_forced);
+    driver_data.health_check.check_demanded = true;
+    health_task_once_();
+    CHECK(s_checks == 1u && s_restarts == 0u && s_paused_mask == 0u,
+          "(9) the next demanded check asks the chip and, passing, restarts nothing");
+    s_check_ret = -ETIMEDOUT;
+    driver_data.health_check.check_demanded = true;
+    health_task_once_();
+    CHECK(s_checks == 2u && s_restarts == 1u && (s_paused_mask & MMDRV_PAUSE_SOURCE_MASK_HW_RESTART) != 0u,
+          "(9) a check the chip fails twice takes the same path (checks %u)", s_checks);
+    s_check_ret = 0;
+    driver_data.started = false;
+    driver_data.health_check.force_fail = false;
+    CHECK(mmdrv_force_health_check_fail() == -ENODEV && !driver_data.health_check.force_fail,
+          "(9) refused while the driver is stopped");
+    driver_data.started = true;
+    driver_data.health_check.force_fail = true;
+    CHECK(driver_health_init(&driver_data) == 0 && !driver_data.health_check.force_fail,
+          "(9) a driver that starts again has no forced failure armed");
+}
+
 int main(void)
 {
     printf("=== chip VIF glue: driver.c status, beacon.c, umac_ps.c (WARTHOG_MESH_CHIP_VIF_MESH=%d) ===\n",
@@ -452,6 +574,8 @@ int main(void)
     t_install_key();
     t_beacon();
     t_ps();
+    t_beacon_teardown();
+    t_health_force();
     CHECK(s_asserts == (WARTHOG_MESH_CHIP_VIF_MESH ? 0u : 1u), "no assert fired but the one expected (%u)",
           s_asserts);
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }

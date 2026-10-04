@@ -170,6 +170,7 @@ bool simnode_timeout_next_due(uint32_t *due)
 static unsigned s_on_loop;
 void simnode_loop_enter(void) { s_on_loop++; }
 void simnode_loop_leave(void) { s_on_loop -= (s_on_loop != 0u) ? 1u : 0u; }
+void simnode_loop_reset(void) { s_on_loop = 0; }
 
 bool umac_core_evtloop_is_active(struct umac_data *umacd)
 {
@@ -215,6 +216,17 @@ bool umac_core_evt_queue(struct umac_data *umacd, const struct umac_evt *evt)
     (void)umacd;
     if (evt == NULL || s_evtq_n >= SIMNODE_EVTQ_MAX) { return false; }
     s_evtq[(s_evtq_head + s_evtq_n) % SIMNODE_EVTQ_MAX] = *evt;
+    s_evtq_n++;
+    return true;
+}
+
+/* At the head of the queue, as the chip-restart event is posted (umac_mmdrv_shim.c). */
+bool umac_core_evt_queue_at_start(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    (void)umacd;
+    if (evt == NULL || s_evtq_n >= SIMNODE_EVTQ_MAX) { return false; }
+    s_evtq_head = (s_evtq_head + SIMNODE_EVTQ_MAX - 1u) % SIMNODE_EVTQ_MAX;
+    s_evtq[s_evtq_head] = *evt;
     s_evtq_n++;
     return true;
 }

@@ -35,8 +35,8 @@
 #include "dot11/dot11.h"
 #include "dot11/dot11_ies.h"
 
-static unsigned s_hits[54];
-static const char *const s_names[54] = {
+static unsigned s_hits[56];
+static const char *const s_names[56] = {
     "bip_is_valid",
     "ie_aid_request_build",
     "ie_morse_info_build",
@@ -44,10 +44,9 @@ static const char *const s_names[54] = {
     "ie_twt_build",
     "ie_wmm_info_build",
     "ieee80211_crc32",
-    "umac_config_get_default_qos_queue_params",
+    "umac_ap_get_beacon",
     "umac_config_get_duty_cycle_mode",
     "umac_config_get_dynamic_ps_timeout",
-    "umac_config_get_health_check_interval",
     "umac_config_get_listen_interval",
     "umac_config_get_max_tx_power",
     "umac_config_get_rts_threshold",
@@ -62,6 +61,8 @@ static const char *const s_names[54] = {
     "umac_connection_get_stad",
     "umac_connection_get_state",
     "umac_connection_handle_ack_status",
+    "umac_connection_handle_beacon_loss",
+    "umac_connection_handle_hw_restarted",
     "umac_connection_populate_tx_metadata",
     "umac_connection_process_assoc_reassoc_rsp",
     "umac_connection_process_auth_resp",
@@ -69,16 +70,17 @@ static const char *const s_names[54] = {
     "umac_connection_process_deauth_rx",
     "umac_connection_process_disassoc_req",
     "umac_core_evt_wake",
+    "umac_core_is_running",
     "umac_interface_get_current_s1g_operation_info",
     "umac_interface_set_channel_from_regdb",
     "umac_mesh_ccmp_kat_run",
+    "umac_offload_dhcp_lease_update",
     "umac_ps_reset",
     "umac_ps_update_mode",
-    "umac_rc_feedback",
-    "umac_rc_init_rate_table_data",
-    "umac_rc_init_rate_table_mgmt",
     "umac_rc_start",
     "umac_rc_stop",
+    "umac_scan_handle_hw_restarted",
+    "umac_scan_hw_scan_done",
     "umac_scan_process_probe_resp",
     "umac_shutdown_is_in_progress",
     "umac_supp_add_mesh_interface",
@@ -93,13 +95,15 @@ static const char *const s_names[54] = {
     "umac_twt_init_vif",
 };
 
+static int s_set_channel_status;
 static uint8_t s_new_peer_addr[6];
 static uint8_t s_new_peer_ies[256];
 static size_t s_new_peer_len;
+static uint8_t s_populate_flags;
 
 unsigned simnode_stub_hits(const char *name)
 {
-    for (unsigned i = 0; i < 54; i++)
+    for (unsigned i = 0; i < 56; i++)
     {
         if (strcmp(s_names[i], name) == 0) { return s_hits[i]; }
     }
@@ -160,8 +164,8 @@ u32 ieee80211_crc32(const u8 *frame, size_t frame_len)
     return 0;
 }
 
-/* umac_config.h */
-const struct mmwlan_qos_queue_params * umac_config_get_default_qos_queue_params(struct umac_data *umacd)
+/* umac_ap.h */
+struct mmpkt * umac_ap_get_beacon(struct umac_data *umacd)
 {
     s_hits[7]++;
     return NULL;
@@ -182,210 +186,212 @@ uint32_t umac_config_get_dynamic_ps_timeout(struct umac_data *umacd)
 }
 
 /* umac_config.h */
-void umac_config_get_health_check_interval(struct umac_data *umacd, uint32_t *min_health_check_intvl_ms, uint32_t *max_health_check_intvl_ms)
-{
-    s_hits[10]++;
-    return;
-}
-
-/* umac_config.h */
 uint16_t umac_config_get_listen_interval(struct umac_data *umacd)
 {
-    s_hits[11]++;
+    s_hits[10]++;
     return 0;
 }
 
 /* umac_config.h */
 uint16_t umac_config_get_max_tx_power(struct umac_data *umacd)
 {
-    s_hits[12]++;
+    s_hits[11]++;
     return 0;
 }
 
 /* umac_config.h */
 uint32_t umac_config_get_rts_threshold(struct umac_data *umacd)
 {
-    s_hits[13]++;
+    s_hits[12]++;
     return 0;
 }
 
 /* umac_config.h */
 int umac_config_get_supported_channel_width_field_override(struct umac_data *umacd)
 {
-    s_hits[14]++;
+    s_hits[13]++;
     return 0;
 }
 
 /* umac_config.h */
 bool umac_config_is_ctrl_resp_out_1mhz_enabled(struct umac_data *umacd)
 {
-    s_hits[15]++;
+    s_hits[14]++;
     return false;
 }
 
 /* umac_config.h */
 bool umac_config_is_ndp_probe_supported(struct umac_data *umacd)
 {
-    s_hits[16]++;
+    s_hits[15]++;
     return false;
 }
 
 /* umac_config.h */
 bool umac_config_is_non_tim_mode_enabled(struct umac_data *umacd)
 {
-    s_hits[17]++;
+    s_hits[16]++;
     return false;
 }
 
 /* umac_config.h */
 bool umac_config_is_opclass_check_enabled(struct umac_data *umacd)
 {
-    s_hits[18]++;
+    s_hits[17]++;
     return false;
 }
 
 /* umac_config.h */
 bool umac_config_rc_is_sgi_enabled(struct umac_data *umacd)
 {
-    s_hits[19]++;
+    s_hits[18]++;
     return false;
 }
 
 /* umac_connection.h */
 bool umac_connection_addr_matches_bssid(struct umac_data *umacd, const uint8_t *addr)
 {
-    s_hits[20]++;
+    s_hits[19]++;
     return false;
 }
 
 /* umac_connection.h */
 enum umac_connection_signal_change umac_connection_check_signal_change(struct umac_data *umacd, int16_t rssi)
 {
-    s_hits[21]++;
+    s_hits[20]++;
     return (enum umac_connection_signal_change)0;
 }
 
 /* umac_connection.h */
 struct umac_sta_data * umac_connection_get_stad(struct umac_data *umacd)
 {
-    s_hits[22]++;
+    s_hits[21]++;
     return NULL;
 }
 
 /* umac_connection.h */
 enum mmwlan_sta_state umac_connection_get_state(struct umac_data *umacd)
 {
-    s_hits[23]++;
+    s_hits[22]++;
     return (enum mmwlan_sta_state)0;
 }
 
 /* umac_connection.h */
 void umac_connection_handle_ack_status(struct mmpkt *mmpkt, struct umac_data *umacd, bool acked)
 {
+    s_hits[23]++;
+    return;
+}
+
+/* umac_connection.h */
+void umac_connection_handle_beacon_loss(struct umac_data *umacd)
+{
     s_hits[24]++;
     return;
 }
 
 /* umac_connection.h */
-void umac_connection_populate_tx_metadata(struct umac_data *umacd, struct mmdrv_tx_metadata *tx_metadata)
+void umac_connection_handle_hw_restarted(struct umac_data *umacd)
 {
     s_hits[25]++;
     return;
 }
 
 /* umac_connection.h */
-void umac_connection_process_assoc_reassoc_rsp(struct umac_data *umacd, struct mmpktview *rxbufview)
+void umac_connection_populate_tx_metadata(struct umac_data *umacd, struct mmdrv_tx_metadata *tx_metadata)
 {
     s_hits[26]++;
+    if (tx_metadata != NULL) { tx_metadata->flags |= s_populate_flags; }
     return;
 }
 
 /* umac_connection.h */
-void umac_connection_process_auth_resp(struct umac_data *umacd, struct mmpktview *rxbufview)
+void umac_connection_process_assoc_reassoc_rsp(struct umac_data *umacd, struct mmpktview *rxbufview)
 {
     s_hits[27]++;
     return;
 }
 
 /* umac_connection.h */
-void umac_connection_process_beacon_ies(struct umac_data *umacd, const uint8_t *ies, uint32_t ies_len)
+void umac_connection_process_auth_resp(struct umac_data *umacd, struct mmpktview *rxbufview)
 {
     s_hits[28]++;
     return;
 }
 
 /* umac_connection.h */
-void umac_connection_process_deauth_rx(struct umac_data *umacd, struct mmpktview *rxbufview)
+void umac_connection_process_beacon_ies(struct umac_data *umacd, const uint8_t *ies, uint32_t ies_len)
 {
     s_hits[29]++;
     return;
 }
 
 /* umac_connection.h */
-void umac_connection_process_disassoc_req(struct umac_data *umacd, struct mmpktview *rxbufview)
+void umac_connection_process_deauth_rx(struct umac_data *umacd, struct mmpktview *rxbufview)
 {
     s_hits[30]++;
+    return;
+}
+
+/* umac_connection.h */
+void umac_connection_process_disassoc_req(struct umac_data *umacd, struct mmpktview *rxbufview)
+{
+    s_hits[31]++;
     return;
 }
 
 /* umac_core.h */
 void umac_core_evt_wake(struct umac_data *umacd)
 {
-    s_hits[31]++;
+    s_hits[32]++;
     return;
+}
+
+/* umac_core.h */
+bool umac_core_is_running(struct umac_data *umacd)
+{
+    s_hits[33]++;
+    return false;
 }
 
 /* umac_interface.h */
 const struct ie_s1g_operation * umac_interface_get_current_s1g_operation_info(struct umac_data *umacd)
 {
-    s_hits[32]++;
+    s_hits[34]++;
     return NULL;
 }
 
 /* umac_interface.h */
 enum mmwlan_status umac_interface_set_channel_from_regdb(struct umac_data *umacd, const struct mmwlan_s1g_channel *channel, bool is_off_channel)
 {
-    s_hits[33]++;
+    s_hits[35]++;
+    if (s_set_channel_status != 0) { return (enum mmwlan_status)s_set_channel_status; }
     return (enum mmwlan_status)0;
 }
 
 /* umac_mesh_ccmp_kat.h */
 void umac_mesh_ccmp_kat_run(void)
 {
-    s_hits[34]++;
+    s_hits[36]++;
+    return;
+}
+
+/* umac_offload.h */
+void umac_offload_dhcp_lease_update(struct umac_data *umacd, const struct mmwlan_dhcp_lease_info *lease_info)
+{
+    s_hits[37]++;
     return;
 }
 
 /* umac_ps.h */
 void umac_ps_reset(struct umac_data *umacd)
 {
-    s_hits[35]++;
+    s_hits[38]++;
     return;
 }
 
 /* umac_ps.h */
 void umac_ps_update_mode(struct umac_data *umacd)
-{
-    s_hits[36]++;
-    return;
-}
-
-/* umac_rc.h */
-void umac_rc_feedback(struct umac_sta_data *stad, struct mmdrv_tx_metadata *tx_metadata)
-{
-    s_hits[37]++;
-    return;
-}
-
-/* umac_rc.h */
-void umac_rc_init_rate_table_data(struct umac_sta_data *stad, struct mmrc_rate_table *table, bool rts_required, uint32_t frame_size)
-{
-    s_hits[38]++;
-    return;
-}
-
-/* umac_rc.h */
-void umac_rc_init_rate_table_mgmt(struct umac_data *umacd, struct mmrc_rate_table *table, bool rts_required)
 {
     s_hits[39]++;
     return;
@@ -406,37 +412,51 @@ void umac_rc_stop(struct umac_sta_data *stad)
 }
 
 /* umac_scan.h */
-void umac_scan_process_probe_resp(struct umac_data *umacd, struct mmpktview *rxbufview)
+void umac_scan_handle_hw_restarted(struct umac_data *umacd)
 {
     s_hits[42]++;
+    return;
+}
+
+/* umac_scan.h */
+void umac_scan_hw_scan_done(struct umac_data *umacd, enum mmwlan_scan_state state)
+{
+    s_hits[43]++;
+    return;
+}
+
+/* umac_scan.h */
+void umac_scan_process_probe_resp(struct umac_data *umacd, struct mmpktview *rxbufview)
+{
+    s_hits[44]++;
     return;
 }
 
 /* umac.h */
 bool umac_shutdown_is_in_progress(struct umac_data *umacd)
 {
-    s_hits[43]++;
+    s_hits[45]++;
     return false;
 }
 
 /* umac_supp_shim.h */
 enum mmwlan_status umac_supp_add_mesh_interface(struct umac_data *umacd)
 {
-    s_hits[44]++;
+    s_hits[46]++;
     return (enum mmwlan_status)0;
 }
 
 /* umac_supp_shim.h */
 void umac_supp_l2_sock_receive(struct umac_data *umacd, const uint8_t *payload, size_t payload_len, const uint8_t *src_addr)
 {
-    s_hits[45]++;
+    s_hits[47]++;
     return;
 }
 
 /* umac_supp_shim.h */
 void umac_supp_mesh_new_peer(const uint8_t *addr, const uint8_t *ies, size_t ies_len)
 {
-    s_hits[46]++;
+    s_hits[48]++;
     if (addr != NULL) { memcpy(s_new_peer_addr, addr, sizeof(s_new_peer_addr)); }
     s_new_peer_len = (ies != NULL && ies_len <= sizeof(s_new_peer_ies)) ? ies_len : 0u;
     if (s_new_peer_len != 0u) { memcpy(s_new_peer_ies, ies, s_new_peer_len); }
@@ -446,51 +466,54 @@ void umac_supp_mesh_new_peer(const uint8_t *addr, const uint8_t *ies, size_t ies
 /* umac_supp_shim.h */
 void umac_supp_notify_signal_change(struct umac_data *umacd, int16_t rssi, bool above_threshold)
 {
-    s_hits[47]++;
+    s_hits[49]++;
     return;
 }
 
 /* umac_supp_shim.h */
 void umac_supp_process_mgmt_frame(struct umac_data *umacd, struct mmpktview *rxbufview)
 {
-    s_hits[48]++;
+    s_hits[50]++;
     return;
 }
 
 /* umac_supp_shim.h */
 void umac_supp_process_unprotected_deauth(struct umac_data *umacd, uint16_t reason_code, const uint8_t *sa, const uint8_t *da)
 {
-    s_hits[49]++;
+    s_hits[51]++;
     return;
 }
 
 /* umac_supp_shim.h */
 void umac_supp_process_unprotected_disassoc(struct umac_data *umacd, uint16_t reason_code, const uint8_t *sa, const uint8_t *da)
 {
-    s_hits[50]++;
+    s_hits[52]++;
     return;
 }
 
 /* umac_supp_shim.h */
 void umac_supp_tx_status(struct umac_data *umacd, struct mmpkt *pkt, bool acked)
 {
-    s_hits[51]++;
+    s_hits[53]++;
     return;
 }
 
 /* umac_twt.h */
 void umac_twt_deinit_vif(struct umac_data *umacd, uint16_t *vif_id)
 {
-    s_hits[52]++;
+    s_hits[54]++;
     return;
 }
 
 /* umac_twt.h */
 void umac_twt_init_vif(struct umac_data *umacd, uint16_t *vif_id)
 {
-    s_hits[53]++;
+    s_hits[55]++;
     return;
 }
+
+/* What umac_interface_set_channel_from_regdb returns from now on (a chip that loses its channel). */
+void simnode_set_channel_status(int status) { s_set_channel_status = status; }
 
 /* The last candidate offered to umac_supp_mesh_new_peer: its address and IEs. */
 size_t simnode_last_new_peer(uint8_t addr[6], const uint8_t **ies)
@@ -499,3 +522,7 @@ size_t simnode_last_new_peer(uint8_t addr[6], const uint8_t **ies)
     if (ies != NULL) { *ies = s_new_peer_ies; }
     return s_new_peer_len;
 }
+
+/* The flags umac_connection_populate_tx_metadata adds to every frame (traveling pilots, 1 MHz
+ * control responses), as a connection that negotiated them would. */
+void simnode_set_populate_flags(uint8_t flags) { s_populate_flags = flags; }

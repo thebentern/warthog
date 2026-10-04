@@ -138,6 +138,42 @@ bool umac_config_is_ampdu_enabled(struct umac_data *umacd)
     return s_ampdu;
 }
 
+/* The chip's TX fragmentation threshold as mmwlan_set_fragment_threshold sets it (AT+FRAG): in the
+ * chip, then in the configuration a chip restart puts back. */
+static uint32_t s_frag_threshold;
+void simnode_set_chip_frag_threshold(uint32_t octets)
+{
+    (void)mmdrv_set_frag_threshold(octets);
+    s_frag_threshold = octets;
+}
+
+uint32_t umac_config_get_frag_threshold(struct umac_data *umacd)
+{
+    (void)umacd;
+    return s_frag_threshold;
+}
+
+/* umac_config.c's default EDCA parameters, which the mesh start pushes to the chip (BE BK VI VO). */
+const struct mmwlan_qos_queue_params *umac_config_get_default_qos_queue_params(struct umac_data *umacd)
+{
+    (void)umacd;
+    static const struct mmwlan_qos_queue_params p[MMWLAN_QOS_QUEUE_NUM_ACIS] = {
+        { .aci = 0, .aifs = 3, .cw_min = 15, .cw_max = 1023, .txop_max_us = 15008 },
+        { .aci = 1, .aifs = 7, .cw_min = 15, .cw_max = 1023, .txop_max_us = 15008 },
+        { .aci = 2, .aifs = 2, .cw_min = 7, .cw_max = 15, .txop_max_us = 15008 },
+        { .aci = 3, .aifs = 2, .cw_min = 3, .cw_max = 7, .txop_max_us = 15008 },
+    };
+    return p;
+}
+
+/* umac_config.c's defaults, which the interface and a chip restart hand the health check. */
+void umac_config_get_health_check_interval(struct umac_data *umacd, uint32_t *min_ms, uint32_t *max_ms)
+{
+    (void)umacd;
+    *min_ms = MMWLAN_DEFAULT_MIN_HEALTH_CHECK_INTERVAL_MS;
+    *max_ms = MMWLAN_DEFAULT_MAX_HEALTH_CHECK_INTERVAL_MS;
+}
+
 uint32_t umac_config_get_datapath_rx_reorder_list_maxlen(struct umac_data *umacd)
 {
     (void)umacd;

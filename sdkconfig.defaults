@@ -25,13 +25,9 @@ CONFIG_USB_OTG_SUPPORTED=y
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
 
-# --- TinyUSB net device (ECM) + CDC console ----------------------------------
-# esp_tinyusb 2.x only supports a single configuration descriptor, so we can't
-# offer a dual RNDIS/ECM composite for Windows + macOS like the upstream
-# tinyusb net_lwip_webserver example does. ECM works natively on macOS and
-# Linux; Windows is deferred. CDC rides alongside so we still have a serial
-# console after USB-OTG takes over from USB-Serial-JTAG.
-# USB network class: CDC-NCM.
+# --- TinyUSB net device (NCM) + CDC console ----------------------------------
+# CDC keeps a serial console after USB-OTG takes over from USB-Serial-JTAG.
+# USB network class: CDC-NCM (CDC-ECM: warthog-us-ecm, sdkconfig.ecm).
 #
 # NCM is bound in-box by macOS, Linux (cdc_ncm), Windows 10+ (usbncm.sys) and
 # iOS/iPadOS (Apple's own driver -- no dext, no MFi). ECM reached only macOS
@@ -40,6 +36,11 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # leaves the old =y line in place and the later line wins.
 CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=n
 CONFIG_TINYUSB_NET_MODE_NCM=y
+# esp_tinyusb's defaults, pinned: the host test's TinyUSB config (usbnet_tusb/tusb_config.h) models these.
+CONFIG_TINYUSB_NCM_OUT_NTB_BUFFS_COUNT=3
+CONFIG_TINYUSB_NCM_IN_NTB_BUFFS_COUNT=3
+CONFIG_TINYUSB_NCM_OUT_NTB_BUFF_MAX_SIZE=3200
+CONFIG_TINYUSB_NCM_IN_NTB_BUFF_MAX_SIZE=3200
 CONFIG_TINYUSB_TASK_STACK_SIZE=8192
 CONFIG_TINYUSB_CDC_ENABLED=y
 CONFIG_TINYUSB_CDC_COUNT=1
@@ -49,6 +50,13 @@ CONFIG_TINYUSB_CDC_COUNT=1
 CONFIG_LWIP_IPV4_NAPT=y
 CONFIG_LWIP_IPV4_NAPT_PORTMAP=y
 CONFIG_LWIP_IP_FORWARD=y
+
+# IPv4 reassembly (IDF default off): a peer with a smaller MTU, OpenMANET's bat0 at 1460 among them,
+# fragments; with it off every fragment to the Warthog is dropped (measured on air 2026-10-03).
+CONFIG_LWIP_IP4_REASSEMBLY=y
+# At most 10 fragments held, as heap copies (main/nat_frag.c): under 16 KB for 3-4 s; Kconfig's floor.
+CONFIG_LWIP_IP_REASS_MAX_PBUFS=10
+# No IPv6 reassembly: with no link-local address, IDF's default IPv6 input hook drops all IPv6.
 
 # --- Morse Micro shim pin map (XIAO + Seeed Wi-Fi HaLow add-on) --------------
 CONFIG_MM_RESET_N=1
@@ -116,6 +124,10 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=32
+# The dump runs on its own stack: with 0 it runs on the asserting one (the 'health' task has 4096 B).
+CONFIG_ESP_COREDUMP_STACK_SIZE=1792
+# No core-dump log lines on the panic path; they print to the USB-Serial-JTAG console.
+# CONFIG_ESP_COREDUMP_LOGS is not set
 
 # Panic prints go to the USB-Serial-JTAG console, but by the time the mesh
 # stack can panic the app has moved the sole USB PHY to OTG -- the print
@@ -123,6 +135,10 @@ CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=32
 # Reboot silently instead: the flash core dump still gets written, RTC
 # survives the SW reset, and the board comes back up readable.
 CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y
+
+# The bootloader's RTC watchdog stays armed into app_main, which re-arms it until USB has started
+# (main/boot_guard.c): a boot that stops before USB reboots instead of staying off USB.
+CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE=y
 
 # L2 bridge mode (AT+MESHBRIDGE=1): USB, Wi-Fi AP and mesh as ports of one
 # lwIP bridge. Off at runtime by default; this only compiles it in.

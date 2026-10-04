@@ -23,3 +23,7 @@ idf_component_register(
 add_subdirectory(components)
 add_dependencies(${COMPONENT_TARGET} mmpktmem shims mmutils morselib regdb)
 target_link_libraries(${COMPONENT_TARGET} PUBLIC mmpktmem shims mmutils morselib regdb)
+
+# warthog: mmhalow.c's MMOSAL_ASSERT records name their file (AT+ASSERT?).
+include(${CMAKE_CURRENT_SOURCE_DIR}/components/mmosal_fileid.cmake)
+warthog_mmosal_fileid(${COMPONENT_LIB})

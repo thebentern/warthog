@@ -201,7 +201,9 @@ static void probes_(bool *first_ok, bool *periodic_ok)
 {
     *first_ok = probe_req_shape_(last_(FC_PROBE_REQ, BCAST));
     simnode_outbox_clear();
-    *periodic_ok = umac_mesh_tx_broadcast_probe() >= 0 && probe_req_shape_(last_(FC_PROBE_REQ, BCAST));
+    const bool posted = umac_mesh_tx_broadcast_probe() >= 0;
+    simnode_pump(); /* the event loop sends it */
+    *periodic_ok = posted && probe_req_shape_(last_(FC_PROBE_REQ, BCAST));
 }
 
 static bool bytes_are_(const uint8_t *got, uint16_t n, const uint8_t *const *parts,
@@ -304,8 +306,9 @@ int main(void)
      * hostap because the Mesh ID ELEMENT names its mesh -- the SSID is empty. */
     simnode_stub_reset();
     simnode_outbox_clear();
-    const struct simnode_frame *ours =
-        umac_mesh_tx_broadcast_probe() >= 0 ? last_(FC_PROBE_REQ, BCAST) : NULL;
+    const bool posted = umac_mesh_tx_broadcast_probe() >= 0;
+    simnode_pump(); /* the event loop sends it */
+    const struct simnode_frame *ours = posted ? last_(FC_PROBE_REQ, BCAST) : NULL;
     uint8_t heard[512];
     uint16_t hn = 0;
     if (ours != NULL)

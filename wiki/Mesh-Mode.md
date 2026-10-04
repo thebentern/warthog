@@ -618,6 +618,73 @@ open mesh one peering link per peer.
   last (or since a peer was last up), the no-peers report and `AT+MESHCFG?`
   name it as the cause.
 
+## Chip restarts
+
+morselib checks the HaLow chip every 90 s, and at once after bus errors. When a
+check fails it pauses TX, reloads the chip's firmware and puts back what the
+node had in the chip. Under a mesh it sends again, in this order:
+
+- the chip interface as the mesh had it, at the same id: MESH on `-meshvif`
+  (falling back to STA as at the start), STA elsewhere; then its TX status
+  watermark, health check interval, dynamic power-save timeout and power-save
+  mode;
+- the channel (with TX power, duty cycle and MPSW), the four QoS queues, on a
+  STA interface `BSS_BEACON_CONFIG` and the derived BSSID, `BSS_CONFIG`, the
+  host beacon timer, and `MESH_CONFIG(START)`, beaconless on a MESH interface.
+  The beacon template, RSN element included, is kept;
+- the last `AT+CRYPTOHOST` setting and the `AT+FRAG` threshold;
+- every peer's station record at its AID;
+- the group key at AID 0 (our MGTK under SAE, the shared key on a keyed open
+  mesh), each peer's pairwise key where the chip holds pairwise keys (not on
+  `-swccmp` or `-nochipkey`), and on `warthog-mesh-sae-meshvif` each peer's
+  MGTK at its AID. Each goes in at a TX packet number above every one
+  it used, so peers take our frames as new, as pairwise keys do when a peer
+  leaves; that the chip honours the number for our group key is not measured
+  (the same assumption as `WARTHOG_MESH_MGTK_PN_BASE`).
+
+Peer links and the host's keys are left as they are, as Linux leaves them
+(mac80211 puts the interface, stations and keys back after morse_driver
+restarts the chip). Frames queued meanwhile go after it, as does a frame
+`AT+HOSTFRAG` cut that was waiting for its DELBA.
+
+What the chip refuses then:
+
+- A station record or key the chip refuses is retried every mesh service tick
+  (2 s) until it goes in; a key at a TX packet number above every one it used.
+  The next peer or another restart puts the group key back the same way, and on
+  a keyed open mesh so does a peer leaving. Until a key is back, data and
+  management frames (Block Ack, path selection under MFP) the chip would seal
+  under it are dropped, not handed to it, those held behind a host fragment run
+  or waiting for a DELBA at the restart included (`nokey` in `AT+DATASTAT?`).
+- Any other restore command that fails, or that the chip refuses with another
+  status than at the start on the same interface type, is counted `cmdfail`;
+  the mesh carries on, as it does at the start. The STA interface's usual
+  refusals (`MESH_CONFIG` and `BSS_BEACON_CONFIG`, status -17) count nothing.
+
+The board still resets when the firmware reload fails, the chip interface
+cannot come back at its id, the channel or its TX power, duty cycle or MPSW
+cannot be set, or `BSS_CONFIG` or `MESH_CONFIG` cannot be sent.
+
+The probe burst, `AT+CRYPTOHOST`, `AT+CHIPRESTART` and `AT+FRAG=` reach the
+driver only from the umac event loop, which runs the restart, so none reaches a
+driver being reloaded.
+
+`AT+CHIPRESTART` restarts the chip through the same path (a request the event
+loop finds with the driver stopped is dropped and counted `dropped`), and
+`AT+CHIPRESTART?` counts restarts and what they put back
+([AT reference](AT-Command-Reference#identity-and-lifecycle)). Host-tested
+(`test_simnode_restart*`, against a fake chip that loses everything when it
+boots). Measured on air on 2026-10-03 on `warthog-mesh-sae-meshvif` and
+`warthog-mesh-sae-swccmp-meshvif` with two OpenMANET 1.8.0 Pis and a second
+Warthog: back in about 1.1 s (`restarts=1 mesh=1 sta=3`, `keys=7` with chip keys
+and 1 on swccmp, `keyfail=0 cmdfail=0`), USB up, no peer re-peered, the Pis'
+replay counters at 0, our group frames taken, pings Pi to Warthog and Warthog
+to Warthog 10/10 (one run 7/10); in a soak, 12 of 12 restarts on both builds,
+the `health` task at least 2356 bytes free of 4096 during a restart
+([Troubleshooting](Troubleshooting#task-stacks)). Not measured on air: a
+restart the chip starts itself (a failed health check or a bus error), a
+restore the chip refuses, a restart in client mode.
+
 ## Limits
 
 - **At most 4 peers per node.** See [Peer capacity](#peer-capacity).

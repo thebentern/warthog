@@ -4,6 +4,7 @@
  */
 #include "simnode.h"
 
+#include <setjmp.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -203,6 +204,93 @@ uint32_t umac_rc_get_expected_tput_kbps(struct umac_sta_data *stad)
         }
     }
     return 0;
+}
+
+/* ---- rate control's table and feedback -------------------------------------
+ *
+ * The chain a test sets is what rate control hands each data frame; without one the frame
+ * keeps the zeroed table its metadata starts with, as the generated stub left it. Feedback
+ * is recorded per call, in the order the chip reported. */
+static struct simnode_rate s_chain[4];
+static unsigned s_chain_n;
+static unsigned s_rc_table_calls;
+static uint32_t s_rc_last_size;
+#define SIMNODE_RCFB_MAX 64u
+static struct simnode_rcfb s_rcfb[SIMNODE_RCFB_MAX];
+static unsigned s_rcfb_n;
+
+void simnode_set_rate_chain(const struct simnode_rate *chain, unsigned n)
+{
+    s_chain_n = (chain != NULL && n <= 4u) ? n : 0u;
+    if (s_chain_n != 0u) { memcpy(s_chain, chain, s_chain_n * sizeof(s_chain[0])); }
+}
+
+unsigned simnode_rc_table_calls(void) { return s_rc_table_calls; }
+uint32_t simnode_rc_last_size(void) { return s_rc_last_size; }
+unsigned simnode_rcfb_count(void) { return s_rcfb_n; }
+const struct simnode_rcfb *simnode_rcfb_get(unsigned i) { return i < s_rcfb_n ? &s_rcfb[i] : NULL; }
+void simnode_rc_clear(void) { s_rc_table_calls = 0; s_rc_last_size = 0; s_rcfb_n = 0; }
+
+static uint8_t rc_bw_enum_(uint8_t mhz)
+{
+    return mhz >= 16u ? MMRC_BW_16MHZ : mhz >= 8u ? MMRC_BW_8MHZ : mhz >= 4u ? MMRC_BW_4MHZ
+         : mhz >= 2u ? MMRC_BW_2MHZ : MMRC_BW_1MHZ;
+}
+
+void umac_rc_init_rate_table_data(struct umac_sta_data *stad, struct mmrc_rate_table *table,
+                                  bool rts_required, uint32_t frame_size)
+{
+    (void)stad;
+    s_rc_table_calls++;
+    s_rc_last_size = frame_size;
+    if (s_chain_n == 0u || table == NULL) { return; }
+    memset(table, 0, sizeof(*table));
+    for (unsigned i = 0; i < MMRC_MAX_CHAIN_LENGTH; i++)
+    {
+        struct mmrc_rate *r = &table->rates[i];
+        if (i >= s_chain_n)
+        {
+            r->rate = MMRC_MCS_UNUSED;
+            continue;
+        }
+        r->rate = s_chain[i].mcs;
+        r->bw = rc_bw_enum_(s_chain[i].bw_mhz);
+        r->attempts = s_chain[i].attempts;
+        r->flags = (rts_required || i != 0u) ? MMRC_MASK(MMRC_FLAGS_CTS_RTS) : 0u;
+    }
+}
+
+static uint8_t s_mgmt_bw;
+void simnode_set_mgmt_rate_bw(uint8_t mhz) { s_mgmt_bw = (mhz == 1u || mhz == 2u) ? mhz : 0u; }
+
+void umac_rc_init_rate_table_mgmt(struct umac_data *umacd, struct mmrc_rate_table *table, bool rts_required)
+{
+    (void)umacd;
+    if (s_mgmt_bw == 0u || table == NULL) { return; }
+    memset(table, 0, sizeof(*table));
+    table->rates[0].attempts = 5;
+    table->rates[0].rate = MMRC_MCS0;
+    table->rates[0].bw = rc_bw_enum_(s_mgmt_bw);
+    table->rates[0].flags = rts_required ? MMRC_MASK(MMRC_FLAGS_CTS_RTS) : 0u;
+    for (unsigned i = 1; i < MMRC_MAX_CHAIN_LENGTH; i++) { table->rates[i].rate = MMRC_MCS_UNUSED; }
+}
+
+void umac_rc_feedback(struct umac_sta_data *stad, struct mmdrv_tx_metadata *tx_metadata)
+{
+    if (tx_metadata == NULL || s_rcfb_n >= SIMNODE_RCFB_MAX) { return; }
+    struct simnode_rcfb *e = &s_rcfb[s_rcfb_n++];
+    memset(e, 0, sizeof(*e));
+    e->aid = umac_sta_data_get_aid(stad);
+    e->attempts = tx_metadata->attempts;
+    e->status_flags = tx_metadata->status_flags;
+    for (unsigned i = 0; i < 4u; i++)
+    {
+        const struct mmrc_rate *r = &tx_metadata->rc_data.rates[i];
+        if (r->rate == MMRC_MCS_UNUSED || r->attempts == 0u) { continue; }
+        e->chain[i].bw_mhz = (uint8_t)(1u << r->bw);
+        e->chain[i].mcs = r->rate;
+        e->chain[i].attempts = r->attempts;
+    }
 }
 
 int simnode_peer_links_query(struct mmwlan_mesh_peer_link *out, uint8_t max, uint8_t *count,
@@ -408,6 +496,9 @@ bool simnode_recycle_peer_record(const uint8_t *mac)
 
 static bool simnode_host_tx_(const uint8_t da[6], const uint8_t sa[6],
                              const uint8_t *payload, uint16_t payload_len, bool pump);
+static bool simnode_host_tx_on_(const uint8_t da[6], const uint8_t sa[6],
+                                const uint8_t *payload, uint16_t payload_len, bool pump,
+                                uint8_t tid);
 
 int simnode_host_tx_eth(const uint8_t *ra, const uint8_t da[6], const uint8_t sa[6],
                         uint16_t ethertype, const uint8_t *payload, uint16_t payload_len)
@@ -441,14 +532,28 @@ bool simnode_host_tx_nopump(const uint8_t da[6], const uint8_t sa[6],
     return simnode_host_tx_(da, sa, payload, payload_len, false);
 }
 
+bool simnode_host_tx_tid(const uint8_t da[6], const uint8_t sa[6],
+                         const uint8_t *payload, uint16_t payload_len, uint8_t tid)
+{
+    return simnode_host_tx_on_(da, sa, payload, payload_len, true, tid);
+}
+
 static bool simnode_host_tx_(const uint8_t da[6], const uint8_t sa[6],
                              const uint8_t *payload, uint16_t payload_len, bool pump)
+{
+    return simnode_host_tx_on_(da, sa, payload, payload_len, pump, 0);
+}
+
+static bool simnode_host_tx_on_(const uint8_t da[6], const uint8_t sa[6],
+                                const uint8_t *payload, uint16_t payload_len, bool pump,
+                                uint8_t tid)
 {
     if (!s_up) { return false; }
     /* An 802.3 frame, the shape the netif hands down. */
     struct mmpkt *pkt = umac_datapath_alloc_mmpkt_for_qos_data_tx(
-        (uint32_t)payload_len + sizeof(struct umac_8023_hdr), MMDRV_PKT_CLASS_DATA_TID0);
+        (uint32_t)payload_len + sizeof(struct umac_8023_hdr), MMDRV_PKT_CLASS_DATA_TID0 + tid);
     if (pkt == NULL) { return false; }
+    mmdrv_get_tx_metadata(pkt)->tid = tid; /* as mmwlan_tx_pkt sets it */
     struct umac_8023_hdr h;
     memcpy(h.dest_addr, da, 6);
     memcpy(h.src_addr, sa, 6);
@@ -559,4 +664,37 @@ void simnode_advance_run(uint32_t ms)
 int simnode_render_paths(char *buf, uint32_t len)
 {
     return umac_mesh_fwd_glue_render(buf, len);
+}
+
+/* driver_health.c's failure path (morse_reset_chip), on the health task. */
+void simnode_chip_restart_queued(void)
+{
+    mmdrv_host_set_tx_paused(MMDRV_PAUSE_SOURCE_MASK_HW_RESTART, true);
+    mmdrv_host_hw_restart_required();
+}
+
+void simnode_chip_restart(void)
+{
+    simnode_chip_restart_queued();
+    simnode_pump();
+}
+
+void simnode_assert_catch(jmp_buf *jb); /* fake_rtos.c */
+void simnode_crit_reset(void);          /* fake_rtos.c */
+void simnode_loop_reset(void);          /* fake_app.c */
+
+bool simnode_expect_assert(void (*fn)(void))
+{
+    static jmp_buf jb;
+    if (setjmp(jb) == 0)
+    {
+        simnode_assert_catch(&jb);
+        fn();
+        simnode_assert_catch(NULL);
+        return false;
+    }
+    /* Left mid-way, as a reset leaves it: no task is in the loop or a critical section. */
+    simnode_loop_reset();
+    simnode_crit_reset();
+    return true;
 }

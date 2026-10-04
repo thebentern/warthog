@@ -20,7 +20,8 @@
 
 
 #define SPI_IRQ_TASK_PRIORITY (MMOSAL_TASK_PRI_HIGH)
-#define SPI_IRQ_TASK_STACK    (768)
+/* warthog: 1024 words (was 768), as the health task: a bus error's MMLOG printf runs on this task. */
+#define SPI_IRQ_TASK_STACK    (1024)
 
 
 #define CMD53_MAX_BLOCKS 128

@@ -163,6 +163,9 @@ void umac_sta_data_queue_pkt(struct umac_sta_data *stad, struct mmpkt *mmpkt);
 
 struct mmpkt *umac_sta_data_pop_pkt(struct umac_sta_data *stad);
 
+/** Warthog: the frame umac_sta_data_pop_pkt would return next, left queued; NULL if none. */
+struct mmpkt *umac_sta_data_peek_pkt(struct umac_sta_data *stad);
+
 
 uint32_t umac_sta_data_get_queued_len(struct umac_sta_data *stad);
 

@@ -341,7 +341,9 @@ while its 300-byte pings passed. That was fragmentation, not RTS
 were back within 51 s.
 
 Not measured on a MESH chip interface: an open mesh, three or more Warthogs (two
-were), recovery after a chip restart.
+were). Recovery after a chip restart (`AT+CHIPRESTART`) was measured on
+2026-10-03 on both `-meshvif` builds against these Pis
+([Mesh Mode](Mesh-Mode#chip-restarts)).
 
 **Other builds: set each OpenMANET node** to use CTS-to-self in place of
 RTS/CTS, or turn RTS off. Either works alone:
@@ -365,18 +367,18 @@ OpenMANET's `netifd-morse` source, not measured.
 
 The MM6108 firmware fragments a frame too long for one transmission at a low
 rate, with no fragmentation threshold set (Morse's `mmwlan_set_fragment_threshold()`
-documents this; Morse rate control names 1 MHz MCS0-2 as such rates). Measured on
+documents this; Morse rate control names 1 MHz MCS0-2 as such rates, from its own
+rough bits-per-symbol table; by the standard's, MCS2 carries a full-size frame,
+[below](#host-fragmentation)). Measured on
 2026-10-01: an OpenMANET 1.8.0 node (chip firmware 2.0.1) whose rate to a Warthog
 had fallen to MCS0 sent each 1000-byte ping as two fragments (`morse_cli -i wlh0
 stats` `TX fragment` +10 for 5 pings); 300-byte pings, and 1000-byte pings relayed
 by a node at MCS7, were not fragmented and passed 8/8.
 
-Earlier builds delivered every fragmented frame corrupt: they removed a Mesh
-Control from each fragment, though only the first carries one, and the IP stack
-dropped the result (ping replies never arrived and no drop counter moved). Fixed:
-fragments are reassembled after decryption and before Mesh Control is read, with
-mac80211's checks (one key, consecutive packet numbers, matching headers, 1 s
-limit); `AT+DEFRAG?` counts them. At most 4 frames are reassembled at once, 2 per
+Fragments are reassembled after decryption and before Mesh Control is read
+(only the first fragment carries one), with mac80211's checks (one key,
+consecutive packet numbers, matching headers, 1 s limit); `AT+DEFRAG?` counts
+them. At most 4 frames are reassembled at once, 2 per
 peer. Measured on 2026-10-01 with a Pi forced to fragment (`iw phy phy0 set frag
 512`, path pinned to the Warthog): 1000- and 1400-byte pings passed 8/8 each on
 `-swccmp-meshvif` and on `warthog-mesh-sae-meshvif`, `AT+DEFRAG?` `in=56 ok=16`
@@ -384,7 +386,7 @@ with every drop counter at 0 on both.
 
 `AT+DATASTAT?` counts `rx_data` per fragment and `delivered` per reassembled
 frame, so `rx_data` minus `delivered` is the fragment count minus 1 for each
-fragmented frame, with or without the fix; it does not show whether the fix works.
+fragmented frame, intact or not; `AT+DEFRAG?` shows whether reassembly worked.
 
 To reproduce, pin a Linux node's path through the Warthog and ping at 1000 bytes
 while its rate is low:
@@ -399,9 +401,9 @@ Pass: every ping is answered, `TX fragment` rises, and on the Warthog
 `AT+DEFRAG?` `ok` rises by 1 for each fragmented ping while `nofirst`, `order`,
 `pn`, `key`, `prot`, `hdr` and `oversize` stay at 0.
 
-What the Warthog sends is not fixed. When its own chip fragments (forced with
-`AT+FRAG=512`, or by itself at 1 MHz MCS0-2 on a weak link), a Linux node loses
-the frame. Measured on 2026-10-01, 1000-byte replies to a pinned Pi:
+What the Warthog sends. When its own chip fragments (forced with `AT+FRAG=512`, or
+by itself at a rate too low for the frame), a Linux node loses the frame. Measured
+on 2026-10-01, 1000-byte replies to a pinned Pi:
 
 | Build | Result | On the Pi |
 |---|---|---|
@@ -411,8 +413,386 @@ the frame. Measured on 2026-10-01, 1000-byte replies to a pinned Pi:
 
 Warthog to Warthog, chip-crypto fragments reassemble (`AT+DEFRAG?` `in=9 ok=3`
 for 3 datagrams), and Pi to Pi fragments pass, so the loss is between the
-Warthog's chip firmware (1.17.6) and the Pi's (2.0.1). Large unicast from a
-Warthog to a Linux node on a link slow enough to fragment is lost.
+Warthog's chip firmware (1.17.6) and the Pi's (2.0.1).
+
+### Host fragmentation
+
+`AT+HOSTFRAG` has the Warthog cut such a frame itself, as Linux does when
+mac80211 fragments. Each fragment is its own frame: one sequence number,
+fragment numbers in order, More Fragments on all but the last, Mesh Control and
+Address Extension in the first only, each encrypted on its own (the chip numbers
+each as it encrypts it), each short enough that every rate in its retry chain
+sends it whole.
+
+#### What chip firmware 1.17.6 does with fragments
+
+Measured on air on 2026-10-03 with `AT+TXCAP` on the sending Warthog and
+`AT+RXCAP` on the receiving one (the two captures agree byte for byte except
+Duration), chip firmware 1.17.6 on both, 1 MHz MCS0 (`AT+TXRATE=0,1`),
+`AT+HOSTFRAG=auto` with no fragment cap (host CCMP cutting too):
+
+| Sender | Fragments | What arrives |
+|---|---|---|
+| host CCMP (`-swccmp-meshvif`) | 2 or more | fragment 0 as sent; every fragment numbered 1 or more, the last included, re-encapsulated by the sending chip: an outer header (a copy of the Warthog's, the chip's Duration, QoS `0x0120`) and the Warthog's 32-octet header and QoS again inside the body, sometimes followed by an extra piece with the next fragment number. A Warthog finds no CCMP header (`AT+SWCCMP?` `badhdr`), a Linux node a MIC failure. Handing the chip one fragment at a time changed nothing. |
+| chip keys (`-meshvif`) | 2 | intact and delivered: Warthog to Warthog UDP 2/2; Warthog to a Pi, ping 8/8 (2026-10-02; host-cut after the session ended, or chip-cut with the Warthog's Block Ack session state not recorded; a Pi drops fragments under its session, **Block Ack** below) |
+| chip keys | 3 | fragment 1 with More Fragments cleared and 32 octets more inside its encrypted body, fragment 2 with 32 more: the frame is lost (the 3-fragment loss below). `AT+TIDPARAMS=0` or `1` changed nothing. |
+
+A host-CCMP frame the chip cuts itself fails too (2026-10-01 and 02, the table
+above). So, whatever `AT+HOSTFRAG` says:
+
+- host-CCMP builds (`-swccmp`, `-swccmp-meshvif`, batman mode on them) cut
+  nothing (`AT+HOSTFRAG?` `rule=off`) and send a sealed frame only at rates that
+  carry it whole (`AT+SEALFIT`, [below](#sealed-and-group-frames-at-rates-the-chip-delivers));
+- chip-key builds (`warthog-mesh-sae`, `-meshvif`) cut in at most 2 (`rule=max2`),
+  and send a frame the chip cuts only at rates where it needs at most 2, or
+  whole under the Warthog's Block Ack session on its TID (`AT+SEALFIT`).
+
+| Setting (chip-key builds) | Cut |
+|---|---|
+| `AT+HOSTFRAG=0` | nothing; the chip cuts a sealed frame in at most 2 at the rates `AT+SEALFIT` leaves; under the Warthog's Block Ack session on the frame's TID not at all while `AT+FRAG` is 0 or the frame fits under it, else still in at most 2 (`seal_nofit`), which a Linux recipient drops |
+| `AT+HOSTFRAG=auto` (default on `warthog-mesh-sae` and `-meshvif`) | a unicast data frame longer than `AT+FRAG` allows (CCMP and FCS counted), or than the slower of the first two rates of its retry chain carries in one transmission; in at most 2 |
+| `AT+HOSTFRAG=<n>` (256 to 2346) | as `auto`, and a unicast data frame longer than *n*, counted as `iw phy set frag <n>` counts it; an *n* that would make more than 2 fragments is raised to the least that makes 2 (`clamp`; any *n* below about 800 for a full-size frame) |
+
+Group and management frames are never cut (as mac80211). A frame is sent whole
+when `AT+FRAG` alone would cut it in more than 2 (`many`; leave `AT+FRAG` at 0,
+or at 810 or more, 816 for frames carrying Address Extension) or no TX buffer is
+free for its fragments (`pool`). The chip
+may cut those itself, so the Warthog counts every packet number it could use for
+them (`chippn`); a key re-install never starts below them. This count applies
+with `AT+HOSTFRAG=0` too. The setting persists and applies to the next frame. A
+node that never stored one runs `auto` on the chip-key builds (`AT+HOSTFRAG?`
+`stored=auto`) and off on every other build: host CCMP, `-nochipkey`, and the
+builds without SAE (`warthog-us`, the region builds, `warthog-mesh-smoke`). A
+stored value keeps applying.
+
+**Block Ack.** mac80211 never fragments under A-MPDU; it sends the frame whole
+(`tx.c`: `IEEE80211_TX_CTL_AMPDU` sets `DONTFRAG`). A Linux recipient ends its
+Block Ack session, and drops the fragment, when a fragment after the first
+arrives on a TID with a session (`rx.c` `ieee80211_rx_reorder_ampdu`). The
+Warthog's chip would fragment such a frame, so when a frame over its limit is on
+a TID where the Warthog holds an originator session (agreed or requested), the
+Warthog ends that session with a DELBA as mac80211 sends one (`agg-tx.c`:
+originator, reason 37), then cuts the frame, never as A-MPDU. mac80211 acts on a
+received DELBA in deferred interface work, and drops a fragment that reaches it
+before that work has run. So the Warthog holds that frame, and the peer's later
+frames, until the DELBA's TX status returns and 20 ms more; 500 ms at most. A
+frame over its limit that goes whole (counted `many` or `pool`, the latter also
+when a fragment buffer cannot be had once cutting starts) still ends the session
+first, then goes to the chip at once, without that wait, at a rate that sends it
+whole (`AT+SEALFIT`, `seal_ba`), as the recipient may still hold its session;
+under an `AT+FRAG` below the frame no rate does, and the chip cuts it. The
+peer's later frames wait.
+
+It sends no ADDBA on that TID until 15 s pass with no frame there that needed
+cutting (mac80211's spacing of ADDBA retries, `HT_AGG_RETRIES_PERIOD`), so a
+session comes back once the link is fast again. The ADDBA response timeout (100
+ms, doubled with each request up to 60 s) carries over a session the Warthog
+ends; once it exceeds the peer's answer time, that is one ADDBA and one DELBA per
+peer and TID per 15 s. Sessions a peer starts are not touched. `AT+AMPDU=0` stops
+the Warthog starting any originator session and ends those it holds, for A/B
+tests.
+
+| Counter | Counts |
+|---|---|
+| `AT+HOSTFRAG?` `ba_end`, `nodelba` | sessions ended to cut a frame, the DELBA handed to the chip or not |
+| `ba_wait`, `ba_late` | cut frames held for that DELBA; waits ended at 500 ms without its TX status |
+| `delba_noack` | DELBAs a cut frame waited on that the chip gave up on unacked (the frame still goes 20 ms later) |
+| `ba_rcpt` | cut frames whose peer's reorder size toward the Warthog was set: its session, or one it ended since |
+| `hold`, `held` | ADDBAs not sent (one each time a cut frame re-arms the hold); peer TIDs held now |
+| `agg` | fragments the chip reports sent in an A-MPDU (the host never asks for it; measured above 0 on 2026-10-03) |
+| `AT+AMPDU?` `addba_tx`, `delba_to`, `delba_end`, `delba_other` | ADDBAs sent; DELBAs sent for an unanswered ADDBA (reason 4), a stopped session (37), other |
+| `rx_delba`, `rx_reason` | DELBAs a peer sent for the Warthog's sessions, the last reason (38 from a Linux node: it ended its session at a fragment, or, once per TID until a new session, it received a frame under Block Ack policy or a BAR on a TID with no session, `rx.c` 1373-1377 and 3273-3277) |
+
+The rate rule is derived, not measured. An S1G transmission carries at most 511
+OFDM symbols of data (the SIG field's length is 9 bits): 764 octets at 1 MHz
+MCS0. Morse's Linux driver refuses a 1 MHz beacon of 764 - 36 = 728 octets or
+more (`beacon.c` `FRAGMENTATION_OVERHEAD`), because the chip may fragment it.
+The Warthog counts a 16-bit SERVICE field and an A-MPDU delimiter, then takes
+the same 36 octets off every rate. The last column is the receiver sensitivity
+802.11-2020 sets for S1G against 1 MHz MCS0 (-95 dBm), about the link budget
+each rate costs; derived, not measured:
+
+| Rate | Longest frame sent whole | A 1500-byte IP packet at this rate | Link budget against 1 MHz MCS0 |
+|---|---|---|---|
+| 1 MHz MCS10 | 340 octets | 6 fragments | +3 dB |
+| 1 MHz MCS0 | 720 | 3 | 0 |
+| 1 MHz MCS1 | 1488 | 2 | -3 dB |
+| 1 MHz MCS2, 2 MHz MCS0 and faster | 1616 or more | whole | -5 dB (1 MHz MCS2), -3 dB (2 MHz MCS0), less above |
+
+The first two rates are rate control's best and the next lower one, or a probe
+and the best. A frame they would cut in more than 2 goes only at the chain's
+rates where it needs at most 2, their attempts moved to the slowest kept
+(`cap_trim`). If no rate in the chain qualifies, the chain becomes the slowest
+rate at the bandwidth of its last entry that does, with all the chain's attempts
+(`cap_sub`); for a full-size frame at 1 MHz that is MCS1, also under
+`AT+TXRATE=0,1`. MCS1 is the most robust rate at which such a frame can arrive:
+whole at 1 MHz needs MCS2, and at every rate the chain had it is lost. A later
+rate that cannot carry a fragment or a whole frame is then dropped from its
+chain and its attempts go to the slowest rate that can (`trim`), so no attempt is
+at a rate the chip would fragment at. Rate control ends every chain with MCS0, at
+1 MHz on a 1 MHz channel and at 2 MHz MCS0 dropping to 1 MHz MCS0 on a 2 MHz one.
+So a full-size frame goes in 2 at MCS1 when rate control's best rate is 1 MHz
+MCS0 or MCS1, in 2 sized for MCS1 at 1 MHz MCS2, whole at 2 MHz MCS0 alone, and
+whole at 1 MHz MCS3, 2 MHz MCS1 and faster.
+
+#### Sealed and group frames at rates the chip delivers
+
+`AT+SEALFIT=1`, the default, sends a frame the host does not cut only at rates
+where chip firmware 1.17.6 delivers it:
+
+- host CCMP: a sealed unicast frame whole;
+- chip keys: a sealed unicast frame in at most 2 fragments under `AT+FRAG` too,
+  with `AT+HOSTFRAG=0` or when `AT+HOSTFRAG` sends it whole; whole while the
+  Warthog holds an originator Block Ack session, requested or agreed, with the
+  frame's peer on its TID, or until the DELBA that ended one for a cut is
+  through, since a Linux recipient drops fragments under its session (**Block
+  Ack**, above). Under an `AT+FRAG` below the frame no rate sends it whole, so it
+  goes in at most 2 as with no session (`seal_nofit`), which a Linux recipient
+  drops: toward Linux nodes keep `AT+FRAG` at 0;
+- every build: a mesh group frame (`AT+MESHGRP=1`) whole, as receivers drop group
+  fragments; `AT+FRAG` does not apply to it.
+
+A rate of the frame's retry chain that fails this is dropped and its attempts go
+to the slowest rate kept (`seal_trim`, `grp_trim`); with none left, the chain
+becomes the slowest rate at the bandwidth of its last entry that passes, with all
+its attempts (`seal_sub`, `grp_sub`, also under `AT+TXRATE`); either change made
+for a Block Ack session counts `seal_ba` instead; with no such rate the chain is
+left (`seal_nofit`, `grp_nofit`; a frame over `AT+FRAG` with host CCMP, or one
+needing 3 under it with chip keys), except that a frame under a Block Ack session
+then gets the 2-fragment rule (`seal_nofit`, then `seal_trim` or `seal_sub`). A
+first rate the rule puts in asks for RTS/CTS only if rate control's first rate
+did (rate control asks for it on every later rate). `AT+SEALFIT=0` keeps rate
+control's chain, for A/B tests. Unsealed unicast frames (an open mesh) are never
+changed.
+
+At 1 MHz, by IP packet size (a unicast frame is the IP packet plus 66 octets; 12
+more with Address Extension, about 24 less IP room in batman mode):
+
+| Frame | 1 MHz MCS0 | Needs MCS1 (-3 dB) | Needs MCS2 (-5 dB) |
+|---|---|---|---|
+| host CCMP, whole | up to 654 | 655 to 1422 | over 1422 |
+| chip keys, at most 2 fragments | up to 1322 | over 1322 | never |
+| chip keys under the Warthog's Block Ack session (`AT+HOSTFRAG=0`), whole | up to 654 | 655 to 1422 | over 1422 |
+| group (`AT+MESHGRP=1`, SAE), whole | up to 660 | 661 to 1428 | over 1428 |
+
+With Address Extension the unicast bands are 12 lower (642, 1410, 1310), in
+batman mode about 24 lower (630, 1398, 1298). The dB figures are derived, not
+measured. Unicast frames in those bands are lost at 1 MHz MCS0 when the chip cuts
+them (measured), so the cost is against a rate that never delivers them; group
+frames that long cannot go whole at MCS0, and receivers drop group fragments
+(source; not measured on air). On a link that closes only at MCS0 they are still
+lost. The lever is the sending host's MTU: 1422 keeps host-CCMP frames within
+MCS1, 1322 keeps chip-key frames at MCS0 in 2 fragments. This covers what the
+Warthog sends; a Linux node picks its own rates.
+
+Measured on air 2026-10-03 ([below](#measured-on-air-and-tests)): with host CCMP
+`AT+SEALFIT=1` delivered replies whole; with chip keys and `AT+HOSTFRAG=0`, replies
+the chip cut in 2 under the Warthog's Block Ack session were all lost. Not
+measured: `seal_ba` (such a frame sent whole, under a session or before its
+DELBA is through), group frames, and how the chip
+picks the rate of an A-MPDU whose frames' chains differ, where `AT+SEALFIT`
+changed one chain and not the next.
+
+#### While fragments are in the chip
+
+On chip-key builds a frame the chip encrypts between two fragments under the
+same counter breaks their packet-number run, and the receiver drops the frame.
+While fragments are in the chip the Warthog therefore holds back, until their TX
+statuses return:
+
+- that peer's frames on another access category;
+- frames the chip encrypts for that peer's management (Block Ack, path
+  selection);
+- on `warthog-mesh-sae` (a STA chip interface, one pairwise counter), frames to
+  every other peer.
+
+Our own group frames are not held; whether the chip numbers them from the
+pairwise counter is not known.
+
+A peer's next frame also waits while the TX pool (20 buffers) lacks the
+buffers its last cut took. While `AT+HOSTFRAG` is in force (chip-key builds),
+the pool pauses the network stack 5 buffers early: a cut's second fragment for
+each of up to 4 peers, and the DELBA that ends a session first. A run whose
+statuses never return is released after 16 s (`stale`).
+
+#### Measured on air and tests
+
+Measured on 2026-10-02 against OpenMANET 1.8.0 Pis on
+`warthog-mesh-sae-swccmp-meshvif` and `warthog-mesh-sae-meshvif`, the Pi's path
+pinned so it pings the Warthog directly, replies sent whole under the Warthog's
+originator Block Ack session with the Pi on their TID (A-MPDU sessions form with
+OpenMANET nodes):
+
+| Warthog | Replies |
+|---|---|
+| `AT+FRAG=512` | 0/8 at 1000, 1400 and 1472 bytes: the chip fragmented each |
+| `AT+FRAG=0` | 16/16: the chip did not fragment them |
+
+`AT+MACSTATS?` tag 4152 (on the Warthog's chip, firmware 1.17.6, the fragments
+the chip transmitted, host-made ones included; measured 2026-10-01 and 02) rose
+with them. On the host-CCMP build the Pi's `RX MPDUs with MIC fail` rose by 3 a
+reply; on the chip-key build the chip sent about one fragment of each frame it
+cut (tag 4152 +10 for 8 frames).
+
+Measured on 2026-10-03 against OpenMANET 1.8.0 Pis (chip firmware 2.0.1), the
+Warthog's chip on 1.17.6, `AT+HOSTFRAG=auto` with no fragment cap (host CCMP
+cutting too, up to 3 fragments a frame), host fragments cut after the session
+ends as above:
+
+| Warthog | To | Result |
+|---|---|---|
+| `warthog-mesh-sae-swccmp-meshvif` (host CCMP) | a Pi | the first fragment of each frame opens; every later one counts `RX MPDUs with MIC fail` on the Pi |
+| `warthog-mesh-sae-swccmp-meshvif` | the other Warthog, `AT+SWCCMP=1` | 3 frames of 3 fragments: host CCMP `ok` 4 (the 3 first fragments and another frame), `badhdr` 6 (no Ext IV bit where the CCMP header should be), `micfail` 0; `AT+DEFRAG?` `in=3 ok=0 restart=2 expired=1` |
+| `warthog-mesh-sae-meshvif` (chip keys) | a Pi | frames in 2 fragments 8/8 when the host cut them (`auto` at `AT+TXRATE=0,1`, the session ended first), and 8/8 when the chip cut them, the Warthog's Block Ack session state then not recorded; in 3 fragments the Pi loses 1 or 2 of each frame (`rx drop misc`), no MIC failure, its RX PN up by 3 a frame |
+
+On `-swccmp-meshvif` `agg` reached 4 with `ba_end` 0 while `AT+AMPDU?` showed
+`orig=2`; on `-meshvif` `ba_end` was 1, then after a new session (`addba_tx` 7 to
+8) frames cut later ended nothing and `agg` rose.
+
+Measured on 2026-10-03 at `AT+TXRATE=0,1` (1 MHz MCS0), an OpenMANET 1.8.0 Pi
+pinging the Warthog with 1000- and 1472-byte ICMP, every other setting at its
+default:
+
+| Warthog | Setting | 1000 bytes | 1472 bytes | Seen |
+|---|---|---|---|---|
+| `warthog-mesh-sae-swccmp-meshvif` (host CCMP) | `AT+SEALFIT=0` | 0/8 | 0/8 | the chip cut the sealed replies |
+| `warthog-mesh-sae-swccmp-meshvif` | `AT+SEALFIT=1` | 8/8 | 8/8 | `seal_sub`; nothing cut by the chip |
+| `warthog-mesh-sae-meshvif` (chip keys) | `AT+HOSTFRAG=0` | 0/8 | 0/8 | the chip cut each reply in 2 while the Warthog held an originator Block Ack session with the Pi, and the Pi drops fragments under its session (`rx.c` `ieee80211_rx_reorder_ampdu`); `AT+SEALFIT=1` too |
+| `warthog-mesh-sae-meshvif` | `AT+HOSTFRAG=auto` | 8/8 | 8/8 | the session ended by a DELBA, each reply in 2 host fragments |
+
+Warthog to Warthog with chip keys, UDP at 1 MHz MCS0, 1000 and 1400 bytes:
+`AT+HOSTFRAG=auto` 5/5 and 5/5, `AT+HOSTFRAG=0` 5/5 and 5/5 (a Warthog recipient
+reassembles the chip's fragments under a session). `seal_ba`, which keeps such a
+frame whole with `AT+HOSTFRAG=0`, is not measured on air.
+
+What the source shows:
+
+- The transmit code sets fragment number and More Fragments before host CCMP
+  seals each fragment, with the CCMP header between QoS Control and the body;
+  fragments after the first are built in their own buffers. `AT+TXCAP` shows
+  them so as handed to the chip; what the chip sends is
+  [above](#what-chip-firmware-1176-does-with-fragments).
+- Morselib puts the reorder size of the peer's session to the Warthog into
+  every unicast frame's TX descriptor (`tid_params`), fragments included, and
+  keeps it after the peer ends that session, until its next ADDBA. So a
+  fragment to a Pi that holds, or held, a session to the Warthog carries a
+  Block Ack field with no session of the Warthog's to end (`ba_rcpt` counts
+  such cuts). morse_driver sets it only under its own agreed session.
+  `AT+TIDPARAMS=1`, the default, does the same while `AT+HOSTFRAG` is in force or
+  `AT+AMPDU=0`, so by default on the chip-key builds (`auto`): a fragment
+  carries none. It changes whole frames when only one side holds a session:
+  under the Warthog's own session a whole frame carries that session's size
+  (`tp=2f` in place of `20`), to a peer holding a session only toward the
+  Warthog none (`00` in place of `0f`); with sessions both ways nothing changes.
+  Whether the chip aggregated on that field is not known; with 3 fragments `=0`
+  and `=1` lost the frame alike (2026-10-03).
+- Each fragment carries the connection's TX flags (traveling pilots, 1 MHz
+  control responses), as a whole frame does.
+- The 3-fragment loss with chip keys is the chip's: fragments 1 and 2 leave it
+  32 octets longer and fragment 1 without More Fragments
+  ([above](#what-chip-firmware-1176-does-with-fragments)). One fragment at a
+  time was tried only with host CCMP (the table above).
+- A Linux recipient that holds a Block Ack session for that TID drops the first
+  fragment numbered 1 or more and ends its session (`rx.c`
+  `ieee80211_rx_reorder_ampdu`, then `iface.c`, a DELBA with reason 38); the
+  rest of that frame then fails reassembly. With `AT+HOSTFRAG=0` nothing holds
+  back the Warthog's next ADDBA (the 15 s hold follows only a host cut), so a
+  session can form again before the next frame (source; `addba_tx` was not
+  recorded); every reply the chip cut in 2 under the Warthog's session was lost
+  (0/8, the table above).
+
+Host-tested: every fragment meets mac80211's reassembly rules and reassembles
+byte-identical through the Warthog's own receive path, on both crypto builds,
+relayed, with Address Extension and in batman mode; every rate in each
+fragment's chain carries it; the pool cases; the Block Ack rule; the descriptor
+fields under `AT+TIDPARAMS` against a fake chip that aggregates on them (`orig`
+1, `ba_end` 0 and `agg` above 0 under `=0`, `agg` 0 under `=1`), also after the
+peer ends its session (`ba_rcpt`); a DELBA the chip gives up on (`delba_noack`);
+`AT+HOSTFRAG=0` leaves every frame's bytes unchanged (pinned to recorded frames,
+with and without Block Ack). These run with `WARTHOG_MESH_HOSTFRAG_ANY` (up to
+16 fragments, host CCMP cutting too), which no env sets. The shipping rule
+(`test_simnode_hostfrag_rule`, all four mesh builds): at most 2 fragments with
+chip keys, the chain moved to rates that need 2 or fewer or replaced by the
+slowest that does, `clamp`, `many` under `AT+FRAG`; nothing cut with host CCMP;
+`AT+SEALFIT` on and off, with chip keys at `AT+HOSTFRAG=0` too (whole under a
+requested or agreed session, `seal_ba`; not under a refused one, on TID 6 or
+with `AT+AMPDU=0`; in at most 2 under an `AT+FRAG` below the frame) and on group
+frames; with `auto`, a frame whose cut ended the session but goes whole (`pool`)
+sent whole before the DELBA's TX status; a first rate put in keeps rate
+control's RTS choice; the pool reserve (5); the default (`auto` on the chip-key
+builds, off with host CCMP; every env's flags in the glue guard) at 1 MHz MCS0
+under a session: the session ended and 1000- and 1472-byte replies cut in 2 with
+chip keys, whole with host CCMP.
+
+To test, on the Warthog sending to a pinned Pi (`AT+TXRATE=0,1` forces 1 MHz
+MCS0; `auto` is the default on chip-key builds):
+
+```
+AT+TXRATE=0,1
+AT+HOSTFRAG=auto
+AT+TXCAP=2,<pi>
+AT+HOSTFRAG?
+AT+TXCAP?
+```
+
+Pass on a chip-key build: 1000-, 1400- and 1472-byte pings from the Pi are
+answered; 1000-byte replies go in 2 fragments at `r=0@1M...`, 1400 and 1472 in
+2 at `r=1@1M...` (`cap_sub` +1 a reply); `msdu ok` rises with `msdu`; `noack`,
+`fail`, `many`, `pool`, `stale`, `overlap`, `agg`, `nodelba`, `ba_late` and
+`delba_noack` stay at 0; the Pi's `RX MPDUs with MIC fail` and `rx drop misc`
+do not move. With `AT+HOSTFRAG=0` the same replies go whole to the chip
+(`hf=0`): under the Warthog's Block Ack session with the Pi (`AT+AMPDU?`
+`ours=`, or `asked=` while its ADDBA is unanswered) and `AT+FRAG=0`, 1000 bytes
+at `r=1@1M...` and 1400 and 1472 at `r=2@1M...` (`seal_ba` +1 a reply), with no
+session (`AT+AMPDU=0`) 1000 bytes at `r=0@1M...` and 1400 and 1472 at
+`r=1@1M...` (`seal_sub` +1 a reply), cut in 2 by the chip. Pass on a
+host-CCMP build: `rule=off`, `msdu` stays, every reply whole (`hf=0`), at
+`r=1@1M...` for 1000 bytes and `r=2@1M...` for 1400 and 1472 (`seal_sub` +1 a
+reply), and the Pi's `RX MPDUs with MIC fail` does not rise. A/B: `AT+SEALFIT=0`
+(the replies go at 1 MHz MCS0 and the chip cuts them), `AT+TIDPARAMS=0`,
+`AT+AMPDU=0`. Read `AT+TXCAP?` after the traffic stops; `st_lost=0` in its
+header.
+
+Before comparing fragments between two Warthogs, check the capture on frames
+it does not cut: `AT+TXCAP=2,<receiver>` on the sender and `AT+RXCAP=1,<sender>`
+on the receiver, small pings. Each frame's bytes match on both sides except
+Duration (one calibration, 2026-10-03).
+
+## IP fragments from nodes at bat0's MTU (1460)
+
+These are IP fragments, not the 802.11 fragments above. OpenMANET sets `bat0`
+to MTU 1460; a node whose `br-lan` or `eth0` has the same MTU sends every IP
+packet over 1460 bytes in fragments, a 1472-byte ping as two. ESP-IDF's lwIP
+drops IP fragments addressed to itself unless reassembly is built in, and it is
+off by default: on air 2026-10-03 (two hours, both boards, every rate) no
+fragmented ping from such a Pi was answered, 0/5 in each of 24 rounds at 1452
+and 1472 bytes, while the Pi at MTU 1500 got 1472-byte replies. Builds from then
+on reassemble IPv4 (`CONFIG_LWIP_IP4_REASSEMBLY`, `main/nat_frag.c`), up to 10
+fragments a datagram, and through NAT before NAPT reads its ports, so a tethered
+host's large packets cross both ways. IPv6 is not reassembled: ESP-IDF drops all
+IPv6 on a netif without a link-local address, and none has one
+([Troubleshooting](Troubleshooting#large-packets-from-a-node-at-mtu-1460-go-unanswered-ip-fragments)).
+
+On the node at MTU 1460:
+
+```sh
+ip link show br-lan | grep -o 'mtu [0-9]*'
+ping -c 5 -s 1472 <warthog>     # two fragments each
+ping -c 5 -s 4000 <warthog>     # three
+ping -c 5 -s 14392 <warthog>    # ten, the most
+```
+
+Pass: 5/5 each, and `AT+MTU?` `ip_reass` rises by 5 each run (`ip_reass_drop`
+flat). From a tethered host on the Warthog's USB or access point, `ping -c 5 -s
+2000 <node>`: 5/5, and `ip_reass` rises by 10 (the host's requests and the
+node's replies). In batman mode `AT+BATSTAT?` `q_tx_full` stays flat.
+
+Measured on air 2026-10-03, both boards, in plain mesh mode
+(`AT+MESHBATMAN=0`): from a Pi at MTU 1460 and at 1500, pings up to `-s 14392`
+5/5; from a Mac on the Warthog's USB through NAT to the Pi, 100, 1472, 1473,
+2000 and 6000 bytes 3/3 (one 6000-byte run 2/3), `ip_reass` rising both ways,
+`ip_reass_drop` 0. Batman mode (fragments on bat0, `q_tx_full`) is not
+measured.
 
 ## Group frames in the chip (`warthog-mesh-sae-meshvif`)
 

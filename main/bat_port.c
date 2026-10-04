@@ -44,6 +44,7 @@ static const char *TAG = "warthog.bat";
 #define BAT_PORT_TASK_PRIO    3 /* tasks that reach umac run at <= 3 (mesh.c) */
 #define BAT_PORT_RENDER_MS    2000
 #define BAT_PORT_TX_READY_MS  50
+#define BAT_PORT_TX_SLOT_MS   (BAT_PORT_TX_READY_MS + 50) /* lwIP's wait for a slot: past bat_port_tx's own */
 #define BAT_PORT_ANSWER_MS    500 /* refresh of the watched MAC's and the gateway's answers */
 #define BAT_PORT_DELIVER_MAX  16  /* copies lwIP may hold at once; more than the two UDP recvmboxes (12) */
 #define BAT_PORT_CURSOR_LINE  0xFFFFFFF0u /* AT+BATSTAT?: only the port's line is left (above any engine cursor) */
@@ -221,7 +222,8 @@ static esp_err_t bat_port_netif_tx(void *h, void *buffer, size_t len)
         return ESP_ERR_INVALID_ARG;
     }
     uint8_t slot;
-    if (xQueueReceive(s_free_tx, &slot, 0) != pdTRUE) {
+    /* ip4_frag sends a datagram's fragments back to back and ignores a refusal: wait, as halow_transmit does. */
+    if (xQueueReceive(s_free_tx, &slot, pdMS_TO_TICKS(BAT_PORT_TX_SLOT_MS)) != pdTRUE) {
         s_cnt.q_tx_full++;
         return ESP_ERR_NO_MEM;
     }

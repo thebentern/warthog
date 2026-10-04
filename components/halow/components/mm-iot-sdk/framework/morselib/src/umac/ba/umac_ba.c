@@ -17,6 +17,10 @@
 
 static void umac_ba_addba_req_timeout_handler(void *arg1, void *arg2);
 
+/* warthog: AT+AMPDU? counts (main/at.c). */
+extern volatile uint32_t g_warthog_ba_addba_tx, g_warthog_ba_delba_to, g_warthog_ba_delba_end;
+extern volatile uint32_t g_warthog_ba_delba_other, g_warthog_ba_rx_delba, g_warthog_ba_rx_reason;
+
 void umac_ba_deinit(struct umac_sta_data *stad)
 {
     struct umac_ba_sta_data *data = umac_sta_data_get_ba(stad);
@@ -76,7 +80,16 @@ static enum mmwlan_status umac_ba_tx_delba(struct umac_sta_data *stad,
                                         .action_field = (uint8_t *)&delba,
                                         .action_field_len = sizeof(delba) };
 
-    return umac_datapath_build_and_tx_mgmt_frame(stad, frame_action_build, &params);
+    const enum mmwlan_status st =
+        umac_datapath_build_and_tx_mgmt_frame(stad, frame_action_build, &params);
+    if (st == MMWLAN_SUCCESS)
+    {
+        volatile uint32_t *n = reason == DOT11_REASON_INACTIVITY ? &g_warthog_ba_delba_to :
+                               reason == DOT11_REASON_END_TS_BS  ? &g_warthog_ba_delba_end :
+                                                                   &g_warthog_ba_delba_other;
+        (*n)++;
+    }
+    return st;
 }
 
 
@@ -139,6 +152,8 @@ static void umac_ba_rx_delba(struct umac_sta_data *stad, const uint8_t *field, u
     else
     {
         session = &data->sessions.originator[tid];
+        g_warthog_ba_rx_delba++; /* the peer ended our session, or one we already ended */
+        g_warthog_ba_rx_reason = le16toh(delba->reason_code);
     }
 
     if (session->status == UMAC_BA_DISABLED)
@@ -288,6 +303,7 @@ static void umac_ba_tx_addba_req(struct umac_sta_data *stad, struct umac_ba_sess
         return;
     }
 
+    g_warthog_ba_addba_tx++;
     MMLOG_DBG("BA session requested, originator. TID %u.\n", session->tid);
     session->status = UMAC_BA_REQUESTED;
 }
@@ -530,4 +546,58 @@ bool umac_ba_is_ampdu_permitted(struct umac_sta_data *stad, uint8_t tid)
     }
 
     return (data->sessions.originator[tid].status == UMAC_BA_SUCCESS);
+}
+
+uint8_t umac_ba_get_originator_buffer_size(struct umac_sta_data *stad, uint8_t tid)
+{
+    struct umac_ba_sta_data *data = umac_sta_data_get_ba(stad);
+    if (tid >= UMAC_BA_MAX_SESSIONS || data->sessions.originator[tid].status != UMAC_BA_SUCCESS)
+    {
+        return 0;
+    }
+    const uint16_t n = data->sessions.originator[tid].buffer_size;
+    return (uint8_t)(n > UINT8_MAX ? UINT8_MAX : n);
+}
+
+bool umac_ba_recipient_agreed(struct umac_sta_data *stad, uint8_t tid)
+{
+    struct umac_ba_sta_data *data = umac_sta_data_get_ba(stad);
+    return tid < UMAC_BA_MAX_SESSIONS && data->sessions.recipient[tid].status == UMAC_BA_SUCCESS;
+}
+
+bool umac_ba_originator_idle(struct umac_sta_data *stad, uint8_t tid)
+{
+    struct umac_ba_sta_data *data = umac_sta_data_get_ba(stad);
+    return tid < UMAC_BA_MAX_SESSIONS && data->sessions.originator[tid].status == UMAC_BA_DISABLED;
+}
+
+bool umac_ba_originator_held(struct umac_sta_data *stad, uint8_t tid)
+{
+    struct umac_ba_sta_data *data = umac_sta_data_get_ba(stad);
+    return tid < UMAC_BA_MAX_SESSIONS && (data->sessions.originator[tid].status == UMAC_BA_REQUESTED ||
+                                          data->sessions.originator[tid].status == UMAC_BA_SUCCESS);
+}
+
+int umac_ba_originator_stop(struct umac_sta_data *stad, uint8_t tid)
+{
+    struct umac_ba_sta_data *data = umac_sta_data_get_ba(stad);
+    if (tid >= UMAC_BA_MAX_SESSIONS)
+    {
+        return 0;
+    }
+    struct umac_ba_session *session = &data->sessions.originator[tid];
+    if (session->status != UMAC_BA_REQUESTED && session->status != UMAC_BA_SUCCESS)
+    {
+        return 0;
+    }
+    (void)umac_core_cancel_timeout(umac_sta_data_get_umacd(stad), umac_ba_addba_req_timeout_handler,
+                                   stad, session);
+    /* Ended even if the DELBA cannot go: a Linux recipient ends its own at the second fragment. */
+    const enum mmwlan_status st =
+        umac_ba_tx_delba(stad, DOT11_DELBA_INITIATOR_ORIGINATOR, tid, DOT11_REASON_END_TS_BS);
+    const uint32_t backoff = session->attempt_backoff;
+    memset(session, 0, sizeof(*session));
+    session->attempt_backoff = backoff; /* kept, as a DELBA received or an ADDBA timeout keeps it */
+    MMLOG_DBG("BA session stopped, originator. TID %u.\n", tid);
+    return st == MMWLAN_SUCCESS ? 1 : -1;
 }

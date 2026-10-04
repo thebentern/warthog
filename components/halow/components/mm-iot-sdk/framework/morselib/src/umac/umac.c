@@ -1567,6 +1567,22 @@ enum mmwlan_status mmwlan_update_beacon_vendor_ie_filter(
     return status;
 }
 
+static void umac_set_frag_threshold_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    const uint32_t threshold = evt->args.set_frag_threshold.threshold;
+    if (mmdrv_set_frag_threshold(threshold))
+    {
+        MMLOG_WRN("Failed to set fragmentation threshold.\n");
+        *evt->args.set_frag_threshold.status = MMWLAN_ERROR;
+    }
+    else
+    {
+        umac_config_set_frag_threshold(umacd, threshold);
+        *evt->args.set_frag_threshold.status = MMWLAN_SUCCESS;
+    }
+    mmosal_semb_give(evt->args.set_frag_threshold.semb);
+}
+
 enum mmwlan_status mmwlan_set_fragment_threshold(unsigned fragment_threshold)
 {
     struct umac_data *umacd = umac_data_get_umacd();
@@ -1581,15 +1597,11 @@ enum mmwlan_status mmwlan_set_fragment_threshold(unsigned fragment_threshold)
         return MMWLAN_INVALID_ARGUMENT;
     }
 
-    if (mmdrv_set_frag_threshold(fragment_threshold))
-    {
-        MMLOG_WRN("Failed to set fragmentation threshold.\n");
-        return MMWLAN_ERROR;
-    }
-
-    umac_config_set_frag_threshold(umacd, fragment_threshold);
-
-    return MMWLAN_SUCCESS;
+    /* warthog: sent from the event loop, as a chip restart is, so never to a driver being reloaded. */
+    enum mmwlan_status status = MMWLAN_ERROR;
+    UMAC_QUEUE_EVT_AND_WAIT(umac_set_frag_threshold_evt_handler, set_frag_threshold, &status,
+                            .threshold = fragment_threshold);
+    return status;
 }
 
 enum mmwlan_status mmwlan_set_health_check_interval(uint32_t min_interval_ms,

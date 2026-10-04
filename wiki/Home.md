@@ -32,7 +32,7 @@ station joining an access point, or an 802.11s mesh peer — and presents
 ```
         ┌──────── downstream ────────┐        ┌──── uplink ────┐
 
-  laptop ──USB──▶ CDC-ECM ┐
+  laptop ──USB──▶ CDC-NCM ┐
                           ├─▶ NAPT ─▶ HaLow ─▶  AP  (station mode)
   phone  ──WiFi─▶ 2.4 AP  ┘                or  mesh (802.11s peers)
 ```

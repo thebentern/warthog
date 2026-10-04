@@ -181,8 +181,10 @@ Batman-adv accepts ELP, OGM and broadcasts only with Ethernet destination
   and past that does not deliver one). So a node beyond a Warthog relay gets at
   most the first 5 of a burst that reaches the relay at once. Ahead of the engine,
   the port holds at most 4 frames from lwIP and 6 from the radio that the engine
-  task has not taken yet, and drops the next (`q_tx_full`, `q_rx_full` in
-  `AT+BATSTAT?`). Sustained, at most one group frame leaves per 5 ms (ELP and the
+  task has not taken yet. A further frame from the radio is dropped; one from lwIP
+  waits up to 100 ms for room (lwIP sends an IP datagram's fragments back to back),
+  then is dropped (`q_rx_full`, `q_tx_full` in `AT+BATSTAT?`; the wait host-tested).
+  Sustained, at most one group frame leaves per 5 ms (ELP and the
   OGM aggregate included), first copies before repeats. The 5 ms run from when the
   radio driver accepted the previous group frame, also when it first had to wait
   for room in the radio's queue (host-tested); frames already waiting in that
@@ -242,11 +244,17 @@ Details in the [AT Command Reference](AT-Command-Reference#batman-mode).
   TCP is unaffected where the far end or a gate (OpenWrt `mtu_fix`) advertises or
   clamps an MSS of 1420 or less; for anything else, UDP from Linux hosts (DF set
   by default) included, set the tethered host's MTU to 1460. From lwIP's source
-  and a one-off host run of it; not measured on a board. Batman fragments only
-  packets it relays or reassembles above 1500 bytes. An OGM record above 1500
-  bytes (Linux sends up to 1504 when a large translation-table change rides on it)
-  is not forwarded; nodes behind the Warthog catch up by translation-table
-  request.
+  and a one-off host run of it; not measured on a board. Packets over 1460 bytes
+  toward a tethered host arrive on bat0 as IP fragments, which the Warthog
+  reassembles before NAPT
+  ([Troubleshooting](Troubleshooting#large-packets-from-a-node-at-mtu-1460-go-unanswered-ip-fragments);
+  reassembly and NAT of fragments measured on a board in plain mesh mode
+  (`AT+MESHBATMAN=0`) 2026-10-03; on bat0, and bat0's 100 ms transmit wait,
+  host-tested only).
+  Batman fragments only packets it relays or reassembles above 1500 bytes. An
+  OGM record above 1500 bytes (Linux sends up to 1504 when a large
+  translation-table change rides on it) is not forwarded; nodes behind the
+  Warthog catch up by translation-table request.
 - On OpenMANET's own radio path (MM6108 with the Linux Morse driver, measured Pi to
   Pi) group frames with more than 1524 bytes of batman payload never arrived. A
   Linux `bat0` left at MTU 1500, batman-adv's default, therefore loses IP
@@ -371,7 +379,9 @@ Details in the [AT Command Reference](AT-Command-Reference#batman-mode).
   MTU, about 33 KB for 2 KB reassembled frames), each freed when lwIP has read it;
   a frame past 16 is dropped and counted in `deliver_cap` (`AT+BATSTAT?`). They
   take the place of the radio's receive buffers, up to 23, that lwIP holds with
-  batman off, so they are not in the 58 KB, but they do show in `heap_min`.
+  batman off, so they are not in the 58 KB, but they do show in `heap_min`. An
+  IP fragment is copied again and its delivery freed at once (`main/nat_frag.c`):
+  reassembly holds none of the 16.
   Flash: 31.7 KB of code (`.text` and `.literal`; 3.8 KB of constants besides)
   for the engine and port; static RAM: 239 B in the port and 124 B of bat0
   addressing state, allocated in every build, and 28 B of RTC memory for the kept

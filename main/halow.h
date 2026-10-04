@@ -7,6 +7,9 @@
 /* Boot the MM6108 and start STA association. Async — see the log. */
 esp_err_t warthog_halow_start(void);
 
+/* Safe mode: the event loop and netif warthog_halow_start sets up, the chip held in reset. */
+esp_err_t warthog_halow_start_safe(void);
+
 /* Block until the HaLow STA reaches association (or gets a DHCP lease),
  * whichever lands first, or until timeout_ms elapses. Used to sequence
  * USB-OTG bring-up AFTER the HaLow SAE TX burst so the two inrush

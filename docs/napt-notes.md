@@ -78,6 +78,30 @@ warthog.nat: tick: halow_ip=192.168.12.160 usb.napt=1 ap.napt=1 default=WIFI_STA
 
 And the upstream tcpdump should show source `192.168.12.160` (translated) instead of `192.168.4.2`.
 
+## Fragments
+
+`ip_napt_recv()` and `ip_napt_forward()` read the transport header at the IP header's end of every packet. A fragment after the first has none there, only payload; and `ip4_input()` calls `ip_napt_recv()` before it reassembles, while forwarded packets are never reassembled. With stock NAPT, from IDF 5.5.4's lwIP and a host run of it (`test_lwip_napt_frag`):
+
+- out (tethered host to HaLow): ICMP fragments after the first keep the host's source address; UDP ones have 8 payload bytes taken for a UDP header, rewritten or dropped.
+- in (HaLow to the tethered host): only the first fragment is translated; the rest are addressed to the Warthog and held until the reassembly timer drops them.
+- a first TCP fragment shorter than a TCP header: NAPT reads past the end of the pbuf (ASan, heap-buffer-overflow).
+
+`main/nat_frag.c` is lwIP's IPv4 input hook (`LWIP_HOOK_IP4_INPUT`, given to the lwip component as `ESP_IDF_LWIP_HOOK_FILENAME` by `main/CMakeLists.txt`). It reassembles, with `ip4_reass()`, every fragment addressed to one of the Warthog's own addresses, in any mode, or to that of the netif without NAPT it came in on while that netif is down (those `ip_napt_recv()` reads among them), and every one in on a NAPT netif routed out one without (`ip_napt_forward()`), and hands the whole datagram back to `ip4_input()` through the tcpip mailbox; lwIP cuts it again for the outgoing MTU. Each fragment is held as a heap copy with room for a link header (`pbuf_clone()`), so the driver's buffer goes back at once and an echo reply reuses the copies. Fragments to a broadcast or multicast address are dropped. Fragments between two NAPT netifs, and others not for the Warthog, are forwarded as they came. A reassembled datagram whose first fragment does not hold its ports (and TCP flags) is dropped. Counts: `AT+MTU?` `ip_reass`, `ip_reass_drop`. Needs `CONFIG_LWIP_IP4_REASSEMBLY` (`sdkconfig.defaults`).
+
+Measured on air 2026-10-03, both boards: a Mac on the USB link pinged an OpenMANET Pi through NAPT with 100, 1472, 1473, 2000 and 6000 bytes, 3/3 each (one 6000-byte run 2/3), `ip_reass` rising both ways, `ip_reass_drop` 0; the Pi, at MTU 1460 and at 1500, pinged the Warthog with up to 14392 bytes (10 fragments), 5/5.
+
+## Short packets
+
+`ip_napt_recv()` and `ip_napt_forward()` read a whole packet's transport header without checking its length: ports, TCP sequence number and flags, ICMP echo id. On a session match they rewrite the port and the checksum (TCP bytes 16-17, UDP 6-7). A TCP, UDP or ICMP packet shorter than its header is therefore read, and on a match written, past its end; any node on the mesh or a host on USB or the access point can send one. Host run of IDF 5.5.4's lwIP (`test_lwip_napt_frag`, buffers exactly the packet's size): ASan reports a heap-buffer-overflow in `ip_napt_modify_port_udp()`, and the plain build crashes after a TCP session match.
+
+The input hook drops such a packet first: not a fragment, TCP, UDP or ICMP, its IP length or first pbuf ending inside the 20-, 8- or 8-byte header, and one NAPT reads:
+
+- addressed to the address of the netif without NAPT it came in on. This is `ip4_input()`'s whole test for calling `ip_napt_recv()`, so it holds while that netif is down, at 0.0.0.0 or at another netif's subnet broadcast. A lost DHCP lease and batman mode's probe leave the HaLow netif up at 0.0.0.0 with NAPT and its sessions kept (TCP ones 30 minutes), so a packet to 0.0.0.0 that matches a session is rewritten.
+- addressed to any other address of the Warthog.
+- in on a NAPT netif and routed out one without (`ip_napt_forward()`).
+
+A UDP packet without its destination port (under 4 bytes of header) is dropped wherever it goes: when no netif takes a UDP packet, `ip4_input()` reads that port for DHCP (`IP_ACCEPT_LINK_LAYER_ADDRESSING`, on with `LWIP_DHCP`). Addressed to the Warthog, lwIP's own TCP, UDP and ICMP input would drop all of these anyway. Other short packets are forwarded as they came. A packet that holds its header costs a protocol and a length test; only short ones are classified (one address compare, then netif addresses, then a route). Count: `AT+MTU?` `ip_short_drop`. Host-tested on the package's lwIP built with DHCP as the firmware's, plain and under ASan in CI; not measured on a board.
+
 ## References
 
 - ESP-IDF lwIP NAPT: `components/lwip/lwip/src/core/ipv4/ip4_napt.c`

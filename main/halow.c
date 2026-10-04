@@ -13,6 +13,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "mmhalow.h"
+#include "warthog_shim.h"
 
 #include <string.h>
 
@@ -84,11 +85,9 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
     }
 }
 
-esp_err_t warthog_halow_start(void)
+/* What USB, the Wi-Fi AP and NAT need from here, with or without the chip. */
+static esp_err_t halow_base_start_(void)
 {
-    ESP_LOGI(TAG, "init region=%s country=%s",
-             WARTHOG_REGION_NAME, WARTHOG_COUNTRY_CODE);
-
     /* Created before any handler that sets HALOW_LINK_BIT can run. */
     s_halow_events = xEventGroupCreate();
     if (!s_halow_events) {
@@ -100,6 +99,23 @@ esp_err_t warthog_halow_start(void)
     ESP_RETURN_ON_ERROR(
         esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &on_ip_event, NULL),
         TAG, "register ip event handler");
+    return ESP_OK;
+}
+
+esp_err_t warthog_halow_start_safe(void)
+{
+    warthog_chip_hold_reset(); /* a panic's CPU-only reset left the chip running */
+    ESP_RETURN_ON_ERROR(halow_base_start_(), TAG, "base start");
+    xEventGroupSetBits(s_halow_events, HALOW_LINK_BIT);
+    return ESP_OK;
+}
+
+esp_err_t warthog_halow_start(void)
+{
+    ESP_LOGI(TAG, "init region=%s country=%s",
+             WARTHOG_REGION_NAME, WARTHOG_COUNTRY_CODE);
+
+    ESP_RETURN_ON_ERROR(halow_base_start_(), TAG, "base start");
 
     ESP_RETURN_ON_ERROR(mmhalow_init(NULL), TAG, "mmhalow init");
     mmhalow_print_version_info();

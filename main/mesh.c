@@ -686,6 +686,10 @@ void warthog_mesh_smoke_test(void)
     /* Before the first peer's MGTK arrives; AT+GTKPERSTA= also sets it live. */
     extern volatile uint32_t g_warthog_peer_gtk_mode;
     g_warthog_peer_gtk_mode = warthog_cfg_get_mesh_gtk();
+    /* Before the first data frame; AT+HOSTFRAG= and AT+AMPDU= also set them live. */
+    extern volatile uint32_t g_warthog_hostfrag, g_warthog_ampdu;
+    g_warthog_hostfrag = warthog_cfg_get_mesh_hostfrag();
+    g_warthog_ampdu = warthog_cfg_get_mesh_ampdu();
 #if WARTHOG_MESH_SAE && !defined(WARTHOG_MESH_HOST_CCMP)
     if (g_warthog_mesh_grp) {
         ESP_LOGE(TAG, "mesh: standard group frames under SAE with chip crypto: sent under our "

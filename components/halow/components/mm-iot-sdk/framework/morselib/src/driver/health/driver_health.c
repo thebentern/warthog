@@ -29,13 +29,17 @@ static mmtrace_channel drv_health_channel_handle;
 
 #define HEALTH_CHECK_TASK_PRIO MMOSAL_TASK_PRI_LOW
 
-#define HEALTH_CHECK_TASK_STACK_SIZE_WORDS 400
+/* warthog: 400 words overflowed in the failure path's MMLOG printf (measured with AT+CHIPRESTART). */
+#define HEALTH_CHECK_TASK_STACK_SIZE_WORDS 1024
 
 
 #define DRIVER_HEALTH_SHUTDOWN_TIMEOUT_MS 3000
 
 
 #define MORSE_HEALTH_CHECK_RETRIES 1
+
+/* AT+CHIPRESTART? (storage in main/at.c). */
+extern volatile uint32_t g_warthog_chiprestart_forced;
 
 
 static void morse_reset_chip(void)
@@ -118,10 +122,20 @@ static void driver_health_task_main(void *arg)
 
 
         int retries = 0;
-        do {
-            ret = morse_cmd_health_check(driverd);
-            MMLOG_INF("Health check attempt %d returned %d\n", retries + 1, ret);
-        } while (ret && retries++ < MORSE_HEALTH_CHECK_RETRIES);
+        if (driverd->health_check.force_fail)
+        {
+            /* warthog: AT+CHIPRESTART. The check fails, so the restart below is a real one's. */
+            driverd->health_check.force_fail = false;
+            g_warthog_chiprestart_forced++;
+            ret = -ETIMEDOUT;
+        }
+        else
+        {
+            do {
+                ret = morse_cmd_health_check(driverd);
+                MMLOG_INF("Health check attempt %d returned %d\n", retries + 1, ret);
+            } while (ret && retries++ < MORSE_HEALTH_CHECK_RETRIES);
+        }
 
         driverd->health_check.last_checked = mmosal_get_time_ms();
         if (ret == -ESTALE)
@@ -163,6 +177,7 @@ int driver_health_init(struct driver_data *driverd)
     driverd->health_check.task_running = true;
     atomic_store(&driverd->health_check.periodic_check_vetoes, 0);
     driverd->health_check.check_demanded = false;
+    driverd->health_check.force_fail = false;
 
     driverd->health_check.task = mmosal_task_create(driver_health_task_main,
                                                     driverd,

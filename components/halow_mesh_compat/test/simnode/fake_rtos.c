@@ -13,6 +13,7 @@
  * deadlock-free design that has never been locked.
  */
 #include <execinfo.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -54,6 +55,8 @@ static uint32_t s_now_ms = 100000u; /* not zero: wrap-safe compares want headroo
 uint32_t mmosal_get_time_ms(void) { return s_now_ms; }
 void simnode_set_time_ms(uint32_t t) { s_now_ms = t; }
 void simnode_advance_ms(uint32_t d) { s_now_ms += d; }
+/* Only the pool's deinit sleeps (mmpktmem_heap.c), never called here: virtual time passes. */
+void mmosal_task_sleep(uint32_t duration_ms) { s_now_ms += duration_ms; }
 
 /* ---- allocation ------------------------------------------------------- */
 
@@ -209,8 +212,22 @@ void mmosal_task_enter_critical(void) { s_crit++; }
 void mmosal_task_exit_critical(void) { if (s_crit) { s_crit--; } }
 unsigned simnode_in_critical(void) { return s_crit; }
 
+/* Armed by simnode_expect_assert, for a case where the firmware resets the board on purpose. */
+static jmp_buf *s_assert_jb;
+static unsigned s_asserts_caught;
+void simnode_assert_catch(jmp_buf *jb) { s_assert_jb = jb; }
+unsigned simnode_asserts_caught(void) { return s_asserts_caught; }
+void simnode_crit_reset(void) { s_crit = 0; }
+
 void mmosal_impl_assert(void)
 {
+    if (s_assert_jb != NULL)
+    {
+        jmp_buf *jb = s_assert_jb;
+        s_assert_jb = NULL;
+        s_asserts_caught++;
+        longjmp(*jb, 1);
+    }
     /* A firmware assertion inside the harness is a finding, not noise: print
      * where it came from so it can be read without a debugger. */
     fflush(stdout);

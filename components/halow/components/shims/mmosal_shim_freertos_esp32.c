@@ -9,25 +9,23 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "freertos/timers.h"
-#include "rom/ets_sys.h"
-#include "esp_debug_helpers.h"
-#include "esp_private/startup_internal.h"
-#include "esp_idf_version.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 
 #include "mmosal.h"
 #include "mmhal_os.h"
+#include "warthog_assert.h"
+#include "warthog_shim.h"
 
 /* --------------------------------------------------------------------------------------------- */
 
 /** Maximum number of failure records to store (must be a power of 2). */
 #define MAX_FAILURE_RECORDS 4
 
+_Static_assert(MAX_FAILURE_RECORDS == WARTHOG_ASSERT_RECORDS_MAX, "AT+ASSERT? reads every record");
+
 /** Fast implementation of _x % _m where _m is a power of 2. */
 #define FAST_MOD(_x, _m) ((_x) & ((_m) - 1))
-
-/** Duration to delay before resetting the device on assert. */
-#define DELAY_BEFORE_RESET_MS 1000
 
 /** Data structure for assertion information to be preserved. */
 struct mmosal_preserved_failure_info
@@ -67,78 +65,93 @@ void mmosal_log_failure_info(const struct mmosal_failure_info *info)
     record_num = FAST_MOD(preserved_failure_info.failure_count, MAX_FAILURE_RECORDS);
     preserved_failure_info.failure_count++;
     memcpy(&preserved_failure_info.info[record_num], info, sizeof(*info));
+    /* This port's mmport.h reads no PC: the return address here is the assert's call site. */
+    if (info->pc == 0)
+    {
+        preserved_failure_info.info[record_num].pc = (uint32_t)(uintptr_t)__builtin_return_address(0);
+    }
 }
 
-static void mmosal_dump_failure_info(void)
+uint32_t warthog_assert_records(struct mmosal_failure_info *out, uint32_t max, uint32_t *kept)
 {
-    unsigned first_failure_num = preserved_failure_info.displayed_failure_count;
-    unsigned new_failure_count =
-        preserved_failure_info.failure_count - preserved_failure_info.displayed_failure_count;
-    unsigned failure_offset;
-
-    if (new_failure_count >= MAX_FAILURE_RECORDS)
+    *kept = 0;
+    if (preserved_failure_info.magic != ASSERT_INFO_MAGIC)
     {
-        first_failure_num = FAST_MOD(preserved_failure_info.failure_count, MAX_FAILURE_RECORDS);
-        new_failure_count = MAX_FAILURE_RECORDS;
+        return 0;
     }
-
-    for (failure_offset = 0; failure_offset < new_failure_count; failure_offset++)
+    const uint32_t count = preserved_failure_info.failure_count;
+    uint32_t n = count < MAX_FAILURE_RECORDS ? count : MAX_FAILURE_RECORDS;
+    n = n < max ? n : max;
+    for (uint32_t i = 0; i < n; i++)
     {
-        unsigned ii;
-        unsigned idx = FAST_MOD(first_failure_num + failure_offset, MAX_FAILURE_RECORDS);
-        struct mmosal_failure_info *info = &preserved_failure_info.info[idx];
+        out[i] = preserved_failure_info.info[FAST_MOD(count - n + i, MAX_FAILURE_RECORDS)];
+    }
+    *kept = n;
+    return count;
+}
 
-        ets_printf("Failure %u logged at pc 0x%08lx, lr 0x%08lx, line %ld in %08lx\n",
-                   first_failure_num + failure_offset,
-                   info->pc,
-                   info->lr,
-                   info->line,
-                   info->fileid);
+void warthog_assert_clear(void)
+{
+    preserved_failure_info.magic = 0;
+    preserved_failure_info.failure_count = 0;
+    preserved_failure_info.displayed_failure_count = 0;
+}
 
-        for (ii = 0; ii < sizeof(info->platform_info) / sizeof(info->platform_info[0]); ii++)
+/** The panic reason the core dump keeps (AT+COREDUMP?): the newest record's pc, fileid and line. */
+static char s_assert_reason[64];
+
+static char *assert_put_(char *p, const char *s)
+{
+    while (*s != '\0')
+    {
+        *p++ = *s++;
+    }
+    return p;
+}
+
+static char *assert_put_hex_(char *p, uint32_t v)
+{
+    for (int sh = 28; sh >= 0; sh -= 4)
+    {
+        *p++ = "0123456789abcdef"[(v >> sh) & 0xfu];
+    }
+    return p;
+}
+
+/* Formatted by hand: no libc call on a path an ISR or a critical section can take. */
+static const char *assert_reason_(void)
+{
+    char *p = assert_put_(s_assert_reason, "MMOSAL_ASSERT");
+    if (preserved_failure_info.magic == ASSERT_INFO_MAGIC && preserved_failure_info.failure_count != 0)
+    {
+        const struct mmosal_failure_info *r =
+            &preserved_failure_info.info[FAST_MOD(preserved_failure_info.failure_count - 1u,
+                                                  MAX_FAILURE_RECORDS)];
+        char d[10];
+        int n = 0;
+        uint32_t v = r->line;
+        p = assert_put_hex_(assert_put_(p, " pc=0x"), r->pc);
+        p = assert_put_hex_(assert_put_(p, " fileid=0x"), r->fileid);
+        p = assert_put_(p, " line=");
+        do
         {
-            ets_printf("    0x%08lx\n", info->platform_info[ii]);
+            d[n++] = (char)('0' + v % 10u);
+            v /= 10u;
+        } while (v != 0u && n < 10);
+        while (n > 0)
+        {
+            *p++ = d[--n];
         }
     }
-
-    preserved_failure_info.displayed_failure_count = preserved_failure_info.failure_count;
+    *p = '\0';
+    return s_assert_reason;
 }
 
+/* No console output (TinyUSB owns the console's USB PHY) and no scheduler call (an ISR or a critical
+ * section can assert): the panic handler writes the core dump, then resets the board. */
 void mmosal_impl_assert(void)
 {
-    ets_printf("MMOSAL Assert, CPU %d (current core) backtrace", xPortGetCoreID());
-    (void)esp_backtrace_print(100);
-#ifdef HALT_ON_ASSERT
-    if (preserved_failure_info.magic == ASSERT_INFO_MAGIC)
-    {
-        mmosal_dump_failure_info();
-    }
-    mmosal_disable_interrupts();
-    mmhal_log_flush();
-    MMPORT_BREAKPOINT();
-#else
-    mmosal_task_sleep(DELAY_BEFORE_RESET_MS);
-    mmhal_reset();
-#endif
-    while (1)
-    {
-    }
-}
-
-/* Function to be called as part of the secondary initialization. See [System
- * Initialization](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-guides/startup.html#system-initialization)
- * for more information. */
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
-ESP_SYSTEM_INIT_FN(mmosal_dump_failure_info, SECONDARY, BIT(0), 999)
-#else
-ESP_SYSTEM_INIT_FN(mmosal_dump_failure_info, BIT(0), 999)
-#endif
-{
-    if (preserved_failure_info.magic == ASSERT_INFO_MAGIC)
-    {
-        mmosal_dump_failure_info();
-    }
-    return ESP_OK;
+    esp_system_abort(assert_reason_());
 }
 
 /* --------------------------------------------------------------------------------------------- */
@@ -186,6 +199,88 @@ void *mmosal_calloc(size_t nitems, size_t size)
 
 /* --------------------------------------------------------------------------------------------- */
 
+/* warthog: AT+STACKS? for the tasks started here; a chip restart ends and restarts drv, spi_irq, health. */
+#define WARTHOG_TASK_SLOTS 8
+
+static struct
+{
+    char name[16];
+    TaskHandle_t live;
+    uint32_t exit_min; /* least free stack (bytes) an instance had as it exited; UINT32_MAX none */
+} s_task_slots[WARTHOG_TASK_SLOTS];
+static portMUX_TYPE s_task_slots_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/* The slot named @p name, taken if new; -1 when full. Lock held. */
+static int task_slot_(const char *name, bool take)
+{
+    int free_slot = -1;
+    for (int i = 0; i < WARTHOG_TASK_SLOTS; i++)
+    {
+        if (s_task_slots[i].name[0] == '\0')
+        {
+            free_slot = free_slot < 0 ? i : free_slot;
+        }
+        else if (strncmp(s_task_slots[i].name, name, sizeof(s_task_slots[i].name) - 1) == 0)
+        {
+            return i;
+        }
+    }
+    if (take && free_slot >= 0)
+    {
+        strncpy(s_task_slots[free_slot].name, name, sizeof(s_task_slots[free_slot].name) - 1);
+        s_task_slots[free_slot].exit_min = UINT32_MAX;
+        return free_slot;
+    }
+    return -1;
+}
+
+static void task_stack_enter_(void)
+{
+    const char *name = pcTaskGetName(NULL);
+    portENTER_CRITICAL(&s_task_slots_lock);
+    const int i = task_slot_(name, true);
+    if (i >= 0)
+    {
+        s_task_slots[i].live = xTaskGetCurrentTaskHandle();
+    }
+    portEXIT_CRITICAL(&s_task_slots_lock);
+}
+
+/* The task's last act before it deletes itself, so a reader holding the lock never sees a freed TCB. */
+static void task_stack_exit_(void)
+{
+    const uint32_t hwm = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+    const TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    portENTER_CRITICAL(&s_task_slots_lock);
+    for (int i = 0; i < WARTHOG_TASK_SLOTS; i++)
+    {
+        if (s_task_slots[i].live == me)
+        {
+            s_task_slots[i].live = NULL;
+            s_task_slots[i].exit_min = hwm < s_task_slots[i].exit_min ? hwm : s_task_slots[i].exit_min;
+        }
+    }
+    portEXIT_CRITICAL(&s_task_slots_lock);
+}
+
+bool warthog_task_stack(const char *name, uint32_t *live, uint32_t *exit_min)
+{
+    *live = UINT32_MAX;
+    *exit_min = UINT32_MAX;
+    portENTER_CRITICAL(&s_task_slots_lock);
+    const int i = task_slot_(name, false);
+    if (i >= 0)
+    {
+        *exit_min = s_task_slots[i].exit_min;
+        if (s_task_slots[i].live != NULL)
+        {
+            *live = (uint32_t)uxTaskGetStackHighWaterMark(s_task_slots[i].live);
+        }
+    }
+    portEXIT_CRITICAL(&s_task_slots_lock);
+    return i >= 0;
+}
+
 struct mmosal_task_arg
 {
     mmosal_task_fn_t task_fn;
@@ -196,7 +291,9 @@ void mmosal_task_main(void *arg)
 {
     struct mmosal_task_arg task_arg = *(struct mmosal_task_arg *)arg;
     mmosal_free(arg);
+    task_stack_enter_();
     task_arg.task_fn(task_arg.task_fn_arg);
+    task_stack_exit_();
     mmosal_task_delete(NULL);
 }
 

@@ -34,7 +34,7 @@ esp_err_t warthog_cfg_get_ap_psk(char *out, size_t out_len);
 uint8_t   warthog_cfg_get_ap_channel(void);
 esp_err_t warthog_cfg_set_ap(const char *ssid, const char *psk, int channel);
 
-/* DNS handed out via DHCP option 6 to USB ECM + Wi-Fi AP clients. The default
+/* DNS handed out via DHCP option 6 to USB + Wi-Fi AP clients. The default
  * is WARTHOG_DOWNSTREAM_DNS from the build flag (1.1.1.1); set persists to
  * NVS and takes effect on next boot (AT+RESET). Input must be dotted-quad
  * IPv4; invalid strings return ESP_ERR_INVALID_ARG without touching NVS. */
@@ -106,6 +106,23 @@ esp_err_t warthog_cfg_set_mesh_grp(uint8_t on);
  * Applies at once and persists. */
 uint8_t   warthog_cfg_get_mesh_gtk(void);
 esp_err_t warthog_cfg_set_mesh_gtk(uint8_t mode);
+
+/* Host TX fragmentation (AT+HOSTFRAG): 0 off, 1 auto, or an even threshold 256..2346. Applies at
+ * once and persists; never stored, it is auto on SAE builds with chip keys and off on the rest. */
+#if defined(WARTHOG_MESH_HOST_CCMP) || defined(WARTHOG_MESH_AMPE_NO_CHIP_KEY)
+#define WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT 0u
+#elif defined(WARTHOG_MESH_SAE)
+#define WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT 1u
+#else
+#define WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT 0u
+#endif
+uint32_t  warthog_cfg_get_mesh_hostfrag(void);
+esp_err_t warthog_cfg_set_mesh_hostfrag(uint32_t mode);
+
+/* AT+AMPDU: 1 the mesh starts originator Block Ack sessions (default), 0 never and ends any it
+ * holds; the recipient side is unchanged. Applies at once and persists. */
+uint8_t   warthog_cfg_get_mesh_ampdu(void);
+esp_err_t warthog_cfg_set_mesh_ampdu(uint8_t on);
 
 /* Management frame protection for the mesh: 0 = off (the warthog-to-warthog
  * default that is measured working), 1 = MFP required.

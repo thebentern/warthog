@@ -1,10 +1,5 @@
 /*
- * TinyUSB CDC-ACM + CDC-NCM composite, backed by an esp_netif.
- *
- * esp_tinyusb 2.x ships default descriptors only for CDC/MSC/NCM; selecting
- * CONFIG_TINYUSB_NET_MODE_* without a custom descriptor leaves the
- * device with no functional interface, so the host enumerates nothing. We
- * supply our own composite (CDC-ACM + CDC-NCM) configuration descriptor here.
+ * TinyUSB CDC-ACM + CDC-NCM composite (CDC-ECM in warthog-us-ecm), backed by an esp_netif.
  *
  * - NCM gives macOS, Linux, Windows 10+ (usbncm.sys) and iOS/iPadOS a USB
  *   Ethernet adapter with the host's own in-box driver -- no dext, no MFi.
@@ -33,9 +28,12 @@
 #include "led.h"
 #include "soc/rtc_cntl_reg.h"         /* RTC_CNTL_OPTION1_REG */
 #include "soc/soc.h"                  /* REG_WRITE */
+#include "device/usbd_pvt.h"          /* usbd_defer_func, usbd_edpt_busy */
+#include "esp_timer.h"
 #include "tinyusb.h"
 #include "tinyusb_cdc_acm.h"
 #include "tusb.h"
+#include "usbnet_core.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -53,10 +51,6 @@ static const char *TAG = "warthog.usb_net";
 /* Host-side MAC the host sees on its USB Ethernet adapter. TinyUSB's
  * net_device.h declares this as extern non-const, so it can't be const here. */
 uint8_t tud_network_mac_address[6] = {0x02, 0x02, 0x84, 0x6A, 0x96, 0x00};
-
-/* Defined in main/at.c: morselib-style archive rules do not apply here, but
- * every other warthog counter lives there and AT+STATUS? prints these. */
-extern volatile uint32_t g_warthog_usb_tx_sent, g_warthog_usb_tx_dropped;
 
 static esp_netif_t *s_usb_netif = NULL;
 static volatile bool s_cdc_ready = false;
@@ -313,114 +307,83 @@ static const tusb_desc_device_t s_desc_device = {
     .bNumConfigurations = 1,
 };
 
-enum {
-#if !WARTHOG_USB_NCM_ONLY
-    ITF_NUM_CDC_CTRL = 0,
-    ITF_NUM_CDC_DATA,
-    ITF_NUM_NET_CTRL,
-#else
-    ITF_NUM_NET_CTRL = 0,
-#endif
-    ITF_NUM_NET_DATA,
-    ITF_NUM_TOTAL,
-};
-
-/* ESP32-S3 USB-OTG full-speed has 5 IN/OUT EP pairs + 1 IN EP (EP0 control).
- * Assigning EP1..4 keeps us comfortably within the budget. */
-#define EPNUM_CDC_NOTIF 0x81
-#define EPNUM_CDC_OUT   0x02
-#define EPNUM_CDC_IN    0x82
-#define EPNUM_NET_NOTIF 0x83
-#define EPNUM_NET_OUT   0x04
-#define EPNUM_NET_IN    0x84
-
-/* WARTHOG_USB_NCM_ONLY drops the CDC-ACM console from the composite, leaving a
- * single NCM function. Used to bisect host-side enumeration problems: it is the
- * exact shape a known-good NCM gadget presents, so if this enumerates and the
- * composite does not, the fault is in combining the two functions rather than
- * in NCM itself. Costs the AT console, so it is a diagnostic, not a default. */
-#ifndef WARTHOG_USB_NCM_ONLY
-#define WARTHOG_USB_NCM_ONLY 0
-#endif
-
-#if WARTHOG_USB_NCM_ONLY
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_NCM_DESC_LEN)
-#else
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_CDC_NCM_DESC_LEN)
-#endif
-
+#if CFG_TUD_ECM_RNDIS
+/* esp_tinyusb's default configuration holds CDC + NCM only; ECM (warthog-us-ecm) needs this one, the pre-NCM composite. */
+enum { ITF_NUM_CDC_CTRL = 0, ITF_NUM_CDC_DATA, ITF_NUM_NET_CTRL, ITF_NUM_NET_DATA, ITF_NUM_TOTAL };
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_CDC_ECM_DESC_LEN)
 static const uint8_t s_desc_fs_config[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0, 100),
-#if !WARTHOG_USB_NCM_ONLY
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC_CTRL, STRID_CDC_INTERFACE,
-                       EPNUM_CDC_NOTIF, 8,
-                       EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
-#endif
-    TUD_CDC_NCM_DESCRIPTOR(ITF_NUM_NET_CTRL, STRID_NET_INTERFACE, STRID_MAC,
-                           EPNUM_NET_NOTIF, 64,
-                           EPNUM_NET_OUT, EPNUM_NET_IN, 64,
-                           CFG_TUD_NET_MTU),
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC_CTRL, STRID_CDC_INTERFACE, 0x81, 8, 0x02, 0x82, 64),
+    TUD_CDC_ECM_DESCRIPTOR(ITF_NUM_NET_CTRL, STRID_NET_INTERFACE, STRID_MAC, 0x83, 64, 0x04, 0x84, 64, CFG_TUD_NET_MTU),
 };
-
-/* The host aborts enumeration if the config descriptor's declared wTotalLength
- * does not match the bytes actually emitted, and the symptom is indirect: the
- * device answers device/string descriptors (so it appears in a hub listing
- * with the right name) while the OS never creates a device for it. Catch a
- * mismatch at build time instead. */
-_Static_assert(sizeof(s_desc_fs_config) == CONFIG_TOTAL_LEN,
-               "USB config descriptor length does not match CONFIG_TOTAL_LEN");
-
-bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
-{
-    /* The return value means OPPOSITE things in the two network classes, and
-     * getting it wrong fails silently in a way that looks like dead hardware.
-     *
-     * ECM (ecm_rndis_device.c:354, `if (!tud_network_recv_cb(...))`):
-     *   false = "processed synchronously, renew the OUT endpoint now"
-     *   true  = "I am holding the buffer; I will renew it myself"
-     *
-     * NCM (ncm_device.c:702, `if (tud_network_recv_cb(...))`):
-     *   true  = "datagram accepted" -- and ONLY then does the driver advance to
-     *           the next datagram in the NTB or release the NTB back to the
-     *           free list.
-     *   false = nothing advances. The receive path stalls on the first
-     *           datagram forever and the NTB is never freed.
-     *
-     * So a callback written for ECM stalls NCM after one frame: the interface
-     * comes up, the host sends its DHCP DISCOVER, and nothing is ever received
-     * again. Under NCM we therefore return true even when we drop the frame --
-     * the driver must advance either way, and a dropped datagram is free
-     * (the peer retransmits) whereas a jammed NTB pipeline is not.
-     *
-     * We copy and hand to esp_netif_receive synchronously, so we never hold
-     * the driver's buffer in either class. */
-#if defined(CFG_TUD_NCM) && CFG_TUD_NCM
-    const bool consumed = true;   /* advance the NTB regardless */
+/* A wTotalLength that disagrees with the bytes sent makes the host drop the device silently. */
+_Static_assert(sizeof(s_desc_fs_config) == CONFIG_TOTAL_LEN, "USB config descriptor length does not match CONFIG_TOTAL_LEN");
+#define USB_NET_FS_CONFIG s_desc_fs_config
 #else
-    const bool consumed = false;  /* ECM: renew the OUT endpoint now */
+#define USB_NET_FS_CONFIG NULL
 #endif
 
-    if (!s_usb_netif || size == 0) {
-        return consumed;
+/* The class driver's frame buffer must hold every frame usbnet_tx accepts. */
+_Static_assert(USBNET_FRAME_MAX <= CFG_TUD_NET_MTU, "usbnet_tx accepts frames the class cannot carry");
+
+static portMUX_TYPE s_usbnet_mux = portMUX_INITIALIZER_UNLOCKED;
+static struct usbnet s_usbnet;
+
+static bool un_can_xmit_(uint16_t len) { return tud_network_can_xmit(len); }
+static void un_xmit_(void *ref, uint16_t len) { tud_network_xmit(ref, len); }
+static void un_recv_renew_(void) { tud_network_recv_renew(); }
+static bool un_ready_(void) { return tud_ready(); }
+static void un_kicked_(void *arg) { (void)arg; usbnet_kicked(&s_usbnet); }
+/* At most one kick is queued; only a 16-event queue full of ISR events (TinyUSB's task starved)
+ * would block lwIP's thread here, until that task drains it. */
+static void un_kick_(void) { usbd_defer_func(un_kicked_, NULL, false); }
+static void un_lock_(void) { portENTER_CRITICAL(&s_usbnet_mux); }
+static void un_unlock_(void) { portEXIT_CRITICAL(&s_usbnet_mux); }
+static uint32_t un_now_ms_(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+static void *un_alloc_(size_t n) { return malloc(n); }
+static void un_free_(void *p) { free(p); }
+
+/* ethernetif_input frees the frame on every failure, so it is never freed here. */
+static int un_input_(void *frame, uint16_t len)
+{
+    if (s_usb_netif == NULL) {
+        free(frame);
+        return -1;
     }
-    void *copy = malloc(size);
-    if (!copy) {
-        return consumed;
-    }
-    memcpy(copy, src, size);
-    if (esp_netif_receive(s_usb_netif, copy, size, NULL) != ESP_OK) {
-        free(copy);
-    }
-    return consumed;
+    return esp_netif_receive(s_usb_netif, frame, len, NULL) == ESP_OK ? 0 : -1;
 }
 
-uint16_t tud_network_xmit_cb(uint8_t *dst, void *ref, uint16_t arg)
+static const struct usbnet_port s_usbnet_port = {
+    .can_xmit = un_can_xmit_, .xmit = un_xmit_, .recv_renew = un_recv_renew_, .input = un_input_,
+    .ready = un_ready_, .kick = un_kick_, .lock = un_lock_, .unlock = un_unlock_,
+    .now_ms = un_now_ms_, .alloc = un_alloc_, .free = un_free_,
+#if defined(CFG_TUD_NCM) && CFG_TUD_NCM
+    .ncm = true,
+#endif
+};
+
+/* TinyUSB task. NCM: true advances the NTB; ECM: false renews the OUT endpoint. */
+bool tud_network_recv_cb(const uint8_t *src, uint16_t size) { return usbnet_rx(&s_usbnet, src, size); }
+
+uint16_t tud_network_xmit_cb(uint8_t *dst, void *ref, uint16_t arg) { return usbnet_xmit_copy(dst, ref, arg); }
+
+/* Linked in place of the class driver's xfer_cb (-Wl,--wrap, main/CMakeLists.txt): a freed
+ * transmit buffer pumps the queue, in the TinyUSB task. */
+bool __real_netd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes);
+bool __wrap_netd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes)
 {
-    if (!ref || arg == 0) {
-        return 0;
+    const bool r = __real_netd_xfer_cb(rhport, ep_addr, result, xferred_bytes);
+    usbnet_xfer_done(&s_usbnet, ep_addr, usbd_edpt_busy(rhport, ep_addr));
+    return r;
+}
+
+void warthog_usb_net_stats(struct usbnet_stats *out)
+{
+    if (s_usbnet.port == NULL) {
+        memset(out, 0, sizeof(*out));
+        return;
     }
-    memcpy(dst, ref, arg);
-    return arg;
+    usbnet_stats(&s_usbnet, out);
 }
 
 /* These two are declared (non-weak) in TinyUSB's net_device.h, so we must
@@ -445,42 +408,11 @@ void tud_network_link_state_cb(uint8_t rhport, bool state) { (void)rhport; (void
 bool tud_network_default_link_state_cb(void) { return false; }
 
 
+/* tcpip thread: never touches TinyUSB, only queues for the TinyUSB task (usbnet_core.c). */
 static esp_err_t l2_transmit(void *h, void *buffer, size_t len)
 {
     (void)h;
-    /* tud_network_can_xmit becomes true once the host has selected alt 1 on the
-     * network data interface -- the only correct "can TX" signal in either
-     * class. Do not gate on a flag wired from tud_network_init_cb; neither the
-     * ECM nor the NCM path calls that callback.
-     *
-     * KNOWN RACE, deliberately left in place. This runs on the lwIP tcpip
-     * thread and drives TinyUSB's transmit state directly, which the TinyUSB
-     * task also mutates from netd_xfer_cb. Under ECM that state was one buffer
-     * and a flag; under NCM it is a multi-buffer NTB ring, so the window is
-     * wider.
-     *
-     * Deferring the send into the TinyUSB task with usbd_defer_func() -- the
-     * textbook fix, and what esp_tinyusb's own glue does (tinyusb_net.c:80) --
-     * was tried and REVERTED: it measured 1/200 packets delivered against
-     * 300/300 for this version, with tx=9 drop=0 after a 200-packet burst,
-     * i.e. the deferred callback was mostly never invoked. usbd_defer_func()
-     * returns void, so a full queue cannot even be detected, let alone fallen
-     * back from. Do not re-apply that change without solving the queueing
-     * first.
-     *
-     * Measured on this path: 300 packets at a 1400-byte payload, 0% loss, and
-     * no observed corruption. The race is real but has never been seen to
-     * bite; the deferred version was reliably broken. */
-    for (int i = 0; i < 50; i++) {
-        if (tud_network_can_xmit(len)) {
-            tud_network_xmit(buffer, len);
-            g_warthog_usb_tx_sent++;
-            return ESP_OK;
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-    g_warthog_usb_tx_dropped++;
-    return ESP_ERR_TIMEOUT;
+    return usbnet_tx(&s_usbnet, buffer, len) == 0 ? ESP_OK : ESP_FAIL;
 }
 
 static void on_tinyusb_event(tinyusb_event_t *event, void *arg)
@@ -488,7 +420,7 @@ static void on_tinyusb_event(tinyusb_event_t *event, void *arg)
     (void)arg;
     switch (event->id) {
     case TINYUSB_EVENT_ATTACHED:
-        ESP_LOGI(TAG, "host attached; raising NCM link");
+        ESP_LOGI(TAG, "host attached; raising the network link");
         warthog_led_set_usb(true);
         /* esp_tinyusb owns tud_mount_cb/tud_umount_cb, so the link is raised
          * from its event hook instead. The netif and DHCP server are already
@@ -498,9 +430,10 @@ static void on_tinyusb_event(tinyusb_event_t *event, void *arg)
         tud_network_link_state(0, true);
         break;
     case TINYUSB_EVENT_DETACHED:
-        ESP_LOGI(TAG, "host detached; dropping NCM link");
+        ESP_LOGI(TAG, "host detached; dropping the network link");
         warthog_led_set_usb(false);
         tud_network_link_state(0, false);
+        usbnet_flush(&s_usbnet);
         break;
     default:
         break;
@@ -516,7 +449,8 @@ static void l2_free_rx_buffer(void *h, void *buffer)
 esp_netif_t *warthog_usb_net_start(void)
 {
     s_cdc_mtx = xSemaphoreCreateMutexStatic(&s_cdc_mtx_buf);
-    ESP_LOGI(TAG, "init CDC+ECM");
+    usbnet_init(&s_usbnet, &s_usbnet_port);
+    ESP_LOGI(TAG, "init CDC+%s", CFG_TUD_ECM_RNDIS ? "ECM" : "NCM");
 
     uint8_t mac[6];
     if (esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY) != ESP_OK) {
@@ -614,21 +548,11 @@ esp_netif_t *warthog_usb_net_start(void)
             .priority = 5,
             .xCoreID = 0,
         },
-        /* Let esp_tinyusb build the CONFIGURATION descriptor.
-         *
-         * It already composes CDC + NCM from CFG_TUD_CDC / CFG_TUD_NCM with
-         * the interface, endpoint and IAD layout the class drivers expect
-         * (usb_descriptors.c). The hand-rolled composite this replaced worked
-         * for ECM and was rejected outright for NCM -- the device answered its
-         * device and string descriptors, so a hub listing showed the right
-         * name, while the host never created a device for it.
-         *
-         * The DEVICE descriptor and strings stay ours, so VID/PID, product
-         * name and the MAC-derived serial are unchanged; only the config
-         * descriptor is handed back. */
+        /* NCM: esp_tinyusb's CDC + NCM configuration (a hand-rolled one was rejected by hosts). ECM: ours.
+         * The device descriptor and strings are ours either way. */
         .descriptor = {
             .device = &s_desc_device,
-            .full_speed_config = NULL,
+            .full_speed_config = USB_NET_FS_CONFIG,
             .string = s_string_desc,
             .string_count = STRID_COUNT,
         },

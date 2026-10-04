@@ -400,6 +400,13 @@ void mmhal_wlan_pktmem_deinit(void);
  */
 enum mmwlan_tx_flow_control_state mmhal_wlan_pktmem_tx_flow_control_state(void);
 
+/** Warthog: TX data pool blocks free now. */
+uint32_t mmhal_wlan_pktmem_tx_free(void);
+
+/** Warthog: pause the TX path @p blocks earlier than the pool's own threshold, so the blocks
+ *  left stay for the UMAC's own allocations (host fragments). 0 restores the default. */
+void mmhal_wlan_pktmem_set_tx_reserve(uint32_t blocks);
+
 /**
  * Enumeration of packet classes used by @ref mmhal_wlan_alloc_mmpkt_for_tx().
  * These definitions must match the corresponding values in @c mmdrv_pkt_class.

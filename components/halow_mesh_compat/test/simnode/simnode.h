@@ -10,7 +10,8 @@
  *
  * What this cannot tell you: anything the radio does. No modulation, no
  * timing, no interference, no chip behaviour beyond a TX status per data frame
- * (and per frame under our group key), the group key slot's PN and, through
+ * (and per frame under our group key, and per DELBA a cut MSDU waits on), the group
+ * key slot's PN and, through
  * simnode_rx_air only, which key the chip opens a received frame under, and nothing
  * about what a real mac80211 peer
  * does with the bytes. A green run here means the firmware's
@@ -22,6 +23,13 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/** One entry of a rate chain: bandwidth in MHz, S1G MCS (10 is MCS10), attempts at it. */
+struct simnode_rate {
+    uint8_t bw_mhz;
+    uint8_t mcs;
+    uint8_t attempts;
+};
 
 /** A frame the firmware handed to the chip: the exact bytes that would have
  *  gone on the air. */
@@ -36,6 +44,22 @@ struct simnode_frame {
      * are the only record that the frame was sent encrypted. */
     uint8_t  tx_flags; /* MMDRV_TX_FLAG_* -- HW_ENC means "encrypt this" */
     uint8_t  key_idx;  /* 0xff when no key was selected */
+    /* What the chip put on the air once it sent the frame: a HW_ENC one sealed under the key
+     * it holds (the station's pairwise key, or the group slot's) at that key's next TX PN,
+     * anything else as handed. air_len 0 until sent, or when it holds no such key. */
+    bool     sent;
+    uint8_t  air[1600];
+    uint16_t air_len;
+    uint64_t pn;           /* the TX PN the chip drew for a HW_ENC frame */
+    uint8_t  status_flags; /* the TX status it reported (MMDRV_TX_STATUS_*) */
+    uint8_t  attempts;
+    uint8_t  aid;          /* the metadata's AID */
+    struct simnode_rate chain[4]; /* its rate table as handed (attempts 0: entry unused) */
+    uint8_t  chain_rts;    /* bit r: chain entry r asks for RTS/CTS */
+    uint8_t  pn_draws;     /* TX PNs the chip drew sealing it: one per fragment it cut it into */
+    bool     host_frag;    /* the metadata's mesh.host_frag */
+    bool     ba_wait;      /* the metadata's mesh.ba_wait: a DELBA a cut MSDU waits on */
+    uint8_t  reorder;      /* the metadata's tid_max_reorder_buf_size: tid_params' reorder size */
 };
 
 /* ---- lifecycle -------------------------------------------------------- */
@@ -162,6 +186,60 @@ void simnode_chip_set_mesh_vif_id(uint16_t vif_id);
  *  as every mesh env but -swccmp-on does (main/mesh.c). Off by default. */
 void simnode_set_boot_scan(bool on);
 
+/* ---- the chip's state, and a hardware restart ---------------------------- */
+
+/** What the chip holds now. All of it is lost when it boots (mmdrv_init), which a hardware
+ *  restart does again; boots and restarts_done count across boots. */
+struct simnode_chipstate {
+    unsigned boots;            /* mmdrv_init calls since the simulator was loaded */
+    unsigned restarts_done;    /* mmdrv_hw_restart_completed calls */
+    bool     down;             /* between mmdrv_deinit and the next mmdrv_init */
+    bool     vif;              /* an interface is added */
+    uint32_t vif_type;
+    uint16_t vif_id;
+    unsigned qos;              /* SET_QOS_PARAMS since it booted */
+    uint16_t beacon_int;       /* BSS_CONFIG's beacon interval; 0 none */
+    bool     bss_beacon;       /* BSS_BEACON_CONFIG(enable) taken */
+    bool     bssid_set;
+    uint8_t  bssid[6];
+    uint32_t beacon_period_ms; /* the host beacon timer's period; 0 not started */
+    bool     mesh_started;     /* MESH_CONFIG(START) taken */
+    bool     mesh_beaconing;
+    uint32_t frag_threshold;   /* its own TX fragmentation threshold (AT+FRAG); 0 off */
+    bool     crypto_in_host_set;
+    bool     crypto_in_host;
+    uint32_t health_ms;        /* the health check's minimum interval; 0 none set */
+    uint32_t flush_wm;         /* MORSE_PARAM_ID_TX_STATUS_FLUSH_WATERMARK; 0 none set */
+    unsigned dyn_ps_sets;      /* dynamic power-save timeouts set since it booted */
+    uint32_t dyn_ps_ms;        /* the last one */
+    unsigned stas, keys;       /* station records and keys it holds */
+};
+const struct simnode_chipstate *simnode_chipstate(void);
+/** The SET_STA_STATE state the chip holds for @p aid (its address to @p addr), or -1. */
+int simnode_chip_sta_state(uint16_t aid, uint8_t addr[6]);
+/** A health check failed: what driver_health.c does then (the TX path paused, the restart event
+ *  posted at the head of the event queue), and the event loop run, which restarts the chip
+ *  (mmdrv_deinit, mmdrv_init: it loses everything above) through umac_mmdrv_shim.c. */
+void simnode_chip_restart(void);
+/** As simnode_chip_restart, returning once the event is posted: the loop has not run. */
+void simnode_chip_restart_queued(void);
+/** The health check the driver runs when its interval is next set (at a restart, right after the
+ *  chip boots) fails, so the health task posts another restart. */
+void simnode_chip_fail_next_health_check(void);
+/** Run @p cb once, as the next restart completes (mmdrv_hw_restart_completed), standing for
+ *  another task at that moment. */
+void simnode_chip_on_restart_done(void (*cb)(void));
+/** The keys the chip holds now, up to @p max, each with its next TX PN; returns how many. */
+struct simnode_keyinst;
+unsigned simnode_chip_keys(struct simnode_keyinst *out, unsigned max);
+/** Run @p fn; true if a firmware assertion fired in it (the board would reset there). */
+bool simnode_expect_assert(void (*fn)(void));
+/** Calls that reached the chip off the umac event loop (which runs a restart): AT+CRYPTOHOST's
+ *  set and read, and AT+CHIPRESTART's forced health check failure. */
+unsigned simnode_chip_calls_off_loop(void);
+/** umac_interface_set_channel_from_regdb (a stub) returns @p status from now on; 0 by default. */
+void simnode_set_channel_status(int status);
+
 /* ---- the chip's keys and its receive crypto (fake_chip.c) ---------------- */
 
 /** True while the chip holds a key at @p aid of that kind and index (a group key's index is
@@ -190,19 +268,64 @@ unsigned simnode_chip_rx_opened(void);
 
 /* ---- the chip's TX queue ---------------------------------------------- */
 
-/** By default the chip sends each data frame as it arrives and reports its TX status.
- *  With hold on, they wait in its queue, as behind an INSTALL_KEY that overtakes them. */
+/** By default the chip sends each data frame (and each DELBA a cut MSDU waits on) as it arrives
+ *  and reports its TX status. With hold on, they wait in its queue, as behind an INSTALL_KEY
+ *  that overtakes them. */
 void simnode_tx_hold(bool on);
 unsigned simnode_tx_held(void);
+/** The QoS TID of held frame @p i, -1 if there is none or it was not recorded. */
+int simnode_tx_held_tid(unsigned i);
 /** The chip sends held frame @p i (0 = oldest): a HW_ENC group frame under the group
  *  slot's key draws that slot's next TX PN. False if there is none. */
 bool simnode_tx_send_held(unsigned i);
 /** The chip hands held frame @p i back untried (attempts 0, duty cycle), drawing no PN. */
 bool simnode_tx_return_held(unsigned i);
+/** On a STA VIF every pairwise seal draws one TX PN counter, which each pairwise install
+ *  sets (the one-slot chip the firmware's comments describe); the key used is still the
+ *  station's own. Off (default): a counter per key. Survives a start. */
+void simnode_chip_shared_pairwise_pn(bool on);
+/** The TX PN the chip would seal the next frame under its key at @p aid (pairwise or group,
+ *  key index @p idx) with; false if it holds none. */
+bool simnode_chip_key_next_pn(uint16_t aid, bool pairwise, uint8_t idx, uint64_t *pn);
 /** True once the group slot encrypted a frame; @p top gets the highest PN it used. */
 bool simnode_group_pn_top(uint64_t *top);
 /** Frames the group slot has encrypted since the simulator was loaded. */
 unsigned simnode_group_pn_draws(void);
+/** The next @p n unicast data frames the chip sends are reported not ACKed, after every
+ *  attempt their rate chain allows (simnode_frame.status_flags, .attempts). */
+void simnode_tx_noack_next(unsigned n);
+/* The next @p n unicast management frames the chip sends are given up on unacked, every attempt used. */
+void simnode_tx_noack_mgmt_next(unsigned n);
+/** The next unicast data frame the chip sends is acked at its @p attempts-th attempt if its
+ *  rate chain allows that many, else reported not acked after every attempt it allows. */
+void simnode_tx_retry_next(unsigned attempts);
+/** The next @p n unicast data frames the chip sends are reported sent in an A-MPDU
+ *  (MMDRV_TX_STATUS_WAS_AGGREGATED), whatever their flags. */
+void simnode_tx_aggregated_next(unsigned n);
+/** A chip that aggregates any unicast data frame whose descriptor carries a Block Ack field (the
+ *  A-MPDU flag or a reorder size), reporting it WAS_AGGREGATED. Off by default; survives a start. */
+void simnode_chip_agg_on_baparams(bool on);
+/** Flags (MMDRV_TX_FLAG_*) the connection's populate step adds to every frame; 0 by default. */
+void simnode_set_populate_flags(uint8_t flags);
+/** The driver releases held frame @p i the chip never reported (its bus write failed, a page
+ *  was invalid, or 15 s passed): a host fragment, or a DELBA a cut waits on, comes back as an
+ *  untried TX status, as skbq.c reports one; any other frame is released silently. */
+bool simnode_tx_drop_held(unsigned i);
+/** Held frame @p i is released with no TX status at all, as a queue flush does. */
+bool simnode_tx_forget_held(unsigned i);
+/** The @p k-th TX packet allocation from now (1 the next) fails, once; 0 disarms. */
+void simnode_tx_alloc_fail_at(unsigned k);
+/** TX packet allocations since the simulator was loaded. */
+unsigned simnode_tx_allocs(void);
+/** On: TX packets come from the firmware's own pool (mmpktmem_heap.c, 20 blocks, as every
+ *  mesh sdkconfig), pausing the TX path as it fills; off (default): heap, unlimited. */
+void simnode_tx_pool(bool on);
+/** The pool's flow control: true while it has the TX path paused. */
+bool simnode_tx_pool_paused(void);
+/** Blocks the pool has free now (mmhal_wlan_pktmem_tx_free). */
+uint32_t simnode_tx_pool_free(void);
+/** The reserve the firmware last asked the pool for (mmdrv_set_tx_pool_reserve). */
+uint32_t simnode_tx_pool_reserve(void);
 
 /* ---- driving ---------------------------------------------------------- */
 
@@ -212,6 +335,37 @@ bool simnode_host_tx(const uint8_t da[6], const uint8_t sa[6],
 /** As simnode_host_tx, returning on the netif task: the event loop has not run yet. */
 bool simnode_host_tx_nopump(const uint8_t da[6], const uint8_t sa[6],
                             const uint8_t *payload, uint16_t payload_len);
+/** As simnode_host_tx on QoS TID @p tid, as mmwlan_tx_pkt sets it from its metadata. */
+bool simnode_host_tx_tid(const uint8_t da[6], const uint8_t sa[6],
+                         const uint8_t *payload, uint16_t payload_len, uint8_t tid);
+
+/* ---- rate control (umac_rc.c is not linked) ---------------------------- */
+
+/** The chain umac_rc_init_rate_table_data hands every data frame from now on, @p n (1-4)
+ *  entries; 0 restores the default, which leaves the frame's table as its metadata had it
+ *  (zero: no rate, no attempts). Survives a start. */
+void simnode_set_rate_chain(const struct simnode_rate *chain, unsigned n);
+/** umac_rc_init_rate_table_mgmt (group data, management, EAPOL) fills MCS0 at this primary
+ *  width, @p mhz 1 or 2, 5 attempts, as umac_rc.c does; 0, the default, leaves the frame's table
+ *  as its metadata had it. Survives a start. */
+void simnode_set_mgmt_rate_bw(uint8_t mhz);
+/** What umac_rc_feedback got for one frame: the chip's attempts and status, and its chain
+ *  (attempts 0: entry unused). */
+struct simnode_rcfb {
+    uint16_t aid;
+    uint8_t  attempts;
+    uint8_t  status_flags;
+    struct simnode_rate chain[4];
+};
+/** umac_rc_init_rate_table_data calls since the last clear, and the frame size the last got. */
+unsigned simnode_rc_table_calls(void);
+uint32_t simnode_rc_last_size(void);
+unsigned simnode_rcfb_count(void);
+const struct simnode_rcfb *simnode_rcfb_get(unsigned i);
+void simnode_rc_clear(void);
+
+/** The chip's own TX fragmentation threshold, as AT+FRAG sets it (umac_config); 0 none. */
+void simnode_set_chip_frag_threshold(uint32_t octets);
 
 /** Inject a received 802.11 frame, through the real RX path. */
 bool simnode_rx(const uint8_t *frame, uint16_t len, int16_t rssi);

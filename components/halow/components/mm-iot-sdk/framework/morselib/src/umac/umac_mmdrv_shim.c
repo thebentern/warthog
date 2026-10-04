@@ -16,6 +16,10 @@
  * route the chip's beacon-template request to umac_mesh_get_beacon instead
  * of umac_ap_get_beacon (which asserts when no AP context exists). */
 #include "umac/mesh/umac_mesh_beacon.h"
+#include "umac/mesh/umac_mesh.h"
+#include "umac/core/umac_core_data.h"
+#include "umac/data/umac_data.h"
+#include "mmwlan_mesh.h"
 
 /* RX entry counters (storage in main/at.c; AT+RXCHAN?). */
 extern volatile uint32_t g_warthog_shim_rx;
@@ -109,9 +113,15 @@ void mmdrv_host_update_tx_paused(uint16_t sources_mask, mmdrv_host_update_tx_pau
     umac_datapath_update_tx_paused(umacd, sources_mask, cb);
 }
 
+/* AT+CHIPRESTART? (storage in main/at.c). */
+extern volatile uint32_t g_warthog_chiprestart_n, g_warthog_chiprestart_mesh, g_warthog_chiprestart_ms;
+extern volatile uint32_t g_warthog_chiprestart_dropped;
+
 static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
 {
     MM_UNUSED(evt);
+    const uint32_t t0 = mmosal_get_time_ms();
+    g_warthog_chiprestart_n++;
 
     if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP) != UMAC_INTERFACE_VIF_ID_INVALID)
     {
@@ -119,14 +129,7 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
         MMOSAL_ASSERT(false);
     }
 
-    /* Nothing below re-adds a mesh VIF, its stations or their keys, so a mesh
-     * node would carry on looking up while hearing nothing. Restart instead. */
-    if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH) != UMAC_INTERFACE_VIF_ID_INVALID)
-    {
-        MMLOG_ERR("Unable to recover from hardware restart with mesh interface active\n");
-        MMOSAL_ASSERT(false);
-    }
-
+    const bool mesh = umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH) != UMAC_INTERFACE_VIF_ID_INVALID;
     if (umac_interface_is_active(umacd))
     {
         const char *country_code = umac_regdb_get_country_code(umacd);
@@ -140,18 +143,83 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
         MMOSAL_ASSERT(mmdrv_init(NULL, country_code) == 0);
         {
             /* warthog: a chip that boots holds no key; the mesh forgets what it held. */
-            extern void umac_datapath_mesh_chip_booted(void);
-            umac_datapath_mesh_chip_booted();
+            extern void umac_datapath_mesh_chip_booted(bool restart);
+            umac_datapath_mesh_chip_booted(true);
         }
 
         umac_interface_configure_periodic_health_check(umacd);
         umac_stats_increment_hw_restart_counter(umacd);
         umac_scan_handle_hw_restarted(umacd);
-        umac_connection_handle_hw_restarted(umacd);
+        bool complete = false;
+        if (!mesh)
+        {
+            umac_connection_handle_hw_restarted(umacd);
+        }
+        else if (umac_mesh_handle_hw_restarted(umacd, &complete) == MMWLAN_SUCCESS)
+        {
+            g_warthog_chiprestart_mesh += complete ? 1u : 0u;
+        }
+        else
+        {
+            /* What cannot go back resets the board, as every mesh restart did before. */
+            MMLOG_ERR("Unable to recover from hardware restart with mesh interface active\n");
+            MMOSAL_ASSERT(false);
+        }
     }
 
+    g_warthog_chiprestart_ms = mmosal_get_time_ms() - t0;
     MMLOG_DBG("Notify MMDRV that restart has completed\n");
     mmdrv_hw_restart_completed();
+}
+
+/* AT+CHIPRESTART: the request reaches the driver on this loop, as the restart handler does. */
+static void chip_restart_request_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    MM_UNUSED(umacd);
+    MM_UNUSED(evt);
+    if (mmdrv_force_health_check_fail() != 0)
+    {
+        g_warthog_chiprestart_dropped++;
+        MMLOG_WRN("Chip restart request dropped: the driver is stopped\n");
+    }
+}
+
+/* Why a post to the event loop failed: UNAVAILABLE with the loop down or stopping, NO_MEM when its
+ * event queue is full. */
+static enum mmwlan_status loop_post_failed_(struct umac_data *umacd)
+{
+    const struct umac_core_data *core = umac_data_get_core(umacd);
+    return (core->evtloop_task != NULL && !core->evtloop_shutting_down) ? MMWLAN_NO_MEM
+                                                                       : MMWLAN_UNAVAILABLE;
+}
+
+enum mmwlan_status umac_chip_restart_request(struct umac_data *umacd)
+{
+    struct umac_evt evt = UMAC_EVT_INIT(chip_restart_request_evt_handler);
+    return umac_core_evt_queue(umacd, &evt) ? MMWLAN_SUCCESS : loop_post_failed_(umacd);
+}
+
+/* AT+ASSERTTEST=loop: an assert on the event loop, from a timeout so the AT reply goes out first. */
+static void assert_test_fire_(void *arg1, void *arg2)
+{
+    MM_UNUSED(arg1);
+    MM_UNUSED(arg2);
+    MMOSAL_ASSERT_LOG_DATA(false, MMWLAN_ASSERT_TEST_LOOP);
+}
+
+static void assert_test_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    MM_UNUSED(evt);
+    if (!umac_core_register_timeout(umacd, MMWLAN_ASSERT_TEST_DELAY_MS, assert_test_fire_, NULL, NULL))
+    {
+        assert_test_fire_(NULL, NULL); /* no timeout free: on the loop at once */
+    }
+}
+
+enum mmwlan_status umac_assert_test_request(struct umac_data *umacd)
+{
+    struct umac_evt evt = UMAC_EVT_INIT(assert_test_evt_handler);
+    return umac_core_evt_queue(umacd, &evt) ? MMWLAN_SUCCESS : loop_post_failed_(umacd);
 }
 
 void mmdrv_host_hw_restart_required(void)

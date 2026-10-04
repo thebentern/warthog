@@ -24,9 +24,12 @@
 #error MMPKTMEM_RX_POOL_N_BLOCKS not defined
 #endif
 
-/* Packet pool for data/management frames configuration. */
-#define TX_DATA_POOL_UNPAUSE_THRESHOLD (MMPKTMEM_TX_POOL_N_BLOCKS - 2)
-#define TX_DATA_POOL_PAUSE_THRESHOLD   (MMPKTMEM_TX_POOL_N_BLOCKS - 1)
+/* Packet pool for data/management frames configuration. Warthog: both less the reserve
+ * (mmhal_wlan_pktmem_set_tx_reserve). */
+#define TX_DATA_POOL_UNPAUSE_THRESHOLD \
+    ((int_least32_t)MMPKTMEM_TX_POOL_N_BLOCKS - 2 - (int_least32_t)pktmem.tx_reserve)
+#define TX_DATA_POOL_PAUSE_THRESHOLD \
+    ((int_least32_t)MMPKTMEM_TX_POOL_N_BLOCKS - 1 - (int_least32_t)pktmem.tx_reserve)
 
 /* Packet pool for command requests configuration. */
 #define TX_COMMAND_POOL_BLOCK_SIZE (256)
@@ -61,6 +64,9 @@ struct pktmem_data
 
     /** Flow control callback function pointer. */
     mmhal_wlan_pktmem_tx_flow_control_cb_t tx_flow_control_cb;
+
+    /** Warthog: blocks the pause leaves free for the UMAC's own allocations. */
+    volatile atomic_int_least32_t tx_reserve;
 };
 
 static struct pktmem_data pktmem;
@@ -284,6 +290,37 @@ struct mmpkt *mmhal_wlan_alloc_mmpkt_for_tx(uint8_t pkt_class,
 enum mmwlan_tx_flow_control_state mmhal_wlan_pktmem_tx_flow_control_state(void)
 {
     return pktmem.tx_data_pool_tx_paused ? MMWLAN_TX_PAUSED : MMWLAN_TX_READY;
+}
+
+uint32_t mmhal_wlan_pktmem_tx_free(void)
+{
+    const int_least32_t used = atomic_load(&pktmem.tx_data_pool_allocated);
+    return used >= MMPKTMEM_TX_POOL_N_BLOCKS ? 0u : (uint32_t)(MMPKTMEM_TX_POOL_N_BLOCKS - used);
+}
+
+void mmhal_wlan_pktmem_set_tx_reserve(uint32_t blocks)
+{
+    if (blocks > MMPKTMEM_TX_POOL_N_BLOCKS - 2u)
+    {
+        blocks = MMPKTMEM_TX_POOL_N_BLOCKS - 2u;
+    }
+    atomic_store(&pktmem.tx_reserve, (int_least32_t)blocks);
+    /* Re-evaluated now, as an allocation or a free would. */
+    const int_least32_t used = atomic_load(&pktmem.tx_data_pool_allocated);
+    atomic_uint_fast8_t want = pktmem.tx_data_pool_tx_paused;
+    if (used > TX_DATA_POOL_PAUSE_THRESHOLD)
+    {
+        want = 1;
+    }
+    else if (used < TX_DATA_POOL_UNPAUSE_THRESHOLD)
+    {
+        want = 0;
+    }
+    if (atomic_exchange(&pktmem.tx_data_pool_tx_paused, want) != want &&
+        pktmem.tx_flow_control_cb != NULL)
+    {
+        pktmem.tx_flow_control_cb();
+    }
 }
 
 static void rx_pkt_free(void *mmpkt)

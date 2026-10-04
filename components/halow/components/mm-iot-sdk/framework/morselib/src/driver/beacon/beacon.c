@@ -125,6 +125,10 @@ static void morse_beacon_host_timer_cb(struct mmosal_timer *timer)
     }
 }
 
+/* warthog: a host beacon timer stopped by morse_beacon_teardown, kept for the next start. */
+static struct mmosal_timer *s_parked_timer;
+static uint32_t s_parked_period_ms;
+
 int morse_beacon_start(struct driver_data *driverd, uint16_t vif_id, uint32_t period_ms)
 {
     MMLOG_INF("Start beaconing (host_timer=%lums)\n", (unsigned long)period_ms);
@@ -149,6 +153,18 @@ int morse_beacon_start(struct driver_data *driverd, uint16_t vif_id, uint32_t pe
      * subsequent beacon. */
     if (period_ms != 0)
     {
+        if (driverd->beacon.host_timer == NULL && s_parked_timer != NULL)
+        {
+            if (s_parked_period_ms == period_ms)
+            {
+                driverd->beacon.host_timer = s_parked_timer;
+            }
+            else
+            {
+                mmosal_timer_delete(s_parked_timer);
+            }
+            s_parked_timer = NULL;
+        }
         if (driverd->beacon.host_timer == NULL)
         {
             driverd->beacon.host_timer = mmosal_timer_create(
@@ -190,6 +206,18 @@ int morse_beacon_stop(struct driver_data *driverd)
     }
 
     return ret;
+}
+
+void morse_beacon_teardown(struct driver_data *driverd)
+{
+    driverd->beacon.enabled = false;
+    if (driverd->beacon.host_timer != NULL)
+    {
+        mmosal_timer_stop(driverd->beacon.host_timer);
+        s_parked_timer = driverd->beacon.host_timer;
+        s_parked_period_ms = driverd->beacon.period_ms;
+        driverd->beacon.host_timer = NULL;
+    }
 }
 
 int morse_beacon_work(struct driver_data *driverd)

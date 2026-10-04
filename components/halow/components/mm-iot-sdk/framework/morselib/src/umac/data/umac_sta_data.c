@@ -119,6 +119,12 @@ struct mmpkt *umac_sta_data_pop_pkt(struct umac_sta_data *stad)
     return mmpkt_list_dequeue(&stad->txq);
 }
 
+struct mmpkt *umac_sta_data_peek_pkt(struct umac_sta_data *stad)
+{
+    MMOSAL_ASSERT(stad != NULL);
+    return mmpkt_list_peek(&stad->txq);
+}
+
 uint32_t umac_sta_data_get_queued_len(struct umac_sta_data *stad)
 {
     return mmpkt_list_length(&stad->txq);

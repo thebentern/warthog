@@ -138,6 +138,22 @@ enum mmwlan_status mmwlan_mesh_query_peer_links(struct mmwlan_mesh_peer_link *ou
  *  failed; use mmwlan_mesh_query_peer_links to tell the two apart. */
 uint8_t mmwlan_mesh_get_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max);
 
+/** AT+CHIPRESTART: the event loop fails the next chip health check (drops it, counted, if the driver
+ *  is stopped). Not posted: NOT_INITIALIZED, UNAVAILABLE (loop down or stopping), NO_MEM (queue full). */
+enum mmwlan_status mmwlan_force_chip_restart(void);
+
+/** AT+ASSERTTEST markers, platform_info[0] of the MMOSAL_ASSERT record each variant leaves. */
+#define MMWLAN_ASSERT_TEST_AT   0x7e570001u
+#define MMWLAN_ASSERT_TEST_LOOP 0x7e570002u
+#define MMWLAN_ASSERT_TEST_CRIT 0x7e570003u
+#define MMWLAN_ASSERT_TEST_HANG 0x7e570004u
+/** How long after the request the loop variant asserts, so the AT reply reaches the host. */
+#define MMWLAN_ASSERT_TEST_DELAY_MS 200u
+
+/** AT+ASSERTTEST=loop: posts a request; the umac event loop asserts (MMWLAN_ASSERT_TEST_LOOP)
+ *  MMWLAN_ASSERT_TEST_DELAY_MS later and the board resets. Not posted: as mmwlan_force_chip_restart. */
+enum mmwlan_status mmwlan_assert_test(void);
+
 #ifdef __cplusplus
 }
 #endif

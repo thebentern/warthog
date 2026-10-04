@@ -490,6 +490,75 @@ esp_err_t warthog_cfg_set_mesh_gtk(uint8_t mode)
     return err;
 }
 
+static bool hostfrag_valid_(uint32_t v)
+{
+    return v == 0u || v == 1u || (v >= 256u && v <= 2346u && (v & 1u) == 0u);
+}
+
+uint32_t warthog_cfg_get_mesh_hostfrag(void)
+{
+    nvs_handle_t h;
+    uint32_t mode = WARTHOG_CFG_MESH_HOSTFRAG_DEFAULT; /* never stored */
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        uint16_t v;
+        if (nvs_get_u16(h, "mesh_hfrag", &v) == ESP_OK && hostfrag_valid_(v)) {
+            mode = v;
+        }
+        nvs_close(h);
+    }
+    return mode;
+}
+
+esp_err_t warthog_cfg_set_mesh_hostfrag(uint32_t mode)
+{
+    if (!hostfrag_valid_(mode)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u16(h, "mesh_hfrag", (uint16_t)mode);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+uint8_t warthog_cfg_get_mesh_ampdu(void)
+{
+    nvs_handle_t h;
+    uint8_t on = 1; /* the mesh starts originator Block Ack sessions, as before */
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v;
+        if (nvs_get_u8(h, "mesh_ampdu", &v) == ESP_OK && v <= 1) {
+            on = v;
+        }
+        nvs_close(h);
+    }
+    return on;
+}
+
+esp_err_t warthog_cfg_set_mesh_ampdu(uint8_t on)
+{
+    if (on > 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, "mesh_ampdu", on);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
 uint8_t warthog_cfg_get_mesh_pmf(void)
 {
     nvs_handle_t h;

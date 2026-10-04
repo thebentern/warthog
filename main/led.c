@@ -103,7 +103,8 @@ esp_err_t warthog_led_start(void)
     }
     led_write(false);
 
-    BaseType_t ok = xTaskCreate(led_task, "warthog_led", 2048, NULL,
+    /* ESP_LOGI's printf left 68-72 of 2048 bytes free (AT+STACKS?, 2026-10-03). */
+    BaseType_t ok = xTaskCreate(led_task, "warthog_led", 3072, NULL,
                                 tskIDLE_PRIORITY + 1, NULL);
     if (ok != pdPASS) {
         return ESP_ERR_NO_MEM;

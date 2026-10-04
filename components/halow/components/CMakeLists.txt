@@ -9,3 +9,9 @@ add_subdirectory(mmutils)
 add_subdirectory(morselib)
 add_subdirectory(regdb)
 add_subdirectory(hostap)
+
+# warthog: name the file in every MMOSAL_ASSERT record (AT+ASSERT?).
+include(${CMAKE_CURRENT_SOURCE_DIR}/mmosal_fileid.cmake)
+foreach(t libmorse mmhostap shims mmpktmem mmutils)
+    warthog_mmosal_fileid(${t})
+endforeach()

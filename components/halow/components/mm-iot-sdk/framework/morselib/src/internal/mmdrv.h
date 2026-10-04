@@ -566,6 +566,10 @@ void mmdrv_unset_health_check_veto(enum mmdrv_health_check_veto_id veto_id);
  */
 void mmdrv_hw_restart_completed(void);
 
+/** Warthog (AT+CHIPRESTART): the next health check fails at once, so the chip restarts exactly as
+ *  after a real failure. -ENODEV while the driver is not started. */
+int mmdrv_force_health_check_fail(void);
+
 /** Enumeration of flags used by @ref mmdrv_tx_metadata.flags */
 enum mmdrv_tx_metadata_flags
 {
@@ -669,6 +673,8 @@ struct mmdrv_tx_metadata
         uint8_t addr_valid : 1;    /* use mesh_da/mesh_sa for addr3/addr4 */
         uint8_t exclude_valid : 1; /* group replication skips this peer (the sender) */
         uint8_t own_group : 1;     /* counted in flight under our MGTK until its TX status */
+        uint8_t host_frag : 1;     /* a host fragment (AT+HOSTFRAG): its status returns even untried */
+        uint8_t ba_wait : 1;       /* a DELBA a cut MSDU waits on: its status returns even untried */
         uint8_t mesh_da[6];
         uint8_t mesh_sa[6];
         uint8_t exclude_ta[6];
@@ -729,6 +735,12 @@ enum mmdrv_pkt_class
 struct mmpkt *mmdrv_alloc_mmpkt_for_tx(uint8_t pkt_class,
                                        uint32_t space_at_start,
                                        uint32_t space_at_end);
+
+/** Warthog: TX packets mmdrv_alloc_mmpkt_for_tx can give now. */
+uint32_t mmdrv_tx_pool_free(void);
+
+/** Warthog: the TX path pauses with @p blocks still free, kept for host fragments; 0 none. */
+void mmdrv_set_tx_pool_reserve(uint32_t blocks);
 
 /**
  * Allocates an mmpkt for fragment chain buffer used for defragmentation.

@@ -55,7 +55,7 @@ volatile uint32_t g_mudp_drop_self, g_mudp_drop_unknown, g_mudp_tx_err;
 /* Last datagram relayed FROM the HaLow mesh, for AT+MUDPLAST? -- lets a host
  * on the USB/AP side verify payload integrity (e.g. decode a MeshPacket)
  * without needing to win macOS multicast routing across three same-subnet
- * ECM links. */
+ * USB links. */
 static uint8_t s_last_halow[256]; static uint16_t s_last_halow_len; static uint32_t s_last_halow_src;
 
 /* A UDP socket on MUDP_PORT that only receives from, and only sends out of, @p nif. */

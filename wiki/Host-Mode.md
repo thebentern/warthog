@@ -15,7 +15,7 @@ macOS, Linux, Windows 10+ and iOS/iPadOS all bind with an in-box driver.
 
 ## What the host sees
 
-Warthog presents **CDC-ECM** and serves DHCP on it.
+Warthog presents **CDC-NCM** (CDC-ECM in the `warthog-us-ecm` build) and serves DHCP on it.
 
 | | |
 |---|---|
