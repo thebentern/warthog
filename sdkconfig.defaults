@@ -136,6 +136,15 @@ CONFIG_ESP_COREDUMP_STACK_SIZE=1792
 # survives the SW reset, and the board comes back up readable.
 CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y
 
+# The task watchdog panics after 60 s (core dump, silent reboot): main/hang_guard.c subscribes
+# app_main's loop; both idle tasks are watched. hang_guard.c refuses an sdkconfig without these.
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
+
 # The bootloader's RTC watchdog stays armed into app_main, which re-arms it until USB has started
 # (main/boot_guard.c): a boot that stops before USB reboots instead of staying off USB.
 CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE=y

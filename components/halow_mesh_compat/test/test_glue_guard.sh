@@ -4505,7 +4505,10 @@ fi
 #     app_main), safe mode never; a failed USB start leaves the watchdog armed for
 #     WARTHOG_BOOT_USB_RETRIES (2) resets that do not count as crash boots (a panic after one does,
 #     and so does a watchdog reset with no failed USB start), then turns it off with no USB; a crash
-#     reset keeps the spent retries, a clean reset or USB up restores them; the watchdog is armed at
+#     reset keeps the spent retries, a clean reset or USB up restores them;
+#     a download-mode mark makes only the next boot's watchdog reset no crash boot, names that boot and
+#     restores the USB retries; a panic or power-on after the mark counts as without it, and a mark without
+#     the magic excuses nothing; the watchdog is armed at
 #     exactly WARTHOG_BOOT_WDT_S of slow clock with RESET_SYSTEM and off after USB. app_main: safe mode runs
 #     warthog_halow_start_safe() (event loop, netif, link bit; no chip) in place of the HaLow start,
 #     the link wait and the bridge; the armed hang stops a normal boot before the HaLow start; the
@@ -4650,6 +4653,27 @@ int main(void)
     CHECK(!boot(ESP_RST_SW) && warthog_boot_guard_usb_failed(), "a clean reset did not restore the retries");
     CHECK(!boot(ESP_RST_PANIC) && warthog_boot_crash_count() == 1, "a panic after a failed USB start not counted");
     CHECK(!boot(ESP_RST_WDT) && warthog_boot_crash_count() == 2, "a watchdog reset with no USB failure not counted");
+    /* Download mode nobody used: its RTC watchdog return is no crash boot, once. */
+    CHECK(!boot(ESP_RST_SW) && warthog_boot_crash_count() == 0, "a clean reset");
+    warthog_boot_mark_download();
+    CHECK(!boot(ESP_RST_WDT) && warthog_boot_crash_count() == 0, "a download mode's watchdog return counted");
+    CHECK(!boot(ESP_RST_WDT) && warthog_boot_crash_count() == 1, "the download mark outlived its boot");
+    warthog_boot_mark_download();
+    CHECK(!boot(ESP_RST_POWERON) && warthog_boot_crash_count() == 0, "flashed: a power-on reset");
+    CHECK(!boot(ESP_RST_WDT) && warthog_boot_crash_count() == 1, "the mark outlived a flashed boot");
+    warthog_boot_mark_download();
+    CHECK(!boot(ESP_RST_PANIC) && warthog_boot_crash_count() == 2, "the mark excused a panic");
+    CHECK(!boot(ESP_RST_SW) && warthog_boot_crash_count() == 0, "a clean reset again");
+    warthog_boot_mark_download();
+    CHECK(!boot(ESP_RST_WDT) && warthog_boot_download_return(), "a download return not named");
+    CHECK(!boot(ESP_RST_WDT) && !warthog_boot_download_return(), "a later watchdog reset named a download return");
+    s_boot.usb_retries = WARTHOG_BOOT_USB_RETRIES;
+    warthog_boot_mark_download();
+    CHECK(!boot(ESP_RST_WDT) && warthog_boot_guard_usb_failed(), "a download return did not restore the USB retries");
+    CHECK(!boot(ESP_RST_SW) && warthog_boot_crash_count() == 0, "a clean reset once more");
+    s_boot.magic ^= 1u; s_boot.dl = BOOT_GUARD_MAGIC;
+    CHECK(!boot(ESP_RST_WDT) && warthog_boot_crash_count() == 1 && !warthog_boot_download_return(),
+          "a mark without the magic excused a watchdog reset");
     printf("ok\n");
     return 0;
 }
@@ -4693,7 +4717,7 @@ for k65 in 'safe mode' 'AT+COREDUMP=0' 'crash_boots' 'reset=WDT' "$(sed -n 's/^#
   grep -q "$k65" "$TS63" || why65="${why65:-Troubleshooting does not name $k65}"
 done
 if [ -z "$why65" ]; then
-  ok "the boot watchdog stays armed into app_main, re-armed with a system reset until USB starts; three crash boots in a row start safe mode (no HaLow start, no hang), counted in .noinit and cleared by a clean reset or a minute up; AT+ASSERT? shows it, AT+COREDUMP=0 erases the dump; documented"
+  ok "the boot watchdog stays armed into app_main, re-armed with a system reset until USB starts; three crash boots in a row start safe mode (no HaLow start, no hang), counted in .noinit and cleared by a clean reset or a minute up; AT+ASSERT? shows it, AT+COREDUMP=0 erases the dump; a download mode's watchdog return, once, is no crash boot; documented"
 else
   bad "boot guard: $why65"
 fi
@@ -5154,8 +5178,9 @@ fi
 #     only from the TinyUSB event callback. What the host test cannot see: main/CMakeLists.txt
 #     builds usbnet_core.c and links with -Wl,--wrap=netd_xfer_cb; __wrap_netd_xfer_cb runs the
 #     driver's callback, then usbnet_xfer_done with whether the driver armed that endpoint again
-#     (tx_busy_ms); the kick is usbd_defer_func(un_kicked_, NULL, false),
-#     the only usbd_defer_func in main/ (at most one queued); the receive callback is usbnet_rx and
+#     (tx_busy_ms); the kick is usbd_defer_func(un_kicked_, NULL, false) and the hang guard's ping
+#     usbd_defer_func(un_pong_, NULL, false), posted only into an empty queue: the only two
+#     usbd_defer_func in main/ (each at most one queued); the receive callback is usbnet_rx and
 #     the port is NCM's under CFG_TUD_NCM; un_input_ never frees after esp_netif_receive (it frees on
 #     every failure); detach flushes the queue. The test's TinyUSB config matches the NTB counts and
 #     sizes sdkconfig.defaults pins (esp_tinyusb's Kconfig defaults, which a package bump could move),
@@ -5188,8 +5213,15 @@ for o72 in ../../../main/*.c ../../../main/bat/*.c; do
   grep -Eq 'tud_network_(can_xmit|xmit|recv_renew|link_state)\(|usbd_defer_func\(|netd_xfer_cb' "$o72" && \
     why72="${why72:-${o72##*/} calls the USB network class or the TinyUSB defer queue}"
 done
-[ "$(grep -c 'usbd_defer_func(' "$U72")" = 1 ] && grep -q '^static void un_kick_(void) { usbd_defer_func(un_kicked_, NULL, false); }$' "$U72" || \
-  why72="${why72:-the kick is not the one usbd_defer_func(un_kicked_, NULL, false)}"
+[ "$(grep -c 'usbd_defer_func(' "$U72")" = 2 ] && grep -q '^static void un_kick_(void) { usbd_defer_func(un_kicked_, NULL, false); }$' "$U72" || \
+  why72="${why72:-the usbd_defer_func in usb_net.c are not the kick, usbd_defer_func(un_kicked_, NULL, false), and the hang guard ping}"
+awk '/^enum warthog_hang_post warthog_usb_net_ping\(void\)/,/^}/' "$U72" | awk '/if \(!tud_inited\(\)\)/ {a=NR}
+  /if \(s_ping_pending\)/ {b=NR} /if \(tud_task_event_ready\(\)\)/ {c=NR} /s_ping_pending = true;/ {d=NR}
+  /usbd_defer_func\(un_pong_, NULL, false\);/ {e=NR} END {exit (a && a < b && b < c && c < d && d < e) ? 0 : 1}' || \
+  why72="${why72:-warthog_usb_net_ping does not post one ping at most, only into the empty queue of a started TinyUSB}"
+awk '/^static void un_pong_\(void \*arg\)/,/^}/' "$U72" | awk '/while \(g_warthog_hang_block == WARTHOG_HANG_TEST_USB\)/ {w=NR}
+  /s_ping_pending = false;/ {f=NR} /s_pongs\+\+;/ {p=NR} END {exit (w && w < f && f < p) ? 0 : 1}' || \
+  why72="${why72:-un_pong_ does not wait on AT+HANGTEST=usb, then let the next ping, then count}"
 grep -q '^static void un_kicked_(void \*arg) { (void)arg; usbnet_kicked(&s_usbnet); }$' "$U72" || why72="${why72:-un_kicked_ does not run usbnet_kicked}"
 grep -q '^bool tud_network_recv_cb(const uint8_t \*src, uint16_t size) { return usbnet_rx(&s_usbnet, src, size); }$' "$U72" || \
   why72="${why72:-tud_network_recv_cb is not usbnet_rx}"
@@ -5235,9 +5267,300 @@ for w72 in tx_stall_ms tx_busy_ms rx_idle_ms; do
 done
 grep -q 'wrap=netd_xfer_cb' ../../../docs/fork-inventory.md || why72="${why72:-the fork inventory does not list the netd_xfer_cb wrap}"
 if [ -z "$why72" ]; then
-  ok "USB network class: one owner (the TinyUSB task), lwIP only queues, the --wrap completion pump with the endpoint's busy state, one kick at most, NCM renews per datagram; host test config matches sdkconfig.defaults' pinned NTBs and every NCM sdkconfig; usbnet in make all and CI, glue guard re-run after the builds; +USBNET documented"
+  ok "USB network class: one owner (the TinyUSB task), lwIP only queues, the --wrap completion pump with the endpoint's busy state, one kick and one hang-guard ping at most, NCM renews per datagram; host test config matches sdkconfig.defaults' pinned NTBs and every NCM sdkconfig; usbnet in make all and CI, glue guard re-run after the builds; +USBNET documented"
 else
   bad "USB network class: $why72"
+fi
+
+# 73. The hang guard (main/hang_guard.c, hang_guard_core.c, the shim's ping, the health and driver test blocks,
+#     usb_net.c's ping, AT+HANG?, AT+HANGTEST): the task watchdog panics at 60 s with both idle tasks watched
+#     and the interrupt watchdog on, in sdkconfig.defaults and every generated sdkconfig.warthog-* with the
+#     flash core dump, and hang_guard.c refuses a config without it; app_main starts the guard after USB and
+#     ticks it last in its loop; the tick logs, allocates, locks and waits on nothing but AT+HANGTEST=main,
+#     aborts on a stall and resets the watchdog last; each probe's post and answer are exact; tiT's message is
+#     allocated once and only tried, and tiT also beats from one lwIP timeout, which runs while its mailbox is
+#     full; the ROM console is silenced once USB is up; the record is in .noinit, its magic written last, and
+#     taken and cleared first in app_main; the health probe counts the health task's wakes; only hang_guard.c
+#     subscribes to the watchdog, and nothing in main/ reconfigures it, uninstalls TinyUSB or stops the umac
+#     event loop the guard posts to; the reason is formatted without libc; the shim's ping waits one at most;
+#     each test block holds only its task; AT+HANG? and AT+HANGTEST are dispatched, AT+HANGTEST replies before
+#     it blocks; where present, IDF's caption and no-wait mailbox post and TinyUSB's queue are as relied on;
+#     documented.
+HG73=../../../main/hang_guard.c
+HC73=../../../main/hang_guard_core.c
+HH73=../../../main/hang_guard_core.h
+MN73=../../../main/main.c
+DF73=../../../sdkconfig.defaults
+MLB73=../../halow/components/mm-iot-sdk/framework/morselib
+why73=""
+TW73='CONFIG_ESP_TASK_WDT_EN=y CONFIG_ESP_TASK_WDT_INIT=y CONFIG_ESP_TASK_WDT_PANIC=y CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
+      CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y'
+for k73 in $TW73; do
+  grep -qx "$k73" "$DF73" || why73="${why73:-sdkconfig.defaults lacks $k73}"
+done
+grep -Eq '^# CONFIG_ESP_INT_WDT is not set$|^CONFIG_ESP_INT_WDT=n$' "$DF73" && why73="${why73:-sdkconfig.defaults turns the interrupt watchdog off}"
+for g73 in ../../../sdkconfig.warthog-*; do
+  [ -f "$g73" ] && grep -q '^CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y$' "$g73" || continue
+  for k73 in $TW73; do
+    grep -qx "$k73" "$g73" || { why73="${why73:-${g73##*/}: the task watchdog does not panic at 60 s (PlatformIO keeps a generated sdkconfig: delete it)}"; break; }
+  done
+done
+tw73=$(sed -n 's/^#define WARTHOG_HANG_TWDT_S \([0-9]*\)u.*/\1/p' "$HH73")
+[ -n "$tw73" ] && [ "$tw73" = "$(sed -n 's/^CONFIG_ESP_TASK_WDT_TIMEOUT_S=\([0-9]*\)$/\1/p' "$DF73")" ] || \
+  why73="${why73:-WARTHOG_HANG_TWDT_S (${tw73:-none}) is not CONFIG_ESP_TASK_WDT_TIMEOUT_S in sdkconfig.defaults}"
+er73=$(awk '/^#if !defined\(CONFIG_ESP_TASK_WDT_PANIC\)/,/^#endif/' "$HG73" | tr -d ' \n\\')
+for k73 in '!defined(CONFIG_ESP_TASK_WDT_PANIC)' 'CONFIG_ESP_TASK_WDT_TIMEOUT_S!=WARTHOG_HANG_TWDT_S' \
+           '!defined(CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0)' '!defined(CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1)' '#error"'; do
+  case "$er73" in *"$k73"*) ;; *) why73="${why73:-hang_guard.c does not refuse a task watchdog config without $k73}" ;; esac
+done
+tr -d ' \n' < "$HG73" | grep -q '_Static_assert(MMWLAN_HANG_BLOCK_LOOP==WARTHOG_HANG_TEST_LOOP&&MMWLAN_HANG_BLOCK_HEALTH==WARTHOG_HANG_TEST_HEALTH&&MMWLAN_HANG_BLOCK_DRV==WARTHOG_HANG_TEST_DRV,' && \
+  tr -d ' \n' < "$HG73" | grep -q '_Static_assert(WARTHOG_HANG_LIMIT_S>=WARTHOG_BOOT_OK_S+10u,' || \
+  why73="${why73:-hang_guard.c does not assert the AT+HANGTEST ids match those of morselib, or that a hang aborts after the crash count clears}"
+grep -q '"hang_guard.c"' ../../../main/CMakeLists.txt && grep -q '"hang_guard_core.c"' ../../../main/CMakeLists.txt || \
+  why73="${why73:-main/CMakeLists.txt does not build hang_guard.c and hang_guard_core.c}"
+awk '/^void app_main\(void\)/,/^}/' "$MN73" | awk '/const bool usb = warthog_usb_net_start\(\) != NULL;/ {u=NR}
+  /USB did not start after/ {r=NR} /warthog_hang_guard_start\(usb\);/ {h=NR} /vTaskDelay\(pdMS_TO_TICKS\(750\)\);/ {d=NR}
+  /warthog_wifi_ap_start\(\)/ {w=NR} /while \(1\) \{/ {l=NR} /vTaskDelay\(pdMS_TO_TICKS\(WARTHOG_HANG_TICK_MS\)\);/ {t=NR}
+  /warthog_boot_guard_tick\(\);/ {b=NR} /warthog_hang_guard_tick\(\);/ {g=NR}
+  END {exit (u && u < r && r < h && h < d && d < w && w < l && l < t && t < b && b < g) ? 0 : 1}' || \
+  why73="${why73:-app_main does not start the guard right after USB, or does not tick it every WARTHOG_HANG_TICK_MS after the boot guard}"
+awk '/^void app_main\(void\)/,/^}/' "$MN73" | awk '/const bool safe = warthog_boot_guard_start\(\);/ {s=NR}
+  /warthog_hang_guard_early\(\);/ {e=NR} /if \(warthog_boot_hang_armed\(\)\)/ {a=NR} /ESP_ERROR_CHECK\(warthog_halow_start\(\)\);/ {h=NR}
+  END {exit (s && e == s + 1 && e < a && a < h) ? 0 : 1}' || \
+  why73="${why73:-app_main does not take and clear the previous record right after the boot guard starts, before the HaLow start}"
+TK73=$(awk '/^void warthog_hang_guard_tick\(void\)/,/^}/' "$HG73")
+[ -n "$TK73" ] || why73="${why73:-warthog_hang_guard_tick is gone}"
+for no73 in ESP_LOG printf malloc calloc 'tcpip_callback(' 'tcpip_try_callback(' 'tcpip_callbackmsg_new(' esp_netif_ \
+            xSemaphoreTake xQueueReceive mmosal_semb_wait mmosal_task_sleep vTaskDelay; do
+  case "$TK73" in *"$no73"*) why73="${why73:-warthog_hang_guard_tick calls $no73}" ;; esac
+done
+[ "$(printf '%s\n' "$TK73" | sed -n '3p' | sed 's#/\*.*\*/##' | tr -d ' ')" = 'block_wait_(WARTHOG_HANG_TEST_MAIN);' ] && \
+  [ "$(printf '%s\n' "$TK73" | grep -c 'block_wait_(')" = 1 ] || \
+  why73="${why73:-warthog_hang_guard_tick waits on more than the AT+HANGTEST=main block, its first statement}"
+case "$TK73" in *'esp_system_abort(s_reason);'*) ;; *) why73="${why73:-warthog_hang_guard_tick does not abort on a stall}" ;; esac
+[ "$(printf '%s\n' "$TK73" | sed '$d' | sed -n '$p' | sed 's/^ *//')" = 'if (s_twdt) { esp_task_wdt_reset(); }' ] || \
+  why73="${why73:-the task watchdog reset is not the last statement of the tick}"
+fn_of73() {
+  awk -v re="$2" '/^[a-z].*\(.*\)$/ || /^[a-z].*\(.*[^;]$/ { if (match($0, /[a-z_0-9]+\(/)) fn = substr($0, RSTART, RLENGTH - 1) }
+    /^}/ { fn = "" } index($0, re) && $0 !~ /^ *\/[*\/]/ { print (fn == "" ? "-" : fn) }' "$1" | sort -u | tr '\n' ' '
+}
+[ "$(fn_of73 "$HG73" 'tcpip_callbackmsg_trycallback(')" = 'tcpip_post_ ' ] && \
+  [ "$(fn_of73 "$HG73" 'tcpip_callbackmsg_new(')" = 'warthog_hang_guard_start ' ] || \
+  why73="${why73:-the tiT message is not allocated once in warthog_hang_guard_start and only tried in tcpip_post_}"
+body73() { awk -v f="$2" '/^[a-z]/ && index($0, " " f "(") { on = 1 } on { print } on && /^}/ { exit }' "$1" | tr -d ' \n'; }
+[ "$(body73 "$HG73" loop_post_)" = 'staticenumwarthog_hang_postloop_post_(void){constenummmwlan_statusst=mmwlan_loop_ping();returnst==MMWLAN_SUCCESS?WARTHOG_HANG_POSTED:st==MMWLAN_NO_MEM?WARTHOG_HANG_FULL:WARTHOG_HANG_OFF;}' ] || \
+  why73="${why73:-loop_post_ does not age the loop probe on a full queue and turn it off only without a loop}"
+[ "$(body73 "$HG73" tcpip_post_)" = 'staticenumwarthog_hang_posttcpip_post_(void){if(s_tcpip_msg==NULL){returnWARTHOG_HANG_OFF;}if(s_tcpip_pending){returnWARTHOG_HANG_POSTED;}s_tcpip_pending=true;if(tcpip_callbackmsg_trycallback(s_tcpip_msg)!=ERR_OK){s_tcpip_pending=false;returnWARTHOG_HANG_FULL;}returnWARTHOG_HANG_POSTED;}' ] || \
+  why73="${why73:-tcpip_post_ does not post one message at most, aging the probe on a full mailbox}"
+[ "$(body73 "$HG73" tcpip_beat_)" = 'staticvoidtcpip_beat_(void*arg){(void)arg;block_wait_(WARTHOG_HANG_TEST_TCPIP);s_tcpip_pongs++;sys_timeout(WARTHOG_HANG_TICK_MS,tcpip_beat_,NULL);}' ] && \
+  [ "$(body73 "$HG73" tcpip_pong_)" = 'staticvoidtcpip_pong_(void*ctx){(void)ctx;s_tcpip_pending=false;sys_untimeout(tcpip_beat_,NULL);tcpip_beat_(NULL);}' ] && \
+  [ "$(fn_of73 "$HG73" 'sys_timeout(')" = 'tcpip_beat_ ' ] && [ "$(fn_of73 "$HG73" 'sys_untimeout(')" = 'tcpip_pong_ ' ] || \
+  why73="${why73:-tiT does not answer by its message and one 1 s lwIP timeout, restarted by each message, waiting only on AT+HANGTEST=tcpip}"
+[ "$(body73 "$HG73" timer_beat_)" = 'staticvoidtimer_beat_(void*arg){(void)arg;block_wait_(WARTHOG_HANG_TEST_TIMER);s_timer_beats++;}' ] || \
+  why73="${why73:-the esp_timer beat does not count, waiting only on AT+HANGTEST=timer}"
+[ "$(fn_of73 "$HG73" 'block_wait_(WARTHOG')" = 'tcpip_beat_ timer_beat_ warthog_hang_guard_tick ' ] || \
+  why73="${why73:-an AT+HANGTEST block in hang_guard.c holds another task than its own}"
+case "$(printf '%s\n' "$TK73" | tr -d ' \n')" in
+  *'constuint32_tnow=now_ms_();uint32_ta=g_warthog_loop_pongs;warthog_hang_step(&s_probe[WARTHOG_HANG_LOOP],a,loop_post_(),now);a=s_tcpip_pongs;warthog_hang_step(&s_probe[WARTHOG_HANG_TCPIP],a,tcpip_post_(),now);a=warthog_usb_net_pongs();warthog_hang_step(&s_probe[WARTHOG_HANG_USB],a,warthog_usb_net_ping(),now);warthog_hang_step(&s_probe[WARTHOG_HANG_TIMER],s_timer_beats,s_timer!=NULL?WARTHOG_HANG_POSTED:WARTHOG_HANG_OFF,now);uint32_twakes=0,interval=0;constboolhealth=mmwlan_hang_health(&wakes,&interval);s_probe[WARTHOG_HANG_HEALTH].limit_ms=warthog_hang_health_limit_ms(interval);warthog_hang_step(&s_probe[WARTHOG_HANG_HEALTH],wakes,health?WARTHOG_HANG_POSTED:WARTHOG_HANG_OFF,now);'*) ;;
+  *) why73="${why73:-the tick does not step each probe once, its answers read before its post, the health limit from its interval}" ;;
+esac
+[ "$(printf '%s\n' "$TK73" | grep -c 'warthog_hang_step(')" = 5 ] || why73="${why73:-the tick does not step exactly the five probes}"
+[ "$(body73 "$HG73" warthog_hang_guard_early)" = 'voidwarthog_hang_guard_early(void){if(s_hang_nv.magic==WARTHOG_HANG_MAGIC){s_prev=s_hang_nv;s_prev_valid=true;}s_hang_nv.magic=0;}' ] && \
+  [ "$(fn_of73 "$HG73" 's_hang_nv.magic = 0;')" = 'warthog_hang_guard_early ' ] && [ "$(fn_of73 "$HG73" 's_prev = ')" = 'warthog_hang_guard_early ' ] || \
+  why73="${why73:-the previous record is not taken and cleared in warthog_hang_guard_early alone}"
+awk '/^void warthog_hang_guard_start\(bool usb\)/,/^}/' "$HG73" | tr -d ' \n' | \
+  grep -q 'if(usb){[^}]*esp_rom_install_channel_putc(1,NULL);esp_rom_install_channel_putc(2,NULL);}' || \
+  why73="${why73:-warthog_hang_guard_start does not silence ROM putc channels 1 and 2 once USB is up}"
+grep -qx 'static __NOINIT_ATTR struct warthog_hang_rec s_hang_nv;' "$HG73" || why73="${why73:-the record is not in .noinit}"
+awk '/^void warthog_hang_rec_fill\(/,/^}/' "$HC73" | grep -q 'volatile struct warthog_hang_rec \*v = r;' && \
+  [ "$(awk '/^void warthog_hang_rec_fill\(/,/^}/' "$HC73" | sed '$d' | sed -n '$p' | sed 's/^ *//')" = 'v->magic = WARTHOG_HANG_MAGIC;' ] || \
+  why73="${why73:-the magic of the record is not its last store}"
+wa73=$(grep -l 'esp_task_wdt_add' ../../../main/*.c ../../../main/bat/*.c 2>/dev/null | sed 's#.*/##' | tr '\n' ' ')
+[ "$wa73" = 'hang_guard.c ' ] || why73="${why73:-esp_task_wdt_add is not in hang_guard.c alone (${wa73:-none})}"
+grep -El 'esp_task_wdt_(init|deinit|reconfigure|delete)|tinyusb_driver_uninstall' ../../../main/*.[ch] ../../../main/bat/*.[ch] 2>/dev/null | \
+  grep -q . && why73="${why73:-main/ reconfigures or deletes the task watchdog, or uninstalls TinyUSB}"
+# The guard posts to the event loop every second, and umac_core_stop deletes the loop's semaphore under a concurrent post.
+st73=$(grep -El '(mmwlan_shutdown|mmwlan_sta_disable(_nowait)?|mmwlan_ap_disable|mmhalow_deinit|mmhalow_disconnect)\(' \
+         ../../../main/*.c ../../../main/bat/*.c 2>/dev/null | sed 's#.*/##' | tr '\n' ' ')
+[ -z "$st73" ] || why73="${why73:-main/ stops the umac event loop the guard posts to (${st73% })}"
+rs73=$({ awk '/^size_t warthog_hang_reason\(/,/^}/' "$HC73"; awk '/^static char \*hang_put_/,/^}/' "$HC73"; })
+[ -n "$rs73" ] && ! printf '%s\n' "$rs73" | grep -Eq '(printf|str(len|n?cpy|n?cat|chr)|mem(cpy|set|move)|[a-z]toa)\(' || \
+  why73="${why73:-the hang reason is formatted with libc}"
+LR73=$(awk '/^enum mmwlan_status umac_loop_ping_request\(/,/^}/' "$SHM" | sed 's#/\*.*\*/##' | tr -d ' \n')
+case "$LR73" in *'if(core->evtloop_task==NULL||core->evtloop_shutting_down){s_loop_ping_queued=false;returnMMWLAN_UNAVAILABLE;}if(s_loop_ping_queued){returnMMWLAN_SUCCESS;}'*'s_loop_ping_queued=true;if(!umac_core_evt_queue(umacd,&evt)){s_loop_ping_queued=false;returnloop_post_failed_(umacd);}returnMMWLAN_SUCCESS;'*) ;;
+  *) why73="${why73:-umac_loop_ping_request does not post one ping at most, or keeps it waiting across a loop down or a failed post}" ;; esac
+awk '/^static void loop_ping_evt_handler\(/,/^}/' "$SHM" | awk '/while \(g_warthog_hang_block == MMWLAN_HANG_BLOCK_LOOP\)/ {w=NR}
+  /s_loop_ping_queued = false;/ {f=NR} /g_warthog_loop_pongs\+\+;/ {p=NR} END {exit (w && w < f && f < p) ? 0 : 1}' || \
+  why73="${why73:-the ping handler does not wait on AT+HANGTEST=loop, then let the next ping, then count}"
+awk '/^void umac_core_stop\(/,/^}/' "$MLB73/src/umac/core/umac_evtloop.c" | grep -q evtq && \
+  why73="${why73:-umac_core_stop touches the event queue: a ping queued across a stop no longer runs after the start}"
+ei73=$(grep -rn 'umac_evtq_init(' "$MLB73/src" | grep -v ':void umac_evtq_init(')
+[ "$(printf '%s\n' "$ei73" | grep -c .)" = 1 ] && \
+  awk '/^void umac_core_init\(/,/^}/' "$MLB73/src/umac/core/umac_core.c" | grep -q 'umac_evtq_init(' || \
+  why73="${why73:-umac_evtq_init is called outside umac_core_init}"
+awk '/^enum mmwlan_status mmwlan_loop_ping\(void\)/,/^}/' "$MLB73/src/umac/mesh/mmwlan_mesh.c" | tr -d ' \n' | \
+  grep -q 'if(!umac_data_is_initialised(umacd)){returnMMWLAN_NOT_INITIALIZED;}returnumac_loop_ping_request(umacd);' || \
+  why73="${why73:-mmwlan_loop_ping does not refuse before morselib is up}"
+HH73B=$(awk '/^int mmdrv_hang_health\(/,/^}/' "$MLB73/src/driver/driver.c" | tr -d ' \n')
+for k73 in '!driver_data.started' '!driver_data.health_check.task_running' '!driver_data.health_check.task_enabled' \
+           'atomic_load(&driver_data.health_check.periodic_check_vetoes)!=0' 'driver_data.health_check.interval_ms==0' \
+           'return-ENODEV;' '*wakes=driver_data.health_check.wakes;'; do
+  case "$HH73B" in *"$k73"*) ;; *) why73="${why73:-mmdrv_hang_health does not test $k73}" ;; esac
+done
+wk73=$(grep -rE 'health_check\.wakes *(=[^=]|\+=|-=|\+\+|--)' "$MLB73/src" | cut -d: -f1 | sed 's#.*/##' | tr '\n' ' ')
+[ "$wk73" = 'driver_health.c ' ] || why73="${why73:-the wake count of the health task has another writer than the task (${wk73:-none})}"
+DH73=$(awk '/^static void driver_health_task_main\(/,/^}/' "$MLB73/src/driver/health/driver_health.c")
+printf '%s\n' "$DH73" | \
+  awk '/bool semb_taken = mmosal_semb_wait\(driverd->health_check.pending_semb, next_interval_ms\);/ {w=NR}
+       w && !e && /if \(!driverd->health_check.task_enabled\)/ {e=NR} e && !k && /break;/ {k=NR}
+       /while \(g_warthog_hang_block == MMWLAN_HANG_BLOCK_HEALTH\) \{ mmosal_task_sleep\(1000\); \}/ {b=NR}
+       /driverd->health_check.wakes\+\+;/ {c=NR; n++} /if \(should_skip\(semb_taken, driverd\)\)/ {s=NR}
+       /if \(driverd->health_check.force_fail\)/ {f=NR}
+       END {exit (w && e == w + 1 && k == e + 2 && b == k + 2 && c == b + 1 && n == 1 && c < s && s < f) ? 0 : 1}' || \
+  why73="${why73:-the health task does not take the AT+HANGTEST=health block, then count its wake, right after each wait and before its skip test}"
+printf '%s\n' "$DH73" | tr -d ' \n' | grep -qF 'constuint32_tlast_ms=driverd->health_check.last_checked;constuint32_tsince_ms=mmosal_get_time_ms()-last_ms;next_interval_ms=since_ms>=driverd->health_check.interval_ms?0:driverd->health_check.interval_ms-since_ms;' || \
+  why73="${why73:-the wait of the health task can wrap past its deadline (to about 49 days), which the hang guard would take for a hang}"
+awk '/^void driver_task_main\(/,/^}/' "$MLB73/src/driver/driver_task.c" | \
+  awk '/^    while \(true\)$/ && !w {w=NR} /while \(g_warthog_hang_block == MMWLAN_HANG_BLOCK_DRV\) \{ mmosal_task_sleep\(1000\); \}/ {b=NR}
+       END {exit (w && b == w + 2) ? 0 : 1}' || \
+  why73="${why73:-the AT+HANGTEST=drv block is not the first statement of the driver task loop}"
+grep -q '^extern volatile uint32_t g_warthog_loop_pongs, g_warthog_hang_block;$' "$SHM" && \
+  grep -q '^extern volatile uint32_t g_warthog_hang_block;$' "$MLB73/src/driver/health/driver_health.c" && \
+  grep -q '^extern volatile uint32_t g_warthog_hang_block;$' "$MLB73/src/driver/driver_task.c" && \
+  grep -q '^volatile uint32_t g_warthog_loop_pongs = 0, g_warthog_hang_block = 0;$' "$A" || \
+  why73="${why73:-the ping count or the AT+HANGTEST block is not stored in at.c}"
+awk '/strcasecmp\(verb, "ASSERTTEST"\) == 0 && terminator == .=./ {a=NR}
+     /strcasecmp\(verb, "HANG"\) == 0 && terminator == .\?./ {h=NR} /^        cmd_hang_query\(\);$/ {hq=NR}
+     /strcasecmp\(verb, "HANGTEST"\) == 0 && terminator == .=./ {t=NR} /^        cmd_hangtest\(trim\(args\)\);$/ {tq=NR}
+     END {exit (a && a < h && hq == h + 1 && h < t && tq == t + 1) ? 0 : 1}' "$A" || \
+  why73="${why73:-AT+HANG? and AT+HANGTEST= are not dispatched after AT+ASSERTTEST}"
+awk '/^static void cmd_hangtest\(const char \*a\)/,/^}/' "$A" | awk '/reply_ok\(\);/ {r=NR}
+  /vTaskDelay\(pdMS_TO_TICKS\(MMWLAN_ASSERT_TEST_DELAY_MS\)\);/ {d=NR; rd=r} /g_warthog_hang_block = id;/ {s=NR}
+  END {exit (rd && rd < d && d < s) ? 0 : 1}' || \
+  why73="${why73:-AT+HANGTEST does not reply, then wait, then block}"
+use73=$(sed -n 's/.*"usage: AT+HANGTEST=<\([^>]*\)>".*/|\1|/p' "$A")
+for n73 in $(awk '/^const char \*const warthog_hang_test_names\[/,/};/' "$HC73" | grep -o '"[a-z]*"' | tr -d '"') off; do
+  case "$use73" in *"|$n73|"*) ;; *) why73="${why73:-the AT+HANGTEST usage does not name $n73}" ;; esac
+done
+awk '/^static void cmd_coredump\(void\)/,/^}/' "$A" | awk '/static char reason\[160\]/ {r=NR} /warthog_hang_coredump_reason\(reason\);/ {c=NR}
+  /"\+COREDUMP: reason=%s\\r\\n", reason/ {p=NR} END {exit (r && r < c && c < p) ? 0 : 1}' || \
+  why73="${why73:-AT+COREDUMP? does not put the abort reason on one line before it prints it}"
+up73=""
+IDFS73=${IDF_ESP_SYSTEM:-$HOME/.platformio/packages/framework-espidf/components/esp_system}
+if [ -f "$IDFS73/task_wdt/task_wdt.c" ]; then
+  ic73=$(awk '/const char \*caption = /,/;/' "$IDFS73/task_wdt/task_wdt.c" | grep -o '"[^"]*"' | tr -d '"\n')
+  oc73=$(awk '/^static const char k_twdt_caption\[\] = /,/;/' "$HC73" | grep -o '"[^"]*"' | tr -d '"\n')
+  [ -n "$ic73" ] && [ "$ic73" = "$oc73" ] || why73="${why73:-the IDF task watchdog caption is not the one warthog_hang_coredump_reason matches}"
+  grep -qF 'msg_handler(opaque, "\n - ");' "$IDFS73/task_wdt/task_wdt.c" || why73="${why73:-the IDF task watchdog no longer lists tasks after a newline and a dash}"
+  up73="$up73 task_wdt.c"
+fi
+if [ -f "$IDFS73/../lwip/port/freertos/sys_arch.c" ]; then
+  awk '/^sys_mbox_trypost\(sys_mbox_t \*mbox, void \*msg\)/,/^}/' "$IDFS73/../lwip/port/freertos/sys_arch.c" | \
+    grep -q 'xQueueSend((\*mbox)->os_mbox, &msg, 0)' && \
+    awk '/^tcpip_callbackmsg_trycallback\(struct tcpip_callback_msg \*msg\)/,/^}/' "$IDFS73/../lwip/lwip/src/api/tcpip.c" | \
+    grep -q 'return sys_mbox_trypost(&tcpip_mbox, msg);' || \
+    why73="${why73:-the IDF tcpip_callbackmsg_trycallback may wait for room in the tiT mailbox}"
+  grep -qF '#define TCPIP_MBOX_FETCH(mbox, msg) tcpip_timeouts_mbox_fetch(mbox, msg)' "$IDFS73/../lwip/lwip/src/api/tcpip.c" && \
+    awk '/^tcpip_timeouts_mbox_fetch\(sys_mbox_t \*mbox, void \*\*msg\)/,/^}/' "$IDFS73/../lwip/lwip/src/api/tcpip.c" | tr -d ' \n' | \
+    grep -qF 'sleeptime=sys_timeouts_sleeptime();if(sleeptime==SYS_TIMEOUTS_SLEEPTIME_INFINITE){UNLOCK_TCPIP_CORE();sys_arch_mbox_fetch(mbox,msg,0);LOCK_TCPIP_CORE();return;}elseif(sleeptime==0){sys_check_timeouts();' && \
+    grep -Eq '^#define MEMP_MEM_MALLOC +1$' "$IDFS73/../lwip/port/include/lwipopts.h" || \
+    why73="${why73:-the IDF tiT no longer runs due lwIP timeouts before each mailbox fetch, or takes them from a pool: the tcpip beat can stop while tiT runs}"
+  up73="$up73 sys_arch.c tcpip.c"
+fi
+TU73=${TUSB_DIR:-../../../managed_components/espressif__tinyusb}
+if [ -d "$TU73/src/device" ]; then
+  awk '/^void usbd_defer_func\(/,/^}/' "$TU73/src/device/usbd.c" | grep -q 'queue_event(&event, in_isr);' && \
+    awk '/osal_queue_send\(osal_queue_t qhdl/,/^}/' "$TU73/src/osal/osal_freertos.h" | tr -d ' \n' | grep -q 'if(!in_isr){returnxQueueSendToBack(' && \
+    awk '/^bool tud_task_event_ready\(void\)/,/^}/' "$TU73/src/device/usbd.c" | grep -q 'return !osal_queue_empty(_usbd_q);' || \
+    why73="${why73:-the TinyUSB defer queue or its empty test is not what warthog_usb_net_ping relies on}"
+  up73="$up73 tinyusb"
+fi
+R73=../../../wiki/AT-Command-Reference.md
+rh73=$(grep '^| `AT+HANG?`' "$R73")
+rt73=$(grep '^| `AT+HANGTEST=' "$R73")
+rows73="$rh73 $rt73"
+ls73=$(sed -n 's/^#define WARTHOG_HANG_LIMIT_S \([0-9]*\)u.*/\1/p' "$HH73")
+for k73 in $(awk '/^const char \*const warthog_hang_names\[/,/};/' "$HC73" | grep -o '"[a-z]*"' | tr -d '"') \
+           $(awk '/^const char \*const warthog_hang_test_names\[/,/};/' "$HC73" | grep -o '"[a-z]*"' | tr -d '"') \
+           TASK_WDT reset=PANIC; do
+  case "$rows73" in *"$k73"*) ;; *) why73="${why73:-the AT+HANG? and AT+HANGTEST rows do not name $k73}" ;; esac
+done
+for k73 in "${ls73:-?} s" "${tw73:-?} s"; do
+  case "$rows73" in *"$k73"*) ;; *) why73="${why73:-the AT+HANG? and AT+HANGTEST rows do not say $k73}" ;; esac
+done
+for r73 in "$rh73" "$rt73"; do
+  case "$r73" in *' Measured on air on 2026-10-07 '*' |') ;; *) why73="${why73:-an AT+HANG? or AT+HANGTEST row is missing, or does not give its on-air measurement}" ;; esac
+done
+grep '^| `AT+COREDUMP?`' "$R73" | grep -F 'HANG <probe>:' | grep -q 'TASK_WDT' || \
+  why73="${why73:-the AT+COREDUMP? row does not name the HANG and TASK_WDT reasons}"
+TH73=$(awk '/^### Hangs$/ {on=1; print; next} on && /^##/ {exit} on {print}' ../../../wiki/Troubleshooting.md)
+for k73 in 'AT+HANG?' 'AT+HANGTEST' 'reason=HANG' 'TASK_WDT' "$ls73 s" "$tw73 s" 'safe mode'; do
+  case "$TH73" in *"$k73"*) ;; *) why73="${why73:-the Hangs section of Troubleshooting does not name $k73}" ;; esac
+done
+for k73 in mmwlan_loop_ping mmwlan_hang_health health_check.wakes g_warthog_hang_block tcpip_timeouts_mbox_fetch \
+           'Re-check the fifteen entries'; do
+  grep -qF "$k73" ../../../docs/fork-inventory.md || why73="${why73:-the fork inventory does not name $k73}"
+done
+if [ -z "$why73" ]; then
+  ok "hang guard: the task watchdog panics at 60 s (main and both idle tasks), a stale sdkconfig refused; main ticks the guard every second after USB, waiting on nothing, and aborts on a probe past its limit; one ping each to the loop, tiT and TinyUSB, none waits, each probe's post and answer exact; tiT beats from one lwIP timeout too; health counts the health task's wakes, its wait never wraps; .noinit record taken first in app_main, ROM console silenced, libc-free reason; nothing in main/ stops the loop or reconfigures the watchdog; test blocks hold only their task; AT+HANG? and AT+HANGTEST documented (upstream compared:${up73:- none present})"
+else
+  bad "hang guard: $why73"
+fi
+
+# 74. ROM download mode (main/dlmode.c; measured on air 2026-10-07: a board left in it kept its peers'
+#     802.11s links up, the MM6108 ACKing their polls; after the ROM's own reset into the app 7 of 7 entries
+#     never enumerated the ROM until the USB and IO_MUX reset exemption was cleared, then 12 of 12 within 1.1 s):
+#     AT+DLMODE and each devloop CDC callback enter it once, only through warthog_enter_download(), which
+#     resets the HaLow chip, marks the boot guard, unlocks and arms the RTC watchdog stage 0 to reset the RTC
+#     domain (clearing FORCE_DOWNLOAD_BOOT) after WARTHOG_DLMODE_BACK_S of the calibrated slow clock, clears
+#     RTC_CNTL_USB_CONF_REG's reset exemptions, leaves the bus for 100 ms, and only then writes the flag to
+#     OPTION1 and SW_SYS_RST to OPTIONS0, never through esp_restart(); comments are stripped before matching;
+#     only boot_guard.c and dlmode.c touch the RTC watchdog; AT+ASSERT? names the return DLMODE; the AT
+#     reference, Flashing and Troubleshooting document it with its time limit.
+why74=""
+DM74=../../../main/dlmode.c
+back74=$(sed -n 's/^#define WARTHOG_DLMODE_BACK_S \([0-9]*\)u.*/\1/p' ../../../main/dlmode.h)
+[ -n "$back74" ] || why74="no WARTHOG_DLMODE_BACK_S in dlmode.h"
+code74=$(sed -e 's://.*$::' -e 's:/\*.*\*/::g' "$DM74" | grep -Ev '^[[:space:]]*(/\*|\*)')
+seq74=$(printf '%s\n' "$code74" | awk '/^void warthog_enter_download\(void\)$/,/^}$/' | grep -o \
+  -e 'warthog_chip_hold_reset();' -e 'warthog_boot_mark_download();' -e 'wdt_hal_init(&ctx, WDT_RWDT, 0, false);' \
+  -e 'wdt_hal_write_protect_disable(&ctx);' \
+  -e 'WARTHOG_DLMODE_BACK_S \* 1000000u) << RTC_CLK_CAL_FRACT) / esp_clk_slowclk_cal_get()' \
+  -e 'wdt_hal_config_stage(&ctx, WDT_STAGE0, ticks, WDT_STAGE_ACTION_RESET_RTC);' -e 'wdt_hal_enable(&ctx);' \
+  -e 'CLEAR_PERI_REG_MASK(RTC_CNTL_USB_CONF_REG, RTC_CNTL_USB_RESET_DISABLE | RTC_CNTL_IO_MUX_RESET_DISABLE);' \
+  -e 'tud_disconnect();' -e 'esp_rom_delay_us(100000);' -e 'portDISABLE_INTERRUPTS();' \
+  -e 'REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);' -e 'REG_WRITE(RTC_CNTL_OPTIONS0_REG, RTC_CNTL_SW_SYS_RST);' | tr '\n' ' ')
+want74='warthog_chip_hold_reset(); warthog_boot_mark_download(); wdt_hal_init(&ctx, WDT_RWDT, 0, false); wdt_hal_write_protect_disable(&ctx); WARTHOG_DLMODE_BACK_S * 1000000u) << RTC_CLK_CAL_FRACT) / esp_clk_slowclk_cal_get() wdt_hal_config_stage(&ctx, WDT_STAGE0, ticks, WDT_STAGE_ACTION_RESET_RTC); wdt_hal_enable(&ctx); CLEAR_PERI_REG_MASK(RTC_CNTL_USB_CONF_REG, RTC_CNTL_USB_RESET_DISABLE | RTC_CNTL_IO_MUX_RESET_DISABLE); tud_disconnect(); esp_rom_delay_us(100000); portDISABLE_INTERRUPTS(); REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT); REG_WRITE(RTC_CNTL_OPTIONS0_REG, RTC_CNTL_SW_SYS_RST); '
+[ "$seq74" = "$want74" ] || why74="${why74:-warthog_enter_download does not reset the chip, mark, unlock and arm the RTC watchdog stage 0 on the calibrated slow clock to RESET_RTC, clear the ROM USB reset exemption, leave the bus for 100 ms and only then set the flag and reset the core, in that order (got: $seq74)}"
+printf '%s\n' "$code74" | grep -q 'esp_restart\|RESET_SYSTEM\|RESET_CPU' && why74="${why74:-dlmode.c restarts through esp_restart or a watchdog action that keeps FORCE_DOWNLOAD_BOOT}"
+for f74 in ../../../main/*.c; do
+  case "$f74" in */dlmode.c) continue ;; esac
+  grep -q 'RTC_CNTL_FORCE_DOWNLOAD_BOOT' "$f74" && why74="${why74:-$(basename "$f74") sets FORCE_DOWNLOAD_BOOT itself}"
+  case "$f74" in */boot_guard.c) ;; *) grep -q 'WDT_RWDT\|RWDT_HAL_CONTEXT' "$f74" && why74="${why74:-$(basename "$f74") touches the RTC watchdog}" ;; esac
+done
+grep -q 'esp_restart' ../../../main/usb_net.c && why74="${why74:-usb_net.c still restarts through esp_restart}"
+for cb74 in cdc_line_coding_cb cdc_line_state_cb; do
+  [ "$(awk "/^static void ${cb74}\\(/,/^}\$/" ../../../main/usb_net.c | grep -c 'warthog_enter_download();')" = 1 ] || \
+    why74="${why74:-$cb74 does not enter through warthog_enter_download}"
+done
+awk '/^static void cmd_dlmode\(void\)$/,/^}$/' ../../../main/at.c | grep -q 'warthog_enter_download();' || \
+  why74="${why74:-AT+DLMODE does not enter through warthog_enter_download}"
+awk '/^static const char \*reset_reason_name_/,/^}$/' ../../../main/at.c | tr -d ' \n' | \
+  grep -q '{if(rr==ESP_RST_WDT&&warthog_boot_download_return()){return"DLMODE";}switch(rr){' || \
+  why74="${why74:-AT+ASSERT? does not name a download-mode return DLMODE}"
+rd74=$(grep '^| `AT+DLMODE`' ../../../wiki/AT-Command-Reference.md)
+for k74 in "$back74 s" 'reset=DLMODE' 'BOOT button has no limit'; do
+  case "$rd74" in *"$k74"*) ;; *) why74="${why74:-the AT+DLMODE row does not say $k74}" ;; esac
+done
+grep -q "$back74 s" ../../../wiki/Flashing.md || why74="${why74:-Flashing does not give the $back74 s download-mode limit}"
+grep '^| `AT+ASSERT?`' ../../../wiki/AT-Command-Reference.md | grep -q '`DLMODE` after' || \
+  why74="${why74:-the AT+ASSERT? reset list does not name DLMODE}"
+grep -q '^## Mesh: a node stays peered but answers nothing$' ../../../wiki/Troubleshooting.md || \
+  why74="${why74:-Troubleshooting does not cover a node left in download mode}"
+if [ -z "$why74" ]; then
+  ok "ROM download mode: one entry (chip reset, boot guard marked, RTC watchdog armed to reset the RTC domain after ${back74} s, USB reset exemption cleared, off the bus 100 ms, then the flag and a core reset), used by AT+DLMODE and both devloop triggers; no esp_restart; only boot_guard.c and dlmode.c touch the RTC watchdog; the return named DLMODE; documented"
+else
+  bad "download mode: $why74"
 fi
 
 [ $fail -eq 0 ] && echo "GLUE INVARIANTS OK" || echo "GLUE INVARIANTS FAILED"

@@ -95,6 +95,47 @@ test, or none after `AT+COREDUMP=0`, means no panic was reached.
 next boots before the HaLow start, the chip held in reset: two `reset=WDT`
 boots, then safe mode (`crash_boots=3 safe=1`).
 
+### Hangs
+
+From the USB start on, `main` (the loop of `app_main`) ticks every second. Each
+tick posts one probe, without waiting, to the umac event loop, lwIP's thread
+and TinyUSB, and checks a 1 s `esp_timer` and the chip health task. A probe
+unanswered for 180 s (`health`: its interval plus 90 s, at least 180 s) aborts
+with `reset=PANIC` and `reason=HANG <probe>: ...`, and the core dump holds
+every task. The task watchdog resets with `reset=TASK_WDT` when `main` misses
+60 s, or when a CPU's idle task has not run for 60 s.
+
+After the board is back:
+
+```
+AT+ASSERT?
++ASSERT: count=<n> kept=<n> reset=PANIC up_s=<s> crash_boots=1 safe=0
+AT+COREDUMP?
++COREDUMP: task=main pc=<hex>
++COREDUMP: reason=HANG loop: loop=180 tcpip=0 usb=0 timer=0 health=40 up=<s>
+AT+HANG?
++HANG: limit_s=180 twdt_s=60 up_s=<s> idle0_max_ms=<n> idle1_max_ms=<n> test=-
+...
++HANG: prev reset=PANIC up_s=<s> loop=180 tcpip=0 usb=0 timer=0 health=40 idle0_ms=<n> idle1_ms=<n> test=-
+```
+
+- The probe after `HANG` waited longest; the other ages show what else had
+  stopped.
+- The core dump holds every task's stack.
+- `TASK_WDT main` with `task=IDLE0` means the guard's own loop stopped; with
+  any other `task=`, that task kept CPU 0 busy. `IDLE0` or `IDLE1` in the reason
+  means that CPU was kept busy, and `task=` names what ran on it.
+- `prev` is the previous boot's last tick, in `.noinit`; power loss loses it,
+  and a boot that ended before its first tick leaves `prev none`.
+
+A hang that comes back every boot reboots about every 3 min with
+`crash_boots=1` and never starts safe mode: the count clears after 60 s up, and
+AT works between reboots. A stop in `app_main` before its loop has run 60 s is
+caught by the task watchdog and counts toward safe mode, as a panic does.
+`AT+HANGTEST` blocks a probed task, `main` or the AT task on demand
+([AT reference](AT-Command-Reference#mesh)); every case was measured on air on
+2026-10-07.
+
 ### Task stacks
 
 `AT+STACKS?` reports the least free stack of each task, in bytes; `drv`,
@@ -418,6 +459,21 @@ header unchecked and, on a session match, rewrites its port and checksum past th
 packet's end, also for a packet to 0.0.0.0 while HaLow has lost its lease. A rise
 means a broken or hostile sender on the mesh, USB or the access point
 (host-tested; `docs/napt-notes.md`, Short packets).
+
+## Mesh: a node stays peered but answers nothing
+
+The peers list the node `mesh plink: ESTAB`, their `rx packets` for it frozen;
+it answers no ping; on USB it shows the ROM device `303a:0009`, or nothing.
+
+The board is in ROM download mode, entered by `AT+DLMODE` or, on the
+`warthog-mesh-*` builds, by opening the console at 1200 baud. Images without
+the chip reset on the way in (built before 2026-10-07) leave the HaLow chip
+running there, and it ACKs the peers' inactivity polls, so the links stay up as
+long as the board stays in download mode. Leave download mode with
+`esptool --before no-reset --after watchdog-reset chip-id` on the ROM port, or a
+power cycle. Current images reset the chip on the way in, so OpenMANET peers
+drop the node at their next 300 s poll, and return to the app after 1800 s
+([Flashing](Flashing#reflashing-a-running-board)).
 
 ## Mesh: perfect peering, zero data in both directions
 

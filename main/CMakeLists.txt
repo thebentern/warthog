@@ -2,6 +2,9 @@ idf_component_register(
     SRCS
         "main.c"
         "boot_guard.c"
+        "dlmode.c"
+        "hang_guard.c"
+        "hang_guard_core.c"
         "halow.c"
         "mesh.c"
         "mesh_diag.c"

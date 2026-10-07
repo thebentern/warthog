@@ -11,6 +11,10 @@
 #include "driver/morse_driver/morse.h"
 #include "driver/morse_driver/ps.h"
 #include "driver/beacon/beacon.h"
+#include "mmwlan_mesh.h"
+
+/* AT+HANGTEST (storage in main/at.c). */
+extern volatile uint32_t g_warthog_hang_block;
 
 #ifdef ENABLE_DRV_TASK_TRACE
 #include "mmtrace.h"
@@ -137,6 +141,7 @@ void driver_task_main(void *arg)
 
     while (true)
     {
+        while (g_warthog_hang_block == MMWLAN_HANG_BLOCK_DRV) { mmosal_task_sleep(1000); } /* AT+HANGTEST=drv */
         bool have_scheduled_evt;
         int32_t relative_next_evt_time;
         uint32_t next_scheduled_evt_time = 0;

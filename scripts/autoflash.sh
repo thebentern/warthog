@@ -2,11 +2,9 @@
 # Flash the mesh-smoke image the moment the XIAO is reachable in ROM download mode.
 #
 # WHY THIS EXISTS
-#   AT+DLMODE (at.c cmd_dlmode) normally works: it sets RTC_CNTL_FORCE_DOWNLOAD_BOOT
-#   and calls esp_restart(). But on the currently-flashed MBCA-ON build the restart
-#   appears to hang in mesh teardown, so the board comes back into the app instead of
-#   the ROM bootloader, and the download window either never opens or is too brief to
-#   catch. Recover with the physical dance:
+#   For a board AT+DLMODE (main/dlmode.c) cannot reach: no console, or an image older
+#   than 2026-10-07, whose download mode never enumerated after the ROM itself had
+#   started the app (an esptool session's end). Recover with the physical dance:
 #
 #       hold BOOT -> tap RESET -> release BOOT
 #

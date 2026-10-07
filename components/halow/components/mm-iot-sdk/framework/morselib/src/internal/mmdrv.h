@@ -570,6 +570,10 @@ void mmdrv_hw_restart_completed(void);
  *  after a real failure. -ENODEV while the driver is not started. */
 int mmdrv_force_health_check_fail(void);
 
+/** The hang guard: the health task's wake count and the interval while it runs periodically; scalar
+ *  reads, any task. @returns 0, or -ENODEV (driver stopped, task down or disabled, vetoed, interval 0). */
+int mmdrv_hang_health(uint32_t *wakes, uint32_t *interval_ms);
+
 /** Enumeration of flags used by @ref mmdrv_tx_metadata.flags */
 enum mmdrv_tx_metadata_flags
 {

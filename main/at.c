@@ -28,7 +28,7 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "soc/rtc_cntl_reg.h"   /* RTC_CNTL_OPTION1_REG for AT+DLMODE */
+#include "soc/rtc_cntl_reg.h"   /* RTC_CNTL_OPTIONS0_REG for AT+RESET */
 #include "esp_attr.h"   /* RTC_NOINIT_ATTR */
 #include "esp_core_dump.h" /* AT+COREDUMP? crash forensics */
 #include "soc/soc.h"            /* REG_WRITE */
@@ -41,6 +41,8 @@
 #include "warthog_assert.h" /* AT+ASSERT? */
 #include "warthog_shim.h"  /* AT+STACKS? */
 #include "boot_guard.h"     /* AT+ASSERT? crash_boots, AT+ASSERTTEST=hang */
+#include "dlmode.h"         /* AT+DLMODE */
+#include "hang_guard.h"     /* AT+HANG?, AT+HANGTEST */
 #include "mudp.h"
 #include "mesh_bridge.h"
 #include "nat_frag.h"       /* AT+MTU? ip_reass */
@@ -398,7 +400,7 @@ static void cmd_reset(void)
     reply_ok();
     /* Give the host a moment to drain TX before we yank the bus. */
     vTaskDelay(pdMS_TO_TICKS(200));
-    /* Same reason cmd_dlmode() avoids esp_restart(): it runs every shutdown
+    /* Same reason warthog_enter_download() avoids esp_restart(): it runs every shutdown
      * handler and resets peripheral modules before the CPU-only soft reset, so
      * anything stuck in between -- a HaLow SPI transaction in flight, a task
      * holding a lock the teardown wants -- lets the watchdog fire instead.
@@ -414,30 +416,15 @@ static void cmd_reset(void)
     while (1) { }
 }
 
-/* — alternate download-mode entry independent of the 1200bps shim.
- * Use this when the host needs to flash and the CDC line-coding trick isn't
- * working (e.g., macOS not propagating SET_LINE_CODING in some configurations).
- * Sets the same RTC bit the 1200bps path sets, then restarts. ROM bootloader
- * skips the app and enters USB-Serial-JTAG download mode. */
+/* ROM download mode on an explicit command, in every build (main/dlmode.c): the
+ * ROM comes up on USB-OTG (303a:0009) and returns to the app after
+ * WARTHOG_DLMODE_BACK_S unless a reset ends it first. */
 static void cmd_dlmode(void)
 {
     cdc_write("+INFO: entering ROM download mode\r\n");
     reply_ok();
     vTaskDelay(pdMS_TO_TICKS(200));
-    /* Set the ROM download-boot flag, then reset the SYSTEM directly at the
-     * RTC level. Do NOT go through esp_restart(): that runs every shutdown
-     * handler, resets peripheral modules, and only then does a CPU-only soft
-     * reset -- and if anything hangs in between (a HaLow SPI transaction in
-     * flight, a task holding a lock the teardown needs) the task/RTC watchdog
-     * fires instead, and THAT reset path clears RTC_CNTL_OPTION1. Result:
-     * DLMODE worked on a fresh boot and failed once the mesh data plane was
-     * live, re-enumerating as the app (303a:4020) instead of ROM (303a:0009).
-     * The flag lives in the RTC domain precisely so a system reset preserves
-     * it; a direct RTC_CNTL_SW_SYS_RST is the reset it is designed for. */
-    portDISABLE_INTERRUPTS();
-    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
-    REG_WRITE(RTC_CNTL_OPTIONS0_REG, RTC_CNTL_SW_SYS_RST);
-    while (1) { }
+    warthog_enter_download();
 }
 
 /* AT+MESHSTAT? — report the mesh receive-path counters.
@@ -895,6 +882,8 @@ volatile uint32_t g_warthog_chiprestart_sta = 0, g_warthog_chiprestart_stafail =
 volatile uint32_t g_warthog_chiprestart_keys = 0, g_warthog_chiprestart_keyfail = 0;
 volatile uint32_t g_warthog_chiprestart_cmdfail = 0, g_warthog_chiprestart_retried = 0;
 volatile uint32_t g_warthog_chiprestart_pending = 0, g_warthog_chiprestart_ms = 0;
+/* The hang guard (main/hang_guard.c): the event loop's ping answers and the AT+HANGTEST block. */
+volatile uint32_t g_warthog_loop_pongs = 0, g_warthog_hang_block = 0;
 
 /* RX frame-filter drop accounting.
  *
@@ -1639,6 +1628,9 @@ static void cmd_chiprestart(void)
 
 static const char *reset_reason_name_(esp_reset_reason_t rr)
 {
+    if (rr == ESP_RST_WDT && warthog_boot_download_return()) {
+        return "DLMODE";
+    }
     switch (rr) {
     case ESP_RST_POWERON: return "POWERON";
     case ESP_RST_SW: return "SW";
@@ -1724,6 +1716,62 @@ static void cmd_asserttest(const char *a)
         MMOSAL_ASSERT_LOG_DATA(false, MMWLAN_ASSERT_TEST_HANG);
     }
     MMOSAL_ASSERT_LOG_DATA(false, MMWLAN_ASSERT_TEST_AT);
+}
+
+/* AT+HANG?: the hang guard as of its last tick, and the previous boot's last tick (.noinit). */
+static void cmd_hang_query(void)
+{
+    static struct warthog_hang_view v; /* AT task only */
+    static char line[192];
+    warthog_hang_guard_view(&v);
+    warthog_hang_summary_line(line, sizeof(line), &v);
+    cdc_write(line);
+    for (int i = 0; i < WARTHOG_HANG_PROBES; i++) {
+        warthog_hang_probe_line(line, sizeof(line), i, &v.probe[i]);
+        cdc_write(line);
+    }
+    warthog_hang_prev_line(line, sizeof(line), reset_reason_name_(esp_reset_reason()), &v);
+    cdc_write(line);
+    reply_ok();
+}
+
+/* AT+HANGTEST=<test|off>: a probed task, main or the AT task blocks, so the hang guard or the task
+ * watchdog resets the board; off releases a block not yet detected. */
+static void cmd_hangtest(const char *a)
+{
+    static struct warthog_hang_view v; /* AT task only */
+    static char line[128];
+    const int id = warthog_hang_test_find(a);
+    if (id < 0) {
+        reply_error("usage: AT+HANGTEST=<loop|tcpip|usb|timer|health|drv|main|spin|off>");
+        return;
+    }
+    if (id == WARTHOG_HANG_TEST_NONE) {
+        g_warthog_hang_block = 0;
+        cdc_write("+HANGTEST: released\r\n");
+        reply_ok();
+        return;
+    }
+    warthog_hang_guard_view(&v);
+    const int need = warthog_hang_test_probe((uint32_t)id);
+    if (need >= 0 && !v.probe[need].on) {
+        snprintf(line, sizeof(line), "%s not watched", warthog_hang_names[need]);
+        reply_error(line);
+        return;
+    }
+    if (id == WARTHOG_HANG_TEST_MAIN && !v.twdt) {
+        reply_error("task watchdog not watching main");
+        return;
+    }
+    warthog_hang_test_reply(line, sizeof(line), (uint32_t)id);
+    cdc_write(line);
+    reply_ok();
+    vTaskDelay(pdMS_TO_TICKS(MMWLAN_ASSERT_TEST_DELAY_MS)); /* the reply reaches the host first */
+    g_warthog_hang_block = id;
+    if (id == WARTHOG_HANG_TEST_SPIN) {
+        for (volatile uint32_t n = 0;; n++) {
+        }
+    }
 }
 
 /* AT+CHIPRESTART?: restarts handled, forced, put back in full; what they put back and not. */
@@ -2522,11 +2570,12 @@ static void cmd_coredump(void)
     snprintf(buf, sizeof(buf), "+COREDUMP: task=%s pc=0x%08lx\r\n",
              sum->exc_task, (unsigned long)sum->exc_pc);
     cdc_write(buf);
-    /* An abort's text: for an MMOSAL_ASSERT, the pc, fileid and line AT+ASSERT? shows. */
-    char reason[96];
+    /* An abort's text on one line: an MMOSAL_ASSERT's, the hang guard's, the task watchdog's. */
+    static char reason[160], line[192]; /* AT task only */
     if (esp_core_dump_get_panic_reason(reason, sizeof(reason)) == ESP_OK) {
-        snprintf(buf, sizeof(buf), "+COREDUMP: reason=%s\r\n", reason);
-        cdc_write(buf);
+        warthog_hang_coredump_reason(reason);
+        snprintf(line, sizeof(line), "+COREDUMP: reason=%s\r\n", reason);
+        cdc_write(line);
     }
     int n = sum->exc_bt_info.depth;
     if (n > 16) { n = 16; }
@@ -3336,6 +3385,10 @@ static void dispatch(char *line)
         }
     } else if (strcasecmp(verb, "ASSERTTEST") == 0 && terminator == '=') {
         cmd_asserttest(trim(args));
+    } else if (strcasecmp(verb, "HANG") == 0 && terminator == '?') {
+        cmd_hang_query();
+    } else if (strcasecmp(verb, "HANGTEST") == 0 && terminator == '=') {
+        cmd_hangtest(trim(args));
     } else if (strcasecmp(verb, "SAESTAGE") == 0 && terminator == '?') {
         cmd_saestage();
     } else if (strcasecmp(verb, "SAEBRIDGE") == 0 && terminator == '=') {

@@ -38,6 +38,11 @@ void warthog_boot_guard_tick(void);
 uint32_t warthog_boot_crash_count(void);
 bool warthog_boot_safe(void);
 
+/** Just before ROM download mode: the next boot's RTC watchdog reset is not counted as a crash boot. */
+void warthog_boot_mark_download(void);
+/** This boot is the download-mode watchdog's return (AT+ASSERT? reset=DLMODE). */
+bool warthog_boot_download_return(void);
+
 /** AT+ASSERTTEST=hang: the next crash boots stop before the HaLow start, until safe mode. */
 void warthog_boot_arm_hang(void);
 bool warthog_boot_hang_armed(void);

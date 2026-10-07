@@ -26,6 +26,7 @@
 #include "umac_mesh.h"
 #include "umac/core/umac_core.h"
 #include "umac/data/umac_data.h"
+#include "mmdrv.h"
 
 static mmwlan_mesh_peer_event_cb_t s_peer_event_cb;
 static void *s_peer_event_arg;
@@ -140,6 +141,21 @@ enum mmwlan_status mmwlan_assert_test(void)
         return MMWLAN_NOT_INITIALIZED;
     }
     return umac_assert_test_request(umacd);
+}
+
+enum mmwlan_status mmwlan_loop_ping(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    if (!umac_data_is_initialised(umacd))
+    {
+        return MMWLAN_NOT_INITIALIZED;
+    }
+    return umac_loop_ping_request(umacd);
+}
+
+bool mmwlan_hang_health(uint32_t *wakes, uint32_t *interval_ms)
+{
+    return mmdrv_hang_health(wakes, interval_ms) == 0;
 }
 
 uint8_t mmwlan_mesh_get_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max)

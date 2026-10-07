@@ -154,6 +154,18 @@ enum mmwlan_status mmwlan_force_chip_restart(void);
  *  MMWLAN_ASSERT_TEST_DELAY_MS later and the board resets. Not posted: as mmwlan_force_chip_restart. */
 enum mmwlan_status mmwlan_assert_test(void);
 
+/** AT+HANGTEST: g_warthog_hang_block (storage in main/at.c) at which the umac event loop, the health
+ *  task or the driver task blocks at its next probe, 1 s at a time, until AT+HANGTEST=off. */
+#define MMWLAN_HANG_BLOCK_LOOP   1u
+#define MMWLAN_HANG_BLOCK_HEALTH 2u
+#define MMWLAN_HANG_BLOCK_DRV    3u
+/** The hang guard's event loop probe: posts one ping unless one waits; its handler counts
+ *  g_warthog_loop_pongs. SUCCESS posted or waiting, NO_MEM queue full, else no loop to watch. */
+enum mmwlan_status mmwlan_loop_ping(void);
+/** The hang guard's view of the chip health task: true while it runs periodically (driver started,
+ *  task up, no veto, interval set); @p wakes counts its wakes, at least one an interval. */
+bool mmwlan_hang_health(uint32_t *wakes, uint32_t *interval_ms);
+
 #ifdef __cplusplus
 }
 #endif

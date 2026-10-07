@@ -35,7 +35,7 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
            ../src/dot11ah/debug.c
 
 TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
-           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd test_mesh_frag test_mesh_cap sim_mesh test_supp_mesh_conf test_mesh_bip test_bat_mode test_beacon_yield test_chipvif_glue test_chipvif_glue_off
+           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd test_mesh_frag test_mesh_cap sim_mesh test_supp_mesh_conf test_mesh_bip test_bat_mode test_beacon_yield test_chipvif_glue test_chipvif_glue_off test_hang_guard
 
 # ---- simnode: the real stack with only the chip and the RTOS replaced ----
 #
@@ -153,6 +153,10 @@ MAINDIR := ../../../main
 test_mesh_diag: test_mesh_diag.c $(MAINDIR)/mesh_diag.c
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $^ -o $@
 
+# The hang guard's logic (main/hang_guard_core.c): ages, the stall pick, the abort reason, AT+HANG? lines.
+test_hang_guard: test_hang_guard.c $(MAINDIR)/hang_guard_core.c $(MAINDIR)/hang_guard_core.h
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $(filter %.c,$^) -o $@
+
 test_mudp_classify: test_mudp_classify.c $(MAINDIR)/mudp_classify.c $(MAINDIR)/mudp_classify.h
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $(filter %.c,$^) -o $@
 
@@ -168,13 +172,13 @@ test_beacon_yield: test_beacon_yield.c $(BCNDIR)/beacon.h
 
 # The chip VIF pieces no simnode links: driver.c's reads of the chip's own status (extracted
 # by name into test_chipvif_glue.fns) against a fake morse_cmd_tx, beacon.c's IRQ count, host-tick
-# yield and teardown, umac_ps.c's CONFIG_PS gate, and driver_health.c's forced failure
-# (AT+CHIPRESTART); with the MESH-VIF flag and without.
+# yield and teardown, umac_ps.c's CONFIG_PS gate, driver_health.c's forced failure
+# (AT+CHIPRESTART) and the hang guard's health read and block; with the MESH-VIF flag and without.
 DRVSRC := $(FW)/morselib/src/driver/driver.c
 CHIPVIF_FNS := mmdrv_add_if mmdrv_add_if_status mmdrv_set_bssid mmdrv_cfg_bss_beacon \
                mmdrv_mesh_config mmdrv_get_capabilities_status mmdrv_update_sta_state \
                mmdrv_update_sta_state_status mmdrv_install_key mmdrv_install_key_status \
-               mmdrv_force_health_check_fail
+               mmdrv_force_health_check_fail mmdrv_hang_health
 CHIPVIF_DEPS := test_chipvif_glue.c test_chipvif_glue.fns $(BCNDIR)/beacon.c $(BCNDIR)/beacon.h \
                 $(FW)/morselib/src/umac/ps/umac_ps.c $(FW)/morselib/src/driver/health/driver_health.c \
                 $(FW)/morselib/src/driver/health/driver_health.h $(SIMNODE_HDRS)
@@ -532,6 +536,7 @@ freestanding:
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/mudp_classify.c && echo "ok   mudp_classify.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/cdc_out.c && echo "ok   cdc_out.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/usbnet_core.c && echo "ok   usbnet_core.c is freestanding"
+	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main ../../../main/hang_guard_core.c && echo "ok   hang_guard_core.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I../../../main -I../../../main/bat ../../../main/bat_mode.c && echo "ok   bat_mode.c is freestanding (libc and the engine's bat.h)"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_ctrl.c && echo "ok   umac_mesh_ctrl.c is freestanding"
 	@$(CC) $(CFLAGS) -Werror -fsyntax-only -I$(SDKMESH) $(SDKMESH)/umac_mesh_frag.c && echo "ok   umac_mesh_frag.c is freestanding"

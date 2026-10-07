@@ -89,6 +89,10 @@ enum mmwlan_status umac_chip_restart_request(struct umac_data *umacd);
  *  MMWLAN_ASSERT_TEST_DELAY_MS later; fails as umac_chip_restart_request does. */
 enum mmwlan_status umac_assert_test_request(struct umac_data *umacd);
 
+/** The hang guard's ping (umac_mmdrv_shim.c): posted unless one waits; UNAVAILABLE with the loop down
+ *  or stopping (forgetting the waiting one), NO_MEM with its queue full. */
+enum mmwlan_status umac_loop_ping_request(struct umac_data *umacd);
+
 /** Send an HWMP PREQ to @p da, targeting @p da itself. Emitting this is what
  *  makes us reachable: a peer installs a path to a PREQ's originator. */
 int umac_mesh_hwmp_send_preq(const uint8_t *da);

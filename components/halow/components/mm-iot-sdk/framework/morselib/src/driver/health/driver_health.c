@@ -10,6 +10,7 @@
 #include "driver/morse_driver/command.h"
 #include "stdatomic.h"
 #include "driver_health.h"
+#include "mmwlan_mesh.h"
 
 #ifdef ENABLE_DRV_HEALTH_TRACE
 #include "mmtrace.h"
@@ -40,6 +41,8 @@ static mmtrace_channel drv_health_channel_handle;
 
 /* AT+CHIPRESTART? (storage in main/at.c). */
 extern volatile uint32_t g_warthog_chiprestart_forced;
+/* AT+HANGTEST (storage in main/at.c). */
+extern volatile uint32_t g_warthog_hang_block;
 
 
 static void morse_reset_chip(void)
@@ -100,10 +103,11 @@ static void driver_health_task_main(void *arg)
         }
         else
         {
-
-            next_interval_ms = driverd->health_check.interval_ms -
-                               mmosal_get_time_ms() +
-                               driverd->health_check.last_checked;
+            /* warthog: 0 once due; a deadline passed since should_skip() wrapped this to ~49 days. */
+            const uint32_t last_ms = driverd->health_check.last_checked;
+            const uint32_t since_ms = mmosal_get_time_ms() - last_ms;
+            next_interval_ms = since_ms >= driverd->health_check.interval_ms ?
+                               0 : driverd->health_check.interval_ms - since_ms;
         }
 
         MMLOG_VRB("Periodic health check in %lu ms.\n", next_interval_ms);
@@ -112,6 +116,8 @@ static void driver_health_task_main(void *arg)
         {
             break;
         }
+        while (g_warthog_hang_block == MMWLAN_HANG_BLOCK_HEALTH) { mmosal_task_sleep(1000); } /* AT+HANGTEST=health */
+        driverd->health_check.wakes++; /* warthog: the hang guard's health probe */
 
         if (should_skip(semb_taken, driverd))
         {

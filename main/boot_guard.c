@@ -19,10 +19,12 @@ static __NOINIT_ATTR struct {
     uint32_t hang;
     uint32_t usb_fail; /* BOOT_GUARD_MAGIC: this boot's USB start failed, the watchdog left to retry */
     uint32_t usb_retries;
+    uint32_t dl; /* BOOT_GUARD_MAGIC: download mode entered; its RTC watchdog's return is no crash */
 } s_boot;
 static bool s_safe;
 static bool s_cleared;
 static bool s_wdt_off;
+static bool s_dl_back;
 
 uint32_t warthog_boot_next_count(uint32_t kept, bool valid, esp_reset_reason_t rr)
 {
@@ -51,14 +53,16 @@ bool warthog_boot_guard_start(void)
 {
     const bool valid = s_boot.magic == BOOT_GUARD_MAGIC;
     const esp_reset_reason_t rr = esp_reset_reason();
-    /* The watchdog retrying a failed USB start is no crash: the count stays as it was. */
-    if (!(valid && rr == ESP_RST_WDT && s_boot.usb_fail == BOOT_GUARD_MAGIC)) {
+    s_dl_back = valid && rr == ESP_RST_WDT && s_boot.dl == BOOT_GUARD_MAGIC;
+    /* The watchdog retrying a failed USB start, or ending a download mode nobody used, is no crash. */
+    if (!s_dl_back && !(valid && rr == ESP_RST_WDT && s_boot.usb_fail == BOOT_GUARD_MAGIC)) {
         s_boot.crash_boots = warthog_boot_next_count(s_boot.crash_boots, valid, rr);
     }
-    if (!valid || warthog_boot_next_count(0, true, rr) == 0) {
+    if (!valid || warthog_boot_next_count(0, true, rr) == 0 || s_dl_back) {
         s_boot.usb_retries = 0; /* a clean reset or lost magic: the USB retries back */
     }
     s_boot.usb_fail = 0;
+    s_boot.dl = 0;
     s_safe = s_boot.crash_boots >= WARTHOG_BOOT_SAFE_AFTER;
     if (!valid || s_boot.crash_boots == 0 || s_safe) {
         s_boot.hang = 0;
@@ -111,6 +115,17 @@ uint32_t warthog_boot_crash_count(void)
 bool warthog_boot_safe(void)
 {
     return s_safe;
+}
+
+bool warthog_boot_download_return(void)
+{
+    return s_dl_back;
+}
+
+void warthog_boot_mark_download(void)
+{
+    s_boot.magic = BOOT_GUARD_MAGIC;
+    s_boot.dl = BOOT_GUARD_MAGIC;
 }
 
 void warthog_boot_arm_hang(void)

@@ -11,6 +11,7 @@
 #include "boot_guard.h"
 #include "cfg.h"
 #include "halow.h"
+#include "hang_guard.h"
 #include "mudp.h"
 #include "led.h"
 #include "nat.h"
@@ -28,6 +29,7 @@ void app_main(void)
 {
     /* Before anything that can hang: the boot watchdog runs until USB is up. */
     const bool safe = warthog_boot_guard_start();
+    warthog_hang_guard_early();
 
     /* Last reset reason — names the cause when the panic handler can't flush
      * a backtrace (e.g. USB de-enumerates on reset). BROWNOUT/POWERON point at
@@ -89,6 +91,7 @@ void app_main(void)
     } else {
         ESP_LOGE(TAG, "USB did not start after %u retries: running without USB", WARTHOG_BOOT_USB_RETRIES);
     }
+    warthog_hang_guard_start(usb);
 
     /* Let the USB-OTG inrush settle before the Wi-Fi AP radio powers on. */
     vTaskDelay(pdMS_TO_TICKS(750));
@@ -113,7 +116,8 @@ void app_main(void)
     (void)warthog_at_start();
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(WARTHOG_HANG_TICK_MS));
         warthog_boot_guard_tick();
+        warthog_hang_guard_tick();
     }
 }

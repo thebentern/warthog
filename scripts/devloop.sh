@@ -76,9 +76,9 @@ except Exception: sys.exit(2)
 }
 
 # Trigger ROM download mode via 1200bps line-coding touch. The firmware's
-# cdc_line_coding_cb watches for baud==1200 and sets FORCE_DOWNLOAD_BOOT before
-# esp_restart(). After this, the chip's USB-Serial-JTAG bootloader takes over
-# with a different USB serial → port renames (e.g. usbmodem00011 → usbmodem1201).
+# cdc_line_coding_cb watches for baud==1200 and enters download mode
+# (main/dlmode.c). After this, the ROM bootloader takes over on USB-OTG
+# (303a:0009) with a different USB serial, so the port renames.
 touch_1200() {
     local port="$1"
     echo "[devloop] 1200bps touch → $port"
@@ -99,8 +99,8 @@ build() {
     cd "$PROJECT" && "$PIO" run -e "$ENV" >/dev/null 2>&1
 }
 
-# Returns the JTAG bootloader port for a freshly-touched board. The chip
-# enumerates as USB-Serial-JTAG with a serial derived from chip MAC, which on
+# Returns the ROM bootloader port for a freshly-touched board. The ROM
+# enumerates on USB-OTG (303a:0009) with a serial derived from chip MAC, which on
 # macOS produces ports like /dev/cu.usbmodem1201 or /dev/cu.usbmodem13101.
 # We identify it by comparing to the pre-touch port list.
 wait_for_bootloader() {
@@ -143,7 +143,7 @@ flash_one() {
         echo "[devloop] no CDC port responding — assuming already in bootloader"
     fi
 
-    # 3. Find the JTAG bootloader port.
+    # 3. Find the ROM bootloader port.
     local jtag_port=""
     for p in /dev/cu.usbmodem*; do
         [[ -e "$p" ]] || continue
@@ -161,7 +161,7 @@ exit(0 if 'OK' in out else 1)
         fi
     done
     if [[ -z "$jtag_port" ]]; then
-        echo "[devloop] could not find JTAG bootloader port — manual BOOT+RESET needed" >&2
+        echo "[devloop] could not find the ROM bootloader port — manual BOOT+RESET needed" >&2
         return 1
     fi
     echo "[devloop] bootloader on $jtag_port — flashing"

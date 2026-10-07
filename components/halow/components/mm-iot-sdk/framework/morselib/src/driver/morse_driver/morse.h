@@ -174,6 +174,7 @@ struct driver_data
         struct mmosal_semb *pending_semb;
         volatile uint32_t last_checked;
         volatile uint32_t interval_ms;
+        volatile uint32_t wakes; /* warthog: the health task's wakes, for the hang guard */
         volatile bool task_enabled;
         volatile bool task_running;
 

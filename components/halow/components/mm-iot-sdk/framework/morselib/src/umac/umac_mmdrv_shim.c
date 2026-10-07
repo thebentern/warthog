@@ -222,6 +222,41 @@ enum mmwlan_status umac_assert_test_request(struct umac_data *umacd)
     return umac_core_evt_queue(umacd, &evt) ? MMWLAN_SUCCESS : loop_post_failed_(umacd);
 }
 
+/* The hang guard's ping (main/hang_guard.c): one waits at most; storage in main/at.c. */
+extern volatile uint32_t g_warthog_loop_pongs, g_warthog_hang_block;
+static volatile bool s_loop_ping_queued;
+
+static void loop_ping_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    MM_UNUSED(umacd);
+    MM_UNUSED(evt);
+    while (g_warthog_hang_block == MMWLAN_HANG_BLOCK_LOOP) { mmosal_task_sleep(1000); } /* AT+HANGTEST=loop */
+    s_loop_ping_queued = false;
+    g_warthog_loop_pongs++;
+}
+
+enum mmwlan_status umac_loop_ping_request(struct umac_data *umacd)
+{
+    const struct umac_core_data *core = umac_data_get_core(umacd);
+    if (core->evtloop_task == NULL || core->evtloop_shutting_down)
+    {
+        s_loop_ping_queued = false; /* a ping queued across a stop runs after the next start */
+        return MMWLAN_UNAVAILABLE;
+    }
+    if (s_loop_ping_queued)
+    {
+        return MMWLAN_SUCCESS;
+    }
+    struct umac_evt evt = UMAC_EVT_INIT(loop_ping_evt_handler);
+    s_loop_ping_queued = true;
+    if (!umac_core_evt_queue(umacd, &evt))
+    {
+        s_loop_ping_queued = false;
+        return loop_post_failed_(umacd);
+    }
+    return MMWLAN_SUCCESS;
+}
+
 void mmdrv_host_hw_restart_required(void)
 {
     struct umac_data *umacd = umac_data_get_umacd();

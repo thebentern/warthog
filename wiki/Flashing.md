@@ -69,6 +69,14 @@ the new image. Used on the bench on 2026-09-29/30; the same esptool line boots a
 board found sitting in download mode. `tools/bench/flash.sh` resets with
 `--after hard-reset` and then power-cycles the hub port.
 
+`AT+DLMODE` resets the HaLow chip first, so the node goes off the air, and arms
+the RTC watchdog: a board that no reset takes out of download mode returns to
+the app 1800 s after the command (`AT+ASSERT?` `reset=DLMODE`). esptool does not
+stop that watchdog on the USB-OTG download port, so the whole session must end
+in a reset before it fires. For a longer session enter download mode with BOOT
+and RESET, which has no limit. The `warthog-mesh-*` builds (`WARTHOG_DEVLOOP`)
+enter download mode the same way when the console is opened at 1200 baud.
+
 The `.factory.bin` write above erases the stored settings. To keep them, write
 the pieces with the same flags:
 

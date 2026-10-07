@@ -21,13 +21,11 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
-#include "esp_system.h"               /* esp_restart() for 1200bps DL trick */
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "hang_guard.h"
 #include "led.h"
-#include "soc/rtc_cntl_reg.h"         /* RTC_CNTL_OPTION1_REG */
-#include "soc/soc.h"                  /* REG_WRITE */
 #include "device/usbd_pvt.h"          /* usbd_defer_func, usbd_edpt_busy */
 #include "esp_timer.h"
 #include "tinyusb.h"
@@ -104,23 +102,27 @@ static int cdc_vprintf(const char *fmt, va_list args)
     return n;
 }
 
-/* Devloop USB reflash watchdogs.
+/* Devloop USB reflash triggers.
  *
  * Phases 5a (1200bps) and 5c (DTR/RTS) install CDC callbacks that, on
- * specific host-driven events, latch the ROM's FORCE_DOWNLOAD_BOOT bit and
- * esp_restart() into bootloader mode. This is essential for the no-touch
+ * specific host-driven events, enter ROM download mode
+ * (warthog_enter_download: the HaLow chip reset, back to the app after
+ * WARTHOG_DLMODE_BACK_S unless a reset ends download mode first). This is essential for the no-touch
  * dev flash loop but actively HAZARDOUS in production: any host program
  * that happens to open the port at 1200 baud, or toggle DTR/RTS in the
  * pattern esptool uses, would silently kick a user's device into bootloader.
  *
- * Both watchdogs are gated behind WARTHOG_DEVLOOP (set in the mesh-smoke env
- * via -DWARTHOG_DEVLOOP=1). Production builds (warthog-us etc.) compile them
+ * Both triggers are gated behind WARTHOG_DEVLOOP (set in warthog-mesh-smoke,
+ * so in every warthog-mesh-* env); the DTR/RTS one also needs
+ * WARTHOG_DEVLOOP_DTRRTS=1, which no env sets. Production builds (warthog-us etc.) compile them
  * out entirely so production firmware can't be bricked into bootloader by an
  * accidental serial-port quirk. AT+DLMODE remains available in production
  * for explicit field debugging — that command requires an unambiguous host
  * action and has no accidental-trigger surface.
  */
 #if defined(WARTHOG_DEVLOOP) && WARTHOG_DEVLOOP
+
+#include "dlmode.h"
 
 /* Startup grace period: after boot, the macOS USB stack often sends a cached
  * SET_LINE_CODING / SET_CONTROL_LINE_STATE right after CDC enumeration. If
@@ -144,11 +146,10 @@ static int cdc_vprintf(const char *fmt, va_list args)
  * with the auto-reset cap network), puts the chip into ROM download
  * mode. We emulate that behaviour entirely in firmware: when we see the
  * → transition (i.e. RTS goes from 1 → 0 while DTR went
- * from 0 → 1), we set FORCE_DOWNLOAD_BOOT and esp_restart(). After the
- * restart the ROM bootloader skips the app and enters USB-Serial-JTAG
- * download mode where esptool can talk to it directly.
+ * from 0 → 1), we enter ROM download mode, where esptool can talk to the
+ * ROM bootloader directly.
  *
- * This complements the 1200bps watchdog: that one trips on SET_LINE_CODING,
+ * This complements the 1200bps trigger: that one trips on SET_LINE_CODING,
  * which esptool DOESN'T use for the default reset path; this one trips on
  * SET_CONTROL_LINE_STATE, which it DOES. With both in place, `pio run -t
  * upload` (which invokes esptool with default reset) works without any
@@ -187,8 +188,7 @@ static void cdc_line_state_cb(int itf, cdcacm_event_t *event)
             return;
         }
         ESP_LOGW(TAG, "CDC DTR/RTS reset → entering ROM download mode");
-        REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
-        esp_restart();
+        warthog_enter_download();
     }
 
     /* Any other transition clears the phase latch — esptool may have given
@@ -203,10 +203,8 @@ static void cdc_line_state_cb(int itf, cdcacm_event_t *event)
  *
  * Fires on the host's SET_LINE_CODING control transfer. If the new baud is
  * exactly 1200 (the de-facto signal across Arduino/Adafruit/RP2040 stacks),
- * latch the FORCE_DOWNLOAD_BOOT bit in RTC_CNTL_OPTION1_REG and esp_restart().
- * The bit survives soft reset (RTC domain is retained); ROM bootloader reads
- * it on next boot and skips the app, entering USB-Serial-JTAG download mode
- * where esptool can write_flash without BOOT being held physically.
+ * enter ROM download mode, where esptool can write_flash without BOOT being
+ * held physically.
  *
  * Any other baud (typical 9600/57600/115200/460800/921600 etc.) is a no-op:
  * the CDC class accepts the line coding and the serial pipe stays up. There
@@ -239,14 +237,9 @@ static void cdc_line_coding_cb(int itf, cdcacm_event_t *event)
     }
     /* The host opened us at 1200 baud. This is the bootloader-entry signal.
      * Log at warning level so it surfaces in any monitor regardless of level
-     * config, then arm the RTC bit and restart. */
+     * config, then enter download mode. */
     ESP_LOGW(TAG, "CDC 1200bps touch — entering ROM download mode");
-    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
-    /* esp_restart() flushes pending TX queues and gives FreeRTOS tasks ~50ms
-     * to wind down before the actual reset. That's enough for the host to
-     * see the TinyUSB disconnect cleanly before the ROM bootloader's
-     * USB-Serial-JTAG enumerates with a different VID:PID. */
-    esp_restart();
+    warthog_enter_download();
 }
 
 #endif /* WARTHOG_DEVLOOP */
@@ -337,6 +330,36 @@ static void un_kicked_(void *arg) { (void)arg; usbnet_kicked(&s_usbnet); }
 /* At most one kick is queued; only a 16-event queue full of ISR events (TinyUSB's task starved)
  * would block lwIP's thread here, until that task drains it. */
 static void un_kick_(void) { usbd_defer_func(un_kicked_, NULL, false); }
+
+/* The hang guard's ping: one waits at most, posted only into an empty queue (main cannot run while TinyUSB can). */
+static volatile bool s_ping_pending;
+static volatile uint32_t s_pongs;
+static void un_pong_(void *arg)
+{
+    (void)arg;
+    while (g_warthog_hang_block == WARTHOG_HANG_TEST_USB) { vTaskDelay(pdMS_TO_TICKS(1000)); } /* AT+HANGTEST=usb */
+    s_ping_pending = false;
+    s_pongs++;
+}
+
+enum warthog_hang_post warthog_usb_net_ping(void)
+{
+    if (!tud_inited()) {
+        return WARTHOG_HANG_OFF;
+    }
+    if (s_ping_pending) {
+        return WARTHOG_HANG_POSTED;
+    }
+    if (tud_task_event_ready()) {
+        return WARTHOG_HANG_FULL;
+    }
+    s_ping_pending = true;
+    usbd_defer_func(un_pong_, NULL, false);
+    return WARTHOG_HANG_POSTED;
+}
+
+uint32_t warthog_usb_net_pongs(void) { return s_pongs; }
+
 static void un_lock_(void) { portENTER_CRITICAL(&s_usbnet_mux); }
 static void un_unlock_(void) { portEXIT_CRITICAL(&s_usbnet_mux); }
 static uint32_t un_now_ms_(void) { return (uint32_t)(esp_timer_get_time() / 1000); }

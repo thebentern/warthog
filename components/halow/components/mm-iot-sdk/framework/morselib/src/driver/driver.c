@@ -1664,6 +1664,20 @@ int mmdrv_force_health_check_fail(void)
     return 0;
 }
 
+int mmdrv_hang_health(uint32_t *wakes, uint32_t *interval_ms)
+{
+    if (!driver_data.started || !driver_data.health_check.task_running ||
+        !driver_data.health_check.task_enabled ||
+        atomic_load(&driver_data.health_check.periodic_check_vetoes) != 0 ||
+        driver_data.health_check.interval_ms == 0)
+    {
+        return -ENODEV;
+    }
+    *wakes = driver_data.health_check.wakes;
+    *interval_ms = driver_data.health_check.interval_ms;
+    return 0;
+}
+
 void mmdrv_hw_restart_completed(void)
 {
     mmdrv_host_set_tx_paused(MMDRV_PAUSE_SOURCE_MASK_HW_RESTART, false);

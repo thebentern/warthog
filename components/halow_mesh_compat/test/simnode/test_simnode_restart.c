@@ -100,6 +100,9 @@
  *      when it fires, MMWLAN_ASSERT_TEST_DELAY_MS later, not before; a post that fails says why, for
  *      it and AT+CHIPRESTART alike: NO_MEM with the loop's queue full, UNAVAILABLE with the loop
  *      stopping or down.
+ *  (25) the hang guard's ping: one waits at most; the loop's answer counts g_warthog_loop_pongs and lets the
+ *      next post; NO_MEM leaves none waiting; a loop down or stopping is UNAVAILABLE and forgets the waiting
+ *      one, which, kept in the queue, still runs after; the handler waits only on AT+HANGTEST=loop's block.
  *  (19) also: (red) a request posted while the driver is stopped is dropped by the loop, counted.
  */
 #include <stdio.h>
@@ -165,6 +168,8 @@ void umac_mesh_beacon_set_rsn(const uint8_t *rsn, uint16_t len);
 int umac_mesh_tx_broadcast_probe(void);
 enum mmwlan_status umac_chip_restart_request(struct umac_data *umacd); /* umac_mmdrv_shim.c */
 enum mmwlan_status umac_assert_test_request(struct umac_data *umacd);  /* umac_mmdrv_shim.c */
+enum mmwlan_status umac_loop_ping_request(struct umac_data *umacd);    /* umac_mmdrv_shim.c */
+extern volatile uint32_t g_warthog_loop_pongs, g_warthog_hang_block;
 unsigned simnode_asserts_caught(void);                                  /* fake_rtos.c */
 void simnode_set_identity(const uint8_t mac[6], uint16_t vif_id); /* fake_config.c */
 void simnode_evt_discard(void);
@@ -1338,6 +1343,66 @@ static void t_loop_requests(void)
           (int)stop_a, (int)stop_c, (int)down_a, (int)down_c);
 }
 
+static void t_loop_ping(void)
+{
+    printf("--- (25) the hang guard's ping: one waits at most; the loop's answer counts ---\n");
+    struct umac_data *umacd = umac_data_get_umacd();
+    struct umac_core_data *core = umac_data_get_core(umacd);
+    struct mmosal_task *const task0 = core->evtloop_task;
+    const bool down0 = core->evtloop_shutting_down;
+    core->evtloop_task = (struct mmosal_task *)core;
+    core->evtloop_shutting_down = false;
+    simnode_evt_discard();
+    const uint32_t p0 = g_warthog_loop_pongs;
+
+    const enum mmwlan_status a = umac_loop_ping_request(umacd);
+    const unsigned n1 = simnode_evt_pending();
+    const enum mmwlan_status b = umac_loop_ping_request(umacd);
+    CHECK(a == MMWLAN_SUCCESS && n1 == 1u && b == MMWLAN_SUCCESS && simnode_evt_pending() == 1u,
+          "(25) a ping posts one event; a second while it waits posts nothing (%d, %d, %u pending)", (int)a, (int)b,
+          simnode_evt_pending());
+
+    g_warthog_hang_block = MMWLAN_HANG_BLOCK_HEALTH;
+    const uint32_t t0 = mmosal_get_time_ms();
+    (void)simnode_evt_dispatch_one(umacd);
+    const uint32_t slept = mmosal_get_time_ms() - t0;
+    g_warthog_hang_block = 0;
+    CHECK(g_warthog_loop_pongs == p0 + 1u && simnode_evt_pending() == 0u && slept == 0u,
+          "(25) the loop answers it (pongs +1), not held by another task's block (slept %lu ms)", (unsigned long)slept);
+
+    const enum mmwlan_status c = umac_loop_ping_request(umacd);
+    CHECK(c == MMWLAN_SUCCESS && simnode_evt_pending() == 1u, "(25) the answer lets the next ping post");
+
+    core->evtloop_shutting_down = true;
+    const enum mmwlan_status d = umac_loop_ping_request(umacd);
+    CHECK(d == MMWLAN_UNAVAILABLE && simnode_evt_pending() == 1u,
+          "(25) the loop stopping: UNAVAILABLE, the queued ping kept (%d)", (int)d);
+    core->evtloop_shutting_down = false;
+    const enum mmwlan_status e = umac_loop_ping_request(umacd);
+    CHECK(e == MMWLAN_SUCCESS && simnode_evt_pending() == 2u,
+          "(25) the waiting one forgotten: the loop back, a ping posts a second (%u pending)", simnode_evt_pending());
+    (void)simnode_evt_dispatch_one(umacd);
+    (void)simnode_evt_dispatch_one(umacd);
+    CHECK(g_warthog_loop_pongs == p0 + 3u && simnode_evt_pending() == 0u, "(25) both run: pongs +2 (+%lu)",
+          (unsigned long)(g_warthog_loop_pongs - p0 - 1u));
+
+    (void)simnode_evt_fill();
+    const enum mmwlan_status f = umac_loop_ping_request(umacd);
+    simnode_evt_discard();
+    const enum mmwlan_status g = umac_loop_ping_request(umacd);
+    CHECK(f == MMWLAN_NO_MEM && g == MMWLAN_SUCCESS && simnode_evt_pending() == 1u,
+          "(25) the queue full: NO_MEM, nothing left waiting, so the next posts (%d, %d)", (int)f, (int)g);
+
+    core->evtloop_task = NULL;
+    const enum mmwlan_status h = umac_loop_ping_request(umacd);
+    CHECK(h == MMWLAN_UNAVAILABLE, "(25) the loop down: UNAVAILABLE (%d)", (int)h);
+
+    (void)umac_loop_ping_request(umacd); /* the task NULL: clears the waiting flag */
+    core->evtloop_task = task0;
+    core->evtloop_shutting_down = down0;
+    simnode_evt_discard();
+}
+
 int main(void)
 {
     printf("=== chip restart under the mesh (MESH VIF %d, chip keys %d, PN base %d) ===\n",
@@ -1357,6 +1422,7 @@ int main(void)
     t_held_mgmt();
     t_ba_wait_restart();
     t_loop_requests();
+    t_loop_ping();
     stop_();
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("test_simnode_restart: all passed\n");

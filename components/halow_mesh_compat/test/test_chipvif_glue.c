@@ -32,6 +32,9 @@
  *      counted; refused while the driver is stopped. A passing check restarts nothing; a check the
  *      chip fails twice restarts it the same way. A driver that starts again (driver_health_init)
  *      has no forced failure armed.
+ *  (10) mmdrv_hang_health: the health task's wake count, only while the check runs periodically. Every
+ *      wake counts, one the check then skips (an RX page just set last_checked) too, and AT+HANGTEST=health
+ *      holds the task at it; a wait whose deadline has passed is 0, not 2^32 - 1 ms less the overrun.
  *
  * Built with WARTHOG_MESH_CHIP_VIF_MESH=1 (test_chipvif_glue) and without (_off).
  */
@@ -85,7 +88,8 @@ void mmosal_impl_assert(void)
 
 int mmosal_printf(const char *format, ...) { (void)format; return 0; }
 const char *mmosal_task_name(void) { return "test"; }
-uint32_t mmosal_get_time_ms(void) { return 0; }
+static uint32_t s_now_ms; /* (10): the health task's clock; 0 elsewhere */
+uint32_t mmosal_get_time_ms(void) { return s_now_ms; }
 
 /* The chip's answer to the next command: its status and the reply's payload after the
  * status, as many octets as it sends; or a transport error instead. */
@@ -219,6 +223,7 @@ int mmdrv_set_wake_enabled(bool enabled) { (void)enabled; return 0; }
 /* ---- what driver_health.c reaches -------------------------------------- */
 
 volatile uint32_t g_warthog_chiprestart_forced;
+volatile uint32_t g_warthog_hang_block;
 static int s_semb_obj, s_task_obj;
 static unsigned s_waits, s_checks, s_restarts, s_semb_gives;
 static int s_check_ret;
@@ -227,12 +232,16 @@ static uint16_t s_paused_mask;
 struct mmosal_semb *mmosal_semb_create(const char *name) { (void)name; return (struct mmosal_semb *)&s_semb_obj; }
 void mmosal_semb_delete(struct mmosal_semb *semb) { (void)semb; }
 bool mmosal_semb_give(struct mmosal_semb *semb) { (void)semb; s_semb_gives++; return true; }
-/* The task's wait: the first returns the demand; the next ends the task, as driver_health_deinit does. */
+/* The task's wait: the first returns the demand (s_wait_timeout: times out); the next ends the task, as
+ * driver_health_deinit does. The first two timeouts are kept. */
+static bool s_wait_timeout;
+static uint32_t s_wait_ms[2];
 bool mmosal_semb_wait(struct mmosal_semb *semb, uint32_t timeout_ms)
 {
-    (void)semb; (void)timeout_ms;
+    (void)semb;
+    if (s_waits < 2u) { s_wait_ms[s_waits] = timeout_ms; }
     if (s_waits++ != 0u) { driver_data.health_check.task_enabled = false; }
-    return true;
+    return !s_wait_timeout;
 }
 struct mmosal_task *mmosal_task_create(mmosal_task_fn_t task_fn, void *argument, enum mmosal_task_priority priority,
                                        unsigned stack_size_u32, const char *name)
@@ -241,7 +250,14 @@ struct mmosal_task *mmosal_task_create(mmosal_task_fn_t task_fn, void *argument,
     return (struct mmosal_task *)&s_task_obj;
 }
 struct mmosal_task *mmosal_task_get_active(void) { return (struct mmosal_task *)&s_task_obj; }
-void mmosal_task_sleep(uint32_t duration_ms) { (void)duration_ms; }
+/* Counted; the s_sleep_release-th clears g_warthog_hang_block (0: never), as AT+HANGTEST=off would. */
+static unsigned s_sleeps, s_sleep_release;
+static uint32_t s_sleep_ms;
+void mmosal_task_sleep(uint32_t duration_ms)
+{
+    s_sleep_ms += duration_ms;
+    if (++s_sleeps == s_sleep_release) { g_warthog_hang_block = 0; }
+}
 int morse_cmd_health_check(struct driver_data *driverd) { (void)driverd; s_checks++; return s_check_ret; }
 void mmdrv_host_set_tx_paused(uint16_t sources_mask, bool paused)
 {
@@ -563,6 +579,92 @@ static void t_health_force(void)
           "(9) a driver that starts again has no forced failure armed");
 }
 
+static void t_hang(void)
+{
+    memset(&driver_data.health_check, 0, sizeof(driver_data.health_check));
+    driver_data.health_check.pending_semb = (struct mmosal_semb *)&s_semb_obj;
+    driver_data.started = true;
+    driver_data.health_check.task_running = true;
+    driver_data.health_check.task_enabled = true;
+    driver_data.health_check.interval_ms = 90000u;
+    driver_data.health_check.last_checked = 999u;
+    driver_data.health_check.wakes = 61234u;
+    uint32_t last = 7u, iv = 8u;
+    CHECK(mmdrv_hang_health(&last, &iv) == 0 && last == 61234u && iv == 90000u,
+          "(10) mmdrv_hang_health: the task's wakes, not last_checked, and the interval while the check runs (%lu, %lu)",
+          (unsigned long)last, (unsigned long)iv);
+    static const char *const off[5] = { "the driver stopped", "the task not running", "the task disabled",
+                                        "a veto set", "interval 0" };
+    for (int c = 0; c < 5; c++) {
+        driver_data.started = c != 0;
+        driver_data.health_check.task_running = c != 1;
+        driver_data.health_check.task_enabled = c != 2;
+        atomic_store(&driver_data.health_check.periodic_check_vetoes, c == 3 ? 1ul << 4 : 0ul);
+        driver_data.health_check.interval_ms = c == 4 ? 0u : 90000u;
+        last = 7u;
+        iv = 8u;
+        CHECK(mmdrv_hang_health(&last, &iv) == -ENODEV && last == 7u && iv == 8u,
+              "(10) mmdrv_hang_health with %s: -ENODEV, nothing written", off[c]);
+    }
+    driver_data.started = true;
+    driver_data.health_check.task_running = true;
+    driver_data.health_check.task_enabled = true;
+    atomic_store(&driver_data.health_check.periodic_check_vetoes, 0ul);
+    driver_data.health_check.interval_ms = 0u;
+
+    s_check_ret = 0;
+    s_sleeps = 0;
+    s_sleep_ms = 0;
+    s_sleep_release = 3u;
+    g_warthog_hang_block = MMWLAN_HANG_BLOCK_HEALTH;
+    driver_data.health_check.check_demanded = true;
+    driver_data.health_check.wakes = 0;
+    health_task_once_();
+    CHECK(s_sleeps == 3u && s_sleep_ms == 3000u && s_checks == 1u && g_warthog_hang_block == 0u &&
+              driver_data.health_check.wakes == 1u,
+          "(10) AT+HANGTEST=health: a demanded wake waits 1 s at a time until released, then counts and checks "
+          "(%u sleeps, %lu ms, %u checks)", s_sleeps, (unsigned long)s_sleep_ms, s_checks);
+    s_sleeps = 0;
+    s_sleep_ms = 0;
+    s_sleep_release = 5u; /* ends a wrong wait rather than hang the test */
+    g_warthog_hang_block = MMWLAN_HANG_BLOCK_DRV;
+    driver_data.health_check.check_demanded = true;
+    health_task_once_();
+    CHECK(s_sleeps == 0u && s_checks == 1u, "(10) another task's block (drv) does not hold the health task (%u sleeps)",
+          s_sleeps);
+    g_warthog_hang_block = 0;
+
+    /* A meshed node: every chip page sets last_checked (skbq.c), so the periodic wake finds it recent and skips. */
+    driver_data.health_check.interval_ms = 90000u;
+    driver_data.health_check.check_demanded = false;
+    s_wait_timeout = true;
+    s_now_ms = 200000u;
+    for (int blocked = 0; blocked < 2; blocked++) {
+        driver_data.health_check.last_checked = s_now_ms - 1000u;
+        driver_data.health_check.wakes = 0;
+        s_sleeps = 0;
+        s_sleep_release = 3u;
+        g_warthog_hang_block = blocked ? MMWLAN_HANG_BLOCK_HEALTH : 0u;
+        health_task_once_();
+        CHECK(s_checks == 0u && driver_data.health_check.wakes == 1u && s_sleeps == (blocked ? 3u : 0u) &&
+                  s_wait_ms[0] == 89000u && s_wait_ms[1] == 89000u,
+              "(10) a wake the check skips, an RX page 1 s before: %s, counted, no check, the waits 89 s "
+              "(%u sleeps, %lu wakes, %lu/%lu ms)", blocked ? "AT+HANGTEST=health holds it" : "not held", s_sleeps,
+              (unsigned long)driver_data.health_check.wakes, (unsigned long)s_wait_ms[0], (unsigned long)s_wait_ms[1]);
+    }
+    g_warthog_hang_block = 0;
+
+    /* The deadline passed between should_skip() and the wait's computation. */
+    driver_data.health_check.last_checked = s_now_ms - 90001u;
+    health_task_once_();
+    CHECK(s_wait_ms[0] == 0u && s_checks == 1u && s_wait_ms[1] == 90000u,
+          "(10) a check due 1 ms ago: the wait is 0, not 2^32 - 1 ms; the check runs, then waits its interval "
+          "(%lu, %u checks, %lu)", (unsigned long)s_wait_ms[0], s_checks, (unsigned long)s_wait_ms[1]);
+    s_wait_timeout = false;
+    s_now_ms = 0;
+    s_sleep_release = 0;
+}
+
 int main(void)
 {
     printf("=== chip VIF glue: driver.c status, beacon.c, umac_ps.c (WARTHOG_MESH_CHIP_VIF_MESH=%d) ===\n",
@@ -576,6 +678,7 @@ int main(void)
     t_ps();
     t_beacon_teardown();
     t_health_force();
+    t_hang();
     CHECK(s_asserts == (WARTHOG_MESH_CHIP_VIF_MESH ? 0u : 1u), "no assert fired but the one expected (%u)",
           s_asserts);
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
