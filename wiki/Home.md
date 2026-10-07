@@ -13,7 +13,7 @@ reconfigure a node over a serial port instead of a rebuild.
 |---|---|
 | Get a board running for the first time | **[Quick Start](Quick-Start)** |
 | Give a laptop a long-range uplink over USB | **[Host Mode](Host-Mode)** |
-| Connect a phone or tablet | **[Client Mode](Client-Mode)** — not USB, see why there |
+| Connect a phone or tablet | **[Client Mode](Client-Mode)**, or USB on iOS and iPadOS ([Host Mode](Host-Mode)) |
 | Let phones and IoT clients share that uplink | **[Client Mode](Client-Mode)** |
 | Build a peer-to-peer network with no infrastructure | **[Mesh Mode](Mesh-Mode)** |
 | Talk to OpenMANET or vanilla OpenWrt | **[OpenMANET Interop](OpenMANET-Interop)** |
@@ -38,8 +38,9 @@ station joining an access point, or an 802.11s mesh peer — and presents
 ```
 
 Both downstream surfaces are live at once and share the uplink. The two uplink
-modes are mutually exclusive: a node is a station **or** a mesh peer, chosen at
-build time.
+modes are mutually exclusive: a node is a station **or** a mesh peer.
+`AT+MESHEN=1` selects mesh on any build from the next boot; the mesh envs always
+run mesh.
 
 ## Hardware
 

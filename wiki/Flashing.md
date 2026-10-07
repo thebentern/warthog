@@ -3,13 +3,15 @@
 > **Easiest route: the [web flasher](https://thebentern.github.io/warthog/).**
 > Chrome, Edge or Opera, nothing to install. Pick a release build or load a
 > `.bin` you built, do the BOOT/RESET dance, and flash. It also configures a
-> running board over the same cable.
+> running board over the same cable. It writes a `.factory.bin` at `0x0`, which
+> erases the stored settings ([below](#from-a-release-bundle)).
 
 ## Why the usual auto-reset does not work
 
-The XIAO plus HaLow add-on drives USB-OTG rather than the built-in
-USB-Serial-JTAG, so `esptool` cannot pull the board into download mode over
-DTR/RTS. Every flash needs the button sequence:
+The Warthog firmware runs its console and USB network on USB-OTG (TinyUSB)
+rather than the built-in USB-Serial-JTAG, so `esptool` cannot pull the board
+into download mode over DTR/RTS. Every flash needs the button sequence, or
+`AT+DLMODE` on a running board ([below](#reflashing-a-running-board)):
 
 **Hold BOOT → tap RESET → release BOOT.**
 
@@ -23,7 +25,8 @@ pio run -e warthog-us -t upload
 pio device monitor -e warthog-us
 ```
 
-Tap **RESET** when the write completes.
+Tap **RESET** when the write completes. The upload writes the bootloader,
+partition table and app separately and keeps the stored settings.
 
 ## From a release bundle
 
@@ -33,11 +36,16 @@ Releases carry per-region binaries and a POSIX flasher:
 ./flash.sh warthog-v0.1.0-us.factory.bin
 ```
 
+A `.factory.bin` written at `0x0` is `0xFF` from `0x9000` to `0xFFFF`, which
+covers the NVS partition. It erases every stored setting (HaLow credentials, AP,
+mesh ID, passphrase, channel, `AT+MESHEN` and the rest), and the board comes up
+on its build defaults. To keep the settings, write the three pieces instead.
+
 | File | Offset | Use |
 |---|---|---|
-| `*.factory.bin` | `0x0` | Everything: bootloader + partitions + app |
+| `*.factory.bin` | `0x0` | Everything: bootloader + partitions + app. Also erases the stored settings |
 | `*.bin` | `0x10000` | App only, e.g. for OTA |
-| `*-bootloader.bin` / `*-partitions.bin` | — | Piecewise flashing |
+| `*-bootloader.bin` / `*-partitions.bin` | `0x0` / `0x8000` | Piecewise flashing; with `*.bin`, keeps the stored settings |
 | `*.elf` | — | Symbols, for `addr2line` on a panic backtrace |
 | `SHA256SUMS.txt` | — | Covers every asset |
 
@@ -61,6 +69,20 @@ the new image. Used on the bench on 2026-09-29/30; the same esptool line boots a
 board found sitting in download mode. `tools/bench/flash.sh` resets with
 `--after hard-reset` and then power-cycles the hub port.
 
+The `.factory.bin` write above erases the stored settings. To keep them, write
+the pieces with the same flags:
+
+```bash
+python -m esptool --chip esp32s3 --port /dev/cu.usbmodemXXXX --baud 921600 \
+  --before no-reset --after watchdog-reset write-flash \
+  0x0 .pio/build/<env>/bootloader.bin 0x8000 .pio/build/<env>/partitions.bin \
+  0x10000 .pio/build/<env>/firmware.bin
+```
+
+These are the three images `pio run -t upload` writes. The bench reflashed boards
+this way after `AT+DLMODE` from 2026-09-30 to 2026-10-03, and their stored
+settings survived.
+
 ## Several boards at once
 
 `tools/bench/flash.sh` flashes a bench of boards in sequence. It finds whichever
@@ -73,7 +95,9 @@ tools/bench/flash.sh "WTHG-0272A1F8738D 0-1 1" "WTHG-021BF681BA51 0-1 2"
 ```
 
 It settles 20 s between boards deliberately — flashing two at once through one
-hub browns them out. Requires `uhubctl`.
+hub browns them out. Requires `uhubctl`. It writes
+`.pio/build/$WARTHOG_ENV/firmware.factory.bin` (default `warthog-mesh-smoke`) at
+`0x0`, so every board it flashes loses its stored settings.
 
 ## Recovering a board that will not enumerate
 
@@ -89,6 +113,9 @@ If it does, flash directly:
 python -m esptool --chip esp32s3 --port /dev/cu.usbmodemXXXX --baud 921600 \
   --before no-reset --after hard-reset write_flash 0x0 firmware.factory.bin
 ```
+
+This erases the stored settings too; the piecewise write
+[above](#reflashing-a-running-board) keeps them.
 
 ## Toolchain traps
 

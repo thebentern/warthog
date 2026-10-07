@@ -20,7 +20,9 @@ pio run -e warthog-mesh-smoke -t upload
 
 The env pins the radio to one S1G channel and fixes the mesh identity, so nodes
 agree with no configuration at all. **These settings must be identical on every
-node in the mesh** — a mismatch is silent, producing no error and no peers:
+node in the mesh.** A mismatch produces no peers; after about 20 s without one
+the node logs a `NOT PEERED` error listing these values, repeated about every
+60 s, and `AT+MESHCFG?` reports them too:
 
 | Flag | Default |
 |---|---|
@@ -298,10 +300,11 @@ delivered on the PREP, a burst before the PREP bounded and rate-limited to
 one PREQ, an unreachable target's frame released when it lapses, and a lost
 PREQ costing a delay rather than the held frame because the tick re-asks; and
 a ten-second flow over a five-second path lifetime losing nothing because the
-path is refreshed in use. What is **not** verified is the radio: whether the MM6108 hands up
-a 4-address frame whose mesh destination is a third party (`AT+RXCHAN?`
-`fwdcand`), and whether it transmits one whose addr4 is not its own. Both
-need a board. Until then forwarding is compiled, simulated and off by
+path is refreshed in use. On 2026-10-02 a `warthog-mesh-sae-meshvif` node with
+`AT+MESHFWD=1` relayed unicast between two OpenMANET 1.8.0 Pis whose paths were
+pinned through it: 300-, 1000- and 1400-byte pings 10/10 each,
+`AT+MESHFWDSTAT?` `fwd uni=106`, no `nopath` or `ttl` drops. Group relaying and
+path discovery through a relay are not measured on air. Forwarding is off by
 default.
 
 ## Bridge mode
@@ -349,7 +352,8 @@ plain 802.11s addressing: the mode for a mesh built by OpenMANET's mesh wizard,
 where every node's 802.11s interface belongs to `bat0`. Forwarding and bridge
 must be off; the HaLow netif becomes the batman soft interface, and only batman
 frames cross the mesh. Measured on air on 2026-09-29/30
-(`warthog-mesh-sae-swccmp`) against two OpenMANET 1.8.0 Pis one hop away. See
+(`warthog-mesh-sae-swccmp`, and `-swccmp-meshvif` on 2026-09-30) against two
+OpenMANET 1.8.0 Pis one hop away. See
 [Batman Mode](Batman-Mode#measured-on-air).
 
 ## Encryption
@@ -359,7 +363,7 @@ build choice; the passphrase and the legacy shared key are runtime settings:
 
 | Mode | Build | What it is |
 |---|---|---|
-| **SAE/AMPE** | `warthog-mesh-sae`; `warthog-mesh-sae-swccmp` against OpenMANET | Real 802.11s security: SAE (Dragonfly, group 19) authentication and AMPE per-link key exchange. This is the mode to use. Of the measured builds only the host-CCMP one opens a Linux node's group frames, which its path to the Warthog needs ([OpenMANET Interop](OpenMANET-Interop#management-frame-protection-peering-does-not-need-it-path-selection-does)). |
+| **SAE/AMPE** | `warthog-mesh-sae`; against OpenMANET `warthog-mesh-sae-swccmp`, or `warthog-mesh-sae-swccmp-meshvif` for a node's frames above its RTS threshold ([Limits](#limits)) | Real 802.11s security: SAE (Dragonfly, group 19) authentication and AMPE per-link key exchange. This is the mode to use. Of the builds in this row only the host-CCMP ones open a Linux node's group frames, which its path to the Warthog needs ([OpenMANET Interop](OpenMANET-Interop#management-frame-protection-peering-does-not-need-it-path-selection-does)). |
 | SAE/AMPE, chip crypto on a MESH chip interface | `warthog-mesh-sae-meshvif` | As `warthog-mesh-sae` (AMPE keys in the chip), on the MESH chip interface of `warthog-mesh-sae-swccmp-meshvif`, with each peer's MGTK in the chip at that peer's AID, as Linux installs it, so the chip opens a Linux node's group frames itself ([OpenMANET Interop](OpenMANET-Interop#group-frames-in-the-chip-warthog-mesh-sae-meshvif)). Measured on air on 2026-10-01: the Pis' group frames open in the chip and Pi to Warthog unicast passes both ways; before that change every Pi group frame was undecryptable. `AT+GTKPERSTA=0` returns it to that measured behaviour on the same flash. Batman mode is refused on it (`sae-no-host-ccmp`). |
 | Shared key | `warthog-mesh-smoke` + `AT+MESHSEC=1` | One hardcoded key baked into every image — obfuscation, not security. Kept for bring-up debugging only. |
 | Open | `warthog-mesh-smoke` + `AT+MESHSEC=0` | No keys. Interops with an open OpenMANET mesh. |
@@ -458,15 +462,16 @@ frames at or below it are dropped (rxdrop 5). Warthog installs a peer's MGTK
 with the RSC that peer advertised (little-endian, as mac80211 reads it);
 installing the same key again on a live link keeps its counter. The floor is
 enforced where a peer's group frames are opened: by host CCMP on
-`warthog-mesh-sae-swccmp` with `AT+SWCCMP=1`, or `-swccmp-on`, and by the chip
-on `warthog-mesh-sae-meshvif`, where the host still checks the PN per sender
-and TID, as mac80211 does behind a chip that decrypts. Other builds drop those
-frames before the replay check (rxdrop 4, or 95). What Warthog
-advertises for its own MGTK depends on the build: `warthog-mesh-sae-swccmp`
-and `-swccmp-on` put it into the chip at a nonzero TX PN base and advertise one
-below it, re-installing at a fresh base when an Open follows group traffic
-(`mgtk_reinst` on `AT+MPMPEERS?`); every other build installs it at PN 0 and
-advertises 0. Neither is measured on air. On the swccmp builds a relay's or
+`warthog-mesh-sae-swccmp` and `-swccmp-meshvif` with `AT+SWCCMP=1`, or
+`-swccmp-on`, and by the chip on `warthog-mesh-sae-meshvif`, where the host
+still checks the PN per sender and TID, as mac80211 does behind a chip that
+decrypts. Other builds drop those frames before the replay check (rxdrop 4, or
+95). What Warthog advertises for its own MGTK depends on the build:
+`warthog-mesh-sae-swccmp`, `-swccmp-on` and `-swccmp-meshvif` put it into the
+chip at a nonzero TX PN base and advertise one below it, re-installing at a
+fresh base when an Open follows group traffic (`mgtk_reinst` on
+`AT+MPMPEERS?`); every other build installs it at PN 0 and advertises 0.
+Neither is measured on air. On the swccmp builds a relay's or
 bridge's group PREQs and PERRs go out under our MGTK too, so `mgtk_reinst`
 climbs with AMPE Opens at the default `AT+MESHGRP=0`, and whether any receiver
 takes them rests on the chip starting the key at the PN it was installed with:
@@ -502,14 +507,16 @@ AT+MESHSEC=0     → open; re-peers within ~2 s
 Keyed uses **one hardcoded key, identical on every warthog image** — a counting
 sequence, `00 11 22 ... ee ff`. Anyone holding the firmware holds the key.
 It never matches OpenMANET. A node set up by OpenMANET's mesh wizard runs SAE
-and needs `warthog-mesh-sae-swccmp` with host CCMP on (`AT+SWCCMP=1` after each
-boot, or batman mode) and its mesh ID and passphrase; `warthog-mesh-sae` peers
-with it but cannot open its group frames. Run open only against a node set to
-`encryption='none'` (see the [OpenMANET interop page](OpenMANET-Interop)).
+and needs `warthog-mesh-sae-swccmp` or `warthog-mesh-sae-swccmp-meshvif` with
+host CCMP on (`AT+SWCCMP=1` after each boot, or batman mode) and its mesh ID and
+passphrase; `warthog-mesh-sae` peers with it but cannot open its group frames.
+Run open only against a node set to `encryption='none'` (see the
+[OpenMANET interop page](OpenMANET-Interop)).
 
-The setting persists in NVS, though a factory flash overwrites that partition,
-so a freshly reflashed node is keyed again. It has no effect on a SAE build,
-which never installs the hardcoded key.
+The setting persists in NVS. A `.factory.bin` written at `0x0` erases that
+partition, so a node flashed that way is keyed again; `pio run -t upload` keeps
+it ([Flashing](Flashing#from-a-release-bundle)). It has no effect on a SAE
+build, which never installs the hardcoded key.
 
 ## How paths work, and why it matters
 
@@ -700,13 +707,20 @@ restore the chip refuses, a restart in client mode.
   mac80211 with forwarding on, hold it and discover the node (warthog
   simulated, OpenMANET read from its source; neither measured).
   Any other unknown unicast goes to the first peer.
-  `AT+MESHFWD=1` makes the node a relay ([Forwarding](#forwarding)), which is
-  host-tested and simulated, not yet run on air. In batman mode batman relays
-  instead ([Batman Mode](Batman-Mode)).
-- SAE/AMPE requires a `warthog-mesh-sae` build (`warthog-mesh-sae-swccmp` against OpenMANET); the default smoke build still peers open or with the fixed key.
+  `AT+MESHFWD=1` makes the node a relay, which is host-tested and simulated; on
+  air on 2026-10-02 a `warthog-mesh-sae-meshvif` relay carried unicast between
+  two Pis whose paths were pinned through it ([Forwarding](#forwarding)). In
+  batman mode batman relays instead ([Batman Mode](Batman-Mode)).
+- SAE/AMPE requires a `warthog-mesh-sae*` build. Against OpenMANET use
+  `warthog-mesh-sae-swccmp-meshvif`, or `warthog-mesh-sae-meshvif` outside
+  batman mode; `warthog-mesh-sae-swccmp` takes frames above a node's RTS
+  threshold from one node only (next item). The default smoke build still peers
+  open or with the fixed key.
 - **A Linux node's unicast above its RTS threshold arrives from every node only
-  on `warthog-mesh-sae-swccmp-meshvif`.** OpenMANET 1.8.0 nodes ran it at 1000
-  on the bench, so larger frames go behind RTS/CTS. On the STA chip interface
+  on the two `-meshvif` builds.** OpenMANET 1.8.0 nodes ran it at 1000 on the
+  bench, so larger frames go behind RTS/CTS. 1000-byte pings from both Pis
+  passed on `warthog-mesh-sae-swccmp-meshvif` on 2026-09-30 and on
+  `warthog-mesh-sae-meshvif` on 2026-10-01. On the STA chip interface
   every other build runs the mesh on, the Warthog's CTS is taken only by the
   peer the chip registered last, and the other nodes' large frames never arrive
   (the chips' MAC counters on both ends, 2026-09-30). On other builds set each

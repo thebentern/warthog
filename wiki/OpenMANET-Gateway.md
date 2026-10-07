@@ -24,7 +24,7 @@ batman member ([Batman Mode](Batman-Mode)). See
 ```
 
 Nothing changes on the OpenMANET side except its mesh security (step 2) and
-the two interface changes below. The mesh does not know or care that a peer
+the interface settings below. The mesh does not know or care that a peer
 has clients behind it.
 
 Verified against OpenMANET 1.8.0 on a Raspberry Pi 4 with a Seeed HaLow HAT.
@@ -58,9 +58,10 @@ Hold **BOOT**, tap **RESET**, release BOOT before uploading; tap RESET after.
 **2. Match the peer's encryption.** OpenMANET's LuCI mesh wizard configures SAE
 (mesh ID `openmanet`, passphrase `changeme123` unless changed); a node runs an
 open mesh only if an operator set `encryption='none'`
-([OpenWrt side](OpenMANET-Interop#openwrt-side)). The data measurements on
-[OpenMANET Interop](OpenMANET-Interop) were taken against such an open node.
-Against it, over the console:
+([OpenWrt side](OpenMANET-Interop#openwrt-side)). The first table on
+[OpenMANET Interop](OpenMANET-Interop) was measured against such an open node,
+and the SAE results there against Pis at `encryption='sae'` and `ieee80211w=2`.
+Against an open node, over the console:
 
 ```
 AT+MESHSEC=0
@@ -69,16 +70,26 @@ AT+MESHSEC=0
 This persists. Skipping it produces perfect peering and zero data — the single
 most common way to end up confused.
 
-Against an SAE node (every wizard node), flash `warthog-mesh-sae-swccmp`
-instead of step 1, set `AT+MESHID=` and `AT+MESHPASS=` to the node's values,
-then `AT+RESET`. Its host CCMP must be on: `AT+SWCCMP=1` after each boot, or
-batman mode (below), which arms it, or the `warthog-mesh-sae-swccmp-on` build.
-`warthog-mesh-sae` peers with the node but cannot open its group frames, so a
-1.8.0 node gets no path to the Warthog, and batman mode refuses that build; keep
-it for meshes of Warthogs only. Encrypted data between a Warthog and OpenMANET
-1.8.0 was measured on 2026-09-29/30: `warthog-mesh-sae-swccmp` in batman mode
-against Pis whose `bat0` was set up by hand ([Batman Mode](Batman-Mode#measured-on-air)).
-Plain mesh mode against an SAE node was not measured separately.
+Against an SAE node (every wizard node), flash
+`warthog-mesh-sae-swccmp-meshvif` instead of step 1, set `AT+MESHID=` and
+`AT+MESHPASS=` to the node's values, then `AT+RESET`. Its host CCMP must be on:
+`AT+SWCCMP=1` after each boot, or batman mode (below), which arms it.
+`warthog-mesh-sae-swccmp` and `warthog-mesh-sae-swccmp-on` (host CCMP on at
+boot) run the mesh on the chip's STA interface, where a node's unicast over its
+RTS threshold (1000 on the 1.8.0 bench Pis) arrives only from the peer the chip
+registered last
+([OpenMANET Interop](OpenMANET-Interop#frames-over-about-1000-bytes-from-a-linux-node)).
+In plain mesh mode `warthog-mesh-sae-meshvif` (keys in the chip, no
+`AT+SWCCMP`) also works; batman mode refuses it. `warthog-mesh-sae` peers with
+the node but cannot open its group frames, so a 1.8.0 node gets no path to the
+Warthog, and batman mode refuses that build; keep it for meshes of Warthogs
+only. Encrypted data between a Warthog and OpenMANET 1.8.0 was measured on
+2026-09-29/30 in batman mode against Pis whose `bat0` was set up by hand, on
+`warthog-mesh-sae-swccmp` and `-swccmp-meshvif`
+([Batman Mode](Batman-Mode#measured-on-air)). Plain mesh mode against SAE nodes
+without `bat0` was measured from 2026-09-30 to 2026-10-03 on
+`warthog-mesh-sae-swccmp-meshvif` and `warthog-mesh-sae-meshvif`
+([OpenMANET Interop](OpenMANET-Interop#frames-over-about-1000-bytes-from-a-linux-node)).
 
 **3. Confirm it joined.**
 
@@ -110,9 +121,9 @@ same comparison.
 
 ## Setup — OpenMANET
 
-Switching the stock HaLow interface to mesh by hand leaves two settings that
-will stop it dead, and neither produces an error message. This is the part
-that costs people hours.
+Switching the stock HaLow interface to mesh by hand leaves `wlh0` in `br-lan`.
+Two mistakes then stop traffic with no error message: an address put on `wlh0`
+while it is bridged, and an unbridged `wlh0` left out of a firewall zone.
 
 **First, run `ip addr show bat0`.** If `bat0` exists, the node was configured by
 OpenMANET's mesh wizard: `wlh0` is a batman-adv (BATMAN_V) hard interface of
@@ -123,11 +134,15 @@ remove `wlh0` from `bat0`: leave the node as it is and use
 nodes whose `bat0` was set up by hand, not yet against a wizard node. The
 steps below are for a node without `bat0`.
 
-**Take the mesh interface out of the bridge.** The interface keeps
-`network='lan'`, so `wlh0` is in `br-lan`. A bridged mesh interface cannot
-hold its own address, and traffic
-entering the mesh from a bridge is *proxied* — 802.11s handles that through a
-different mechanism than locally-originated frames.
+**Give the node a mesh-subnet address.** The interface keeps `network='lan'`,
+so `wlh0` is in `br-lan`, and an address on `wlh0` is ignored. Put it on
+`br-lan` (`ip addr add 10.77.191.116/16 dev br-lan`): with both 1.8.0 Pis'
+`wlh0` in `br-lan`, Pi to Warthog pings of 1000 and 1472 bytes passed 476/480
+in a 1-hour soak under SAE on 2026-10-03. Two Pis bridged this way share one
+LAN segment, so their `br-lan` addresses must differ. Or take `wlh0` out of the
+bridge, give it the address and put it back in a firewall zone, as below.
+Traffic from hosts behind a bridge is *proxied*, which 802.11s handles through
+a different mechanism than locally-originated frames.
 
 ```sh
 ip link set wlh0 nomaster
@@ -135,8 +150,9 @@ ip addr add 10.77.191.116/16 dev wlh0    # 10.77.<mac[4]>.<mac[5]>, see below
 ip link set wlh0 up
 ```
 
-Symptom if you skip it: an address on `wlh0` is ignored, `iw dev wlh0 mpath
-dump` stays empty, and the peer's per-station `tx packets` freezes at exactly 5.
+Symptom of an address on `wlh0` while it is still in `br-lan`: `iw dev wlh0
+mpath dump` stays empty, and the peer's per-station `tx packets` freezes at
+exactly 5.
 
 **Put it back in a firewall zone.** Unbridging removed `wlh0` from the `lan`
 zone, so the default policy now rejects inbound.
@@ -164,6 +180,11 @@ is given by hand with the `ip addr add` above:
 ```
 10.77.<mac[4]>.<mac[5]> / 255.255.0.0
 ```
+
+A Pi that keeps `wlh0` in `br-lan` runs a DHCP server on that bridge. Both
+bench Pis did (dnsmasq serving `lan`), and on 2026-10-03 both warthogs, with
+`AT+MESHDHCP=1`, were still on the static address; why no lease bound is not
+investigated ([Mesh Mode](Mesh-Mode#addressing)).
 
 `AT+MESHDHCP=0` skips the lease attempt. `AT+STATUS?` reports what a warthog
 picked.
@@ -200,22 +221,27 @@ From a phone on the AP or a laptop on USB, ping a mesh node directly:
 ping 10.77.191.116        # the Pi
 ```
 
-If that works, the phone can reach that Pi's `wlh0` address. It receives none
-of OpenMANET's multicast (CoT, mDNS, voice): warthog repeats only Meshtastic's
-`239.0.0.69:4403` across its NAT. If it does not work, work outward:
-[Troubleshooting](Troubleshooting) has the symptom → cause table.
+If that works, the phone can reach that Pi's mesh-subnet address. It receives
+none of OpenMANET's multicast (CoT, mDNS, voice): warthog repeats only
+Meshtastic's `239.0.0.69:4403` across its NAT. If it does not work, work
+outward: [Troubleshooting](Troubleshooting) has the symptom → cause table.
 
 ## What warthog does not do
 
 - **Forward, by default.** A warthog answers path requests aimed at itself and
   relays nothing. It is a leaf with clients behind it, not a repeater. Two mesh
   nodes that cannot hear each other will not be relayed through a warthog
-  between them. `AT+MESHFWD=1` makes it a relay; that is host-tested and
-  simulated, not yet run on air.
-- **Encrypt meaningfully, on this path.** The keyed mode is one hardcoded key
-  on every node, and SAE does not yet carry data between warthog and
-  OpenMANET. Run open, and treat the mesh as an untrusted transport — which
-  for ATAK-style traffic you should be doing anyway.
+  between them. `AT+MESHFWD=1` makes it a relay. On 2026-10-02, on
+  `warthog-mesh-sae-meshvif` under SAE, it relayed 300-, 1000- and 1400-byte
+  pings between two OpenMANET Pis, 10/10 each, with both Pis' paths to each
+  other set through it by hand (`iw dev wlh0 mpath new`). Path selection
+  through it is not measured on air.
+- **Encrypt meaningfully without SAE.** The keyed mode of the builds without
+  SAE (`warthog-mesh-smoke`, step 1) is one hardcoded key on every node. SAE
+  carried data between warthog and OpenMANET 1.8.0 on air from 2026-09-29 to
+  2026-10-03 (step 2), but every peer of a node holds that node's group key and
+  can forge its group frames. Treat the mesh as an untrusted transport, which
+  for ATAK-style traffic you should do anyway.
 - **Bridge at L2, by default.** Clients are NAT'd, so a mesh node cannot
   initiate a connection *to* a phone behind a warthog. Phone-initiated flows
   are fine. `AT+MESHBRIDGE=1` puts the clients on the mesh at layer 2 instead;

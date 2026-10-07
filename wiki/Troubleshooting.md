@@ -105,8 +105,8 @@ bytes): a restart takes it to about 1740 bytes used, and at 400 words
 `AT+CHIPRESTART` ended in `stack overflow in task health` (the core dump's
 reason). Measured on air on 2026-10-03, least free: `health` 2356 bytes during
 `AT+CHIPRESTART` on the `-meshvif` builds; on both boards ESP-IDF's `wifi` task
-4192-4388 and `warthog_led` 68-72 of 2048; the LED task has 3072 bytes (not
-measured at that size).
+4192-4388 and `warthog_led` 68-72 of 2048, and 1092-1096 of the 3072 bytes it
+now has.
 The stack canary (`CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY`) checks the
 lowest 16 bytes of a task's stack each time it is switched out and panics on an
 overflow, so after a run read `AT+ASSERT?` `reset=` and `AT+COREDUMP?` too.
@@ -263,13 +263,15 @@ about 900 bytes, and the Warthog counts nothing arriving (no `micfail` in
 `AT+SWCCMP?`, no `uc_rx` in `AT+BATSTAT?`); another node's may pass. The node's
 RTS threshold (1000 on both OpenMANET 1.8.0 bench Pis) puts an RTS/CTS exchange
 before those frames. On a STA chip interface, which every build but
-`warthog-mesh-sae-swccmp-meshvif` runs the mesh on, the Warthog's CTS is taken
-only by the peer the chip registered last; every other node times out and never
-sends the frame. Measured on 2026-09-30 with the chips' MAC counters on both
-ends.
+`warthog-mesh-sae-swccmp-meshvif` and `warthog-mesh-sae-meshvif` runs the mesh
+on, the Warthog's CTS is taken only by the peer the chip registered last; every
+other node times out and never sends the frame. Measured on 2026-09-30 with the
+chips' MAC counters on both ends.
 
-Fix: flash `warthog-mesh-sae-swccmp-meshvif`; `AT+MESHCFG?` must read
-`chip_vif=mesh(5)`. On other builds, on each node:
+Fix: flash `warthog-mesh-sae-swccmp-meshvif` (measured 2026-09-30, plain mesh
+and batman mode) or `warthog-mesh-sae-meshvif` (measured 2026-10-01; batman
+mode refuses it), both against nodes at RTS threshold 1000; `AT+MESHCFG?` must
+read `chip_vif=mesh(5)`. On other builds, on each node:
 
 ```sh
 echo Y > /sys/module/mm6108_sdio/parameters/enable_cts_to_self
@@ -451,8 +453,8 @@ in `AT+SWCCMP?`.
 
 | Reading | Meaning |
 |---|---|
-| `delivered=0` in `AT+DATASTAT?` | Expected. Only incremented on a receive path this build does not take. Not evidence of anything. |
-| `rx_data` barely moving while pings succeed | Expected. It counts frames reaching the datapath, not frames delivered to the IP stack. |
+| `delivered` flat in `AT+DATASTAT?` while traffic runs | Real. It counts every data frame handed to the network stack, on every delivery path; flat means none is. |
+| `rx_data=0` in `AT+DATASTAT?` | Expected on the region builds, which lack `WARTHOG_MESH_RX_TAP`. On `warthog-mesh-smoke` and the `warthog-mesh-sae*` builds it counts every data frame the chip hands up and climbs with traffic. |
 | `parse_fail` climbing on `AT+HWMPSTAT?` | Real. Investigate with `AT+HWMPDUMP?`. |
 
 ## Build fails right after adding a source file

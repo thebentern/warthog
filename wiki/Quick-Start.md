@@ -47,8 +47,10 @@ For a peer-to-peer mesh instead of a station uplink, build
 
 ## 4. Flash
 
-The HaLow add-on uses USB-OTG, so the usual auto-reset does not work. Put the
-board in download mode by hand:
+The Warthog firmware runs its console and USB network on USB-OTG (TinyUSB), so
+`esptool` cannot reset the board into download mode over DTR/RTS. Put the board
+in download mode by hand (a board already running Warthog can take `AT+DLMODE`
+instead; see [Flashing](Flashing#reflashing-a-running-board)):
 
 **Hold BOOT → tap RESET → release BOOT**, then:
 
@@ -69,7 +71,7 @@ AT
 OK
 
 AT+VERSION?
-+VERSION: warthog 0.1.0-dev
++VERSION: warthog 7f6599f
 OK
 
 AT+STATUS?

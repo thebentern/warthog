@@ -7,12 +7,13 @@ made on evidence rather than re-argued.
 **Short version.** Warthog is a non-forwarding 802.11s mesh point (model A), a
 plain STA leaf (model B), or, opt-in, a BATMAN_V member (model C,
 `AT+MESHBATMAN=1`). By default none relays; `AT+MESHFWD=1` adds 802.11s HWMP
-forwarding, host-tested and not yet on a radio. If you need a relay — an
-airborne node extending coverage between two nodes that cannot hear each other
-— on a bare or bridged 802.11s network the answer is HWMP forwarding. Inside a
-wizard-configured OpenMANET `bat0` fabric it is model C, which relays as batman
-does; measured on air on 2026-09-29/30 as a one-hop member of two OpenMANET
-1.8.0 Pis' hand-made `bat0`, and not yet as a relay.
+forwarding, host-tested; on air it has relayed unicast over pinned paths
+(2026-10-02). If you need a relay — an airborne node extending coverage between
+two nodes that cannot hear each other — on a bare or bridged 802.11s network the
+answer is HWMP forwarding. Inside a wizard-configured OpenMANET `bat0` fabric it
+is model C, which relays as batman does; measured on air on 2026-09-29/30 as a
+one-hop member of two OpenMANET 1.8.0 Pis' hand-made `bat0`, and not yet as a
+relay.
 
 ## The models
 
@@ -21,9 +22,11 @@ does; measured on air on 2026-09-29/30 as a one-hop member of two OpenMANET
 Warthog peers directly with OpenMANET nodes over 802.11s. SAE/AMPE peering is
 verified cross-vendor (2026-09-20: three-node mesh, all links `ESTAB`, two
 simultaneous AMPE pairwise keys on one Warthog). Unencrypted data passes at
-0–3% loss. Encrypted data needs host CCMP (`warthog-mesh-sae-swccmp`), measured
-cross-vendor on air only in model C so far; see *Prerequisite: group-addressed
-frames*.
+0–3% loss. Encrypted data with OpenMANET 1.8.0 is measured on air in this model
+on `warthog-mesh-sae-swccmp-meshvif` (host CCMP, 2026-09-30 to 2026-10-03) and
+`warthog-mesh-sae-meshvif` (every peer's keys in the chip, 2026-10-01 to
+2026-10-03), and in model C on `warthog-mesh-sae-swccmp`; see *Prerequisite:
+group-addressed frames*.
 
 Gives up: relaying. Warthog is a leaf. It is reachable by, and can reach, the
 peers it can hear — and nothing beyond them.
@@ -115,9 +118,12 @@ batman's job, and no Warthog relay has been measured in a `bat0` fabric.
 > behind `AT+MESHFWD=1`: HWMP relay (PREQ/PREP/PERR), data-plane forwarding
 > with duplicate suppression, proxied endpoints via Address Extension, and
 > link-loss PERRs — all as freestanding, host-tested decision code with a
-> multi-node simulator over it. It is compiled and off by default; nothing in
-> it has been on a radio, and the `fwdcand` measurement below still decides
-> whether the chip will let a relay see the frames at all.
+> multi-node simulator over it. It is compiled and off by default. On
+> 2026-10-02 it relayed unicast on air between two OpenMANET 1.8.0 Pis whose
+> paths were pinned through a `warthog-mesh-sae-meshvif` node (300, 1000 and
+> 1400 bytes, 10/10 each), so on a MESH chip interface the chip lets a relay
+> see the frames. Relayed path selection, group data and proxied endpoints are
+> not measured on air.
 
 3. **OpenMANET interoperates at the 802.11s layer without batman-adv.** The
    verified cross-vendor result (`docs/mesh-openmanet.md`) is plain 802.11s.
@@ -246,26 +252,31 @@ Mesh gate announcement is not implemented. None of the AE paths has been on a
 radio against a bridged peer; all are host-tested only.
 
 DHCP on the mesh (`AT+MESHDHCP`, default on) removes the *addressing* half of
-the bridged-peer requirement. Whether a Warthog carries traffic with a peer
-that keeps its mesh interface in `br-lan` is not measured; until it is, the
-setup in `docs/mesh-openmanet.md` takes the interface out of the bridge.
+the bridged-peer requirement. A Warthog carries traffic with a peer that keeps
+its mesh interface in `br-lan`: from 2026-10-01 to 2026-10-03 both bench Pis
+kept `wlh0` in `br-lan` and pinged both Warthogs from an address on `br-lan`
+(2-hour soak on 2026-10-03: 479/480 at 300 and 1000 bytes). A lease from the
+bridge and Address Extension to hosts behind it are not measured.
 
 ## Prerequisite: group-addressed frames
 
-Warthog puts one MGTK in the chip, at AID 0, while every 802.11s peer
-generates its own. Under SAE that is Warthog's own TX MGTK: hostap delivers it
-at mesh start, it is stored, and it goes into the chip with the first peer, so
-standard group frames (`AT+MESHGRP=1`) go out under Warthog's own key id.
-Peers' MGTKs stay in the host keychain only. On Warthog's chip firmware
-(MM-IoT-SDK 2.10.4, `mm6108.mbin` 1.17.6) group RX from more than one peer
-failed both with the key installed at each peer's AID and with it once at
-AID 0. Linux (`morse_driver`) installs each peer's MGTK at that peer's AID
-alongside its own at AID 0; that sequence has not been tried here, so this is
-a measured limit of Warthog's firmware and key sequence, not a proven chip
-limit. It is why the host software CCMP path exists, and that path (RX *and*
-TX, compiled only into the `warthog-mesh-sae-swccmp` builds) is implemented
-and keeps a per-transmitter key for every peer. Host CCMP refuses a unicast
-frame keyed with a group key (`grpkey=` on `AT+SWCCMP?`).
+On every build but `warthog-mesh-sae-meshvif`, Warthog puts one MGTK in the
+chip, at AID 0, while every 802.11s peer generates its own. Under SAE that is
+Warthog's own TX MGTK: hostap delivers it at mesh start, it is stored, and it
+goes into the chip with the first peer, so standard group frames
+(`AT+MESHGRP=1`) go out under Warthog's own key id. On a MESH chip interface
+`warthog-mesh-sae-meshvif` installs each peer's MGTK at that peer's AID beside
+its own at AID 0, as Linux (`morse_driver`) does, and chip firmware 1.17.6
+opened every peer's group frames (on air 2026-10-01, two OpenMANET 1.8.0 Pis
+and another Warthog: `AT+GTKSTAT?` `inst=3 fail=0`, no undecryptable group
+frame). Elsewhere peers' MGTKs stay in the host keychain only: on the STA chip
+interface (MM-IoT-SDK 2.10.4, `mm6108.mbin` 1.17.6) group RX from more than one
+peer failed both with the key installed at each peer's AID and with it once at
+AID 0; the Linux order is untested there. That limit is why the host software
+CCMP path exists, and that path (RX *and* TX, compiled only into the
+`warthog-mesh-sae-swccmp` builds) is implemented and keeps a per-transmitter
+key for every peer. Host CCMP refuses a unicast frame keyed with a group key
+(`grpkey=` on `AT+SWCCMP?`).
 
 Measured on air on 2026-09-29 (`warthog-mesh-sae-swccmp`, batman mode, two
 OpenMANET 1.8.0 Pis): host CCMP opened the Pis' 3-address group frames (ELP,
@@ -314,24 +325,32 @@ simulator relays such a frame end to end (`scenario_relay`,
 has decrypted, sending the copy out under the pairwise key.
 
 The chip is a closed binary. Its one receive-address filter reachable through
-morselib is `BSSID_SET`, and Warthog programs it with a synthetic value that no
-data frame's addr3 ever equals, yet the data plane works. That rules out a
-BSSID match on addr3 — and nothing more. Every frame measured so far had addr3
-equal to the receiver itself, so a firmware rule "addr3 must be me" would have
-passed all of them. (The command set also defines a monitor interface type,
-`ADD_INTERFACE` type 3; morselib does not use it and it is untested on this
-firmware.) The comments in `mmdrv.h`, `driver.c` and `umac_mesh.c` describing a
-chip "addr3 filter" were hypotheses written before mesh receive worked; nothing
-measured supports or refutes them.
+morselib is `BSSID_SET`, and on a STA chip interface Warthog programs it with a
+synthetic value that no data frame's addr3 ever equals, yet the data plane
+works. That rules out a BSSID match on addr3 — and nothing more. On a STA chip
+interface every frame measured had addr3 equal to the receiver itself, so a
+firmware rule "addr3 must be me" would have passed all of them. (The command
+set also defines a monitor interface type, `ADD_INTERFACE` type 3; morselib
+does not use it and it is untested on this firmware.) The comments in
+`mmdrv.h`, `driver.c` and `umac_mesh.c` describing a chip "addr3 filter" were
+hypotheses written before mesh receive worked. The relay run below refutes them
+on a MESH chip interface; on a STA chip interface nothing measured supports or
+refutes them.
 
-So two questions need a radio, and a relay needs both answered yes:
+On a MESH chip interface both questions below were answered yes on air on
+2026-10-02: a `warthog-mesh-sae-meshvif` node with `AT+MESHFWD=1` relayed
+unicast between two OpenMANET 1.8.0 Pis whose paths were pinned through it
+(`fwd uni` 106; 300, 1000 and 1400 bytes 10/10 each). On a STA chip interface
+neither is measured.
+
+Two questions decide it, and a relay needs both answered yes:
 
 1. **Receive:** does the MM6108 deliver a 4-address data frame **addressed to
    us** (addr1) by a peer, whose addr3 names somebody else? That is the frame a
    relay receives.
 2. **Transmit:** does it send a frame whose addr4 is not its own address? That
    is the frame a relay emits. Step 3 of the on-air sequence in
-   `wiki/OpenMANET-Interop.md` answers it, once the first answer is yes.
+   `wiki/OpenMANET-Interop.md` answers it.
 
 **Do not test the first by overhearing.** A Warthog "in range of two peers but
 addressed by neither" receives data frames whose addr1 is another station. The
@@ -343,9 +362,12 @@ before the datapath (`not_ours` in `AT+FILTSTAT?`), so they never count in
 
 Two nodes: a Linux 802.11s node (an OpenMANET node, or an MM8108 adapter on a
 Linux host) and one Warthog, peered — `mesh plink: ESTAB` on the Linux side.
-Use `warthog-mesh-sae` against an SAE peer, the pairing that has already peered
-on this hardware; `AT+MESHPASS` is ignored on an open build. The third party is
-fabricated and never has to exist.
+Use `warthog-mesh-sae-swccmp-on` against an SAE peer: it runs the STA chip
+interface, where the answer is not measured, with host CCMP on from boot.
+`warthog-mesh-sae-meshvif` runs the MESH chip interface, answered above. On
+`warthog-mesh-sae` a Linux node gets no path to the Warthog, so the positive
+control below fails; `AT+MESHPASS` is ignored on an open build. The third party
+is fabricated and never has to exist.
 
 On the Warthog, keep `AT+MESHFWD=0` and `AT+MESHBRIDGE=0`, so a relay frame is
 counted by `fwdcand` and then dropped with reason 93. The two are readouts of
@@ -380,7 +402,7 @@ Then read `AT+RXCHAN?` and `AT+DATASTAT?`:
 |---|---|
 | `fwdcand` up by about 50, its last destination the low octets of `X`, `rxdrop` up with `reason=93` | **Yes.** The chip delivers relay frames. |
 | `fwdcand` up by about 50 but `reason=4` instead of 93 | **Yes** for the chip — it delivered them — but they did not decrypt. The keyed path is the next problem, not the chip. |
-| `fwdcand` flat and `data` up by no more than the control accounts for, while the Linux node's `tx packets` rose by 50 | **Probably no**: the chip filters on addr3, and host-side unicast relaying is impossible without Morse Micro. `data` is counted when a page reaches the host's page handler, so a host page-level drop (checksum, sync, allocation) would read the same — rule those out before concluding. |
+| `fwdcand` flat and `data` up by no more than the control accounts for, while the Linux node's `tx packets` rose by 50 | **Probably no**: the chip filters on addr3 on this chip interface, and a relay needs a MESH chip interface, where it delivers them. `data` is counted when a page reaches the host's page handler, so a host page-level drop (checksum, sync, allocation) would read the same — rule those out before concluding. |
 | `data` up by about 50 but `fwdcand` flat | The chip delivered and the host dropped it earlier — see `AT+FILTSTAT?` and `stad_miss` in `AT+DATASTAT?`. The chip's answer is still yes. |
 | The Linux node's `tx packets` did not move | Void: the path was never used. |
 
