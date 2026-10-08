@@ -2149,7 +2149,8 @@ int main(void)
           "AT+BATTG=<a client>: that row alone");
     struct bat_gw gw;
     unsigned gn = 0;
-    for (int i = 0; i < 1500 && !gn; i++) { sleep_ms(1); gn = warthog_bat_port_gw(&gw); }
+    /* both: a 500 ms refresh can land between node 0's OGMs and node 1's */
+    for (int i = 0; i < 1500 && gn < 2; i++) { sleep_ms(1); gn = warthog_bat_port_gw(&gw); }
     CHECK(gn == (uint8_t)(gw_ret_t)2 && gw.orig[1] == 0xA0 && gw.orig[5] == 1 && gw.down == 11,
           "gateways: bat_gw_best's answer for two (%u), node 1 the best", gn);
     printf(fails ? "bat_port_scale: %d FAILED\n" : "bat_port_scale: all passed\n", fails);
