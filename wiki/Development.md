@@ -16,12 +16,14 @@ SDK and a host-side test suite for the parts that can be tested without a radio.
 
 ## Building every environment
 
-Six device environments plus `native`. Build them all before sending a change —
+Thirteen device environments plus `native`. Build them all before sending a change —
 it is easy to break an env you are not using, because build flags differ between
 them:
 
 ```bash
-for e in warthog-us warthog-eu warthog-jp warthog-kr warthog-au warthog-mesh-smoke; do
+for e in warthog-us warthog-eu warthog-jp warthog-kr warthog-au warthog-us-ecm \
+         warthog-mesh-smoke warthog-mesh-sae warthog-mesh-sae-nochipkey warthog-mesh-sae-swccmp \
+         warthog-mesh-sae-swccmp-on warthog-mesh-sae-swccmp-meshvif warthog-mesh-sae-meshvif; do
   pio run -e $e || echo "FAILED: $e"
 done
 ```

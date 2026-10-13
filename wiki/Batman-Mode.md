@@ -62,7 +62,7 @@ on a board.
 
 | Build | Mesh security | Hears Linux peers' batman broadcasts | `AT+MESHBATMAN=1` |
 |---|---|---|---|
-| region images with `AT+MESHEN=1`, `warthog-mesh-smoke` | open with `AT+MESHSEC=0`; the default `1` keys the mesh with a key published in the source, which no Linux node joins | yes (plain group frames) | accepted |
+| region images with `AT+MESHEN=1`, `warthog-mesh-smoke` | open with `AT+MESHSEC=0`; the default `1` keys the mesh with a key published in the source: an open Linux node peers with it but passes no data | yes (plain group frames) | accepted |
 | `warthog-mesh-sae` | SAE, chip crypto | **no**: peers' group frames are dropped | **refused** (`sae-no-host-ccmp`) |
 | `warthog-mesh-sae-nochipkey` | SAE, no host CCMP | no | **refused** |
 | `warthog-mesh-sae-meshvif` | SAE, chip crypto on a MESH chip interface, each peer's MGTK in the chip at its AID | in the chip ([OpenMANET Interop](OpenMANET-Interop#group-frames-in-the-chip-warthog-mesh-sae-meshvif)) | **refused** (`sae-no-host-ccmp`) |

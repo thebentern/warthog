@@ -61,7 +61,7 @@ The single most common "the internet is broken" cause here is DNS, not routing.
 If `ping 8.8.8.8` works and `curl example.com` hangs, the DNS handed out by DHCP
 is unreachable from wherever the uplink lands.
 
-Change it at runtime — no rebuild, persists in NVS:
+Change it over the console — no rebuild, persists in NVS, and applies after `AT+RESET` (the USB and AP DHCP servers read it at boot; `AT+DNS=` answers `+INFO: stored. AT+RESET to apply.`):
 
 ```
 AT+DNS=8.8.8.8
@@ -71,7 +71,7 @@ OK
 ```
 
 Malformed input is rejected without touching NVS. To go back to the build-time
-default, `AT+ERASE` clears the whole `warthog` namespace — which also clears
+default, run `AT+ERASE` and then `AT+RESET`. `AT+ERASE` clears the whole `warthog` namespace — which also clears
 HaLow and AP credentials, so you will re-enter those.
 
 ## The console shares the cable

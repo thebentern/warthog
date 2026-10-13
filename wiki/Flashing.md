@@ -44,10 +44,10 @@ on its build defaults. To keep the settings, write the three pieces instead.
 | File | Offset | Use |
 |---|---|---|
 | `*.factory.bin` | `0x0` | Everything: bootloader + partitions + app. Also erases the stored settings |
-| `*.bin` | `0x10000` | App only, e.g. for OTA |
+| `*.bin` | `0x10000` | App only (the firmware has no OTA partition or updater) |
 | `*-bootloader.bin` / `*-partitions.bin` | `0x0` / `0x8000` | Piecewise flashing; with `*.bin`, keeps the stored settings |
 | `*.elf` | — | Symbols, for `addr2line` on a panic backtrace |
-| `SHA256SUMS.txt` | — | Covers every asset |
+| `SHA256SUMS.txt` | — | Covers every `warthog-*` file (not `flash.sh`) |
 
 ## Reflashing a running board
 

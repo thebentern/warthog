@@ -9,7 +9,7 @@ deployments, convoys, anything that has to come up on its own.
 
 ## Building for mesh
 
-Mesh is mutually exclusive with station mode, but it is a runtime choice:
+Mesh is mutually exclusive with station mode, but it is a runtime choice (the mesh envs force it on, so `AT+MESHEN=0` does nothing there):
 `AT+MESHEN=1` then `AT+RESET` turns it on for any build, region images
 included. The mesh envs exist because they pin a channel and fix the identity
 at build time, so a bench of boards agrees with no configuration at all:
@@ -18,7 +18,7 @@ at build time, so a bench of boards agrees with no configuration at all:
 pio run -e warthog-mesh-smoke -t upload
 ```
 
-The env pins the radio to one S1G channel and fixes the mesh identity, so nodes
+The env pins the radio to one S1G channel and sets the mesh identity by default (`AT+MESHCHAN=` and `AT+MESHID=` override both), so nodes
 agree with no configuration at all. **These settings must be identical on every
 node in the mesh.** A mismatch produces no peers; after about 20 s without one
 the node logs a `NOT PEERED` error listing these values, repeated about every
@@ -32,14 +32,14 @@ the node logs a `NOT PEERED` error listing these values, repeated about every
 | `WARTHOG_PIN_S1G_BW_MHZ` | `2` |
 | `WARTHOG_PIN_S1G_GLOBAL_OP_CLASS` | `69` |
 
-Channel 42 at 2 MHz is what Warthog pins by default. It must match your peer
+Channel 42 at 2 MHz is what the mesh envs pin; a region image switched on with `AT+MESHEN=1` pins no channel and uses mesh ID `warthog-mesh-test` until `AT+MESHCHAN=` and `AT+MESHID=` set them. It must match your peer
 exactly — read the peer's actual setting rather than assuming a default; see
 [OpenMANET Interop](OpenMANET-Interop).
 
 ## Addressing
 
 On its first peer establishment a node asks for a DHCP lease over the mesh,
-with no address, for up to 6 s. A peer whose mesh interface sits in a bridge
+with no address, for up to 6 s (16 s while an offer is being taken). A peer whose mesh interface sits in a bridge
 with a DHCP server on it (an OpenMANET node with `wlh0` in `br-lan`) can
 answer. With no lease by then — every warthog-only mesh — the node takes a
 static address derived from its own MAC and keeps asking beside it: at once
@@ -67,7 +67,7 @@ what it picked with `AT+STATUS?`.
 On the static address the gateway is the node's own address, so **mesh mode
 has no upstream route** — it is a network between peers, not a path to the
 internet. On a lease the gateway is the lease's router. A node has no mesh
-address before its first peer establishment, nor during the 6 s lease wait
+address before its first peer establishment, nor during the 6–16 s lease wait
 after it.
 
 ## Bringing up a mesh
@@ -111,7 +111,7 @@ limits, unless a point says otherwise:
   TTL − 1, with its original source and sequence number kept so every relay's
   duplicate cache sees the same identity — that cache is what stops two
   relays in range of each other rebroadcasting a frame to each other until
-  TTL runs out. Under the chip's group-key constraint the rebroadcast goes
+  TTL runs out. With `AT+MESHGRP=1` the rebroadcast goes out once as a standard group frame; by default (`0`), under the chip's group-key constraint, it goes
   out as one unicast per peer (excluding the sender) carrying the group
   address in Address Extension, which a mac80211 receiver rebuilds into the
   real Ethernet frame and floods on its bridge.
@@ -195,7 +195,7 @@ limits, unless a point says otherwise:
   SAE peer that runs MFP, plaintext unicast path selection; from any SAE peer,
   group path selection in the clear or with an MMIE (so a relay never re-sends
   under its MGTK what anyone could have sent in a peer's name), and protected
-  group path selection not opened by host CCMP under that peer's MGTK or
+  group path selection not opened under that peer's MGTK (by host CCMP, or on `warthog-mesh-sae-meshvif` by the chip) or
   replayed (see the README's MFP section; `mgmt gp`); from any SAE peer,
   protected unicast path selection under a group key (`mgmt prot grpkey`);
   and on any mesh, once a peer has sent protected unicast path selection, a
@@ -384,16 +384,20 @@ pio run -e warthog-mesh-sae -t upload
 ```
 
 > **Mesh ID, passphrase and mesh mode are runtime settings.** `AT+MESHEN=1`
-> turns mesh on (any build, including the region envs), `AT+MESHID=<id>` and
+> turns mesh on (any build, including the region envs; the mesh envs force it
+> on, so `AT+MESHEN=0` does nothing there), `AT+MESHID=<id>` and
 > `AT+MESHPASS=<pass>` set the credentials. All persist to NVS and take effect
 > on the next boot. `AT+MESHPASS?` reports only the length, deliberately.
 >
 > **Channel is settable too, as a set:**
 > `AT+MESHCHAN=42,923000000,69,2,2` then `AT+RESET`. Read it back with
-> `AT+MESHCHAN?` — it reports `applied=yes|NO`, and `NO` means the regulatory
-> table refused the set and the radio fell back, which is the usual cause of
-> "peers with nothing and looks like a range problem". A refused set is
-> discarded rather than retried every boot. `AT+MESHCHAN=default` restores the
+> `AT+MESHCHAN?` — it reports `applied=yes|NO`. A set the regulatory
+> table refuses is discarded at boot and the radio falls back (to the build-time
+> pin on a mesh env, to the full country list on a region env), so it reads back
+> as `build-time pin`, not as the set you stored; that is the usual cause of
+> "peers with nothing and looks like a range problem". On a mesh env, `NO` beside
+> `build-time pin` means the build's own pin was refused, which
+> `AT+MESHCHAN=default` does not fix. `AT+MESHCHAN=default` restores the
 > build-time pin on a mesh env, and on a region env returns the radio to the
 > full country list.
 >
@@ -411,12 +415,8 @@ pio run -e warthog-mesh-sae -t upload
 > channel and a mismatch peers with nothing while looking like a radio fault:
 >
 > ```bash
-> pio run -e warthog-mesh-sae \
->   --build-flag='-UWARTHOG_REGION_US' --build-flag='-DWARTHOG_REGION_EU=1' \
->   --build-flag='-UWARTHOG_PIN_S1G_CHAN'          --build-flag='-DWARTHOG_PIN_S1G_CHAN=<ch>' \
->   --build-flag='-UWARTHOG_PIN_S1G_FREQ_HZ'       --build-flag='-DWARTHOG_PIN_S1G_FREQ_HZ=<hz>' \
->   --build-flag='-UWARTHOG_PIN_S1G_GLOBAL_OP_CLASS' --build-flag='-DWARTHOG_PIN_S1G_GLOBAL_OP_CLASS=<n>' \
->   --build-flag='-UWARTHOG_PIN_S1G_BW_MHZ'        --build-flag='-DWARTHOG_PIN_S1G_BW_MHZ=<mhz>'
+> PLATFORMIO_BUILD_FLAGS='-UWARTHOG_REGION_US -DWARTHOG_REGION_EU=1 -UWARTHOG_PIN_S1G_CHAN -DWARTHOG_PIN_S1G_CHAN=<ch> -UWARTHOG_PIN_S1G_FREQ_HZ -DWARTHOG_PIN_S1G_FREQ_HZ=<hz> -UWARTHOG_PIN_S1G_GLOBAL_OP_CLASS -DWARTHOG_PIN_S1G_GLOBAL_OP_CLASS=<n> -UWARTHOG_PIN_S1G_OP_CLASS -DWARTHOG_PIN_S1G_OP_CLASS=<s1g-class> -UWARTHOG_PIN_S1G_BW_MHZ -DWARTHOG_PIN_S1G_BW_MHZ=<mhz>' \
+>   pio run -e warthog-mesh-sae
 > ```
 >
 > Take the values from your peer: `morse_cli -i wlh0 channel` on an OpenMANET
@@ -438,8 +438,9 @@ commit in 19, 20 or 21 (P-384, P-521). Keep 19 in an OpenMANET `sae_group`
 list; a list without it relies on the peer's commit and is unmeasured. The
 MODP groups 15 and 16 are not supported. AMPE then derives a per-link
 pairwise key (MTK) and each side sends the other its own group key (MGTK).
-The MTK and Warthog's own MGTK go
-into the chip; a peer's MGTK stays in the host keychain only, because the chip
+Warthog's own MGTK goes into the chip, and so does the MTK except on the builds
+that withhold it for host CCMP (`-nochipkey` and the `-swccmp` builds,
+`WARTHOG_MESH_AMPE_NO_CHIP_KEY`); a peer's MGTK stays in the host keychain only, because the chip
 has one group slot on the STA chip interface, except on `warthog-mesh-sae-meshvif`, which also puts it into the chip
 at the peer's AID. Peering completes in a single
 Open/Confirm exchange and data flows CCMP-encrypted end to end. Verify:
@@ -516,8 +517,8 @@ AT+MESHSEC=0     → open; re-peers within ~2 s
 Keyed uses **one hardcoded key, identical on every warthog image** — a counting
 sequence, `00 11 22 ... ee ff`. Anyone holding the firmware holds the key.
 It never matches OpenMANET. A node set up by OpenMANET's mesh wizard runs SAE
-and needs `warthog-mesh-sae-swccmp` or `warthog-mesh-sae-swccmp-meshvif` with
-host CCMP on (`AT+SWCCMP=1` after each boot, or batman mode) and its mesh ID and
+and needs `warthog-mesh-sae-swccmp-meshvif` (or `warthog-mesh-sae-swccmp`) in
+batman mode (`AT+MESHBATMAN=1`, which arms host CCMP) and its mesh ID and
 passphrase; `warthog-mesh-sae` peers with it but cannot open its group frames.
 Run open only against a node set to `encryption='none'` (see the
 [OpenMANET interop page](OpenMANET-Interop)).

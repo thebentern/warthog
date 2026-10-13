@@ -155,8 +155,8 @@ overflow, so after a run read `AT+ASSERT?` `reset=` and `AT+COREDUMP?` too.
 ## AT does not answer
 
 - The board enumerates more than one CDC port. Try each; only one answers `AT`.
-- Any terminal at 115200 8-N-1. CDC ignores baud, so the value does not matter.
-- Boot logs go to USB-Serial-JTAG for about a second and then the app hands the
+- Any terminal at 115200 8-N-1. CDC ignores the baud rate, except that on a `warthog-mesh-*` build (`WARTHOG_DEVLOOP`) opening the port at 1200 baud more than 5 s after boot puts the board in ROM download mode.
+- Boot logs go to USB-Serial-JTAG until the HaLow start is done (in client mode up to 20 s more for the link) and then the app hands the
   shared PHY to USB-OTG. If you are watching the JTAG port you will see boot and
   then silence — that is normal. `scripts/watch.sh` follows the handoff.
 
@@ -167,6 +167,7 @@ resolver handed out by DHCP is not reachable from where the uplink lands:
 
 ```
 AT+DNS=8.8.8.8
+AT+RESET
 ```
 
 Then confirm the uplink actually has an address:
@@ -230,10 +231,10 @@ CI runs after its build).
 
 ```
 AT+MPMPEERS?
-+MPMPEERS: (none) ... s1g_bcn=0
++MPMPEERS: self=<mac> (none) ... s1g_bcn=0/0 ...
 ```
 
-`s1g_bcn=0` means no mesh beacons are being heard. Channel, mesh ID, bandwidth
+The field is `s1g_bcn=<ours>/<all>`: `s1g_bcn=0/0` means no S1G beacons are being heard at all, and `0/<n>` means beacons are heard but none carries our mesh ID. Channel, mesh ID, bandwidth
 or operating class do not match. Every one of them must be identical across the
 mesh, and a mismatch produces no error — just silence. A peer in beaconless
 mode sends no beacons and reads the same; `AT+MESHCFG?` names that case when
@@ -242,7 +243,7 @@ its probe requests name our mesh.
 ## Mesh: peer seen but never establishes
 
 ```
-+MPMPEERS: ... 28bf74 llid=34244 plid=0 estab=0 opens=12
++MPMPEERS: ... 28bf74 llid=34244 plid=0 estab=0 opens=6
 ```
 
 `plid=0` with `opens` climbing means the node is sending Opens nobody answers. The

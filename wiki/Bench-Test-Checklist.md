@@ -72,9 +72,9 @@ ping -c 3 -b en10 8.8.8.8       # IP-only — proves L3 forwarding + NAPT
 curl -s -o /dev/null -w "%{http_code}\n" https://example.com   # proves DNS too
 ```
 
-✅ Expected: three echo replies (~90 ms each — HaLow RTT), then `200` from the `curl`. CDC console shows `warthog.nat: NAPT up on HaLow STA`.
+✅ Expected: three echo replies (~90 ms each — HaLow RTT), then `200` from the `curl`. CDC console shows `warthog.nat: NAPT on inside netifs (usb=... ap=...); HaLow default route: ip=... gw=...`.
 
-⚠️ If `ping` works but `curl` hangs, the DHCP-DNS option isn't reaching the host — see [Troubleshooting](#ping-8888-works-but-curl-examplecom-hangs).
+⚠️ If `ping` works but `curl` hangs, the DHCP-DNS option isn't reaching the host — see [Troubleshooting](Troubleshooting#the-link-is-up-but-nothing-routes).
 
 ## 9. Mesh (mesh build only, needs a second node)
 
@@ -93,8 +93,8 @@ AT+MPING=<peer's 10.77.x.y>,4
 
 ✅ Expected: four replies. Against an OpenMANET peer set to
 `encryption='none'`, `AT+MESHSEC=0` first; a node set up by OpenMANET's mesh
-wizard runs SAE and needs `warthog-mesh-sae-swccmp` with `AT+SWCCMP=1` (or batman
-mode) and its mesh ID and passphrase; `warthog-mesh-sae` (step 10) peers with it
+wizard runs SAE and needs `warthog-mesh-sae-swccmp-meshvif` (or `-swccmp`) in batman
+mode (`AT+MESHBATMAN=1`) and its mesh ID and passphrase; `warthog-mesh-sae` (step 10) peers with it
 but cannot open its group frames. See [OpenMANET Gateway](OpenMANET-Gateway).
 
 ## 10. Encrypted mesh — SAE/AMPE (two boards)

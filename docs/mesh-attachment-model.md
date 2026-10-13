@@ -136,7 +136,7 @@ Two things are true here and this section used to state only the first, as
 though it were universal.
 
 **OpenMANET's mesh wizard does build a batman fabric.** Read from the
-OpenMANET 24.10 Pi image, `/www/luci-static/resources/tools/morse/`:
+OpenMANET 1.8.0 (OpenWrt 24.10) Pi image, `/www/luci-static/resources/tools/morse/`:
 `wizard.js:93-94` calls `setupBatmanDeviceOnNetwork()` (`gw_mode` `server`
 when `mesh_gate_announcements=1`, else `client`), then
 `setupBatmanInterfaceOnDevice()`. In `uci.js:58-65` these create `bat0`
@@ -153,8 +153,8 @@ restarts when `bat0` comes up.
 **A fresh image has no mesh**: its HaLow radio is an SAE access point in
 `br-lan`. **A node switched to `mode='mesh'` by hand, without the wizard, is
 bare bridged 802.11s.**
-Measured 2026-09-21 on two Pi 4 / MM6108 nodes running OpenMANET 24.10
-(`r28739-d9340319c6`), switched to mesh by hand:
+Measured 2026-09-21 on two Pi 4 / MM6108 nodes running OpenMANET 1.8.0
+(`r28739-d9340319c6`, OpenWrt 24.10), switched to mesh by hand:
 
 ```
 # ip -br link show type batadv   -> (nothing)

@@ -29,7 +29,7 @@ baked into the image:
 ```bash
 pio run -e warthog-us      # 902–928 MHz
 pio run -e warthog-eu      # 863–868 MHz
-pio run -e warthog-jp      # 916.5–927.5 MHz
+pio run -e warthog-jp      # 920.5–927.5 MHz
 pio run -e warthog-kr      # 917.5–923.5 MHz
 pio run -e warthog-au
 ```
@@ -80,8 +80,10 @@ OK
 
 AT+STATUS?
 +HALOW: ip=... gw=...
-+USB: ip=192.168.4.1 mounted=1
++USB: ip=192.168.4.1 mounted=1 tx=... drop=...
++USBNET: tx_queued=... txq=... ...
 +AP: ip=192.168.5.1
++DNS: offered=1.1.1.1
 OK
 ```
 

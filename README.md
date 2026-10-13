@@ -119,7 +119,7 @@ These screenshots are regenerated against an attached board by `scripts/regen-sc
 | `warthog-mesh-sae-swccmp-meshvif` | SAE/AMPE, host CCMP, MESH chip interface — for OpenMANET in batman mode |
 | `warthog-mesh-sae-nochipkey` | Host-CCMP receive probe; not a shipping build |
 
-Region frequency ranges: US 902–928 MHz, EU 863–868 MHz, JP 916.5–927.5 MHz,
+Region frequency ranges: US 902–928 MHz, EU 863–868 MHz, JP 920.5–927.5 MHz,
 KR 917.5–923.5 MHz.
 
 ## Flashing

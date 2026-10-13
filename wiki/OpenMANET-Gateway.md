@@ -23,7 +23,7 @@ batman member ([Batman Mode](Batman-Mode)). See
                                                 phone   tablet           laptop  iPad
 ```
 
-Nothing changes on the OpenMANET side except its mesh security (step 2) and
+Nothing changes on the OpenMANET side (step 2 matches the warthog to the node's mesh security, not the other way round) except
 the interface settings below. The mesh does not know or care that a peer
 has clients behind it.
 
@@ -104,7 +104,7 @@ That is the whole warthog side. Channel, bandwidth and mesh ID default to S1G
 ch 42, 2 MHz, mesh ID `halowmesh`, and are settable at runtime with
 `AT+MESHCHAN=` / `AT+MESHID=`.
 
-Measured against OpenMANET 24.10 (`r28739-d9340319c6`) on a Pi 4 with a Morse
+Measured against OpenMANET 1.8.0 (`r28739-d9340319c6`, OpenWrt 24.10) on a Pi 4 with a Morse
 MM6108, those defaults matched that peer. Channel 42 and country US are
 OpenMANET's radio defaults; its mesh ID `halowmesh` was set by hand, where the
 mesh wizard's default is `openmanet`:
@@ -172,7 +172,7 @@ answers path discovery properly; it is not needed.
 
 ## Addressing
 
-A warthog first asks for a DHCP lease over the mesh and waits up to 6 s. A Pi
+A warthog first asks for a DHCP lease over the mesh and waits up to 6 s (10 s more if an offer is being taken at that point). A Pi
 taken out of its bridge as above serves no lease on `wlh0`, so the warthog
 falls back to a static address derived from its own MAC — the same form the Pi
 is given by hand with the `ip addr add` above:

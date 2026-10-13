@@ -62,7 +62,7 @@ nothing routes.
 Warthog side:
 
 ```bash
-pio run -e warthog-mesh-sae-swccmp-meshvif -t upload   # passphrase: -DWARTHOG_MESH_PASSPHRASE='"..."', default warthog-mesh
+pio run -e warthog-mesh-sae-swccmp-meshvif -t upload   # passphrase: PLATFORMIO_BUILD_FLAGS='-DWARTHOG_MESH_PASSPHRASE=\"...\"' before pio run, or AT+MESHPASS= (below); default warthog-mesh
 ```
 
 `warthog-mesh-sae` peers the same way, but its chip crypto cannot open the
@@ -790,8 +790,8 @@ drops IP fragments addressed to itself unless reassembly is built in, and it is
 off by default: on air 2026-10-03 (two hours, both boards, every rate) no
 fragmented ping from such a Pi was answered, 0/5 in each of 24 rounds at 1452
 and 1472 bytes, while the Pi at MTU 1500 got 1472-byte replies. Builds from then
-on reassemble IPv4 (`CONFIG_LWIP_IP4_REASSEMBLY`, `main/nat_frag.c`), up to 10
-fragments a datagram, and through NAT before NAPT reads its ports, so a tethered
+on reassemble IPv4 (`CONFIG_LWIP_IP4_REASSEMBLY`, `main/nat_frag.c`), at most 10
+fragments held at once across all datagrams, and through NAT before NAPT reads its ports, so a tethered
 host's large packets cross both ways. IPv6 is not reassembled: ESP-IDF drops all
 IPv6 on a netif without a link-local address, and none has one
 ([Troubleshooting](Troubleshooting#large-packets-from-a-node-at-mtu-1460-go-unanswered-ip-fragments)).
@@ -1000,7 +1000,7 @@ reading first:
 | Reading | Means | Check |
 |---|---|---|
 | `applied chan=NONE` | The radio has the whole country list; its operating channel is neither chosen nor observable | Region builds ship unpinned. Set `AT+MESHCHAN=<chan>,<freq_hz>,<gclass>,<sclass>,<bw>` to match the peer and reboot. An unpinned radio meeting a mesh is luck, not configuration. |
-| `set_channel_list` non-zero | The channel was refused; the radio is **not** on the channel printed above | The channel must exist in the country's regulatory table. `AT+MESHCHAN=default` restores the build-time pin. |
+| `set_channel_list` non-zero | The build's own channel pin was refused (a stored channel the table refuses is discarded at boot); the radio is **not** on the channel printed above | Check the region build: the pin must exist in the country's regulatory table. `AT+MESHCHAN=default` does not help here. |
 | `beacons_heard=0` | Nothing is audible | Channel, bandwidth, or range. Compare `applied chan`/`bw` against `uci get wireless.radio1.channel` on the peer — `radio1` is the HaLow device and `channel` lives on the device, not the iface; `radio0` is the 5 GHz radio and `default_radio0.channel` is unset. Fix this before looking at anything else. A peer in beaconless mode sends no beacons at all; when its probe requests name our mesh, the diagnosis line says so. |
 | `beacons_heard>0`, `peers=0` | The mesh is audible and Warthog will not join it | Mesh ID (exact match, case included), operating class, or security mode. An open Warthog will not peer with an SAE mesh, and vice versa. Signal: an OpenMANET node takes no candidate it hears at or below its `mesh_rssi_threshold` (-80 dBm), and Warthog starts no peering at or below its own floor (`AT+MESHRSSI`, also -80), which the diagnosis line reports. Management frame protection is **not** on this list — peering is measured working with it off; it governs path selection (see the PMF note below). |
 | `peers>0` but no traffic | Peered; this is a data-plane question | `AT+RXCHAN?` and `AT+MPING=<peer>,8`. |
@@ -1322,5 +1322,5 @@ relay over pinned paths has a measured baseline.
 
 The same procedure applies to stock OpenWrt with a Morse Micro driver — nothing
 above is OpenMANET-specific. What matters is that `mesh_id`, channel, bandwidth
-and operating class match the Warthog build, and that the two interface defaults
+and operating class match the Warthog's — its build's defaults, or what `AT+MESHID=` and `AT+MESHCHAN=` stored, and that the two interface defaults
 above are dealt with.

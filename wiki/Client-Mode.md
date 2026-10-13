@@ -32,7 +32,7 @@ AT+WIFIAP?
 OK
 ```
 
-Arguments are SSID, passphrase, channel. Stored in NVS, so it survives reboots
+Arguments are SSID, passphrase (8–63 characters, or the AP does not start; an empty one makes the AP open) and an optional channel 1–13. Takes effect on `AT+RESET`; stored in NVS, so it survives reboots
 and outranks the build-time default.
 
 ## Build-time defaults
