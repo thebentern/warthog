@@ -12,10 +12,14 @@ and **GND** pads. Skipping this produces resets that look like firmware bugs.
 ## 2. Install the toolchain
 
 ```bash
-pip install platformio
+pip install platformio==6.1.19
 git clone https://github.com/thebentern/warthog.git
 cd warthog
 ```
+
+PlatformIO 6.2 does not build this project from a fresh install: it adds SCons 4.11.1 beside
+the 4.8.1 the pinned pioarduino platform installs, and the build stops with
+`No module named 'SCons.Tool.FortranCommon'`.
 
 ## 3. Choose a build
 

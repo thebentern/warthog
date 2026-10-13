@@ -11,6 +11,9 @@ on:
 permissions:
   contents: write   # softprops/action-gh-release needs this to publish
 
+env:
+  PIO_VERSION: 6.1.19
+
 jobs:
   build:
     name: build ${{ matrix.region }}
@@ -32,8 +35,10 @@ jobs:
         with:
           python-version: '3.11'
 
+      # 6.1.x wants the SCons 4.8.1 that pioarduino 55.03.38 installs; PlatformIO 6.2 adds SCons 4.11.1
+      # beside it and the build dies on the mix (No module named 'SCons.Tool.FortranCommon').
       - name: Install PlatformIO
-        run: pip install --upgrade platformio
+        run: pip install "platformio==${PIO_VERSION}"
 
       - name: Cache PlatformIO toolchain + packages
         uses: actions/cache@v4
@@ -42,9 +47,9 @@ jobs:
             ~/.platformio/.cache
             ~/.platformio/packages
             ~/.platformio/platforms
-          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml') }}
+          key: pio-${{ runner.os }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml') }}
           restore-keys: |
-            pio-${{ runner.os }}-
+            pio-${{ runner.os }}-${{ env.PIO_VERSION }}-
 
       - name: Build warthog-${{ matrix.region }}
         env:
