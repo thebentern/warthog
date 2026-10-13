@@ -8,6 +8,7 @@ idf_component_register(
         "halow.c"
         "mesh.c"
         "mesh_diag.c"
+        "mesh_addr.c"
         "mesh_bridge.c"
         "usb_net.c"
         "usbnet_core.c"

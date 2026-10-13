@@ -2185,7 +2185,14 @@ rm -rf "$T"
 #     lease whose router stops resolving for 60 s
 #     asks again keeping its address, the wait doubling while the same router comes back and
 #     still fails, and a live router whose MAC left TT is ARPed back first; AT+MESHDHCP=0 never
-#     asks; and every lwIP call it makes runs inside esp_netif_tcpip_exec.
+#     asks; and every lwIP call it makes runs inside esp_netif_tcpip_exec. Batman off,
+#     mesh_addr_netif_poll_ runs against the same model: a lease 2 s after the first ESTAB
+#     binds and the static address never appears; no server: 10.77.<mac4>.<mac5> via itself
+#     at 6 s, DHCP asked beside it 30 s later without dropping it; a peer joining after the
+#     static address (the bench's OpenMANET node, seconds after the other warthog) is asked at
+#     once and its lease replaces the static address without a tick at 0.0.0.0; a lost lease
+#     puts the static address back; nothing before ESTAB or while the bridge is pending; and
+#     AT+MESHDHCP=0 never asks.
 MC=../../../main/mesh.c
 T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
 awk '/^\/\* Batman mode: bat0 comes up/ {p=1} /^static void mesh_probe_burst_task/ {exit} p' "$MC" > "$T/fn.c"
@@ -2200,6 +2207,7 @@ cat > "$T/t.c" <<'EOF'
 #include <string.h>
 #include "bat.h"
 #include "bat_mode.h"
+#include "mesh_addr.h"
 typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_FAIL (-1)
@@ -2409,6 +2417,18 @@ static esp_err_t esp_netif_set_ip_info(esp_netif_t *n, const esp_netif_ip_info_t
     if (LW.up) lw_set(i->ip.addr, i->netmask.addr, i->gw.addr);
     return ESP_OK;
 }
+/* The plain poll's world: ESTAB counters, the peer count, the HaLow MAC and the bridge. */
+volatile uint32_t g_warthog_mpm_estab;
+volatile unsigned int g_warthog_hostap_estab;
+static uint8_t peer_count;
+static int br_pending, plain, br_active;
+static esp_netif_t BR; /* AT+MESHBRIDGE=1: the L3 interface, distinct from the mesh port N */
+static uint8_t mac_lo[2] = { 0x83, 0xa5 };
+static uint8_t mmwlan_mesh_get_peer_count(void) { return peer_count; }
+static int mmwlan_get_mac_addr(uint8_t m[6]) { static const uint8_t h[6] = { 0x3c, 0x1a, 0xcc, 0x4c, 0x83, 0xa5 }; memcpy(m, h, 6); m[4] = mac_lo[0]; m[5] = mac_lo[1]; return 0; }
+static bool warthog_mesh_bridge_pending(void) { return br_pending; }
+static bool warthog_mesh_bridge_active(void) { return br_active != 0; }
+static esp_netif_t *warthog_mesh_bridge_netif(void) { return br_active ? &BR : NULL; }
 #include "fn.c"
 
 static void bind_first(esp_err_t (*fn)(void *), void *ctx)
@@ -2447,10 +2467,19 @@ static void reset(int dhcp)
     cfg_dhcp = (uint8_t)dhcp;
     routes = 1;
     tcpip_first = bind_first;
+    memset(&s_addr, 0, sizeof(s_addr));
+    memset(&BR, 0, sizeof(BR));
+    mac_lo[0] = 0x83;
+    mac_lo[1] = 0xa5;
+    s_addr_poll_us = 0;
+    plain = br_pending = br_active = 0;
+    g_warthog_mpm_estab = 0;
+    g_warthog_hostap_estab = 1;
+    peer_count = 1;
 }
 static void step(void)
 {
-    mesh_bat_netif_poll_();
+    if (plain) mesh_addr_netif_poll_(); else mesh_bat_netif_poll_();
     clock_us += 2000000;
     tick++;
     rtr_arp_ms += 2000;
@@ -2767,13 +2796,116 @@ int main(int argc, char **argv)
           LW.ip.addr == lease_ip, "a lease renewing or rebinding was taken for a lost one (%d ticks off it, restarts %d "
           "probes %d releases %d)", off_lease, raw_starts, probes, releases);
 
+    /* ---- batman off: mesh_addr_netif_poll_ ---- */
+    const uint32_t ST = A4(10, 77, 0x83, 0xa5); /* 10.77.<mac4>.<mac5>, its own gateway */
+    reset(1); /* a bridged node's dnsmasq answers 2 s after the first ESTAB */
+    plain = srv_on = 1;
+    srv_delay_ms = 2000;
+    int saw_st = 0;
+    for (int i = 0; i < 20; i++) { step(); saw_st += LW.ip.addr == ST; }
+    CHECK(LW.ip.addr == lease_ip && LW.gw.addr == lease_router && saw_st == 0 && dhcp_starts == 1 && raw_starts == 0 &&
+          N.st == ESP_NETIF_DHCP_STARTED && bad_set == 0, "plain: a lease 2 s after the first ESTAB binds, the static "
+          "address never on (ip %08x seen static %d starts %d/%d st %d)", LW.ip.addr, saw_st, dhcp_starts, raw_starts, N.st);
+
+    reset(1); /* no server */
+    plain = 1;
+    t = 0;
+    while (t < 10 && LW.ip.addr != ST) { step(); t++; }
+    CHECK(t == 4 && LW.gw.addr == ST && LW.mask.addr == MASK && N.st == ESP_NETIF_DHCP_STOPPED && D.state == DHCP_STATE_OFF &&
+          N.cache.ip.addr == ST && bad_set == 0, "plain, no server: the static address via itself at 6 s, DHCP stopped "
+          "(tick %d ip %08x gw %08x st %d)", t, LW.ip.addr, LW.gw.addr, N.st);
+    flap = 0;
+    t = 0;
+    while (t < 40 && raw_starts == 0) { step(); t++; flap += LW.ip.addr != ST; }
+    CHECK(raw_starts == 1 && t == 15 && D.state == DHCP_STATE_SELECTING, "plain: DHCP asked beside it 30 s later (tick %d)", t);
+    while (t < 60 && D.state != DHCP_STATE_OFF) { step(); t++; flap += LW.ip.addr != ST; }
+    CHECK(flap == 0 && D.state == DHCP_STATE_OFF && LW.ip.addr == ST && bad_set == 0,
+          "plain: that attempt kept the address throughout, then stopped the client (%d ticks off it)", flap);
+
+    reset(1); /* the bench: the other warthog first, a bridged OpenMANET node 6 s later */
+    plain = 1;
+    t = 0;
+    while (t < 3) { step(); t++; }
+    peer_count = 2;
+    srv_on = 1;
+    srv_delay_ms = 2000;
+    saw_st = zero = 0;
+    for (int i = 0; i < 8; i++) { step(); saw_st += LW.ip.addr == ST; zero += saw_st && LW.ip.addr == 0; }
+    CHECK(saw_st >= 1 && zero == 0 && LW.ip.addr == lease_ip && raw_starts == 1 && dhcp_starts == 1 && bad_set == 0,
+          "plain: a peer joining after the first window is asked at once, its lease replacing the static address "
+          "with no tick at 0.0.0.0 (static ticks %d zero %d ip %08x raw %d)", saw_st, zero, LW.ip.addr, raw_starts);
+    for (int i = 0; i < 5; i++) step();
+    D.state = DHCP_STATE_SELECTING; /* the lease expired: lwIP released it and asks again */
+    lw_set(0, 0, 0);
+    srv_on = 0;
+    step();
+    zero = LW.ip.addr == 0;
+    for (int i = 0; i < 10; i++) { step(); zero += LW.ip.addr == 0; }
+    CHECK(zero == 0 && LW.ip.addr == ST && D.state == DHCP_STATE_OFF && bad_set == 0,
+          "plain: a lost lease puts the static address back on the next tick and the attempt ends (%d ticks at 0, "
+          "ip %08x dhcp %d)", zero, LW.ip.addr, D.state);
+
+    reset(1);
+    plain = 1;
+    g_warthog_hostap_estab = 0;
+    for (int i = 0; i < 5; i++) step();
+    CHECK(LW.up == 0 && dhcp_starts == 0, "plain: a candidate's slot is not ESTAB: nothing comes up");
+    g_warthog_mpm_estab = 1; /* open mesh: warthog's own MPM */
+    br_pending = 1;
+    for (int i = 0; i < 5; i++) step();
+    CHECK(LW.up == 0 && dhcp_starts == 0, "plain: nothing while the bridge is still to come");
+
+    reset(1); /* AT+MESHBRIDGE=1 and up: the bridge is the L3 interface, the mesh netif a port */
+    plain = br_active = 1;
+    t = 0;
+    while (t < 10 && LW.ip.addr != ST) { step(); t++; }
+    CHECK(t == 4 && BR.cache.ip.addr == ST && BR.st == ESP_NETIF_DHCP_STOPPED && dhcp_starts == 1 &&
+          N.cache.ip.addr == 0 && N.st == ESP_NETIF_DHCP_INIT && bad_set == 0,
+          "plain, bridge up: DHCP and the static address go on the BRIDGE, never on the mesh port "
+          "(tick %d bridge %08x/%d port %08x/%d)", t, BR.cache.ip.addr, BR.st, N.cache.ip.addr, N.st);
+
+    reset(1); /* an offer still under lwIP's ARP check when the 12 s attempt lapses */
+    plain = 1;
+    t = 0;
+    while (t < 10 && LW.ip.addr != ST) { step(); t++; }
+    while (t < 40 && raw_starts == 0) { step(); t++; }
+    srv_on = 1;
+    srv_delay_ms = 2000;
+    srv_req_ms = 2000;
+    check_ms = 10000; /* bound at 14 s: past the 12 s deadline, inside the 10 s grace */
+    client_ms = 0;
+    for (int i = 0; i < 10; i++) step();
+    CHECK(set_in_check == 0 && D.state == DHCP_STATE_BOUND && LW.ip.addr == lease_ip && bad_set == 0,
+          "plain: an offer under ARP check past the 12 s deadline gets the grace and binds, and nothing "
+          "writes the netif during the check (in-check sets %d dhcp %d ip %08x)", set_in_check, D.state, LW.ip.addr);
+
+    reset(1); /* a MAC ending FF:FF must not take 10.77.255.255, the /16 broadcast address */
+    plain = 1;
+    mac_lo[0] = 0xff;
+    mac_lo[1] = 0xff;
+    t = 0;
+    while (t < 10 && LW.ip.addr == 0) { step(); t++; }
+    CHECK(LW.ip.addr == A4(10, 77, 0x4c, 0xcc) && LW.ip.addr != A4(10, 77, 255, 255),
+          "plain: a MAC ending FF:FF falls back to the next MAC bytes, not the /16 broadcast (%08x)", LW.ip.addr);
+
+    br_pending = 0;
+    step();
+    CHECK(LW.up == 1 && dhcp_starts == 1, "plain: then DHCP on the first poll");
+
+    reset(0);
+    plain = srv_on = 1;
+    step();
+    CHECK(LW.ip.addr == ST && dhcp_starts == 0 && LW.up, "plain, AT+MESHDHCP=0: the static address at the first ESTAB");
+    for (int i = 0; i < 400; i++) { peer_count = (uint8_t)(1 + (i / 7) % 3); step(); }
+    CHECK(dhcp_starts == 0 && raw_starts == 0 && LW.ip.addr == ST, "plain, AT+MESHDHCP=0: never asks DHCP");
+
     CHECK(outside == 0, "%d lwIP calls outside tcpip context", outside);
     return fails != 0;
 }
 EOF
 why=""
 if ! ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -I"$T" -I../../../main -I../../../main/bat -o "$T/t" "$T/t.c" \
-       ../../../main/bat_mode.c 2>"$T/cc.log"; then
+       ../../../main/bat_mode.c ../../../main/mesh_addr.c 2>"$T/cc.log"; then
   why="did not build: $(head -3 "$T/cc.log" | tr '\n' ' ')"
 elif ! why=$("$T/t" 2>&1); then
   why="${why:-crashed}"
@@ -2783,10 +2915,10 @@ fi
 rm -rf "$T"
 if ! awk '/^static void mesh_probe_burst_task\(/,/^}/' "$MC" | \
        awk '/if \(warthog_bat_port_running\(\)\) \{/ {r=NR} r && NR == r + 1 && /^ *mesh_bat_netif_poll_\(\);/ {p=NR}
-            p && NR == p + 1 && /} else if \(g_warthog_mpm_estab \|\| g_warthog_hostap_estab\) \{/ {e=NR}
-            e && NR == e + 1 && /^ *mesh_netif_up_\(\);/ {u=1} /mesh_netif_up_\(\);/ {n++}
+            p && NR == p + 1 && /} else \{/ {e=NR}
+            e && NR == e + 1 && /^ *mesh_addr_netif_poll_\(\);/ {u=1} /mesh_addr_netif_poll_\(\);/ {n++}
             END {exit (u && n == 1) ? 0 : 1}'; then
-  why="$why the probe task does not poll bat0 exactly while batman runs;"
+  why="$why the probe task does not poll bat0 exactly while batman runs, plain addressing otherwise;"
 fi
 if ! awk '/^void warthog_mesh_smoke_test\(/,/^}/' "$MC" | \
        awk '/st = mmwlan_mesh_enable\(/ {e=NR} e && !s && /if \(st == MMWLAN_SUCCESS\) \{/ {s=NR}
@@ -2798,7 +2930,7 @@ fi
 why="$why$(lwip_only_in_tcpip "$MC" mesh_bat_io_ \
   '(dhcp_start|dhcp_release_and_stop|dhcp_supplied_address|netif_dhcp_data|netif_set_addr|etharp_[a-z_]+|netif_ip4_[a-z]+)[(]')"
 if [ -z "$why" ]; then
-  ok "bat0: polled while batman runs, DHCP for 45 s from the first route (an offer ARP-checked at the deadline kept), ARP-probed static via 10.41.0.1, retried beside it, router loss restarts DHCP backing off, renewals stay leased, lwIP only in tcpip context"
+  ok "bat0: polled while batman runs, DHCP for 45 s from the first route (an offer ARP-checked at the deadline kept), ARP-probed static via 10.41.0.1, retried beside it, router loss restarts DHCP backing off, renewals stay leased; plain mesh: DHCP 6 s from the first ESTAB, then the static address with DHCP asked beside it, at once when a peer joins; lwIP only in tcpip context"
 else
   bad "mesh.c batman bring-up: $why"
 fi

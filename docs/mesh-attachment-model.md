@@ -256,7 +256,8 @@ the bridged-peer requirement. A Warthog carries traffic with a peer that keeps
 its mesh interface in `br-lan`: from 2026-10-01 to 2026-10-03 both bench Pis
 kept `wlh0` in `br-lan` and pinged both Warthogs from an address on `br-lan`
 (2-hour soak on 2026-10-03: 479/480 at 300 and 1000 bytes). A lease from the
-bridge and Address Extension to hosts behind it are not measured.
+bridge was measured on 2026-10-05 (a bench Pi's dnsmasq, reached through
+`br-lan` from the Mac 5/5); Address Extension to hosts behind it is not measured.
 
 ## Prerequisite: group-addressed frames
 

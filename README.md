@@ -286,7 +286,10 @@ override them). Whether a build speaks SAE/AMPE is a build-time choice.
   `warthog-mesh`.
 - **Addressing:** a node asks for a DHCP lease on the mesh for 6 s after its
   first peer establishes, then takes `10.77.<mac[4]>.<mac[5]>/16` from its MAC
-  (`3c:1a:cc:4c:83:a5` → `10.77.131.165`). `AT+MESHDHCP=0` skips the lease attempt.
+  (`3c:1a:cc:4c:83:a5` → `10.77.131.165`) and keeps asking beside it: at once when
+  another peer establishes, otherwise after 30 s, doubling to 10 min. A lease
+  replaces the static address; a lost lease puts it back. `AT+MESHDHCP=0` uses the
+  static address only, and stops further asking without a reset.
 - **Batman mode addressing:** the address comes up on the first batman route,
   with a 45 s DHCP wait, an ARP-probed `10.41.253.x/16` fallback beside which DHCP
   keeps asking, and a new lease when the old one's router leaves
@@ -376,7 +379,9 @@ The mesh envs default to channel 42 at 2 MHz (OpenMANET's default) and mesh ID
   which Warthog drops), and 802.11s forwarding should be off on every Linux node
   (mesh11sd `mesh_fwding '0'`).
 - *Node without `bat0`:* `wlh0` stays in `br-lan`, which ignores an address put
-  on `wlh0`. Give `br-lan` an address in the Warthogs' subnet:
+  on `wlh0`. If the node serves DHCP on `br-lan`, a Warthog takes a lease from it.
+  To reach Warthogs on their static addresses, give `br-lan` an address in their
+  subnet:
 
   ```sh
   ip addr add 10.77.191.116/16 dev br-lan
@@ -405,10 +410,12 @@ The mesh envs default to channel 42 at 2 MHz (OpenMANET's default) and mesh ID
 | Node | `iw dev wlh0 mpath dump` | the Warthog with `FLAGS 0x15` at hop count 1 |
 | Node, batman | `batctl n` | the Warthog's mesh MAC |
 
-**Addressing.** In plain mesh mode a Warthog asks for a DHCP lease for 6 s after
-its first peer establishes, then takes `10.77.<mac[4]>.<mac[5]>/16` — hence the
-node's `10.77.x.y` address above. `AT+MESHDHCP=0` skips the lease attempt. In
-batman mode the address comes from DHCP through `bat0` (see
+**Addressing.** In plain mesh mode a Warthog takes a DHCP lease from a node that
+keeps `wlh0` in `br-lan` and serves DHCP there: on its first peering, or beside its
+static address when that node peers later. Otherwise it stays on
+`10.77.<mac[4]>.<mac[5]>/16`, hence the node's `10.77.x.y` address above. Set
+`AT+MESHDHCP=0` on a Warthog that must keep its static address next to such a
+node. In batman mode the address comes from DHCP through `bat0` (see
 [Mesh mode](#mesh-mode-80211s)).
 
 ### When a node does not join

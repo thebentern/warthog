@@ -181,10 +181,10 @@ is given by hand with the `ip addr add` above:
 10.77.<mac[4]>.<mac[5]> / 255.255.0.0
 ```
 
-A Pi that keeps `wlh0` in `br-lan` runs a DHCP server on that bridge. Both
-bench Pis did (dnsmasq serving `lan`), and on 2026-10-03 both warthogs, with
-`AT+MESHDHCP=1`, were still on the static address; why no lease bound is not
-investigated ([Mesh Mode](Mesh-Mode#addressing)).
+A Pi that keeps `wlh0` in `br-lan` runs a DHCP server on that bridge, and a
+warthog takes a lease from it: on its first peering, or beside the static
+address when the Pi peers later ([Mesh Mode](Mesh-Mode#addressing)). Measured
+2026-10-05 against a bench Pi's dnsmasq.
 
 `AT+MESHDHCP=0` skips the lease attempt. `AT+STATUS?` reports what a warthog
 picked.

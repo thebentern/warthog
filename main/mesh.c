@@ -20,6 +20,7 @@
 #include "mmhalow.h"
 #include "cfg.h"
 #include "mesh_diag.h"
+#include "mesh_addr.h"
 #include "mesh_bridge.h"
 #include "bat_mode.h"
 #include "bat_port.h"
@@ -142,71 +143,6 @@ static void mesh_report_unpeered(unsigned int peers)
     ESP_LOGE(TAG, "  heard     %lu beacons", (unsigned long)g_warthog_rxchan_beacon);
     ESP_LOGE(TAG, "  -> %s.", warthog_mesh_diag_text(d));
     ESP_LOGE(TAG, "  AT+MESHCFG? reports the same over the console.");
-}
-
-/* Bring the HaLow netif up over the mesh link.
- *
- * In STA mode this happens through mmhalow_link_state() when the chip reports
- * MMWLAN_LINK_UP; mesh has no such event, so it is done here on the first
- * ESTAB. DHCP first when AT+MESHDHCP=1 (the default); otherwise, or with no
- * lease, a static 10.77.0.0/16 address with the host part taken from the low
- * two octets of the HaLow MAC, so two boards never collide. That is enough for
- * IP, ARP, and UDP multicast -- which is what a Meshtastic UDP transport needs. */
-extern volatile uint32_t g_warthog_mpm_estab;
-extern volatile unsigned int g_warthog_hostap_estab;
-/* Long enough for a bridged peer's dnsmasq to answer, short enough not to
- * stall a warthog-only mesh noticeably. */
-#define MESH_DHCP_WAIT_MS 6000
-static bool s_mesh_netif_up;
-static void mesh_netif_up_(void)
-{
-    /* In bridge mode the bridge is the L3 interface; the mesh netif is a port.
-     * A peer can reach ESTAB before app_main has built the bridge, so wait
-     * while the start is still to come (the probe task calls this every 2 s);
-     * once it has failed the mesh netif takes the address itself, NAT mode. */
-    if (warthog_mesh_bridge_pending()) {
-        return;
-    }
-    esp_netif_t *netif = warthog_mesh_bridge_active() ? warthog_mesh_bridge_netif()
-                                                      : mmhalow_get_netif();
-    if (netif == NULL || s_mesh_netif_up) {
-        return;
-    }
-    uint8_t mac[6];
-    mmwlan_get_mac_addr(mac);
-    /* Claim the slot before the DHCP wait below, so a second peer reaching
-     * ESTAB mid-wait does not start a parallel bring-up. */
-    s_mesh_netif_up = true;
-
-    /* A bridged OpenMANET node (mesh iface in br-lan) serves DHCP on the bridge;
-     * a lease joins its LAN. A wizard node's iface is a bat0 port and gives none
-     * unless batman mode runs (mesh_bat_netif_poll_). Else the static address below. */
-    if (warthog_cfg_get_mesh_dhcp()) {
-        esp_netif_action_connected(netif, NULL, 0, NULL);
-        if (esp_netif_dhcpc_start(netif) == ESP_OK) {
-            for (int waited = 0; waited < MESH_DHCP_WAIT_MS; waited += 250) {
-                vTaskDelay(pdMS_TO_TICKS(250));
-                esp_netif_ip_info_t got;
-                if (esp_netif_get_ip_info(netif, &got) == ESP_OK && got.ip.addr != 0) {
-                    ESP_LOGI(TAG, "mesh: DHCP lease " IPSTR " — peer bridge reachable",
-                             IP2STR(&got.ip));
-                    return;
-                }
-            }
-            ESP_LOGI(TAG, "mesh: no DHCP offer in %d ms (expected on a peerless or "
-                          "unbridged mesh) — using the static address",
-                     MESH_DHCP_WAIT_MS);
-        }
-    }
-
-    esp_netif_dhcpc_stop(netif);
-    esp_netif_ip_info_t ip = { 0 };
-    IP4_ADDR(&ip.ip, 10, 77, mac[4], mac[5]);
-    IP4_ADDR(&ip.netmask, 255, 255, 0, 0);
-    IP4_ADDR(&ip.gw, 10, 77, mac[4], mac[5]);
-    esp_netif_set_ip_info(netif, &ip);
-    esp_netif_action_connected(netif, NULL, 0, NULL);
-    ESP_LOGI(TAG, "mesh: netif up at " IPSTR, IP2STR(&ip.ip));
 }
 
 /* Batman mode: bat0 comes up on the first originator with a route; bat_mode_bat0_step decides
@@ -465,6 +401,102 @@ int warthog_mesh_bat0_line(char *buf, size_t len)
     return bat_mode_bat0_line(&v, buf, len);
 }
 
+/* Plain mesh addressing: the netif comes up on the first ESTAB (mesh has no MMWLAN_LINK_UP), and
+ * mesh_addr_step decides the rest; the static address is 10.77.<mac[4]>.<mac[5]>/16 via itself. */
+extern volatile uint32_t g_warthog_mpm_estab;
+extern volatile unsigned int g_warthog_hostap_estab;
+static struct mesh_addr s_addr; /* probe task only */
+static int64_t s_addr_poll_us;  /* probe task only */
+
+static void mesh_addr_static_(esp_netif_ip_info_t *ip)
+{
+    uint8_t mac[6];
+    mmwlan_get_mac_addr(mac);
+    /* 10.77.0.0 and 10.77.255.255 are the /16's own network and broadcast
+     * addresses: a MAC ending 00:00 or FF:FF would take one and be unreachable. */
+    uint16_t host = (uint16_t)(((uint16_t)mac[4] << 8) | mac[5]);
+    if (host == 0x0000u || host == 0xffffu) {
+        host = (uint16_t)(((uint16_t)mac[3] << 8) | mac[2]);
+    }
+    if (host == 0x0000u || host == 0xffffu) {
+        host = 1u;
+    }
+    IP4_ADDR(&ip->ip, 10, 77, (uint8_t)(host >> 8), (uint8_t)host);
+    IP4_ADDR(&ip->netmask, 255, 255, 0, 0);
+    ip->gw = ip->ip;
+}
+
+static void mesh_addr_netif_poll_(void)
+{
+    /* In bridge mode the bridge is the L3 interface; a peer can reach ESTAB before app_main builds it. */
+    if (warthog_mesh_bridge_pending()) {
+        return;
+    }
+    esp_netif_t *netif = warthog_mesh_bridge_active() ? warthog_mesh_bridge_netif() : mmhalow_get_netif();
+    if (netif == NULL) {
+        return;
+    }
+    const int64_t now_us = esp_timer_get_time();
+    const uint32_t elapsed = s_addr_poll_us ? (uint32_t)((now_us - s_addr_poll_us) / 1000)
+                                            : MESH_PROBE_BURST_PERIOD_MS;
+    s_addr_poll_us = now_us;
+    struct mesh_bat_io io = { .netif = netif, .op = MESH_BAT_IO_READ };
+    if (esp_netif_tcpip_exec(mesh_bat_io_, &io) != ESP_OK) {
+        return;
+    }
+    const struct mesh_addr_in in = { /* either MPM: warthog's own (open mesh) or hostap's (SAE) */
+        .elapsed_ms = elapsed, .estab = g_warthog_mpm_estab || g_warthog_hostap_estab,
+        .peers = mmwlan_mesh_get_peer_count(), .dhcp = warthog_cfg_get_mesh_dhcp() != 0,
+        .dhcp_running = io.running, .leased = io.leased, .have_ip = io.now.ip.addr != 0, .binding = io.binding,
+    };
+    esp_netif_ip_info_t st;
+    mesh_addr_static_(&st);
+    switch (mesh_addr_step(&s_addr, &in)) {
+    case MESH_ADDR_START_DHCP:
+        /* Start first: on a down netif it waits in INIT for action_connected; started after, it fails ALREADY_STARTED. */
+        (void)esp_netif_dhcpc_start(netif);
+        esp_netif_action_connected(netif, NULL, 0, NULL);
+        ESP_LOGI(TAG, "mesh: first peer; DHCP for up to %d s", MESH_ADDR_DHCP_WAIT_MS / 1000);
+        break;
+    case MESH_ADDR_LEASED:
+        ESP_LOGI(TAG, "mesh: DHCP lease " IPSTR " via " IPSTR, IP2STR(&io.now.ip), IP2STR(&io.now.gw));
+        break;
+    case MESH_ADDR_STATIC:
+        (void)esp_netif_dhcpc_stop(netif);
+        (void)esp_netif_set_ip_info(netif, &st);
+        esp_netif_action_connected(netif, NULL, 0, NULL);
+        ESP_LOGI(TAG, "mesh: netif up at " IPSTR "%s", IP2STR(&st.ip),
+                 in.dhcp ? "; no DHCP lease yet, asking again beside it" : "");
+        break;
+    case MESH_ADDR_RETRY: {
+        struct mesh_bat_io op = { .netif = netif, .op = MESH_BAT_IO_START };
+        if (esp_netif_tcpip_exec(mesh_bat_io_, &op) != ESP_OK) {
+            ESP_LOGW(TAG, "mesh: the DHCP client did not start"); /* the next tick ends the attempt */
+        } else {
+            ESP_LOGI(TAG, "mesh: DHCP again beside " IPSTR " (attempt %lu)", IP2STR(&io.now.ip),
+                     (unsigned long)s_addr.retries);
+        }
+        break;
+    }
+    case MESH_ADDR_HOLD: {
+        struct mesh_bat_io op = { .netif = netif, .op = MESH_BAT_IO_HOLD, .hold = st };
+        if (esp_netif_tcpip_exec(mesh_bat_io_, &op) == ESP_OK) {
+            ESP_LOGW(TAG, "mesh: no lease; " IPSTR " re-applied", IP2STR(&st.ip));
+        }
+        break;
+    }
+    case MESH_ADDR_RETRY_FAIL: {
+        struct mesh_bat_io op = { .netif = netif, .op = MESH_BAT_IO_STOP };
+        (void)esp_netif_tcpip_exec(mesh_bat_io_, &op);
+        op = (struct mesh_bat_io){ .netif = netif, .op = MESH_BAT_IO_HOLD, .hold = st }; /* only if it has none */
+        (void)esp_netif_tcpip_exec(mesh_bat_io_, &op);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static void mesh_probe_burst_task(void *arg)
 {
     (void)arg;
@@ -481,13 +513,10 @@ static void mesh_probe_burst_task(void *arg)
         } else if (iter <= 4 || (iter % 30) == 0) {
             ESP_LOGW(TAG, "probe_burst#%lu: ret=%d", (unsigned long)iter, ret);
         }
-        /* Either MPM counts: warthog's own (open mesh) or hostap's (SAE --
-         * where warthog's MPM is deliberately disabled and this gate used to
-         * keep the netif down forever, leaving a keyed link with no L3). */
         if (warthog_bat_port_running()) {
             mesh_bat_netif_poll_();
-        } else if (g_warthog_mpm_estab || g_warthog_hostap_estab) {
-            mesh_netif_up_();
+        } else {
+            mesh_addr_netif_poll_();
         }
 
         /* Watchdog: complain once after the grace period, then periodically,

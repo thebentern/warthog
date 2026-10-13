@@ -38,11 +38,20 @@ exactly — read the peer's actual setting rather than assuming a default; see
 
 ## Addressing
 
-A node first asks for a DHCP lease over the mesh and waits up to 6 s. A peer
-whose mesh interface sits in a bridge with a DHCP server on it (an OpenMANET
-node with `wlh0` in `br-lan`) can answer; that path is not yet measured on air.
-With no offer — every warthog-only mesh — the node falls back to a static
-address derived from its own MAC. `AT+MESHDHCP=0` skips the lease attempt.
+On its first peer establishment a node asks for a DHCP lease over the mesh,
+with no address, for up to 6 s. A peer whose mesh interface sits in a bridge
+with a DHCP server on it (an OpenMANET node with `wlh0` in `br-lan`) can
+answer. With no lease by then — every warthog-only mesh — the node takes a
+static address derived from its own MAC and keeps asking beside it: at once
+when another peer establishes, otherwise 30 s later, the wait doubling to
+10 min. Each attempt lasts 12 s and keeps the static address (OpenWrt's
+dnsmasq pings an address for about 3 s before offering it). A lease replaces
+the static address; a lost lease (NAK, expiry) puts it back. Measured
+2026-10-05: a Warthog whose first peer was another Warthog took the static
+address at 6 s, asked again when a bench Pi with `wlh0` in `br-lan` peered, and
+bound a lease from that Pi's dnsmasq 5.6 s later.
+`AT+MESHDHCP=0` takes the static address at once and never asks; the setting
+is read live, so it also stops further attempts without a reset.
 Batman mode differs: the address comes up on the first batman route, with a 45 s
 DHCP wait and an ARP-probed `10.41.253.x/16` fallback via `10.41.0.1`, beside which
 DHCP keeps being asked ([Batman Mode](Batman-Mode#what-changes-on-the-warthog)).
@@ -57,9 +66,9 @@ what it picked with `AT+STATUS?`.
 
 On the static address the gateway is the node's own address, so **mesh mode
 has no upstream route** — it is a network between peers, not a path to the
-internet. The address is also
-applied on first peer establishment rather than at boot, so a node that has not
-peered yet has no mesh address.
+internet. On a lease the gateway is the lease's router. A node has no mesh
+address before its first peer establishment, nor during the 6 s lease wait
+after it.
 
 ## Bringing up a mesh
 

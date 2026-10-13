@@ -41,7 +41,7 @@ esp_err_t warthog_mesh_bridge_start(esp_netif_t *mesh_netif, const uint8_t mac[6
 {
     esp_err_t e = warthog_mesh_bridge_start_(mesh_netif, mac);
     if (e != ESP_OK) {
-        s_failed = true; /* releases mesh_netif_up_ to the NAT fallback */
+        s_failed = true; /* releases mesh_addr_netif_poll_ to the NAT fallback */
     }
     return e;
 }

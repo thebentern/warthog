@@ -81,8 +81,9 @@ esp_err_t warthog_cfg_set_mesh_enable(uint8_t enable);
  * wizard-configured node enslaves the interface to bat0 instead: no lease and
  * no IP path unless AT+MESHBATMAN=1 makes this node a BATMAN_V member.
  *
- * The static fallback applies whenever no lease arrives, which includes every
- * warthog-to-warthog mesh. */
+ * With no lease in 6 s the static address applies (every warthog-to-warthog
+ * mesh); DHCP is asked again beside it, at once when a peer joins, and a lease
+ * replaces it. Read live: 0 stops further asking. */
 uint8_t   warthog_cfg_get_mesh_dhcp(void);
 esp_err_t warthog_cfg_set_mesh_dhcp(uint8_t on);
 

@@ -35,7 +35,7 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
            ../src/dot11ah/debug.c
 
 TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
-           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd test_mesh_frag test_mesh_cap sim_mesh test_supp_mesh_conf test_mesh_bip test_bat_mode test_beacon_yield test_chipvif_glue test_chipvif_glue_off test_hang_guard
+           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mesh_addr test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd test_mesh_frag test_mesh_cap sim_mesh test_supp_mesh_conf test_mesh_bip test_bat_mode test_beacon_yield test_chipvif_glue test_chipvif_glue_off test_hang_guard
 
 # ---- simnode: the real stack with only the chip and the RTOS replaced ----
 #
@@ -155,6 +155,10 @@ test_mesh_diag: test_mesh_diag.c $(MAINDIR)/mesh_diag.c
 
 # The hang guard's logic (main/hang_guard_core.c): ages, the stall pick, the abort reason, AT+HANG? lines.
 test_hang_guard: test_hang_guard.c $(MAINDIR)/hang_guard_core.c $(MAINDIR)/hang_guard_core.h
+	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $(filter %.c,$^) -o $@
+
+# Plain mesh addressing: DHCP first, then the static address with DHCP asked again beside it.
+test_mesh_addr: test_mesh_addr.c $(MAINDIR)/mesh_addr.c $(MAINDIR)/mesh_addr.h
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $(filter %.c,$^) -o $@
 
 test_mudp_classify: test_mudp_classify.c $(MAINDIR)/mudp_classify.c $(MAINDIR)/mudp_classify.h

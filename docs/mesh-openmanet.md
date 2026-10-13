@@ -85,7 +85,8 @@ tools/bench/flash.sh "WTHG-0272A1F8738D 0-1 1" "WTHG-021BF681BA51 0-1 2"
 On its first peer establishment a node asks for a DHCP lease (`AT+MESHDHCP`,
 default 1) and waits up to 6 s; a peer whose mesh interface is bridged to a
 DHCP server can serve one. With no offer, the node derives a static address
-from its MAC:
+from its MAC, and keeps asking beside it — at once when another peer
+establishes, else 30 s later doubling to 10 min — until a lease replaces it:
 
 ```
 10.77.<mac[4]>.<mac[5]> / 255.255.0.0
@@ -106,8 +107,8 @@ ip addr add 10.77.191.116/16 dev wlh0
 Two behaviours worth knowing. With the static address the gateway is set to
 the node's **own** address, so the node has no upstream route — the static mesh
 is not a path to the internet. And the address is applied lazily, on the first
-peer establishment rather than at boot, so a node with no peers yet has no mesh
-address to report.
+peer establishment rather than at boot (6 s later when no lease comes), so a
+node with no peers yet has no mesh address to report.
 
 ## Setting up an OpenMANET / OpenWrt peer
 
