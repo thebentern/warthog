@@ -187,10 +187,11 @@ const bar = (pct) => { $("bar").style.width = `${Math.max(0, Math.min(100, pct))
 const VARIANTS = [
   { key: "us",         label: "US — 902–928 MHz (station uplink)" },
   { key: "eu",         label: "EU — 863–868 MHz (station uplink)" },
-  { key: "jp",         label: "JP — 916.5–927.5 MHz (station uplink)" },
+  { key: "jp",         label: "JP — 920.5–927.5 MHz (station uplink)" },
   { key: "kr",         label: "KR — 917.5–923.5 MHz (station uplink)" },
   { key: "au",         label: "AU (station uplink)" },
-  { key: "mesh-sae",   label: "Mesh, encrypted — 802.11s + SAE/AMPE per-link keys (US band)" },
+  { key: "mesh-sae-meshvif",        label: "Mesh, encrypted — 802.11s + SAE/AMPE, keys in the chip (US band)" },
+  { key: "mesh-sae-swccmp-meshvif", label: "Mesh, encrypted, batman-capable — host CCMP; send AT+SWCCMP=1 after each boot (US band)" },
   { key: "mesh-smoke", label: "Mesh, no SAE — 802.11s; data plane keyed with a built-in constant until set to Open (US band)" },
 ];
 

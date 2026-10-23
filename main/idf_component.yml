@@ -20,7 +20,7 @@ dependencies:
     # Provides the firmware_binary_start/end + bcf_binary_start/end symbols
     # the halow shim looks up at link time. Version-match the halow component.
     version: "2.10.4-esp32-1"
-  espressif/esp_tinyusb: "*"
+  espressif/esp_tinyusb: "~2.2.0"
   # NCM control requests only work reliably on iOS/iPadOS from 0.21.0
   # (hathach/tinyusb#3630). esp_tinyusb itself only requires >=0.17.0~2, so
   # without this constraint the resolve lands on 0.19.0 and iOS DHCP succeeds
