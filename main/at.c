@@ -14,6 +14,7 @@
 
 #include "at.h"
 #include "cfg.h"
+#include "halow.h"
 #include "region.h"
 #include "mesh_diag.h"
 #include "mesh.h"
@@ -196,6 +197,20 @@ static bool starts_with_i(const char *s, const char *prefix)
     return true;
 }
 
+/* AT+STATUS?'s +REGION line: this boot's country (none while held or in safe mode) and the stored one. */
+static void status_region_line_(void)
+{
+    const struct warthog_region_plan *rp = warthog_region_running();
+    struct warthog_rg_stored rg;
+    warthog_cfg_get_region(&rg);
+    char line[96];
+    snprintf(line, sizeof(line), "+REGION: running=%s stored=%s%s\r\n",
+             (rp != NULL && rp->hold == WARTHOG_HOLD_NONE) ? rp->cc : "none",
+             rg.state == WARTHOG_RG_VALID ? rg.cc : rg.state == WARTHOG_RG_INVALID ? "invalid" : "none",
+             rg.state == WARTHOG_RG_ABSENT ? " (not set: " WARTHOG_DEFAULT_REGION " default)" : "");
+    cdc_write(line);
+}
+
 static void cmd_status(void)
 {
     char buf[320]; /* +USBNET: at most 312 */
@@ -247,6 +262,8 @@ static void cmd_status(void)
     warthog_cfg_get_dns(dns_str, sizeof(dns_str));
     snprintf(buf, sizeof(buf), "+DNS: offered=%s\r\n", dns_str);
     cdc_write(buf);
+
+    status_region_line_();
 
     reply_ok();
 }
@@ -383,6 +400,156 @@ static void cmd_dns_set(char *args)
         return;
     }
     cdc_write("+INFO: stored. AT+RESET to apply.\r\n");
+    reply_ok();
+}
+
+/* AT+REGION=<CC>: stored in regnvs for the next boot, only when this module offers it. */
+static void cmd_region_set(char *args)
+{
+    const struct warthog_region_ctx ctx = warthog_region_ctx_get();
+    char allowed[48], why[128], line[192], cc[3];
+    (void)warthog_region_allowed_list(&ctx, '|', allowed, sizeof(allowed));
+    if (!warthog_region_normalize(trim(args), cc) || mmwlan_lookup_regulatory_domain(ctx.db, cc) == NULL) {
+        snprintf(why, sizeof(why), "usage: AT+REGION=<%s>", allowed);
+        reply_error(why);
+        return;
+    }
+    if (!warthog_region_allowed(&ctx, cc)) {
+        snprintf(why, sizeof(why), "%s is not offered on this module; AT+REGION=<%s>", cc, allowed);
+        reply_error(why);
+        return;
+    }
+    const esp_err_t err = warthog_cfg_set_region(cc);
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        reply_error("no region partition: reflash the factory image");
+        return;
+    }
+    if (err != ESP_OK) {
+        reply_error("nvs write");
+        return;
+    }
+    struct warthog_mesh_chan mc;
+    if (warthog_cfg_get_mesh_chan(&mc) &&
+        warthog_region_match(&ctx, mmwlan_lookup_regulatory_domain(ctx.db, cc), &mc, NULL) == NULL) {
+        snprintf(line, sizeof(line),
+                 "+INFO: stored AT+MESHCHAN chan=%u freq=%lu bw=%u is not in the %s table; with mesh on the %s "
+                 "default channel is used\r\n",
+                 (unsigned)mc.chan, (unsigned long)mc.freq_hz, (unsigned)mc.bw_mhz, cc, cc);
+        cdc_write(line);
+    }
+    cdc_write("+INFO: stored. AT+RESET to apply.\r\n");
+    reply_ok();
+}
+
+/* AT+REGION?: this boot's region, the next boot's, what is stored, what is offered, any hold. */
+static void cmd_region_query(void)
+{
+    const struct warthog_region_ctx ctx = warthog_region_ctx_get();
+    const struct warthog_region_plan *p = warthog_region_running();
+    struct warthog_rg_stored st;
+    warthog_cfg_get_region(&st);
+    char next[3], stored[32], allowed[48], line[192];
+    enum warthog_cc_src src;
+    const enum warthog_hold nh = warthog_region_resolve(&ctx, &st, next, &src);
+    if (st.state == WARTHOG_RG_VALID) {
+        snprintf(stored, sizeof(stored), "%s", st.cc);
+    } else if (st.state == WARTHOG_RG_INVALID) {
+        snprintf(stored, sizeof(stored), "invalid('%s')", st.raw);
+    } else {
+        snprintf(stored, sizeof(stored), "none");
+    }
+    snprintf(line, sizeof(line), "+REGION: running=%s next_boot=%s stored=%s\r\n",
+             (p != NULL && p->hold == WARTHOG_HOLD_NONE) ? p->cc : "none", nh == WARTHOG_HOLD_NONE ? next : "none",
+             stored);
+    cdc_write(line);
+    (void)warthog_region_allowed_list(&ctx, ',', allowed, sizeof(allowed));
+    snprintf(line, sizeof(line), "+REGION: allowed=%s default=%s\r\n", allowed, WARTHOG_DEFAULT_REGION);
+    cdc_write(line);
+    (void)warthog_region_allowed_list(&ctx, '|', allowed, sizeof(allowed));
+    if (p != NULL && p->hold != WARTHOG_HOLD_NONE) {
+        snprintf(line, sizeof(line), "+REGION: radio held: %s; AT+REGION=<%s> then AT+RESET\r\n",
+                 warthog_region_hold_text(p->hold), allowed);
+        cdc_write(line);
+    } else if (nh != WARTHOG_HOLD_NONE) {
+        snprintf(line, sizeof(line), "+REGION: the next boot holds the radio: %s; AT+REGION=<%s> then AT+RESET\r\n",
+                 warthog_region_hold_text(nh), allowed);
+        cdc_write(line);
+    }
+    if (st.no_partition) {
+        cdc_write("+REGION: region partition missing (reflash the factory image)\r\n");
+    } else if (st.unreadable) {
+        cdc_write("+REGION: region partition unreadable; AT+REGION=<CC> reformats it\r\n");
+    }
+    reply_ok();
+}
+
+/* AT+MESHCHAN=<chan>,<freq_hz>,<gclass>,<sclass>,<bw>: one set, stored only when all five equal an
+ * in-band row of the next boot's region that Morse does not flag; "default" clears it. */
+static void cmd_meshchan_set(char *args)
+{
+    if (strcasecmp(args, "default") == 0) {
+        if (warthog_cfg_clear_mesh_chan() == ESP_OK) {
+            cdc_write("+MESHCHAN: cleared; the region's default mesh channel on next boot\r\n");
+            reply_ok();
+        } else {
+            reply_error("nvs erase failed");
+        }
+        return;
+    }
+    unsigned ch = 0, gc = 0, oc = 0, bw = 0;
+    unsigned long hz = 0;
+    if (sscanf(args, "%u,%lu,%u,%u,%u", &ch, &hz, &gc, &oc, &bw) != 5 || ch > 0xffffu || hz > 0xfffffffful ||
+        gc > 0xffu || oc > 0xffu || bw > 0xffu) {
+        reply_error("usage: AT+MESHCHAN=<chan>,<freq_hz>,<global_class>,<s1g_class>,<bw_mhz>");
+        return;
+    }
+    const struct warthog_mesh_chan c = {
+        .freq_hz = (uint32_t)hz, .chan = (uint16_t)ch, .global_op_class = (uint8_t)gc,
+        .op_class = (uint8_t)oc, .bw_mhz = (uint8_t)bw,
+    };
+    const struct warthog_region_ctx ctx = warthog_region_ctx_get();
+    struct warthog_rg_stored st;
+    warthog_cfg_get_region(&st);
+    char cc[3], why[128];
+    enum warthog_cc_src src;
+    if (warthog_region_resolve(&ctx, &st, cc, &src) != WARTHOG_HOLD_NONE) {
+        reply_error("no usable region for the next boot; set AT+REGION first");
+        return;
+    }
+    if (!warthog_region_check_set(&ctx, mmwlan_lookup_regulatory_domain(ctx.db, cc), &c, why, sizeof(why))) {
+        reply_error(why);
+        return;
+    }
+    if (warthog_cfg_set_mesh_chan(&c) != ESP_OK) {
+        reply_error("rejected: freq must be 750-950 MHz, bw 1|2|4|8, chan/classes non-zero");
+        return;
+    }
+    cdc_write("+MESHCHAN: stored; applied on next boot (mesh on, or pins the station)\r\n");
+    reply_ok();
+}
+
+/* AT+MESHCHAN?: the stored set, whether set_channel_list took this boot's list, and the channel's source. */
+static void cmd_meshchan_query(void)
+{
+    extern int g_warthog_chan_pin_status;
+    struct warthog_mesh_chan c;
+    char line[224], src[64];
+    (void)warthog_region_chan_src_text(warthog_region_running(), src, sizeof(src));
+    if (warthog_cfg_get_mesh_chan(&c)) {
+        snprintf(line, sizeof(line),
+                 "+MESHCHAN: stored chan=%u freq=%lu gclass=%u sclass=%u bw=%u | "
+                 "applied=%s src=%s (set_channel_list=%d)\r\n",
+                 (unsigned)c.chan, (unsigned long)c.freq_hz,
+                 (unsigned)c.global_op_class, (unsigned)c.op_class, (unsigned)c.bw_mhz,
+                 g_warthog_chan_pin_status == 0 ? "yes" : "NO", src,
+                 g_warthog_chan_pin_status);
+    } else {
+        snprintf(line, sizeof(line),
+                 "+MESHCHAN: none stored | applied=%s src=%s (set_channel_list=%d)\r\n",
+                 g_warthog_chan_pin_status == 0 ? "yes" : "NO", src,
+                 g_warthog_chan_pin_status);
+    }
+    cdc_write(line);
     reply_ok();
 }
 
@@ -571,6 +738,8 @@ volatile uint32_t g_warthog_chipcmd_key_refused = 0;
 volatile int32_t g_warthog_chipcmd_key_status = 0;
 volatile uint32_t g_warthog_chipcmd_keyidx_mismatch = 0;
 volatile uint32_t g_warthog_chipcmd_meshcfg_mode = 0;
+/* The status the chip refused the mesh channel with at the first start (umac_mesh.c); 0 it took it. */
+volatile int32_t g_warthog_mesh_chan_st = 0;
 /* Mesh data-plane protection. 1 (default) = register peers as secured and
  * install the static MTK/MGTK; 0 = leave them OPEN.
  *
@@ -1299,6 +1468,76 @@ static int meshcfg_chipcmd_line_(char *buf, size_t len, const struct meshcfg_chi
                     (unsigned long)c->meshcfg_mode);
 }
 
+/* AT+MESHCFG?'s first line: this boot's country (none while held), whether it is the default, the
+ * next boot's when it differs, and the hold. */
+static void meshcfg_region_line_(void)
+{
+    const struct warthog_region_plan *rp = warthog_region_running();
+    struct warthog_rg_stored rg;
+    warthog_cfg_get_region(&rg);
+    const struct warthog_region_ctx rctx = warthog_region_ctx_get();
+    char rnext[3], nb[32] = "", hd[32] = "", line[128];
+    enum warthog_cc_src rsrc;
+    const enum warthog_hold rnh = warthog_region_resolve(&rctx, &rg, rnext, &rsrc);
+    const bool held = rp == NULL || rp->hold != WARTHOG_HOLD_NONE;
+    const char *rcc = held ? "none" : rp->cc;
+    if (rnh == WARTHOG_HOLD_NONE && strcmp(rnext, rcc) != 0) {
+        snprintf(nb, sizeof(nb), " next_boot=%s (AT+RESET)", rnext);
+    }
+    if (rp != NULL && rp->hold != WARTHOG_HOLD_NONE) {
+        snprintf(hd, sizeof(hd), " held=%s", warthog_region_hold_token(rp->hold));
+    }
+    snprintf(line, sizeof(line), "+MESHCFG: region=%s country=%s%s%s%s\r\n", rcc, rcc,
+             rg.state == WARTHOG_RG_ABSENT ? " (not set: " WARTHOG_DEFAULT_REGION " default)" : "", nb, hd);
+    cdc_write(line);
+}
+
+/* AT+MESHCFG?'s channel lines: what applied and from where, a stored set the region refused, and a
+ * first mesh start whose channel the chip refused. */
+static void meshcfg_chan_lines_(void)
+{
+    extern int g_warthog_chan_pin_status;
+    extern uint32_t g_warthog_applied_freq_hz;
+    extern uint16_t g_warthog_applied_chan;
+    extern int16_t  g_warthog_applied_gclass, g_warthog_applied_sclass;
+    extern uint8_t  g_warthog_applied_bw_mhz;
+
+    const struct warthog_region_plan *rp = warthog_region_running();
+    const bool held = rp == NULL || rp->hold != WARTHOG_HOLD_NONE;
+    const char *rcc = held ? "none" : rp->cc;
+    char src[64], line[256];
+    (void)warthog_region_chan_src_text(rp, src, sizeof(src));
+    if (held) {
+        snprintf(line, sizeof(line), "+MESHCFG: applied chan=NONE -- radio held: %s src=%s (set_channel_list=%d)\r\n",
+                 rp != NULL ? warthog_region_hold_text(rp->hold) : "no region plan this boot (safe mode)", src,
+                 g_warthog_chan_pin_status);
+    } else if (g_warthog_applied_chan == 0) {
+        snprintf(line, sizeof(line),
+                 "+MESHCFG: applied chan=NONE -- full %s regulatory list, operating "
+                 "channel not pinned and not observable src=%s (set_channel_list=%d)\r\n",
+                 rcc, src, g_warthog_chan_pin_status);
+    } else {
+        snprintf(line, sizeof(line),
+                 "+MESHCFG: applied chan=%u freq=%lu bw=%u gclass=%d sclass=%d src=%s (set_channel_list=%d)\r\n",
+                 (unsigned)g_warthog_applied_chan, (unsigned long)g_warthog_applied_freq_hz,
+                 (unsigned)g_warthog_applied_bw_mhz, (int)g_warthog_applied_gclass,
+                 (int)g_warthog_applied_sclass, src, g_warthog_chan_pin_status);
+    }
+    cdc_write(line);
+    struct warthog_mesh_chan smc;
+    if (!held && (rp->chan_flags & WARTHOG_CHAN_F_STORED_REFUSED) && warthog_cfg_get_mesh_chan(&smc)) {
+        snprintf(line, sizeof(line), "+MESHCFG: stored chan=%u freq=%lu bw=%u is not in the %s table -- the %s %s in use\r\n",
+                 (unsigned)smc.chan, (unsigned long)smc.freq_hz, (unsigned)smc.bw_mhz, rcc, rcc,
+                 rp->chan_src == WARTHOG_CHAN_DEFAULT ? "default" : "full list");
+        cdc_write(line);
+    }
+    if (g_warthog_mesh_chan_st != 0) {
+        snprintf(line, sizeof(line), "+MESHCFG: mesh not started: the chip refused the channel (st=%ld)\r\n",
+                 (long)g_warthog_mesh_chan_st);
+        cdc_write(line);
+    }
+}
+
 /* AT+MESHCFG? -- every value a peer matches on, plus what this node will not
  * do. Interop failures are mismatches, and comparing them one AT verb at a
  * time is how they get missed; the capability lines are here so nobody has to
@@ -1306,10 +1545,7 @@ static int meshcfg_chipcmd_line_(char *buf, size_t len, const struct meshcfg_chi
 static void cmd_meshcfg(void)
 {
     extern int g_warthog_chan_pin_status;
-    extern uint32_t g_warthog_applied_freq_hz;
     extern uint16_t g_warthog_applied_chan;
-    extern int16_t  g_warthog_applied_gclass, g_warthog_applied_sclass;
-    extern uint8_t  g_warthog_applied_bw_mhz;
     extern volatile uint32_t g_warthog_rxchan_beacon;
 
     char line[320];
@@ -1318,9 +1554,7 @@ static void cmd_meshcfg(void)
     warthog_cfg_get_mesh_id(id, sizeof(id));
     warthog_cfg_get_mesh_pass(pw, sizeof(pw));
 
-    snprintf(line, sizeof(line), "+MESHCFG: region=%s country=%s\r\n",
-             WARTHOG_REGION_NAME, WARTHOG_COUNTRY_CODE);
-    cdc_write(line);
+    meshcfg_region_line_();
     snprintf(line, sizeof(line),
              "+MESHCFG: enable=%u secure=%u pmf=%s dhcp=%u fwd=%u bridge=%u grp=%s batman=%u id='%s' "
              "pass=%u chars\r\n",
@@ -1331,19 +1565,7 @@ static void cmd_meshcfg(void)
              warthog_cfg_get_mesh_grp() ? "std" : "replicate",
              (unsigned)warthog_cfg_get_mesh_batman(), id, (unsigned)strlen(pw));
     cdc_write(line);
-    if (g_warthog_applied_chan == 0) {
-        snprintf(line, sizeof(line),
-                 "+MESHCFG: applied chan=NONE -- full %s regulatory list, operating "
-                 "channel not pinned and not observable (set_channel_list=%d)\r\n",
-                 WARTHOG_COUNTRY_CODE, g_warthog_chan_pin_status);
-    } else {
-        snprintf(line, sizeof(line),
-                 "+MESHCFG: applied chan=%u freq=%lu bw=%u gclass=%d sclass=%d (set_channel_list=%d)\r\n",
-                 (unsigned)g_warthog_applied_chan, (unsigned long)g_warthog_applied_freq_hz,
-                 (unsigned)g_warthog_applied_bw_mhz, (int)g_warthog_applied_gclass,
-                 (int)g_warthog_applied_sclass, g_warthog_chan_pin_status);
-    }
-    cdc_write(line);
+    meshcfg_chan_lines_();
     unsigned peers = (unsigned)mmwlan_mesh_get_peer_count();
     snprintf(line, sizeof(line), "+MESHCFG: peers=%u beacons_heard=%lu\r\n",
              peers, (unsigned long)g_warthog_rxchan_beacon);
@@ -3023,7 +3245,7 @@ static void cmd_erase(void)
         reply_error("nvs erase");
         return;
     }
-    cdc_write("+INFO: NVS warthog namespace cleared. AT+RESET to apply.\r\n");
+    cdc_write("+INFO: NVS warthog namespace cleared; the region is kept (AT+REGION?). AT+RESET to apply.\r\n");
     reply_ok();
 }
 
@@ -3075,6 +3297,10 @@ static void dispatch(char *line)
         cmd_dns_query();
     } else if (strcasecmp(verb, "DNS") == 0 && terminator == '=') {
         cmd_dns_set(args);
+    } else if (strcasecmp(verb, "REGION") == 0 && terminator == '?') {
+        cmd_region_query();
+    } else if (strcasecmp(verb, "REGION") == 0 && terminator == '=') {
+        cmd_region_set(args);
     } else if (strcasecmp(verb, "RESET") == 0 && terminator == '\0') {
         cmd_reset();
     } else if (strcasecmp(verb, "DLMODE") == 0 && terminator == '\0') {
@@ -3179,55 +3405,9 @@ static void dispatch(char *line)
         }
         reply_ok();
     } else if (strcasecmp(verb, "MESHCHAN") == 0 && terminator == '=') {
-        /* chan,freq_hz,global_class,s1g_class,bw_mhz -- one set, because class
-         * and bandwidth belong to the channel. "default" clears the override. */
-        if (strcasecmp(args, "default") == 0) {
-            if (warthog_cfg_clear_mesh_chan() == ESP_OK) {
-                cdc_write("+MESHCHAN: cleared; build-time pin on next boot\r\n");
-                reply_ok();
-            } else {
-                reply_error("nvs erase failed");
-            }
-        } else {
-            struct warthog_mesh_chan c = {0};
-            unsigned ch = 0, gc = 0, oc = 0, bw = 0; unsigned long hz = 0;
-            if (sscanf(args, "%u,%lu,%u,%u,%u", &ch, &hz, &gc, &oc, &bw) != 5) {
-                reply_error("usage: AT+MESHCHAN=<chan>,<freq_hz>,<global_class>,<s1g_class>,<bw_mhz>");
-            } else {
-                c.chan = (uint16_t)ch; c.freq_hz = (uint32_t)hz;
-                c.global_op_class = (uint8_t)gc; c.op_class = (uint8_t)oc;
-                c.bw_mhz = (uint8_t)bw;
-                esp_err_t e = warthog_cfg_set_mesh_chan(&c);
-                if (e == ESP_OK) {
-                    cdc_write("+MESHCHAN: stored; applied on next boot, and discarded "
-                              "if the regulatory table rejects it\r\n");
-                    reply_ok();
-                } else {
-                    reply_error("rejected: freq must be 750-950 MHz, bw 1|2|4|8, "
-                                "chan/classes non-zero");
-                }
-            }
-        }
+        cmd_meshchan_set(args);
     } else if (strcasecmp(verb, "MESHCHAN") == 0 && terminator == '?') {
-        extern int g_warthog_chan_pin_status;
-        struct warthog_mesh_chan c;
-        char line[224];
-        if (warthog_cfg_get_mesh_chan(&c)) {
-            snprintf(line, sizeof(line),
-                     "+MESHCHAN: stored chan=%u freq=%lu gclass=%u sclass=%u bw=%u | "
-                     "applied=%s (set_channel_list=%d)\r\n",
-                     (unsigned)c.chan, (unsigned long)c.freq_hz,
-                     (unsigned)c.global_op_class, (unsigned)c.op_class, (unsigned)c.bw_mhz,
-                     g_warthog_chan_pin_status == 0 ? "yes" : "NO",
-                     g_warthog_chan_pin_status);
-        } else {
-            snprintf(line, sizeof(line),
-                     "+MESHCHAN: build-time pin | applied=%s (set_channel_list=%d)\r\n",
-                     g_warthog_chan_pin_status == 0 ? "yes" : "NO",
-                     g_warthog_chan_pin_status);
-        }
-        cdc_write(line);
-        reply_ok();
+        cmd_meshchan_query();
     } else if (strcasecmp(verb, "MESHFWD") == 0 && terminator == '=') {
         unsigned long v = strtoul(args, NULL, 10);
         if (v > 1) { /* before the cast: 257 would store 1 past the batman refusal */

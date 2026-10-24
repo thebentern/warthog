@@ -1,8 +1,8 @@
 name: release
 
 # Trigger: tag pushes matching v*.*.* (with optional -rcN / -alpha / -beta suffix
-# for pre-releases). Annotated tags carry their message into the release notes;
-# lightweight tags use the auto-generated commit log.
+# for pre-releases). The release body is the annotated tag's message (notes.md),
+# then GitHub's generated notes; a lightweight tag gets the generated notes only.
 on:
   push:
     tags:
@@ -16,14 +16,14 @@ env:
 
 jobs:
   build:
-    name: build ${{ matrix.region }}
+    name: build ${{ matrix.variant }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # Region builds plus the 802.11s mesh images. Each entry is the suffix
-        # of a pio env (warthog-<suffix>) and of the release asset name.
-        region: [us, au, mesh-smoke, mesh-sae-meshvif, mesh-sae-swccmp-meshvif]
+        # The station image and the 802.11s mesh images, all region-agnostic (AT+REGION).
+        # Each entry is the suffix of a pio env (warthog-<suffix>) and of the release asset name.
+        variant: [station, mesh-smoke, mesh-sae-meshvif, mesh-sae-swccmp-meshvif]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,20 +51,20 @@ jobs:
           restore-keys: |
             pio-${{ runner.os }}-${{ env.PIO_VERSION }}-
 
-      - name: Build warthog-${{ matrix.region }}
+      - name: Build warthog-${{ matrix.variant }}
         env:
           # Bakes the tag into the firmware so AT+VERSION? reports e.g. "v0.1.0".
           WARTHOG_VERSION: ${{ github.ref_name }}
-        run: pio run -e warthog-${{ matrix.region }}
+        run: pio run -e warthog-${{ matrix.variant }}
 
-      - name: Bundle region artifacts
+      - name: Bundle variant artifacts
         run: |
           set -euo pipefail
           mkdir -p dist
           TAG="${GITHUB_REF_NAME}"
-          REGION="${{ matrix.region }}"
-          BUILD=".pio/build/warthog-${REGION}"
-          STEM="warthog-${TAG}-${REGION}"
+          VARIANT="${{ matrix.variant }}"
+          BUILD=".pio/build/warthog-${VARIANT}"
+          STEM="warthog-${TAG}-${VARIANT}"
           cp "$BUILD/firmware.bin"         "dist/${STEM}.bin"
           cp "$BUILD/firmware.factory.bin" "dist/${STEM}.factory.bin"
           cp "$BUILD/firmware.elf"         "dist/${STEM}.elf"
@@ -73,10 +73,24 @@ jobs:
           ( cd dist && sha256sum ${STEM}* > "${STEM}.SHA256SUMS" )
           ls -la dist/
 
-      - name: Upload region bundle
+      # One regnvs image per country the station build offers (CONFIG_WARTHOG_HW_REGIONS), for the
+      # web flasher and flash.sh --region; each is checked to hold exactly warthog/region=<CC>.
+      - name: Region NVS images
+        if: matrix.variant == 'station'
+        run: |
+          set -euo pipefail
+          # Its own venv: the generator's click must not move PlatformIO's.
+          python -m venv "$RUNNER_TEMP/nvsgen"
+          "$RUNNER_TEMP/nvsgen/bin/pip" install "esp-idf-nvs-partition-gen==0.3.0"
+          TAG="${GITHUB_REF_NAME}"
+          PYTHON="$RUNNER_TEMP/nvsgen/bin/python" scripts/region-images.sh "$TAG" dist
+          ( cd dist && sha256sum warthog-${TAG}-region-*.bin > "warthog-${TAG}-region.SHA256SUMS" )
+          ls -la dist/
+
+      - name: Upload variant bundle
         uses: actions/upload-artifact@v4
         with:
-          name: warthog-${{ matrix.region }}
+          name: warthog-${{ matrix.variant }}
           path: dist/
           retention-days: 3
           if-no-files-found: error
@@ -91,7 +105,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download all region bundles
+      # checkout leaves a tag event's ref lightweight; fetch the tag object to read its message.
+      - name: Release notes from the tag message
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" = tag ]; then
+            git tag -l --format='%(contents:subject)%0a%0a%(contents:body)' "${GITHUB_REF_NAME}" > notes.md
+          else
+            : > notes.md
+          fi
+          cat notes.md
+
+      - name: Download all variant bundles
         uses: actions/download-artifact@v4
         with:
           path: dist
@@ -119,6 +145,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body_path: notes.md
           prerelease: ${{ steps.prerel.outputs.prerelease == 'true' }}
           generate_release_notes: true
           fail_on_unmatched_files: true

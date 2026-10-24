@@ -47,6 +47,9 @@ struct mmhalow_scan_args
  */
 esp_err_t mmhalow_init(const wifi_init_config_t *config);
 
+/* The channel list mmhalow_init hands to mmwlan_set_channel_list; static storage, set before init. */
+void mmhalow_use_channel_list(const struct mmwlan_s1g_channel_list *list);
+
 /**
  * Shut down the WLAN interface
  */

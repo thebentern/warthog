@@ -100,9 +100,10 @@ AT+MPMPEERS?
 
 `estab=1` with a non-zero `plid` is a complete handshake with the Pi.
 
-That is the whole warthog side. Channel, bandwidth and mesh ID default to S1G
-ch 42, 2 MHz, mesh ID `halowmesh`, and are settable at runtime with
-`AT+MESHCHAN=` / `AT+MESHID=`.
+That is the whole warthog side. Channel, bandwidth and mesh ID default to the
+region's mesh channel (US: S1G ch 42, 2 MHz) and mesh ID `halowmesh`, and are
+settable at runtime with `AT+REGION=` (set it to the node's `radio1.country`),
+`AT+MESHCHAN=` and `AT+MESHID=`.
 
 Measured against OpenMANET 1.8.0 (`r28739-d9340319c6`, OpenWrt 24.10) on a Pi 4 with a Morse
 MM6108, those defaults matched that peer. Channel 42 and country US are

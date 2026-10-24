@@ -160,6 +160,21 @@ overflow, so after a run read `AT+ASSERT?` `reset=` and `AT+COREDUMP?` too.
   shared PHY to USB-OTG. If you are watching the JTAG port you will see boot and
   then silence — that is normal. `scripts/watch.sh` follows the handoff.
 
+## Console works, HaLow is silent
+
+```
+AT+REGION?
++REGION: running=none next_boot=none stored=invalid('u$')
++REGION: allowed=AU,JP,KR,NZ,US default=US
++REGION: radio held: the stored region is not a valid code; AT+REGION=<AU|JP|KR|NZ|US> then AT+RESET
+```
+
+`radio held:` means the HaLow chip is kept in reset: the stored region is not a
+valid code, or is not offered by this image. USB, the AP and the console run.
+Store an offered country with `AT+REGION=<CC>`, then `AT+RESET`. With mesh on,
+`radio held: mesh is on and the region has no default mesh channel` needs
+`AT+MESHCHAN=` set to a row of the region's table, or `AT+MESHEN=0`.
+
 ## The link is up but nothing routes
 
 Check DNS first. If `ping 8.8.8.8` works and `curl example.com` hangs, the
@@ -511,7 +526,7 @@ in `AT+SWCCMP?`.
 | Reading | Meaning |
 |---|---|
 | `delivered` flat in `AT+DATASTAT?` while traffic runs | Real. It counts every data frame handed to the network stack, on every delivery path; flat means none is. |
-| `rx_data=0` in `AT+DATASTAT?` | Expected on the region builds, which lack `WARTHOG_MESH_RX_TAP`. On `warthog-mesh-smoke` and the `warthog-mesh-sae*` builds it counts every data frame the chip hands up and climbs with traffic. |
+| `rx_data=0` in `AT+DATASTAT?` | Expected on `warthog-station`, which lacks `WARTHOG_MESH_RX_TAP`. On `warthog-mesh-smoke` and the `warthog-mesh-sae*` builds it counts every data frame the chip hands up and climbs with traffic. |
 | `parse_fail` climbing on `AT+HWMPSTAT?` | Real. Investigate with `AT+HWMPDUMP?`. |
 
 ## Build fails right after adding a source file
@@ -523,5 +538,5 @@ If `pio run -t clean` then fails with `No module named 'esptool'`, the clean
 removed `tool-esptoolpy`:
 
 ```bash
-pio pkg install -e warthog-us
+pio pkg install -e warthog-station
 ```

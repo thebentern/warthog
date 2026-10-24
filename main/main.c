@@ -53,10 +53,11 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    ESP_LOGI(TAG, "Warthog %s booting (region=%s, country=%s)", WARTHOG_VERSION,
-             WARTHOG_REGION_NAME, WARTHOG_COUNTRY_CODE);
-
     ESP_ERROR_CHECK(warthog_cfg_init());
+    struct warthog_rg_stored rg;
+    warthog_cfg_get_region(&rg);
+    ESP_LOGI(TAG, "Warthog %s booting (stored region %s)", WARTHOG_VERSION,
+             rg.state == WARTHOG_RG_VALID ? rg.cc : rg.state == WARTHOG_RG_INVALID ? "invalid" : "none");
     ESP_ERROR_CHECK(warthog_led_start());
     if (safe) {
         /* Crash boots in a row: USB and AT come up, the HaLow chip held in reset (AT+ASSERT?). */
@@ -99,7 +100,7 @@ void app_main(void)
 
     /* Bridge mode replaces NAT and the multicast repeater with one L2 segment.
      * Batman mode refuses bridge at the setter; this only guards a stale NVS pair. */
-    if (!safe && warthog_cfg_get_mesh_bridge() && !warthog_bat_port_running()) {
+    if (warthog_halow_radio_up() && warthog_cfg_get_mesh_bridge() && !warthog_bat_port_running()) {
         uint8_t mesh_mac[6] = { 0 };
         mmwlan_get_mac_addr(mesh_mac);
         esp_err_t be = warthog_mesh_bridge_start(mmhalow_get_netif(), mesh_mac);

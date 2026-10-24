@@ -14,8 +14,8 @@ CAP=$(mktemp -d)
 cd "$ROOT"
 
 echo "== build =="
-{ echo '$ pio run -e warthog-us'
-  pio run -e warthog-us 2>&1 | grep -E "^(RAM|Flash|Building|Linking|Successfully created|=+ \[SUCCESS\])" | head -8
+{ echo '$ pio run -e warthog-station'
+  pio run -e warthog-station 2>&1 | grep -E "^(RAM|Flash|Building|Linking|Successfully created|=+ \[SUCCESS\])" | head -8
 } > "$CAP/build.txt"
 
 echo "== AT console =="
@@ -50,7 +50,7 @@ IFACE=$(for i in $(ifconfig -l | tr ' ' '\n' | grep -E '^en[0-9]+'); do
   echo '$ ping -c 4 192.168.4.1'; ping -c 4 -t 3 192.168.4.1
 } > "$CAP/host.txt" 2>&1
 
-python3 scripts/make_terminal_svg.py "$CAP/build.txt" docs/img/usb-build.svg   "Building — pio run -e warthog-us"
+python3 scripts/make_terminal_svg.py "$CAP/build.txt" docs/img/usb-build.svg   "Building — pio run -e warthog-station"
 python3 scripts/make_terminal_svg.py "$CAP/at.txt"    docs/img/usb-console.svg "warthog — AT console over USB"
 python3 scripts/make_terminal_svg.py "$CAP/host.txt"  docs/img/usb-host.svg    "macOS — USB Ethernet via CDC-NCM"
 # OpenMANET captures need the Pi (PI_SSH="ssh root@<pi>") and a mesh build on

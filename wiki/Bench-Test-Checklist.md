@@ -5,7 +5,7 @@ Bring-up flow for a fresh board. Each step has a clear pass signal — stop and 
 ## 1. Build + flash
 
 ```bash
-pio run -e warthog-us -t upload    # hold BOOT, tap RESET, release BOOT first
+pio run -e warthog-station -t upload    # hold BOOT, tap RESET, release BOOT first
 ```
 
 ## 2. USB-Serial-JTAG boot logs (~1 s window before USB-OTG takes over)
@@ -48,9 +48,10 @@ In a serial terminal on `/dev/cu.usbmodemXXXX`:
 AT
 AT+STATUS?
 AT+VERSION?
+AT+REGION?
 ```
 
-✅ Expected: each replies `OK`. `STATUS?` shows real IPs for USB + AP, zeros for HaLow if no AP is associated.
+✅ Expected: each replies `OK`. `STATUS?` shows real IPs for USB + AP, zeros for HaLow if no AP is associated. `REGION?` shows `running=<bench country>` and no `radio held:` line; set it with `AT+REGION=<CC>` and `AT+RESET`.
 
 ## 7. HaLow STA (requires upstream HaLow AP)
 

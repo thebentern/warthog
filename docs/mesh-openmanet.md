@@ -39,24 +39,19 @@ This env starts in it:
 pio run -e warthog-mesh-smoke
 ```
 
-That env pins the radio to a single S1G channel and sets the mesh identity, so
-every node agrees without any runtime configuration. The values that must match
-across the whole mesh are compile-time defaults in `platformio.ini`;
-`AT+MESHID=` and `AT+MESHCHAN=` override the first five at runtime (stored;
-applied on the next boot):
+That env sets the mesh identity, and with mesh on every image pins the radio to
+one S1G channel, the region's default (US: ch42, 923.0 MHz, 2 MHz, global class
+69; `AT+REGION` picks the region). `AT+MESHID=` and `AT+MESHCHAN=` override them
+at runtime (stored; applied on the next boot):
 
-| Flag | Default | Must match peers |
+| Setting | Default | Must match peers |
 |---|---|---|
 | `WARTHOG_MESH_ID` | `halowmesh` | yes |
-| `WARTHOG_PIN_S1G_CHAN` | `42` | yes |
-| `WARTHOG_PIN_S1G_FREQ_HZ` | `923000000` | yes |
-| `WARTHOG_PIN_S1G_BW_MHZ` | `2` | yes |
-| `WARTHOG_PIN_S1G_GLOBAL_OP_CLASS` | `69` | yes |
+| channel, frequency, bandwidth, classes (`AT+MESHCHAN=`) | the region's default row | yes |
 | `WARTHOG_MESH_BEACON_TU` | `1000` | no |
 
-S1G channel 42 at 2 MHz is what Warthog pins by default. Verify your peer's
-actual channel (`morse_cli -i wlh0 channel`) and match it; do not assume.
-Change any of the first five and you must change them on every node, Warthog and
+Verify your peer's actual channel (`morse_cli -i wlh0 channel`) and match it; do
+not assume. Change the mesh ID or the channel and you must change them on every node, Warthog and
 Linux alike — a mismatch produces a silent non-event, not an error. The
 OpenMANET mesh wizard defaults to mesh ID `openmanet` and passphrase
 `changeme123`; set `AT+MESHID=` (and `AT+MESHPASS=` on the SAE build) to what

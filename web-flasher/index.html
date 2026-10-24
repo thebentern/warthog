@@ -71,6 +71,11 @@
       <input type="file" id="localBin" accept=".bin" style="font-size:13px">
     </div>
     <p class="hint">Load a <code>.factory.bin</code> you built yourself — <code>.pio/build/warthog-&lt;env&gt;/firmware.factory.bin</code>. Written to <code>0x0</code>, same as a release asset.</p>
+    <div id="regionPreBox" hidden>
+      <label for="regionPre">Regulatory region</label>
+      <select id="regionPre"></select>
+      <p class="hint" id="regionPreHint">Written to the board's region partition (<code>0x420000</code>) with the firmware. <b>Flash</b> otherwise keeps the stored region; <b>Erase &amp; flash</b> wipes it, so it needs a country. A board with none set runs as US.</p>
+    </div>
   </div>
 
   <div class="card">
@@ -94,7 +99,7 @@
     </div>
     <div class="prog"><div id="bar"></div></div>
     <pre id="log"></pre>
-    <p class="dim" style="font-size:13px;margin:10px 0 0">Tap <kbd>RESET</kbd> when it finishes. <b>Erase &amp; flash</b> also wipes stored settings (HaLow and AP credentials, DNS, mesh security).</p>
+    <p class="dim" style="font-size:13px;margin:10px 0 0">Tap <kbd>RESET</kbd> when it finishes. Both buttons write the factory image, which wipes stored settings (HaLow and AP credentials, DNS, mesh) but not the region; <b>Erase &amp; flash</b> also wipes the region and writes the one chosen above.</p>
   </div>
 
   </section>
@@ -109,6 +114,14 @@
         <span id="cfgPort" class="dim"></span>
       </div>
       <div class="kv" id="status">Not connected.</div>
+    </div>
+
+    <div class="card">
+      <h2>Regulatory region</h2>
+      <label for="region">Country</label>
+      <select id="region"></select>
+      <p class="hint" id="regionHint">Read from <code>AT+REGION?</code> once connected.</p>
+      <div class="row"><button id="regionSave" class="secondary" disabled>Save region</button></div>
     </div>
 
     <div class="card">
@@ -163,14 +176,14 @@
         <button id="reboot" disabled>Apply &amp; reboot</button>
         <button id="eraseNvs" class="secondary" disabled>Erase all settings</button>
       </div>
-      <p class="hint">Reboot applies stored HaLow, AP and DNS changes. <b>Erase all settings</b> wipes every field above back to the build defaults.</p>
+      <p class="hint">Reboot applies stored region, HaLow, AP and DNS changes. <b>Erase all settings</b> wipes every setting above except the region.</p>
       <pre id="cfgLog"></pre>
     </div>
   </section>
 
   <p class="foot">
-    Same bytes as <code>scripts/flash.sh</code>: the <code>.factory.bin</code> for your region written to <code>0x0</code>.
-    Pick the region you are operating in — the channel list is baked into the image and it is on you to be legal.
+    Same bytes as <code>scripts/flash.sh</code>: the <code>.factory.bin</code> written to <code>0x0</code>, plus the region image at <code>0x420000</code> when you choose one.
+    One image serves every region this module offers (AU, JP, KR, NZ, US); it is on you to be legal.
     <a href="https://github.com/thebentern/warthog">Source</a> · <a href="https://github.com/thebentern/warthog/wiki/Flashing">Flashing guide</a>
   </p>
 </main>
@@ -184,12 +197,22 @@ const log = $("log");
 const say = (msg, cls = "") => { const l = document.createElement("div"); if (cls) l.className = cls; l.textContent = msg; log.appendChild(l); log.scrollTop = log.scrollHeight; };
 const bar = (pct) => { $("bar").style.width = `${Math.max(0, Math.min(100, pct))}%`; };
 
+// regnvs in partitions.csv: AT+REGION's partition, which a release's warthog-<tag>-region-<CC>.bin fills.
+const REGNVS_OFFSET = 0x420000;
+const REGNVS_SIZE = 0x3000;
+const REGION_LABELS = {
+  AU: "AU — Australia, 915.5–927.5 MHz", JP: "JP — Japan, 920.5–927.5 MHz", KR: "KR — South Korea, 917.5–928 MHz",
+  NZ: "NZ — New Zealand, 915–928 MHz", US: "US — United States, 902–928 MHz",
+};
+// Asset keys, warthog-<tag>-<key>.factory.bin. usBand: before the station image, a mesh image was US-only.
 const VARIANTS = [
-  { key: "us",         label: "US — 902–928 MHz (station uplink)" },
-  { key: "au",         label: "AU (station uplink)" },
-  { key: "mesh-sae-meshvif",        label: "Mesh, encrypted — 802.11s + SAE/AMPE, keys in the chip (US band)" },
-  { key: "mesh-sae-swccmp-meshvif", label: "Mesh, encrypted, batman-capable — host CCMP; send AT+SWCCMP=1 after each boot (US band)" },
-  { key: "mesh-smoke", label: "Mesh, no SAE — 802.11s; data plane keyed with a built-in constant until set to Open (US band)" },
+  { key: "station", label: "Station uplink — set the region below" },
+  { key: "mesh-sae-meshvif",        label: "Mesh, encrypted — 802.11s + SAE/AMPE, keys in the chip", usBand: true },
+  { key: "mesh-sae-swccmp-meshvif", label: "Mesh, encrypted, batman-capable — host CCMP; send AT+SWCCMP=1 after each boot", usBand: true },
+  { key: "mesh-smoke", label: "Mesh, no SAE — 802.11s; data plane keyed with a built-in constant until set to Open", usBand: true },
+  // v0.1.0's per-region station images.
+  { key: "us", label: "US station uplink — 902–928 MHz (v0.1.0 per-region image)" },
+  { key: "au", label: "AU station uplink (v0.1.0 per-region image)" },
 ];
 
 if (!("serial" in navigator)) {
@@ -231,16 +254,42 @@ function currentRelease() { return releases.find((r) => r.tag_name === $("releas
 function assetFor(rel, key) {
   return rel?.assets?.find((a) => a.name === `warthog-${rel.tag_name}-${key}.factory.bin`);
 }
+const agnostic = (rel) => !!assetFor(rel, "station");
+// The release's region images by country code.
+function regionAssets(rel) {
+  const out = new Map(), pre = `warthog-${rel?.tag_name}-region-`;
+  for (const a of rel?.assets ?? []) {
+    const cc = a.name.startsWith(pre) && a.name.endsWith(".bin") ? a.name.slice(pre.length, -4) : "";
+    if (/^[A-Z]{2}$/.test(cc)) out.set(cc, a);
+  }
+  return out;
+}
+// Where region images come from: the selected release, or for a local .bin the newest release that has them.
+function regionSource() {
+  if ($("localBin")?.files?.[0]) return releases.find((r) => regionAssets(r).size) || null;
+  const rel = currentRelease();
+  return rel && regionAssets(rel).size ? rel : null;
+}
+const option = (value, text) => { const o = document.createElement("option"); o.value = value; o.textContent = text; return o; };
+function populateRegions() {
+  const src = regionSource(), sel = $("regionPre"), prev = sel.value;
+  sel.innerHTML = "";
+  $("regionPreBox").hidden = !src;
+  if (!src) return;
+  sel.appendChild(option("", "Keep the board's stored region"));
+  for (const cc of [...regionAssets(src).keys()].sort()) sel.appendChild(option(cc, REGION_LABELS[cc] || cc));
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
 function populateVariants() {
   const rel = currentRelease();
   const sel = $("variant"); sel.innerHTML = "";
   for (const v of VARIANTS) {
     const a = assetFor(rel, v.key);
     if (!a) continue;              // only offer what the release actually shipped
-    const o = document.createElement("option");
-    o.value = v.key; o.textContent = v.label; sel.appendChild(o);
+    sel.appendChild(option(v.key, v.usBand && !agnostic(rel) ? `${v.label} (US band)` : v.label));
   }
   describeAsset();
+  populateRegions();
 }
 function describeAsset() {
   const local = $("localBin")?.files?.[0];
@@ -250,7 +299,7 @@ function describeAsset() {
 }
 $("release").addEventListener("change", populateVariants);
 $("variant").addEventListener("change", describeAsset);
-$("localBin").addEventListener("change", describeAsset);
+$("localBin").addEventListener("change", () => { describeAsset(); populateRegions(); });
 loadReleases();
 
 // ---- serial + esptool -----------------------------------------------------
@@ -277,41 +326,64 @@ $("connect").addEventListener("click", async () => {
   }
 });
 
-async function fetchAsset() {
-  const local = $("localBin").files?.[0];
-  if (local) {
-    say(`Using local file ${local.name} (${(local.size / 1024).toFixed(0)} KB)`);
-    const buf = new Uint8Array(await local.arrayBuffer());
-    let s = ""; for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-    return s;
-  }
-  const rel = currentRelease(); const a = assetFor(rel, $("variant").value);
-  if (!a) throw new Error("no firmware selected — pick a release build or load a .bin file");
+// esptool-js wants a binary string.
+function binStr(buf) {
+  let s = ""; for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+  return s;
+}
+async function download(a) {
   say(`Downloading ${a.name}…`);
   // browser_download_url redirects to a CORS-enabled objects host, so a plain fetch works.
   const r = await fetch(a.browser_download_url);
   if (!r.ok) throw new Error(`download failed: ${r.status}`);
   const buf = new Uint8Array(await r.arrayBuffer());
   say(`Downloaded ${(buf.length / 1024).toFixed(0)} KB`, "ok");
-  // esptool-js wants a binary string
-  let s = ""; for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-  return s;
+  return binStr(buf);
+}
+async function fetchAsset() {
+  const local = $("localBin").files?.[0];
+  if (local) {
+    say(`Using local file ${local.name} (${(local.size / 1024).toFixed(0)} KB)`);
+    return binStr(new Uint8Array(await local.arrayBuffer()));
+  }
+  const rel = currentRelease(); const a = assetFor(rel, $("variant").value);
+  if (!a) throw new Error("no firmware selected — pick a release build or load a .bin file");
+  return download(a);
+}
+async function fetchRegion(src, cc) {
+  const a = regionAssets(src).get(cc);
+  if (!a) throw new Error(`${src.tag_name} has no ${cc} region image`);
+  const data = await download(a);
+  if (data.length !== REGNVS_SIZE) throw new Error(`${a.name} is ${data.length} bytes, not ${REGNVS_SIZE}`);
+  return data;
 }
 
 async function doFlash(erase) {
+  const src = regionSource(), cc = src ? $("regionPre").value : "";
+  if (erase && src && !cc) { say("Erase & flash wipes the region: choose a country first.", "err"); return; }
   $("flash").disabled = true; $("erase").disabled = true; bar(0);
   try {
     const data = await fetchAsset();
+    const fileArray = [{ data, address: 0x0 }];
+    if (cc) {
+      if (data.length > REGNVS_OFFSET) throw new Error("the firmware image reaches the region partition at 0x420000");
+      fileArray.push({ data: await fetchRegion(src, cc), address: REGNVS_OFFSET });
+    }
     if (erase) { say("Erasing flash… (takes a while)", "warn"); await loader.eraseFlash(); say("Erased", "ok"); }
-    say("Writing at 0x0…");
+    say(cc ? `Writing at 0x0, and the ${cc} region at 0x420000…` : "Writing at 0x0…");
     await loader.writeFlash({
-      fileArray: [{ data, address: 0x0 }],
+      fileArray,
       flashSize: "keep", flashMode: "keep", flashFreq: "keep",
       eraseAll: false, compress: true,
-      reportProgress: (i, written, total) => bar((written / total) * 100),
+      reportProgress: (i, written, total) => bar(((i + written / total) / fileArray.length) * 100),
     });
     bar(100);
     say("Done. Tap RESET on the board.", "ok");
+    if (cc) say(`Region ${cc} written.`, "ok");
+    else if ($("localBin").files?.[0] || agnostic(currentRelease())) {
+      say(erase ? "Erase wiped the region and none was written: the board runs as US until you set one on the Configure tab."
+                : "No region written: the board keeps its stored region; one that never had one runs as US until set on the Configure tab.", "warn");
+    }
     say("The console reappears as /dev/cu.usbmodem* (macOS) or /dev/ttyACM* (Linux) once it boots.", "dim");
     try { await transport.disconnect(); } catch {}
     $("connect").disabled = false;
@@ -374,7 +446,7 @@ async function at(cmd, timeoutMs = 4000) {
   }
 }
 function setCfgEnabled(on) {
-  for (const id of ["cfgRefresh", "halowSave", "apSave", "dnsSave", "meshsecSave", "reboot", "eraseNvs"]) $(id).disabled = !on;
+  for (const id of ["cfgRefresh", "regionSave", "halowSave", "apSave", "dnsSave", "meshsecSave", "reboot", "eraseNvs"]) $(id).disabled = !on;
   $("cfgConnect").disabled = on;
 }
 // AT+ERR lines are the useful part of a failure; surface them verbatim.
@@ -386,10 +458,37 @@ function report(label, r) {
 }
 const q = (s) => s.replace(/,/g, "");   // commas are the argument separator; strip rather than mangle silently
 
+// AT+REGION?: running=, next_boot=, stored=; allowed=, default=; "radio held: <why>;" while held.
+function fillRegion(r) {
+  const sel = $("region"); sel.innerHTML = ""; $("regionSave").disabled = true;
+  const t = r.lines.join("\n");
+  const m = t.match(/\+REGION:\s*running=(\S+)\s+next_boot=(\S+)\s+stored=(\S+)/);
+  const a = t.match(/allowed=([A-Z,]*)\s+default=([A-Z]{2})/);
+  if (!r.ok || !m || !a) {
+    const why = r.lines.some((l) => l.includes("unknown command"))
+      ? "(region is fixed in this image: v0.1.0 per-region build)" : "(could not read AT+REGION?)";
+    $("regionHint").textContent = why;
+    return why;
+  }
+  const [, running, next, stored] = m, allowed = a[1].split(",").filter(Boolean), def = a[2];
+  const pick = allowed.includes(stored) ? stored : allowed.includes(running) ? running : "";
+  if (!pick) { const o = option("", "— choose —"); o.disabled = true; sel.appendChild(o); }
+  for (const cc of allowed) sel.appendChild(option(cc, REGION_LABELS[cc] || cc));
+  sel.value = pick;
+  $("regionSave").disabled = !pick;
+  const hint = [`Stored in its own partition; reflashing keeps it. A board with none set runs as ${def}.`];
+  if (running !== next) hint.push(`Running ${running}; ${next} after reboot.`);
+  const held = t.match(/radio held: ([^;\n]*)/);
+  if (held) hint.push(`Radio held: ${held[1]}.`);
+  $("regionHint").textContent = hint.join(" ");
+  return null;
+}
+
 async function readStatus() {
   const out = [];
   const st = await at("AT+STATUS?"); out.push(...st.lines);
   const ver = await at("AT+VERSION?"); out.push(...ver.lines);
+  const rgWhy = fillRegion(await at("AT+REGION?")); if (rgWhy) out.push(rgWhy);
   const h = await at("AT+HALOW?");   const hm = h.lines.join(" ").match(/ssid="([^"]*)"/);   if (hm) $("halowSsid").value = hm[1];
   const a = await at("AT+WIFIAP?");  const am = a.lines.join(" ").match(/ssid="([^"]*)" chan=(\d+)/); if (am) { $("apSsid").value = am[1]; $("apChan").value = am[2]; }
   const d = await at("AT+DNS?");     const dm = d.lines.join(" ").match(/\+DNS:\s*(\S+)/);        if (dm) $("dns").value = dm[1];
@@ -414,6 +513,12 @@ $("cfgConnect").addEventListener("click", async () => {
 });
 $("cfgRefresh").addEventListener("click", readStatus);
 
+$("region").addEventListener("change", () => { $("regionSave").disabled = !$("region").value; });
+$("regionSave").addEventListener("click", async () => {
+  const cc = $("region").value;
+  if (!/^[A-Z]{2}$/.test(cc)) return csay("Region: choose a country", "err");
+  if (report("Region", await at(`AT+REGION=${cc}`))) fillRegion(await at("AT+REGION?"));
+});
 $("halowSave").addEventListener("click", async () => {
   const ssid = q($("halowSsid").value.trim()), psk = $("halowPsk").value;
   if (!ssid) return csay("HaLow: SSID required", "err");
@@ -439,7 +544,7 @@ $("reboot").addEventListener("click", async () => {
   setCfgEnabled(false);
 });
 $("eraseNvs").addEventListener("click", async () => {
-  if (!confirm("Erase ALL stored settings (HaLow, AP, DNS, mesh)? The board reverts to build defaults.")) return;
+  if (!confirm("Erase all stored settings (HaLow, AP, DNS, mesh)? The board reverts to build defaults; the regulatory region is kept.")) return;
   if (report("Erase", await at("AT+ERASE"))) csay("Reboot to apply the defaults.", "warn");
 });
 </script>

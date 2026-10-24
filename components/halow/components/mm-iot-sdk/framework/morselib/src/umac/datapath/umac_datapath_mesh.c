@@ -3048,7 +3048,7 @@ static void mesh_queue_one_(struct umac_data *umacd, struct umac_sta_data *stad,
  * in scope). It is not a reason to change this path yet, for two reasons that
  * have to be cleared in order:
  *
- *   1. It compiles only in warthog-mesh-sae-swccmp{,-on}. The region images
+ *   1. It compiles only in warthog-mesh-sae-swccmp{,-on}. The station image
  *      and warthog-mesh-sae do not have it.
  *   2. `swccmp ok` has never been observed above zero on air, for unicast or
  *      group. Until it has, host CCMP is a compiled hypothesis.

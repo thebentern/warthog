@@ -341,9 +341,31 @@ static struct morse_cmd_req_hw_scan *hw_scan_construct_base_request(
     return hw_scan_req;
 }
 
+/* warthog: duty cycle and MPSW are otherwise programmed only by a channel set, which a station's or
+ * a mesh probe's first scan precedes: program the list's strictest first, or do not scan. */
+static enum mmwlan_status hw_scan_program_restriction(struct umac_data *umacd)
+{
+    struct mmwlan_s1g_channel r;
+    if (!umac_regdb_strictest(umac_config_get_channel_list(umacd), &r))
+    {
+        return MMWLAN_SUCCESS;
+    }
+    if (mmdrv_set_duty_cycle(r.duty_cycle_sta, r.duty_cycle_omit_ctrl_resp, umac_config_get_duty_cycle_mode(umacd)) != 0 ||
+        mmdrv_cfg_mpsw(r.airtime_min_us, r.airtime_max_us, r.pkt_spacing_us) != 0)
+    {
+        MMLOG_ERR("scan: the channel list's duty cycle / MPSW not programmed: not scanning\n");
+        return MMWLAN_ERROR;
+    }
+    return MMWLAN_SUCCESS;
+}
+
 static enum mmwlan_status hw_scan_start(struct umac_data *umacd)
 {
-    enum mmwlan_status status = MMWLAN_SUCCESS;
+    enum mmwlan_status status = hw_scan_program_restriction(umacd);
+    if (status != MMWLAN_SUCCESS)
+    {
+        return status;
+    }
     struct umac_scan_data *data = umac_data_get_scan(umacd);
     struct consbuf cbuf = CONSBUF_INIT_WITHOUT_BUF;
 

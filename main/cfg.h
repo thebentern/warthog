@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include "esp_err.h"
 
+/* Defined in region.h, which also declares their getters. */
+struct warthog_mesh_chan;
+struct warthog_rg_stored;
+
 /*
  * NVS-backed config store. All getters fall back to the compile-time -D
  * defaults when the NVS entry is missing, so a freshly-flashed board with no
@@ -14,6 +18,7 @@
  * success it's updated to the byte length (excluding the null).
  */
 
+/* Opens the regnvs partition; never fails the boot. */
 esp_err_t warthog_cfg_init(void);
 
 /* Maximum stored lengths, excluding the terminator. These are what the boot
@@ -153,28 +158,14 @@ esp_err_t warthog_cfg_set_mesh_battp(uint32_t units);
 int16_t   warthog_cfg_get_mesh_rssi(void);
 esp_err_t warthog_cfg_set_mesh_rssi(int16_t dbm);
 
-/* S1G channel pin, stored and returned as a set.
- *
- * Channel, frequency, operating class and bandwidth are not independent --
- * class and bandwidth belong to the channel, and a mismatched set peers with
- * nothing while looking like a radio fault. They are written atomically and
- * only ever read together, so a half-applied change cannot exist.
- *
- * Returns false when nothing is stored, in which case the build-time pin is
- * used. Values are sanity-checked on the way in, but the chip's regulatory
- * database is the final arbiter: a set it rejects at boot is discarded and the
- * build-time pin used instead, rather than transmitting something unvetted. */
-struct warthog_mesh_chan {
-    uint32_t freq_hz;
-    uint16_t chan;
-    uint8_t  global_op_class;
-    uint8_t  op_class;
-    uint8_t  bw_mhz;
-};
-
-bool      warthog_cfg_get_mesh_chan(struct warthog_mesh_chan *out);
+/* AT+MESHCHAN set, stored as one blob; boot uses it when freq, chan and bw match a row of the
+ * region's table (region.c). The getter is in region.h. */
 esp_err_t warthog_cfg_set_mesh_chan(const struct warthog_mesh_chan *in);
 esp_err_t warthog_cfg_clear_mesh_chan(void);
 
-/* Wipe the entire "warthog" NVS namespace. */
+/* AT+REGION in the regnvs partition: exactly [A-Z]{2}; INVALID_ARG otherwise, NOT_SUPPORTED with no
+ * partition. The only thing that reformats a regnvs NVS refused at boot. */
+esp_err_t warthog_cfg_set_region(const char *cc);
+
+/* Wipe the "warthog" namespace of the default NVS partition; the region (regnvs) is not in it. */
 esp_err_t warthog_cfg_erase(void);

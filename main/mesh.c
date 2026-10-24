@@ -9,6 +9,7 @@
 #include "mmwlan.h"
 #include "mmwlan_mesh.h"
 #include "region.h"
+#include "halow.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
 #include "esp_timer.h"
@@ -128,15 +129,24 @@ static void mesh_report_unpeered(unsigned int peers)
     warthog_mesh_diag_windowed(&in);
     enum warthog_mesh_diag d = warthog_mesh_diagnose(&in);
 
+    const struct warthog_region_plan *rp = warthog_region_running();
+    const char *cc = (rp != NULL && rp->hold == WARTHOG_HOLD_NONE) ? rp->cc : "none";
+    char rg[48], rf[112];
+    warthog_region_report_text(rp, rg, sizeof(rg), rf, sizeof(rf));
+
     ESP_LOGE(TAG, "NOT PEERED. Every value below must match the rest of the mesh:");
     ESP_LOGE(TAG, "  mesh id   '%s'", s_mesh_id_active);
+    ESP_LOGE(TAG, "  region    %s", rg);
     if (g_warthog_applied_chan == 0) {
-        ESP_LOGE(TAG, "  channel   NOT PINNED (country %s)", WARTHOG_COUNTRY_CODE);
+        ESP_LOGE(TAG, "  channel   NOT PINNED (country %s)", cc);
     } else {
         ESP_LOGE(TAG, "  channel   %u @ %lu Hz, %u MHz BW, class %d/%d, country %s",
                  (unsigned)g_warthog_applied_chan, (unsigned long)g_warthog_applied_freq_hz,
                  (unsigned)g_warthog_applied_bw_mhz, (int)g_warthog_applied_gclass,
-                 (int)g_warthog_applied_sclass, WARTHOG_COUNTRY_CODE);
+                 (int)g_warthog_applied_sclass, cc);
+    }
+    if (rf[0] != '\0') {
+        ESP_LOGE(TAG, "  %s", rf);
     }
     ESP_LOGE(TAG, "  beacon    %u TU", (unsigned)s_mesh_beacon_tu);
     ESP_LOGE(TAG, "  security  %s", WARTHOG_MESH_SAE ? "SAE/AMPE" : "open");
@@ -751,7 +761,13 @@ void warthog_mesh_smoke_test(void)
 #ifndef WARTHOG_SKIP_SCAN_PROBE
     /* The probe wedges on some chip firmware: the completion callback never
      * fires and the bounded wait never returns, so the VIF is never added. */
-    warthog_mesh_scan_probe();
+    const struct warthog_region_plan *probe_rp = warthog_region_running();
+    if (probe_rp != NULL && warthog_region_restricted(probe_rp->list)) {
+        /* An optional active probe is not sent where the rows ration airtime. */
+        ESP_LOGW(TAG, "scan probe skipped: %s rows carry a duty cycle or packet spacing", probe_rp->cc);
+    } else {
+        warthog_mesh_scan_probe();
+    }
 #else
     ESP_LOGW(TAG, "scan probe skipped (WARTHOG_SKIP_SCAN_PROBE)");
 #endif
@@ -766,12 +782,8 @@ void warthog_mesh_smoke_test(void)
     return;
 #endif
 
-    /* NOTE: the single-channel pin lives in mmhalow_init() (components/halow/
-     * mmhalow.c, guarded by WARTHOG_PIN_S1G_CHAN), NOT here.
-     * mmwlan_set_channel_list() must run while the WLAN subsystem is inactive
-     * and before mmwlan_boot(); calling it from this function returns
-     * MMWLAN_UNAVAILABLE (3) and silently leaves the full regulatory list in
-     * place, which is what made our operating channel unobservable. */
+    /* The single-channel pick is main/region.c (warthog_region_plan), applied by mmhalow_init before
+     * mmwlan_boot; set_channel_list after boot returns MMWLAN_UNAVAILABLE. */
 
     /* mmhalow_init() has already run mmwlan_init(), set the channel list, and
      * booted the chip, so mmwlan_mesh_enable() can go straight to

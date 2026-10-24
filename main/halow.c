@@ -12,12 +12,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "mmhal_wlan.h"
 #include "mmhalow.h"
+#include "mmregdb.h"
+#include "sdkconfig.h"
 #include "warthog_shim.h"
 
 #include <string.h>
 
 static const char *TAG = "warthog.halow";
+
+/* The boot's region decision; static because mmwlan keeps the channel list pointer. */
+static struct warthog_region_plan s_plan;
+static bool s_plan_set, s_radio_up;
 
 /* Set once the HaLow STA associates (or gets a DHCP lease). app_main waits
  * on this so USB-OTG bring-up is sequenced after the SAE TX burst. */
@@ -110,14 +117,57 @@ esp_err_t warthog_halow_start_safe(void)
     return ESP_OK;
 }
 
+struct warthog_region_ctx warthog_region_ctx_get(void)
+{
+    struct mmhal_robuf rb = {0};
+    mmhal_wlan_read_bcf_file(0, UINT32_MAX, &rb);
+    if (rb.free_cb != NULL) {
+        /* This shim maps the linked BCF in place; a copy that needs freeing offers nothing. */
+        rb.free_cb(rb.free_arg);
+        rb.buf = NULL;
+        rb.len = 0;
+    }
+    const struct warthog_region_ctx ctx = {
+        .db = get_regulatory_db(),
+        .bcf = rb.buf,
+        .bcf_len = rb.len,
+        .hw = CONFIG_WARTHOG_HW_REGIONS,
+        .band_lo_hz = (uint32_t)CONFIG_WARTHOG_HW_BAND_LO_KHZ * 1000u,
+        .band_hi_hz = (uint32_t)CONFIG_WARTHOG_HW_BAND_HI_KHZ * 1000u,
+    };
+    return ctx;
+}
+
+const struct warthog_region_plan *warthog_region_running(void)
+{
+    return s_plan_set ? &s_plan : NULL;
+}
+
+bool warthog_halow_radio_up(void)
+{
+    return s_radio_up;
+}
+
 esp_err_t warthog_halow_start(void)
 {
-    ESP_LOGI(TAG, "init region=%s country=%s",
-             WARTHOG_REGION_NAME, WARTHOG_COUNTRY_CODE);
+    warthog_region_boot_plan(&s_plan);
+    s_plan_set = true;
+    char src[64];
+    (void)warthog_region_chan_src_text(&s_plan, src, sizeof(src));
+    if (s_plan.hold != WARTHOG_HOLD_NONE) {
+        ESP_LOGE(TAG, "radio held: %s (%s); AT+REGION=<CC> then AT+RESET",
+                 warthog_region_hold_text(s_plan.hold), warthog_region_hold_token(s_plan.hold));
+        return warthog_halow_start_safe();
+    }
+    ESP_LOGI(TAG, "region %s (%s); channel %s, %u row(s) in band", s_plan.cc,
+             s_plan.cc_src == WARTHOG_CC_STORED ? "stored" : "not set: " WARTHOG_DEFAULT_REGION " default", src,
+             s_plan.list->num_channels);
 
     ESP_RETURN_ON_ERROR(halow_base_start_(), TAG, "base start");
 
+    mmhalow_use_channel_list(s_plan.list);
     ESP_RETURN_ON_ERROR(mmhalow_init(NULL), TAG, "mmhalow init");
+    s_radio_up = true;
     mmhalow_print_version_info();
 
 #if HALOW_MAX_TX_DBM > 0

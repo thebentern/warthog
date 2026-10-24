@@ -35,7 +35,7 @@ AHUS-1, Vantron MM8108) is simpler. Warthog is firmware you own and modify.
 
 ## Features
 
-- **USB CDC-NCM** Ethernet adapter, in-box on macOS, Linux, Windows 10+ and iOS/iPadOS (CDC-ECM build: `warthog-us-ecm`)
+- **USB CDC-NCM** Ethernet adapter, in-box on macOS, Linux, Windows 10+ and iOS/iPadOS (CDC-ECM build: `warthog-station-ecm`)
 - **2.4 GHz Wi-Fi AP** for clients that are not wired
 - **HaLow uplink** on a Morse Micro MM6108 (Quectel FGH100M-H): station mode to an AP, or an **802.11s mesh** peer
 - **Mesh security:** SAE authentication and AMPE per-link keys
@@ -43,7 +43,7 @@ AHUS-1, Vantron MM8108) is simpler. Warthog is firmware you own and modify.
 - **NAT** between every surface by default; **L2 bridge mode** (`AT+MESHBRIDGE=1`, experimental)
 - **802.11s forwarding** (`AT+MESHFWD=1`, experimental)
 - **USB CDC-ACM console** with ESP-IDF logs and an **AT command** interface; settings persist in NVS
-- Per-region builds (US / EU / JP / KR / AU), board config and country code fixed at compile time
+- One image for every supported region: `AT+REGION=<CC>` (AU, JP, KR, NZ or US on the FGH100M-H) picks the country's channel list, power and duty limits at boot; a board with none set runs as US
 - ESP-IDF 5.5, TinyUSB, `morsemicro/halow`
 
 Not supported: per-transmitter group keys in the chip (except on
@@ -75,7 +75,7 @@ About $30 in parts.
 **1. Build**
 
 ```bash
-pio run -e warthog-us
+pio run -e warthog-station
 ```
 
 ![Building warthog](docs/img/usb-build.svg)
@@ -84,13 +84,14 @@ pio run -e warthog-us
 reset the board into download mode. **Hold BOOT, tap RESET, release BOOT**, then:
 
 ```bash
-pio run -e warthog-us -t upload
+pio run -e warthog-station -t upload
 ```
 
 Tap **RESET** when it finishes. Without a toolchain, use the
 [web flasher](https://thebentern.github.io/warthog/) (Chrome, Edge or Opera). It
-writes the factory image, which erases stored settings; its Configure tab sends
-the same AT commands.
+writes the factory image, which erases stored settings but keeps the region;
+Erase & flash also clears the region and writes the one you pick. Its Configure
+tab sends the same AT commands.
 
 **3. Console.** `/dev/cu.usbmodem*` (macOS) or `/dev/ttyACM*` (Linux), 115200 8-N-1.
 `AT+STATUS?` reports the HaLow uplink, the USB network, the Wi-Fi AP and the DNS
@@ -98,7 +99,10 @@ offered to clients.
 
 ![AT console over USB](docs/img/usb-console.svg)
 
-**4. Network.** The same cable presents a USB Ethernet adapter; the host takes a
+**4. Region.** `AT+REGION=<CC>` then `AT+RESET` sets the country you operate in
+(`AT+REGION?` lists the offered ones); a board with none set runs as US.
+
+**5. Network.** The same cable presents a USB Ethernet adapter; the host takes a
 DHCP lease from the board.
 
 ![macOS USB Ethernet via CDC-NCM](docs/img/usb-host.svg)
@@ -109,8 +113,8 @@ These screenshots are regenerated against an attached board by `scripts/regen-sc
 
 | Env | Purpose |
 |---|---|
-| `warthog-us`, `-eu`, `-jp`, `-kr`, `-au` | Region builds. Station uplink by default; `AT+MESHEN=1` runs the mesh instead |
-| `warthog-us-ecm` | CDC-ECM instead of CDC-NCM, for a host that binds ECM only |
+| `warthog-station` | Station uplink by default; `AT+MESHEN=1` runs the mesh instead; region from `AT+REGION` |
+| `warthog-station-ecm` | CDC-ECM instead of CDC-NCM, for a host that binds ECM only |
 | `warthog-mesh-smoke` | Mesh without SAE |
 | `warthog-mesh-sae` | SAE/AMPE, keys in the chip |
 | `warthog-mesh-sae-meshvif` | SAE/AMPE, keys in the chip, MESH chip interface — for OpenMANET |
@@ -119,32 +123,36 @@ These screenshots are regenerated against an attached board by `scripts/regen-sc
 | `warthog-mesh-sae-swccmp-meshvif` | SAE/AMPE, host CCMP, MESH chip interface — for OpenMANET in batman mode |
 | `warthog-mesh-sae-nochipkey` | Host-CCMP receive probe; not a shipping build |
 
-Region frequency ranges: US 902–928 MHz, EU 863–868 MHz, JP 920.5–927.5 MHz,
-KR 917.5–923.5 MHz.
+Regions (`AT+REGION=`), each country's channels within the module's 902–928 MHz:
+AU 915.5–927.5 MHz, JP 920.5–927.5 MHz, KR 917.5–928 MHz, NZ 915–928 MHz,
+US 902–928 MHz; unset = US. No other country is offered.
 
 ## Flashing
 
-**Release bundles**, one per region plus `mesh-smoke` and `mesh-sae`, are on the
+**Release bundles**, the station image plus `mesh-smoke`, `mesh-sae-meshvif` and
+`mesh-sae-swccmp-meshvif`, and one region image per country, are on the
 [releases page](../../releases):
 
 | File | Purpose |
 |------|---------|
-| `warthog-vX.Y.Z-REGION.factory.bin` | Bootloader + partitions + app, written at `0x0`. **Erases stored settings** |
-| `warthog-vX.Y.Z-REGION.bin` | App only, at `0x10000` |
-| `warthog-vX.Y.Z-REGION.elf` | Symbols for `addr2line` |
-| `warthog-vX.Y.Z-REGION-{bootloader,partitions}.bin` | For flashing piecewise |
+| `warthog-vX.Y.Z-VARIANT.factory.bin` | Bootloader + partitions + app, written at `0x0`. **Erases stored settings**, not the region |
+| `warthog-vX.Y.Z-VARIANT.bin` | App only, at `0x10000` |
+| `warthog-vX.Y.Z-VARIANT.elf` | Symbols for `addr2line` |
+| `warthog-vX.Y.Z-VARIANT-{bootloader,partitions}.bin` | For flashing piecewise |
+| `warthog-vX.Y.Z-region-<CC>.bin` | `0x420000`: the region partition holding `AT+REGION=<CC>` |
 | `flash.sh` | Flasher: finds the port, wraps `esptool` |
 | `SHA256SUMS.txt` | Checksums for every `warthog-*` file |
 
 ```bash
-./flash.sh warthog-v0.1.0-us.factory.bin   # in download mode: hold BOOT, tap RESET, release BOOT
+./flash.sh --region US warthog-vX.Y.Z-station.factory.bin   # in download mode: hold BOOT, tap RESET, release BOOT
 ```
 
 Tap RESET when it finishes.
 
 The factory image is blank over the NVS partition (`0x9000`), so the board comes
-up on build defaults. To keep settings, write the bootloader, partitions and app
-images at `0x0`, `0x8000` and `0x10000` instead.
+up on build defaults; the region, in its own partition at `0x420000`, is kept.
+Without `--region` the board keeps its stored region. To keep settings, write the
+bootloader, partitions and app images at `0x0`, `0x8000` and `0x10000` instead.
 
 **Reflashing a running board** needs no buttons: `AT+DLMODE` re-enumerates it as
 the ROM port (`303a:0009`). Flash that and leave with a watchdog reset
@@ -153,14 +161,14 @@ the ROM port (`303a:0009`). Flash that and leave with a watchdog reset
 ```bash
 python -m esptool --chip esp32s3 --port /dev/cu.usbmodemXXXX --baud 921600 \
   --before no-reset --after watchdog-reset write-flash \
-  0x0 .pio/build/warthog-us/bootloader.bin \
-  0x8000 .pio/build/warthog-us/partitions.bin \
-  0x10000 .pio/build/warthog-us/firmware.bin
+  0x0 .pio/build/warthog-station/bootloader.bin \
+  0x8000 .pio/build/warthog-station/partitions.bin \
+  0x10000 .pio/build/warthog-station/firmware.bin
 ```
 
 Writing `firmware.factory.bin` at `0x0` instead erases settings.
 
-`pio device monitor -e warthog-us` opens the console.
+`pio device monitor -e warthog-station` opens the console.
 
 ## Configuration
 
@@ -181,7 +189,7 @@ stored in NVS take precedence.
 | `WARTHOG_MESH_PASSPHRASE` | `warthog-mesh` | Default SAE passphrase |
 
 ```bash
-PLATFORMIO_BUILD_FLAGS='-DHALOW_SSID=\"MyHaLowAP\" -DHALOW_PASSPHRASE=\"secret\"' pio run -e warthog-us
+PLATFORMIO_BUILD_FLAGS='-DHALOW_SSID=\"MyHaLowAP\" -DHALOW_PASSPHRASE=\"secret\"' pio run -e warthog-station
 ```
 
 ### AT commands
@@ -195,19 +203,21 @@ AT+HALOW=MyAP,secret        HaLow credentials (AT+RESET to apply); AT+HALOW? sho
 AT+WIFIAP=warthog,secret99,11
                             Wi-Fi AP SSID, PSK (8-63 chars), channel; AT+WIFIAP? reads back
 AT+DNS=8.8.8.8              DNS offered to clients; AT+DNS? reads back
+AT+REGION=AU                regulatory country (AT+RESET to apply); AT+REGION? shows running/stored/allowed
 AT+MESHEN=1                 mesh uplink instead of station (AT+RESET to apply)
 AT+MESHID=halowmesh         mesh ID; must match every peer
 AT+MESHPASS=secret          SAE passphrase; AT+MESHPASS? reports only its length
 AT+MESHCHAN=42,923000000,69,2,2
-                            pin the S1G channel (region builds ship unpinned)
+                            pin the S1G channel (default: the region's mesh channel)
 AT+MESHCFG?                 everything a peer must match
 AT+RESET                    reboot
-AT+ERASE                    erase all settings in the NVS namespace `warthog`
+AT+ERASE                    erase all settings in the NVS namespace `warthog` (the region is kept)
 ```
 
 `AT+DNS=` rejects anything that is not a valid IPv4 address (`+ERR: not a valid
 IPv4 address`). Settings live in NVS namespace `warthog`; `AT+ERASE` clears all
-of them, returning DNS and credentials to the build defaults.
+of them, returning DNS and credentials to the build defaults; the region lives in
+its own partition and is kept.
 
 ## Operating modes
 
@@ -325,10 +335,10 @@ non-SAE Warthog left at `AT+MESHSEC=1` peers with an open node but passes no dat
 |---|---|---|
 | LuCI mesh wizard (SAE, mesh ID `openmanet`, passphrase `changeme123`, `wlh0` in `bat0`) | `warthog-mesh-sae-swccmp-meshvif` | `AT+MESHBATMAN=1` |
 | SAE mesh without `bat0` | `warthog-mesh-sae-meshvif` | — |
-| Open mesh (`encryption='none'`) | `warthog-mesh-smoke`, or a region build with `AT+MESHEN=1` | `AT+MESHSEC=0` |
+| Open mesh (`encryption='none'`) | `warthog-mesh-smoke`, or `warthog-station` with `AT+MESHEN=1` | `AT+MESHSEC=0` |
 
 - A fresh OpenMANET image runs no mesh: its HaLow radio is an SAE access point.
-- The `-meshvif` builds are not in the release bundles; build them from source.
+- The `-meshvif` builds are in the release bundles.
 - `warthog-mesh-sae` peers with an OpenMANET node but cannot open its group
   frames, so the node never gets a path to it. Use it for Warthog-only meshes.
 - Under SAE, batman mode needs host CCMP: `warthog-mesh-sae`, `-nochipkey` and
@@ -362,6 +372,7 @@ pio run -e warthog-mesh-sae-swccmp-meshvif -t upload
 **3. Match the mesh** on the Warthog console, then reboot:
 
 ```
+AT+REGION=US                       the node's radio1.country
 AT+MESHID=openmanet
 AT+MESHPASS=changeme123            SAE builds; AT+MESHSEC=0 instead for an open node
 AT+MESHCHAN=42,923000000,69,2,2    the node's channel: <chan>,<freq_hz>,<gclass>,<sclass>,<bw_mhz>
@@ -369,8 +380,10 @@ AT+MESHBATMAN=1                    wizard node only
 AT+RESET
 ```
 
-The mesh envs default to channel 42 at 2 MHz (OpenMANET's default) and mesh ID
-`halowmesh`; region builds ship with no channel pinned, so set it there.
+With mesh on, every image uses the region's default mesh channel (US ch42 at
+2 MHz, OpenMANET's US default; AU ch41 at 922.5 MHz; the rest in
+[Mesh Mode](wiki/Mesh-Mode.md#building-for-mesh)) unless `AT+MESHCHAN=` stores
+another row of that table; the mesh envs set mesh ID `halowmesh`.
 
 **4. Prepare the node.**
 
@@ -425,8 +438,9 @@ same line is logged every minute while the Warthog has no peers.
 
 | Reading | Check |
 |---|---|
-| `applied chan=NONE` | No channel pinned (region builds): set `AT+MESHCHAN=` to the node's |
-| `set_channel_list` non-zero | The radio is not on the channel shown: the build's own pin was refused for the country (a refused stored channel is discarded at boot). Check the region build |
+| `applied chan=NONE` | Mesh off: the station holds the whole country list, or the radio is held (`AT+REGION?`) |
+| `src=default+stored-refused` | The stored `AT+MESHCHAN` is not in this region's table: set a row of it, or `AT+MESHCHAN=default` |
+| `set_channel_list` non-zero | morselib refused the list: a firmware fault, not configuration; read the boot log |
 | `beacons_heard=0` | Channel, bandwidth or range — compare with `uci get wireless.radio1.channel` |
 | `beacons_heard>0`, `peers=0` | Mesh ID (exact, case-sensitive), security mode, or signal at or below -80 dBm (`AT+MESHRSSI?`) |
 | `peers>0`, no traffic | `AT+MESHSEC` mismatch: a keyed Warthog and an open node peer but pass no data. Then `AT+RXCHAN?` |
@@ -444,7 +458,7 @@ CDC-NCM binds with the in-box driver on macOS, Linux (`cdc_ncm`), Windows 10+
   simpler path.
 - Two Warthogs on one host collide: both serve `192.168.4.1/24`, and the second
   falls back to a link-local address.
-- `warthog-us-ecm` serves CDC-ECM for a host that binds ECM but not NCM.
+- `warthog-station-ecm` serves CDC-ECM for a host that binds ECM but not NCM.
 - NCM needs TinyUSB ≥ 0.21.0 (pinned in `main/idf_component.yml`) and the
   configuration descriptor built by `esp_tinyusb`; a hand-built NCM descriptor is
   rejected by the host.
@@ -466,7 +480,7 @@ AT+RESET
 or at build time, e.g. a Pi-hole on the upstream LAN:
 
 ```bash
-PLATFORMIO_BUILD_FLAGS='-DWARTHOG_DOWNSTREAM_DNS=\"10.0.0.53\"' pio run -e warthog-us
+PLATFORMIO_BUILD_FLAGS='-DWARTHOG_DOWNSTREAM_DNS=\"10.0.0.53\"' pio run -e warthog-station
 ```
 
 Check on macOS (expect `{1.1.1.1}`):
@@ -482,7 +496,7 @@ or replug. Offering option 6 takes both `esp_netif_dhcps_option(OFFER_DNS)` and
 ### Debug logging
 
 ```bash
-PLATFORMIO_BUILD_FLAGS="-DWARTHOG_DEBUG=1" pio run -e warthog-us -t upload
+PLATFORMIO_BUILD_FLAGS="-DWARTHOG_DEBUG=1" pio run -e warthog-station -t upload
 ```
 
 Adds `warthog.nat: tick:` every 30 s (NAPT state). Gate new diagnostics behind
@@ -510,7 +524,7 @@ read and inject traffic crossing it. OpenMANET nodes are in the same position.
 | `AT+MESHSEC=0` | open | cleartext | OpenMANET node set to `encryption='none'` |
 | SAE builds | SAE | CCMP under a per-link AMPE key | the only mode with link security |
 
-The `AT+MESHSEC=1` key (region builds and `warthog-mesh-smoke`) is the counting
+The `AT+MESHSEC=1` key (`warthog-station` and `warthog-mesh-smoke`) is the counting
 sequence `00 11 22 33 … ff`, compiled into every image. It does not interoperate
 with a peer that derives real keys or sends cleartext.
 
@@ -593,8 +607,12 @@ directory. The GPL does not apply to them.
 
 ## Regulatory
 
-The regulatory domain is fixed at build time by the region env, which selects
-the board config and channel list. **Build the env for the jurisdiction you
-operate in**; another region's channel plan is likely illegal where you are.
+The regulatory country is set at runtime: `AT+REGION=<CC>` then `AT+RESET`, or
+chosen when flashing. It selects the Morse regulatory table (channels, EIRP, duty
+cycle) and the module's BCF section; only countries the module is rated for are
+offered (AU, JP, KR, NZ, US), with channels cut to its 902–928 MHz band. A board
+with nothing stored runs as US; one whose stored region cannot be used keeps its
+radio off. **Set the country you operate in**; another country's channel plan is
+likely illegal where you are.
 You are responsible for operating within local rules, including duty-cycle and
 transmit-power limits. Warthog is an experimental project.

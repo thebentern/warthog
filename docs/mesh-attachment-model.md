@@ -33,7 +33,7 @@ peers it can hear — and nothing beyond them.
 
 ### B. STA leaf behind an AP VAP — **built, hardware-verified**
 
-The default region builds associate to a HaLow AP. SAE association plus DHCP
+The station build associates to a HaLow AP. SAE association plus DHCP
 is verified against a HaLowLink 2, with the full tethered-EUD path working
 (`docs/napt-notes.md`).
 

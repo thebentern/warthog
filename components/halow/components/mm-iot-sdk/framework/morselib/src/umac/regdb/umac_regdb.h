@@ -30,6 +30,11 @@ const struct mmwlan_s1g_channel *umac_regdb_get_channel_from_freq_and_bw(struct 
                                                                          uint8_t bw_mask);
 
 
+/* warthog: the strictest duty cycle and MPSW over @p list's rows into @p out (EIRP and channel
+ * fields unset); false, @p out untouched, when no row restricts either (duty 100%, no MPSW). */
+bool umac_regdb_strictest(const struct mmwlan_s1g_channel_list *list, struct mmwlan_s1g_channel *out);
+
+
 static inline unsigned umac_regdb_get_num_channels(struct umac_data *umacd)
 {
     const struct mmwlan_s1g_channel_list *channel_list = umac_config_get_channel_list(umacd);

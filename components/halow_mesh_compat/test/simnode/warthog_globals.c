@@ -114,6 +114,7 @@ volatile uint32_t g_warthog_chipcmd_key_refused = 0;
 volatile int32_t g_warthog_chipcmd_key_status = 0;
 volatile uint32_t g_warthog_chipcmd_keyidx_mismatch = 0;
 volatile uint32_t g_warthog_chipcmd_meshcfg_mode = 0;
+volatile int32_t g_warthog_mesh_chan_st = 0;
 volatile uint32_t g_warthog_mesh_secure = 1;
 volatile uint32_t g_warthog_mesh_fwd = 0, g_warthog_mesh_bridge = 0, g_warthog_mesh_grp = 0;
 volatile uint32_t g_warthog_mesh_batman = 0;

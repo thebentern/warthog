@@ -35,7 +35,7 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
            ../src/dot11ah/debug.c
 
 TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
-           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mesh_addr test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd test_mesh_frag test_mesh_cap sim_mesh test_supp_mesh_conf test_mesh_bip test_bat_mode test_beacon_yield test_chipvif_glue test_chipvif_glue_off test_hang_guard
+           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mesh_addr test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd test_mesh_frag test_mesh_cap sim_mesh test_supp_mesh_conf test_mesh_bip test_bat_mode test_beacon_yield test_chipvif_glue test_chipvif_glue_off test_hang_guard test_hw_scan test_region test_region_au2020
 
 # ---- simnode: the real stack with only the chip and the RTOS replaced ----
 #
@@ -114,18 +114,38 @@ MESHIES := $(SDKMESH)/umac_mesh_ies.c
 # that is no longer built -- which is exactly what a green run must never mean.
 MESHHDRS := $(wildcard $(SDKMESH)/*.h)
 
-.PHONY: all clean linkcheck freestanding region glueguard simnode-seamed
-all: $(TESTS) linkcheck freestanding region glueguard bat-freestanding bat-nostatic bat-registered simnode-seamed lwip-napt usbnet
+.PHONY: all clean linkcheck freestanding region-bcf glueguard simnode-seamed flasher
+all: $(TESTS) linkcheck freestanding region-bcf glueguard flasher bat-freestanding bat-nostatic bat-registered simnode-seamed lwip-napt usbnet
 	@echo "=== running host tests ==="
 	@fail=0; for t in $(TESTS); do echo "--- $$t ---"; ./$$t || fail=1; done; \
 	  if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
 
-# The build's regulatory domain must reach the radio, not just the log. Shell
-# rather than C because what needs checking is the PREPROCESSOR result of the
-# real header under each region flag, plus the call sites that consume it.
-region:
-	@echo "=== regulatory region mapping ==="
-	@sh ./test_region_map.sh
+# region_bcf.h is the BCF sdkconfig.defaults links, byte for byte: compared once a build fetched it.
+CFG_DEFAULTS := ../../../sdkconfig.defaults
+cfg_val = $(shell sed -n 's/^$(1)=\(.*\)$$/\1/p' $(CFG_DEFAULTS))
+REGION_BCF_FILE := $(patsubst "%",%,$(call cfg_val,CONFIG_MM_BCF_FILE))
+REGION_BCF_SRC := ../../../managed_components/morsemicro__firmware/mm6108/$(REGION_BCF_FILE)
+region_bcf_gen = { printf '/* SPDX-License-Identifier: LicenseRef-MorseMicroBDL */\n'; \
+  printf '/* %s from morsemicro/firmware (managed_components), byte for byte: make region-bcf checks it. */\n' "$(REGION_BCF_FILE)"; \
+  printf 'static const unsigned char k_region_bcf[%s] = {' "$$(wc -c < $(1) | tr -d ' ')"; \
+  od -An -v -tx1 $(1) | awk '{for (i = 1; i <= NF; i++) {printf "%s0x%s,", (n % 12 == 0 ? "\n    " : " "), $$i; n++}} END {printf "\n"}'; \
+  printf '};\n'; }
+region-bcf:
+	@echo "=== region_bcf.h is the linked BCF ==="
+	@if [ ! -f $(REGION_BCF_SRC) ]; then echo "skip $(REGION_BCF_SRC) not fetched (a pio build fetches it)"; \
+	elif $(call region_bcf_gen,$(REGION_BCF_SRC)) | cmp -s - region_bcf.h; then echo "ok   region_bcf.h is $(REGION_BCF_FILE) byte for byte"; \
+	else echo "FAIL region_bcf.h is not $(REGION_BCF_SRC): make region-bcf-regen"; exit 1; fi
+region-bcf-regen:
+	$(call region_bcf_gen,$(REGION_BCF_SRC)) > region_bcf.h
+
+# The web flasher's module script on stubbed browser APIs (test_flasher.mjs); needs node, which CI must have.
+flasher:
+	@echo "=== the web flasher ==="
+	@if ! command -v node >/dev/null 2>&1; then \
+	  if [ -n "$$CI" ]; then echo "FAIL node is not installed (CI must run the flasher test)"; exit 1; fi; \
+	  echo "skip node not installed"; \
+	else t=$$(mktemp -d "$${TMPDIR:-/tmp}/flasher.XXXXXX"); node test_flasher.mjs ../../../web-flasher/index.html "$$t/flasher.mjs"; \
+	  rc=$$?; rm -rf "$$t"; exit $$rc; fi
 
 # A shipping .c that a simnode source #includes must be in SIMNODE_SEAMED: nothing else
 # makes it a prerequisite, so an edit to it would leave every simnode binary stale.
@@ -152,6 +172,28 @@ glueguard:
 MAINDIR := ../../../main
 test_mesh_diag: test_mesh_diag.c $(MAINDIR)/mesh_diag.c
 	$(CC) $(CFLAGS) $(SANFLAGS) -I$(MAINDIR) $^ -o $@
+
+# The region decision (main/region.c) on the real regdb and BCF, with the HW list and band
+# sdkconfig.defaults ships; again over the 2020 AU channelisation, which has no AU default row.
+REGION_DEFS = -DHW_REGIONS='$(call cfg_val,CONFIG_WARTHOG_HW_REGIONS)' \
+              -DHW_BAND_LO_KHZ=$(call cfg_val,CONFIG_WARTHOG_HW_BAND_LO_KHZ)u \
+              -DHW_BAND_HI_KHZ=$(call cfg_val,CONFIG_WARTHOG_HW_BAND_HI_KHZ)u
+REGION_SRCS = test_region.c region_bcf.h $(MAINDIR)/region.c $(MAINDIR)/region.h $(FW)/src/mmregdb/mmregdb.c $(CFG_DEFAULTS)
+test_region: $(REGION_SRCS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-void-pointer-to-int-cast $(REGION_DEFS) $(SIMNODE_INCS) -I$(FW)/src/mmregdb -I$(MAINDIR) $(filter %.c,$^) -o $@
+
+test_region_au2020: $(REGION_SRCS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-void-pointer-to-int-cast $(REGION_DEFS) -DMM_REGDB_DEFAULT_S1G_CHANNEL_LIST_AU=s1g_channel_list_au_80211_2020 \
+	  -DWANT_AU2020=1 $(SIMNODE_INCS) -I$(FW)/src/mmregdb -I$(MAINDIR) $(filter %.c,$^) -o $@
+
+# A scan programs its channel list's strictest duty cycle and MPSW before HW_SCAN (morselib hw_scan.c,
+# umac_regdb.c as shipped), over the lists main/region.c hands the chip.
+HWSCAN_SRCS = test_hw_scan.c region_bcf.h $(FW)/morselib/src/umac/scan/hw_scan.c $(FW)/morselib/src/umac/regdb/umac_regdb.c \
+              $(MAINDIR)/region.c $(MAINDIR)/region.h $(FW)/src/mmregdb/mmregdb.c $(wildcard $(FW)/morselib/src/umac/scan/*.h) \
+              $(FW)/morselib/src/umac/regdb/umac_regdb.h
+test_hw_scan: $(HWSCAN_SRCS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) -I$(FW)/morselib/src/umac/scan -I$(FW)/src/mmregdb \
+	  -I$(MAINDIR) $(filter %.c,$^) -o $@
 
 # The hang guard's logic (main/hang_guard_core.c): ages, the stall pick, the abort reason, AT+HANG? lines.
 test_hang_guard: test_hang_guard.c $(MAINDIR)/hang_guard_core.c $(MAINDIR)/hang_guard_core.h
