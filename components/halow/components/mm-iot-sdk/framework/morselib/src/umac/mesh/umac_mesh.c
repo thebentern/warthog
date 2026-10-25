@@ -227,6 +227,8 @@ static struct
     int32_t beacon, bssid, meshcfg;
 } s_start_st;
 extern volatile uint32_t g_warthog_chiprestart_cmdfail;
+/* The chip's refusal of the mesh channel at the last first start, 0 when it took it (AT+MESHCFG?). */
+extern volatile int32_t g_warthog_mesh_chan_st;
 
 /* A command the mesh carries on without: at a start its answer is kept, at a restore (@p restore)
  * a failure, or a refusal other than the start's on the same interface type, is counted. */
@@ -313,34 +315,36 @@ static enum mmwlan_status mesh_chip_start_(struct umac_data *umacd, uint16_t vif
      * via umac_interface_set_channel before BSS_CONFIG (umac_ap.c:245). The
      * chip uses this to know which radio channel the VIF lives on; without
      * it, the chip likely doesn't tune the RX path for the mesh VIF even if
-     * the global channel list is populated. Pick the first channel from the
-     * regdb — both boards on the same region get the same first channel, so
-     * they auto-coordinate. A future revision can let the user specify a channel. */
+     * the global channel list is populated. With mesh on the list is one row,
+     * main/region.c's pick (the stored AT+MESHCHAN or the region default). */
     const struct mmwlan_s1g_channel *mesh_chan = umac_regdb_get_channel_at_index(umacd, 0);
-    if (mesh_chan != NULL)
+    if (mesh_chan == NULL)
     {
-        enum mmwlan_status ch_status = umac_interface_set_channel_from_regdb(umacd, mesh_chan, false);
-        if (ch_status != MMWLAN_SUCCESS)
+        MMLOG_ERR("mesh: no channel in the channel list — not starting\n");
+        if (!restore)
         {
-            MMLOG_ERR("mesh: set_channel_from_regdb failed (status=%d) — "
-                      "chip RX may stay closed for this VIF\n", (int)ch_status);
-            if (restore)
-            {
-                return MMWLAN_ERROR; /* as upstream's STA restore asserts on its channel */
-            }
-            /* Don't bail: the chip MIGHT still RX via the global channel list.
-             * If it doesn't, we'll see zero rx# lines in the diagnostic. */
+            g_warthog_mesh_chan_st = (int32_t)MMWLAN_ERROR;
         }
-        else
-        {
-            MMLOG_INF("mesh: SET_CHANNEL OK — operating chan=%u bw=%uMHz\n",
-                      mesh_chan->s1g_chan_num, mesh_chan->bw_mhz);
-        }
+        return MMWLAN_ERROR;
     }
-    else
+    enum mmwlan_status ch_status = umac_interface_set_channel_from_regdb(umacd, mesh_chan, false);
+    if (ch_status != MMWLAN_SUCCESS)
     {
-        MMLOG_WRN("mesh: no channels in regdb — skipping SET_CHANNEL\n");
+        /* No beacon config, no MESH_CONFIG(START): never beacon on a channel the chip refused. */
+        MMLOG_ERR("mesh: set_channel_from_regdb failed (status=%d) — not starting\n", (int)ch_status);
+        if (restore)
+        {
+            return MMWLAN_ERROR; /* as upstream's STA restore asserts on its channel */
+        }
+        g_warthog_mesh_chan_st = (int32_t)ch_status;
+        return ch_status;
     }
+    if (!restore)
+    {
+        g_warthog_mesh_chan_st = 0;
+    }
+    MMLOG_INF("mesh: SET_CHANNEL OK — operating chan=%u bw=%uMHz\n",
+              mesh_chan->s1g_chan_num, mesh_chan->bw_mhz);
 
     /* ===================================================================
      * REORDER chip commands to match Linux exactly.

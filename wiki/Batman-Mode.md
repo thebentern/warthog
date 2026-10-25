@@ -53,7 +53,7 @@ control without it (a restart 12 s after the previous one went 18 s without
 replies), pings, bursts and a 3-minute soak. The full-table request backoff, the
 TTVN its unicast carries toward a node whose table it cannot take and a count of
 two gateways have run on the host and in the VM only (one hop, tables in sync).
-`warthog-us`, `warthog-mesh-smoke`, `warthog-mesh-sae`,
+`warthog-station`, `warthog-mesh-smoke`, `warthog-mesh-sae`,
 `warthog-mesh-sae-meshvif`, `warthog-mesh-sae-swccmp` and `-swccmp-meshvif`
 build. Only `warthog-mesh-sae-swccmp` and `-swccmp-meshvif` have run batman mode
 on a board.
@@ -62,7 +62,7 @@ on a board.
 
 | Build | Mesh security | Hears Linux peers' batman broadcasts | `AT+MESHBATMAN=1` |
 |---|---|---|---|
-| region images with `AT+MESHEN=1`, `warthog-mesh-smoke` | open with `AT+MESHSEC=0`; the default `1` keys the mesh with a key published in the source: an open Linux node peers with it but passes no data | yes (plain group frames) | accepted |
+| `warthog-station` with `AT+MESHEN=1`, `warthog-mesh-smoke` | open with `AT+MESHSEC=0`; the default `1` keys the mesh with a key published in the source: an open Linux node peers with it but passes no data | yes (plain group frames) | accepted |
 | `warthog-mesh-sae` | SAE, chip crypto | **no**: peers' group frames are dropped | **refused** (`sae-no-host-ccmp`) |
 | `warthog-mesh-sae-nochipkey` | SAE, no host CCMP | no | **refused** |
 | `warthog-mesh-sae-meshvif` | SAE, chip crypto on a MESH chip interface, each peer's MGTK in the chip at its AID | in the chip ([OpenMANET Interop](OpenMANET-Interop#group-frames-in-the-chip-warthog-mesh-sae-meshvif)) | **refused** (`sae-no-host-ccmp`) |

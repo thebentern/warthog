@@ -23,31 +23,28 @@ the 4.8.1 the pinned pioarduino platform installs, and the build stops with
 
 ## 3. Choose a build
 
-Pick the env for your region — this sets the radio's regulatory domain and is
-baked into the image:
+One station image serves every region the module offers (AU, JP, KR, NZ, US):
 
 ```bash
-pio run -e warthog-us      # 902–928 MHz
-pio run -e warthog-eu      # 863–868 MHz
-pio run -e warthog-jp      # 920.5–927.5 MHz
-pio run -e warthog-kr      # 917.5–923.5 MHz
-pio run -e warthog-au
+pio run -e warthog-station
 ```
+
+The country is set at runtime: `AT+REGION=<CC>` ([step 6](#6-point-it-at-an-uplink)), or
+pick it in the web flasher. A board with none set runs as US.
 
 For a peer-to-peer mesh instead of a station uplink, build
 `warthog-mesh-smoke` and read [Mesh Mode](Mesh-Mode) first.
 
-> **A region env can join a mesh at runtime** — `AT+MESHEN=1`, then
+> **The station build can join a mesh at runtime** — `AT+MESHEN=1`, then
 > `AT+RESET`. Mesh ID, passphrase and channel are set the same way
 > (`AT+MESHID=`, `AT+MESHPASS=`, `AT+MESHCHAN=`); all persist to NVS.
 >
-> **A region build ships with no channel pinned** — it carries the whole
-> country list, so its operating channel is neither chosen nor observable, and
-> meeting a mesh on it is luck. Pin one to match your peer:
+> **With mesh on it uses its region's default mesh channel** (US: ch42,
+> 923.0 MHz, 2 MHz; the table is in [Mesh Mode](Mesh-Mode#building-for-mesh)).
+> To match a peer on another channel:
 > `AT+MESHCHAN=<chan>,<freq_hz>,<gclass>,<sclass>,<bw>`, then `AT+RESET`. The
-> channel must exist in the country's regulatory table; one that does not is
-> refused and logged rather than forced. `AT+MESHCFG?` reports what actually
-> applied. See [Mesh Mode](Mesh-Mode).
+> set must be a row of the region's table; one that is not is refused with the
+> reason. `AT+MESHCFG?` reports what actually applied.
 
 ## 4. Flash
 
@@ -59,7 +56,7 @@ instead; see [Flashing](Flashing#reflashing-a-running-board)):
 **Hold BOOT → tap RESET → release BOOT**, then:
 
 ```bash
-pio run -e warthog-us -t upload
+pio run -e warthog-station -t upload
 ```
 
 Tap **RESET** when it finishes. Full detail and the multi-board flasher in
@@ -84,6 +81,7 @@ AT+STATUS?
 +USBNET: tx_queued=... txq=... ...
 +AP: ip=192.168.5.1
 +DNS: offered=1.1.1.1
++REGION: running=US stored=none (not set: US default)
 OK
 ```
 
@@ -91,10 +89,12 @@ If `AT` does not answer, see [Troubleshooting](Troubleshooting).
 
 ## 6. Point it at an uplink
 
-For station mode, give it an access point. Credentials persist in NVS, so this
-survives reboots and does not need a rebuild:
+Set the country you operate in (`AT+REGION?` lists the offered ones; none set
+runs as US), then, for station mode, give it an access point. Both persist, so
+this survives reboots and does not need a rebuild:
 
 ```
+AT+REGION=US
 AT+HALOW=MyHaLowAP,secretpassphrase
 AT+RESET
 ```

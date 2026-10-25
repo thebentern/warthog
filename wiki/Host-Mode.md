@@ -15,7 +15,7 @@ macOS, Linux, Windows 10+ and iOS/iPadOS all bind with an in-box driver.
 
 ## What the host sees
 
-Warthog presents **CDC-NCM** (CDC-ECM in the `warthog-us-ecm` build) and serves DHCP on it.
+Warthog presents **CDC-NCM** (CDC-ECM in the `warthog-station-ecm` build) and serves DHCP on it.
 
 | | |
 |---|---|
@@ -72,7 +72,7 @@ OK
 
 Malformed input is rejected without touching NVS. To go back to the build-time
 default, run `AT+ERASE` and then `AT+RESET`. `AT+ERASE` clears the whole `warthog` namespace — which also clears
-HaLow and AP credentials, so you will re-enter those.
+HaLow and AP credentials, so you will re-enter those; the region (`regnvs`) is kept.
 
 ## The console shares the cable
 

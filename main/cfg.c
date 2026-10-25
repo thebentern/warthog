@@ -1,10 +1,12 @@
 #include "cfg.h"
+#include "region.h"
 
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "warthog.cfg";
@@ -29,10 +31,27 @@ static const char *NS = "warthog";
 #define WARTHOG_DOWNSTREAM_DNS "1.1.1.1"
 #endif
 
+/* AT+REGION's own partition (partitions.csv): no factory image, NVS reformat or AT+ERASE reaches it. */
+#define REGION_PART "regnvs"
+enum { REGION_PART_OK, REGION_PART_UNREADABLE, REGION_PART_MISSING, REGION_PART_BROKEN };
+static int s_region_part = REGION_PART_BROKEN;
+
 esp_err_t warthog_cfg_init(void)
 {
-    /* nvs_flash_init() is already called from app_main; this is a no-op
-     * placeholder so callers can be explicit about cfg lifecycle. */
+    const esp_err_t err = nvs_flash_init_partition(REGION_PART);
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        /* Never erased here: the region it may hold reads invalid and holds the radio until AT+REGION=. */
+        s_region_part = REGION_PART_UNREADABLE;
+        ESP_LOGE(TAG, "regnvs unreadable (%s): radio held until AT+REGION=<CC> rewrites it", esp_err_to_name(err));
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        s_region_part = REGION_PART_MISSING;
+        ESP_LOGE(TAG, "no regnvs partition: reflash the factory image");
+    } else {
+        s_region_part = err == ESP_OK ? REGION_PART_OK : REGION_PART_BROKEN;
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "regnvs failed to open (%s)", esp_err_to_name(err));
+        }
+    }
     return ESP_OK;
 }
 
@@ -259,9 +278,7 @@ esp_err_t warthog_cfg_set_mesh_enable(uint8_t enable)
     return err;
 }
 
-/* S1G occupies roughly 750-950 MHz across all regions. This is a sanity bound
- * to catch a typo, not a regulatory check -- mmwlan_set_channel_list() applies
- * the real one against the country's table at boot. */
+/* Sanity bound to catch a typo; at.c and region.c match the set against the region's table. */
 #define WARTHOG_S1G_FREQ_MIN_HZ 750000000u
 #define WARTHOG_S1G_FREQ_MAX_HZ 950000000u
 
@@ -327,6 +344,89 @@ esp_err_t warthog_cfg_clear_mesh_chan(void)
         err = nvs_commit(h);
     }
     nvs_close(h);
+    return err;
+}
+
+static bool cc_upper_(const char *v)
+{
+    return v[0] >= 'A' && v[0] <= 'Z' && v[1] >= 'A' && v[1] <= 'Z' && v[2] == '\0';
+}
+
+void warthog_cfg_get_region(struct warthog_rg_stored *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->state = WARTHOG_RG_ABSENT;
+    out->unreadable = s_region_part == REGION_PART_UNREADABLE;
+    out->no_partition = s_region_part == REGION_PART_MISSING;
+    if (s_region_part == REGION_PART_MISSING) {
+        return;
+    }
+    nvs_handle_t h;
+    esp_err_t err = s_region_part != REGION_PART_OK ? ESP_FAIL
+                                                    : nvs_open_from_partition(REGION_PART, NS, NVS_READONLY, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    char v[8] = {0};
+    size_t len = sizeof(v);
+    if (err == ESP_OK) {
+        err = nvs_get_str(h, "region", v, &len);
+        nvs_close(h);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            return;
+        }
+    }
+    out->state = WARTHOG_RG_INVALID;
+    if (err != ESP_OK) {
+        snprintf(out->raw, sizeof(out->raw), "(unreadable)");
+        return;
+    }
+    if (len == 3 && cc_upper_(v)) {
+        out->state = WARTHOG_RG_VALID;
+        memcpy(out->cc, v, 3);
+        return;
+    }
+    size_t i = 0;
+    for (; i < len && i + 1 < sizeof(out->raw) && v[i] != '\0'; i++) {
+        out->raw[i] = (v[i] >= 0x20 && v[i] < 0x7f) ? v[i] : '?';
+    }
+    out->raw[i] = '\0';
+}
+
+esp_err_t warthog_cfg_set_region(const char *cc)
+{
+    if (cc == NULL || !cc_upper_(cc)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_region_part == REGION_PART_MISSING) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    esp_err_t err;
+    if (s_region_part == REGION_PART_UNREADABLE) {
+        /* Only an explicit set reformats an unreadable regnvs, and only to write this code. */
+        err = nvs_flash_erase_partition(REGION_PART);
+        if (err == ESP_OK) {
+            err = nvs_flash_init_partition(REGION_PART);
+        }
+        if (err != ESP_OK) {
+            return err;
+        }
+        s_region_part = REGION_PART_OK;
+        ESP_LOGW(TAG, "regnvs reformatted to store the region");
+    }
+    nvs_handle_t h;
+    err = nvs_open_from_partition(REGION_PART, NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_str(h, "region", cc);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "region stored: %s", cc);
+    }
     return err;
 }
 

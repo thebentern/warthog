@@ -94,3 +94,32 @@ const struct mmwlan_s1g_channel *umac_regdb_get_channel_from_freq_and_bw(struct 
 
     return match;
 }
+
+bool umac_regdb_strictest(const struct mmwlan_s1g_channel_list *list, struct mmwlan_s1g_channel *out)
+{
+    if (list == NULL || list->num_channels == 0)
+    {
+        return false;
+    }
+    struct mmwlan_s1g_channel r = { .duty_cycle_sta = 10000, .duty_cycle_omit_ctrl_resp = true };
+    bool restricted = false;
+    for (uint32_t ii = 0; ii < list->num_channels; ii++)
+    {
+        const struct mmwlan_s1g_channel *c = &list->channels[ii];
+        restricted |= c->duty_cycle_sta < 10000 || c->pkt_spacing_us || c->airtime_min_us || c->airtime_max_us;
+        r.duty_cycle_sta = c->duty_cycle_sta < r.duty_cycle_sta ? c->duty_cycle_sta : r.duty_cycle_sta;
+        /* Omitting control responses from the duty count loosens it: only when every row does. */
+        r.duty_cycle_omit_ctrl_resp = r.duty_cycle_omit_ctrl_resp && c->duty_cycle_omit_ctrl_resp;
+        r.pkt_spacing_us = c->pkt_spacing_us > r.pkt_spacing_us ? c->pkt_spacing_us : r.pkt_spacing_us;
+        r.airtime_min_us = (ii == 0 || c->airtime_min_us < r.airtime_min_us) ? c->airtime_min_us : r.airtime_min_us;
+        if (c->airtime_max_us != 0 && (r.airtime_max_us == 0 || c->airtime_max_us < r.airtime_max_us))
+        {
+            r.airtime_max_us = c->airtime_max_us;
+        }
+    }
+    if (restricted)
+    {
+        *out = r;
+    }
+    return restricted;
+}

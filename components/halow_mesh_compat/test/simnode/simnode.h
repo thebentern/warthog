@@ -239,6 +239,8 @@ bool simnode_expect_assert(void (*fn)(void));
 unsigned simnode_chip_calls_off_loop(void);
 /** umac_interface_set_channel_from_regdb (a stub) returns @p status from now on; 0 by default. */
 void simnode_set_channel_status(int status);
+/** The node's channel list has no rows from now on (true) or its usual three (false, the default). */
+void simnode_set_channel_list_empty(bool empty);
 
 /* ---- the chip's keys and its receive crypto (fake_chip.c) ---------------- */
 

@@ -5,7 +5,7 @@
  * generated stubs because a NULL channel list makes umac_mesh_enable_mesh
  * assert: the firmware is entitled to assume it was configured, and a
  * simulated node has to be configured too. The values are a US 902-928 MHz
- * 2 MHz channel, the domain the warthog-us build ships.
+ * 2 MHz channel: US, the no-region default.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -41,11 +41,17 @@ static const struct mmwlan_s1g_channel_list s_list = {
     .channels = s_channels,
 };
 
+static const struct mmwlan_s1g_channel_list s_empty = { .country_code = { 'U', 'S', '\0' }, .num_channels = 0,
+                                                         .channels = s_channels };
+static bool s_list_empty;
+
 const struct mmwlan_s1g_channel_list *umac_config_get_channel_list(struct umac_data *umacd)
 {
     (void)umacd;
-    return &s_list;
+    return s_list_empty ? &s_empty : &s_list;
 }
+
+void simnode_set_channel_list_empty(bool empty) { s_list_empty = empty; }
 
 /** The channel a simulated node operates on, for a test that cares. */
 const struct mmwlan_s1g_channel *simnode_channel(void) { return &s_channels[0]; }

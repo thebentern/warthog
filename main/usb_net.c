@@ -1,5 +1,5 @@
 /*
- * TinyUSB CDC-ACM + CDC-NCM composite (CDC-ECM in warthog-us-ecm), backed by an esp_netif.
+ * TinyUSB CDC-ACM + CDC-NCM composite (CDC-ECM in warthog-station-ecm), backed by an esp_netif.
  *
  * - NCM gives macOS, Linux, Windows 10+ (usbncm.sys) and iOS/iPadOS a USB
  *   Ethernet adapter with the host's own in-box driver -- no dext, no MFi.
@@ -114,7 +114,7 @@ static int cdc_vprintf(const char *fmt, va_list args)
  *
  * Both triggers are gated behind WARTHOG_DEVLOOP (set in warthog-mesh-smoke,
  * so in every warthog-mesh-* env); the DTR/RTS one also needs
- * WARTHOG_DEVLOOP_DTRRTS=1, which no env sets. Production builds (warthog-us etc.) compile them
+ * WARTHOG_DEVLOOP_DTRRTS=1, which no env sets. Production builds (warthog-station etc.) compile them
  * out entirely so production firmware can't be bricked into bootloader by an
  * accidental serial-port quirk. AT+DLMODE remains available in production
  * for explicit field debugging — that command requires an unambiguous host
@@ -301,7 +301,7 @@ static const tusb_desc_device_t s_desc_device = {
 };
 
 #if CFG_TUD_ECM_RNDIS
-/* esp_tinyusb's default configuration holds CDC + NCM only; ECM (warthog-us-ecm) needs this one, the pre-NCM composite. */
+/* esp_tinyusb's default configuration holds CDC + NCM only; ECM (warthog-station-ecm) needs this one, the pre-NCM composite. */
 enum { ITF_NUM_CDC_CTRL = 0, ITF_NUM_CDC_DATA, ITF_NUM_NET_CTRL, ITF_NUM_NET_DATA, ITF_NUM_TOTAL };
 #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_CDC_ECM_DESC_LEN)
 static const uint8_t s_desc_fs_config[] = {

@@ -4,9 +4,7 @@
 
 set(src "mmhalow.c")
 
-# main/region.h is the single source of truth for the build's regulatory
-# domain. Without it here, mmhalow.c falls back to CONFIG_HALOW_COUNTRY_CODE
-# and every non-US build comes up on the US channel list.
+# main/ for the shims' warthog_shim.h; the region is AT+REGION, decided in main/region.c.
 set(inc "." "${CMAKE_SOURCE_DIR}/main")
 
 idf_component_register(
@@ -19,6 +17,17 @@ idf_component_register(
 	esp_netif
 	esp_wifi
 )
+
+if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    if(NOT "${CONFIG_WARTHOG_HW_REGIONS}" MATCHES "^[A-Z][A-Z](,[A-Z][A-Z])*$" OR
+       NOT ",${CONFIG_WARTHOG_HW_REGIONS}," MATCHES ",US,")
+        message(FATAL_ERROR "warthog: CONFIG_WARTHOG_HW_REGIONS must be a comma list of two-letter codes "
+                            "including US (the no-region default), not '${CONFIG_WARTHOG_HW_REGIONS}'")
+    endif()
+    if(NOT CONFIG_WARTHOG_HW_BAND_LO_KHZ LESS CONFIG_WARTHOG_HW_BAND_HI_KHZ)
+        message(FATAL_ERROR "warthog: CONFIG_WARTHOG_HW_BAND_LO_KHZ must be below CONFIG_WARTHOG_HW_BAND_HI_KHZ")
+    endif()
+endif()
 
 add_subdirectory(components)
 add_dependencies(${COMPONENT_TARGET} mmpktmem shims mmutils morselib regdb)

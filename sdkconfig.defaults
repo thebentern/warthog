@@ -27,7 +27,7 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
 # --- TinyUSB net device (NCM) + CDC console ----------------------------------
 # CDC keeps a serial console after USB-OTG takes over from USB-Serial-JTAG.
-# USB network class: CDC-NCM (CDC-ECM: warthog-us-ecm, sdkconfig.ecm).
+# USB network class: CDC-NCM (CDC-ECM: warthog-station-ecm, sdkconfig.ecm).
 #
 # NCM is bound in-box by macOS, Linux (cdc_ncm), Windows 10+ (usbncm.sys) and
 # iOS/iPadOS (Apple's own driver -- no dext, no MFi). ECM reached only macOS
@@ -73,11 +73,10 @@ CONFIG_MMHAL_CHIP_TYPE_MM6108=y
 # Quectel FGH100M-H specific BCF for rated TX power.
 CONFIG_MM_BCF_FILE="bcf_fgh100mhaamd.mbin"
 CONFIG_MM_FW_FILE="mm6108.mbin"
-
-# --- HaLow regulatory --------------------------------------------------------
-# Without this mmhalow_init defaults to "??" → mmwlan_set_channel_list fails →
-# mmwlan_boot fails → version reads come back as uninitialized garbage.
-CONFIG_HALOW_COUNTRY_CODE="US"
+# FGH100M-H: rated 902-928 MHz; its BCF has sections (AU, US populated) for these in-band countries.
+CONFIG_WARTHOG_HW_REGIONS="AU,JP,KR,NZ,US"
+CONFIG_WARTHOG_HW_BAND_LO_KHZ=902000
+CONFIG_WARTHOG_HW_BAND_HI_KHZ=928000
 
 # --- Morse packet memory pool sizes ------------------------------------------
 CONFIG_MMPKTMEM_TX_POOL_N_BLOCKS=20

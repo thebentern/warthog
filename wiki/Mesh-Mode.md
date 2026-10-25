@@ -10,29 +10,30 @@ deployments, convoys, anything that has to come up on its own.
 ## Building for mesh
 
 Mesh is mutually exclusive with station mode, but it is a runtime choice (the mesh envs force it on, so `AT+MESHEN=0` does nothing there):
-`AT+MESHEN=1` then `AT+RESET` turns it on for any build, region images
-included. The mesh envs exist because they pin a channel and fix the identity
-at build time, so a bench of boards agrees with no configuration at all:
+`AT+MESHEN=1` then `AT+RESET` turns it on for any build, `warthog-station`
+included. The mesh envs exist because they fix the identity at build time, so a
+bench of boards agrees with no configuration at all:
 
 ```bash
 pio run -e warthog-mesh-smoke -t upload
 ```
 
-The env pins the radio to one S1G channel and sets the mesh identity by default (`AT+MESHCHAN=` and `AT+MESHID=` override both), so nodes
-agree with no configuration at all. **These settings must be identical on every
+With mesh on, every image pins the radio to one S1G channel, the region's default (`AT+MESHCHAN=` overrides it), and the mesh envs set mesh ID `halowmesh` (`WARTHOG_MESH_ID`; `AT+MESHID=` overrides it). **These settings must be identical on every
 node in the mesh.** A mismatch produces no peers; after about 20 s without one
 the node logs a `NOT PEERED` error listing these values, repeated about every
-60 s, and `AT+MESHCFG?` reports them too:
+60 s, and `AT+MESHCFG?` reports them too.
 
-| Flag | Default |
-|---|---|
-| `WARTHOG_MESH_ID` | `halowmesh` |
-| `WARTHOG_PIN_S1G_CHAN` | `42` |
-| `WARTHOG_PIN_S1G_FREQ_HZ` | `923000000` |
-| `WARTHOG_PIN_S1G_BW_MHZ` | `2` |
-| `WARTHOG_PIN_S1G_GLOBAL_OP_CLASS` | `69` |
+Default mesh channel per region (`AT+REGION`; none stored: US):
 
-Channel 42 at 2 MHz is what the mesh envs pin; a region image switched on with `AT+MESHEN=1` pins no channel and uses mesh ID `warthog-mesh-test` until `AT+MESHCHAN=` and `AT+MESHID=` set them. It must match your peer
+| Region | Channel | Frequency | Bandwidth | Classes (global/S1G) |
+|---|---|---|---|---|
+| US | 42 | 923.0 MHz | 2 MHz | 69/2 |
+| AU | 41 | 922.5 MHz | 2 MHz | 51/23 |
+| JP | 2 | 923.5 MHz | 2 MHz | 64/9 |
+| KR | 10 | 922.5 MHz | 2 MHz | 75/15 |
+| NZ | 38 | 921.0 MHz | 2 MHz | 69/27 |
+
+US ch42 is OpenMANET's US default. The station image uses mesh ID `warthog-mesh-test` until `AT+MESHID=` sets one. The channel must match your peer
 exactly — read the peer's actual setting rather than assuming a default; see
 [OpenMANET Interop](OpenMANET-Interop).
 
@@ -384,40 +385,29 @@ pio run -e warthog-mesh-sae -t upload
 ```
 
 > **Mesh ID, passphrase and mesh mode are runtime settings.** `AT+MESHEN=1`
-> turns mesh on (any build, including the region envs; the mesh envs force it
+> turns mesh on (any build, including `warthog-station`; the mesh envs force it
 > on, so `AT+MESHEN=0` does nothing there), `AT+MESHID=<id>` and
 > `AT+MESHPASS=<pass>` set the credentials. All persist to NVS and take effect
 > on the next boot. `AT+MESHPASS?` reports only the length, deliberately.
 >
 > **Channel is settable too, as a set:**
-> `AT+MESHCHAN=42,923000000,69,2,2` then `AT+RESET`. Read it back with
-> `AT+MESHCHAN?` — it reports `applied=yes|NO`. A set the regulatory
-> table refuses is discarded at boot and the radio falls back (to the build-time
-> pin on a mesh env, to the full country list on a region env), so it reads back
-> as `build-time pin`, not as the set you stored; that is the usual cause of
-> "peers with nothing and looks like a range problem". On a mesh env, `NO` beside
-> `build-time pin` means the build's own pin was refused, which
-> `AT+MESHCHAN=default` does not fix. `AT+MESHCHAN=default` restores the
-> build-time pin on a mesh env, and on a region env returns the radio to the
-> full country list.
+> `AT+MESHCHAN=42,923000000,69,2,2` then `AT+RESET`. The set must be an in-band
+> row of the region's table on all five values, and not a row Morse flags as
+> possibly non-compliant, or `AT+MESHCHAN=` refuses it with the reason; send
+> `AT+REGION=` first. At boot a stored set is used when its frequency, channel
+> and bandwidth match a row, with that row's classes, EIRP and duty cycle. After
+> a region change a set not in the new table is kept but not used
+> (`src=default+stored-refused`). `AT+MESHCHAN=default` returns to the region
+> default. Read it back with `AT+MESHCHAN?`: `applied=yes|NO` and `src=`.
 >
-> **The mesh envs pin a channel; the region envs do not.** A region build
-> carries the whole country list, so until you set `AT+MESHCHAN=` its operating
-> channel is neither chosen nor observable — pin one before expecting it to
-> meet a mesh. `AT+MESHCFG?` reports the channel that actually applied, which
-> is not the same thing as the one configured.
+> **Every image pins one channel when mesh is on.** With mesh off the station
+> holds the country's whole list unless a stored set pins it. `AT+MESHCFG?`
+> reports the channel that actually applied.
 >
-> **Region is still build-time.** The mesh envs hard-code `WARTHOG_REGION_US` and pin
-> the radio to S1G channel 42 (923.0 MHz, 2 MHz, global op class 69). That
-> matches OpenMANET's US default, which is why it is the default here. Outside
-> the US, or against a peer on another channel, override the pin — the five
+> **Region is runtime:** `AT+REGION=<CC>`, then `AT+MESHCHAN=<a row of that
+> table>` if the peer is not on the region default, then `AT+RESET`. The five
 > values move together, because operating class and bandwidth belong to the
-> channel and a mismatch peers with nothing while looking like a radio fault:
->
-> ```bash
-> PLATFORMIO_BUILD_FLAGS='-UWARTHOG_REGION_US -DWARTHOG_REGION_EU=1 -UWARTHOG_PIN_S1G_CHAN -DWARTHOG_PIN_S1G_CHAN=<ch> -UWARTHOG_PIN_S1G_FREQ_HZ -DWARTHOG_PIN_S1G_FREQ_HZ=<hz> -UWARTHOG_PIN_S1G_GLOBAL_OP_CLASS -DWARTHOG_PIN_S1G_GLOBAL_OP_CLASS=<n> -UWARTHOG_PIN_S1G_OP_CLASS -DWARTHOG_PIN_S1G_OP_CLASS=<s1g-class> -UWARTHOG_PIN_S1G_BW_MHZ -DWARTHOG_PIN_S1G_BW_MHZ=<mhz>' \
->   pio run -e warthog-mesh-sae
-> ```
+> channel and a mismatch peers with nothing while looking like a radio fault.
 >
 > Take the values from your peer: `morse_cli -i wlh0 channel` on an OpenMANET
 > node prints the operating frequency, bandwidth and primary width it is

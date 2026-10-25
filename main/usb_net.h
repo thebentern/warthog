@@ -6,7 +6,7 @@
 #include "hang_guard_core.h"
 #include "usbnet_core.h"
 
-/* Bring up TinyUSB CDC-NCM (CDC-ECM on warthog-us-ecm) + a DHCP-serving esp_netif. NULL on failure. */
+/* Bring up TinyUSB CDC-NCM (CDC-ECM on warthog-station-ecm) + a DHCP-serving esp_netif. NULL on failure. */
 esp_netif_t *warthog_usb_net_start(void);
 
 /* The USB network counters AT+STATUS? prints; zeros before warthog_usb_net_start. */

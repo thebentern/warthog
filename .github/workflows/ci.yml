@@ -30,6 +30,12 @@ jobs:
         with:
           python-version: '3.11'
 
+      # make all runs the web flasher's script under node (test_flasher.mjs) and fails without it in CI.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       # Seconds, and needs no embedded toolchain -- so it runs before the slow
       # PlatformIO steps and fails fast. Covers the mesh on-air byte layout
       # (IE construction, MPM frame build/parse) against a frame captured from
@@ -66,20 +72,26 @@ jobs:
           restore-keys: |
             pio-${{ runner.os }}-${{ env.PIO_VERSION }}-
 
-      - name: Smoke build (warthog-us)
-        # One region is enough for CI — the others differ only in the
-        # WARTHOG_REGION_XX define and the BCF/country pick that drives.
-        run: pio run -e warthog-us
+      # One station image serves every region (AT+REGION at runtime); test_region covers the countries.
+      - name: Smoke build (warthog-station)
+        run: pio run -e warthog-station
 
       # The CDC-ECM fallback (sdkconfig.ecm): main/usb_net.c's ECM side compiles only here. esp_tinyusb's
       # default descriptor has no ECM function, so the ELF must hold usb_net.c's CDC + ECM one.
-      - name: Smoke build (warthog-us-ecm)
+      - name: Smoke build (warthog-station-ecm)
         run: |
-          pio run -e warthog-us-ecm
-          ~/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-nm -S .pio/build/warthog-us-ecm/firmware.elf | grep ' 0000009a [dr] s_desc_fs_config$'
+          pio run -e warthog-station-ecm
+          ~/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-nm -S .pio/build/warthog-station-ecm/firmware.elf | grep ' 0000009a [dr] s_desc_fs_config$'
+
+      # release.yml's region images, from the station build's sdkconfig with the same pinned generator.
+      - name: Region NVS images
+        run: |
+          python -m venv "$RUNNER_TEMP/nvsgen"
+          "$RUNNER_TEMP/nvsgen/bin/pip" install "esp-idf-nvs-partition-gen==0.3.0"
+          PYTHON="$RUNNER_TEMP/nvsgen/bin/python" scripts/region-images.sh ci "$RUNNER_TEMP/region"
 
       # The glue guard again: its checks of the generated sdkconfig.warthog-* files found none in a fresh
-      # checkout, and the two builds above have now written warthog-us's and warthog-us-ecm's.
+      # checkout, and the two builds above have now written warthog-station's and warthog-station-ecm's.
       - name: Glue guard (generated sdkconfigs)
         run: make -C components/halow_mesh_compat/test glueguard
 
@@ -97,9 +109,8 @@ jobs:
           make -C components/halow_mesh_compat/test usbnet USBNET_REQUIRED=1
           make -C components/halow_mesh_compat/test clean usbnet SAN=1 USBNET_REQUIRED=1
 
-      # warthog-us compiles the mesh sources too (mesh is a runtime switch). This
-      # env adds the code behind its own flags: the RX tap, the build-time
-      # channel pin and the USB devloop helpers.
+      # warthog-station compiles the mesh sources too (mesh is a runtime switch). This
+      # env adds the code behind its own flags: the RX tap and the USB devloop helpers.
       - name: Smoke build (warthog-mesh-smoke)
         run: pio run -e warthog-mesh-smoke
 
@@ -115,12 +126,12 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: warthog-us-${{ github.sha }}
+          name: warthog-station-${{ github.sha }}
           path: |
-            .pio/build/warthog-us/firmware.bin
-            .pio/build/warthog-us/firmware.factory.bin
-            .pio/build/warthog-us/firmware.elf
-            .pio/build/warthog-us/bootloader.bin
-            .pio/build/warthog-us/partitions.bin
+            .pio/build/warthog-station/firmware.bin
+            .pio/build/warthog-station/firmware.factory.bin
+            .pio/build/warthog-station/firmware.elf
+            .pio/build/warthog-station/bootloader.bin
+            .pio/build/warthog-station/partitions.bin
           retention-days: 14
           if-no-files-found: error

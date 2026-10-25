@@ -3715,7 +3715,7 @@ EOF2
 # Each build's flags (platformio.ini) and the default it must boot with.
 for d49 in "1 -DWARTHOG_MESH_SAE=1" "1 -DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_CHIP_VIF_MESH=1" \
            "0 -DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1" \
-           "0 -DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1" "0 -DWARTHOG_MESH_SMOKE=1" "0 -DWARTHOG_REGION_US=1"; do
+           "0 -DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1" "0 -DWARTHOG_MESH_SMOKE=1" "0 -UWARTHOG_MESH_SMOKE"; do
   r49=""
   ${CC:-cc} -std=gnu11 -w -DWANT=${d49%% *} ${d49#* } -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null && r49=$("$T/t")
   [ "$r49" = ok ] || why49="${why49:-the NVS default (${d49#* }, want ${d49%% *}): ${r49:-did not build or run}}"
@@ -4827,9 +4827,9 @@ printf '%s\n' "$AM" | awk '/const bool safe = warthog_boot_guard_start\(\);/ {g=
      /warthog_halow_wait_link\(/ {w=NR} /const bool usb = warthog_usb_net_start\(\) != NULL;/ {u=NR}
      /if \(usb \|\| safe\) \{/ {uc=NR} /warthog_boot_guard_usb_up\(\);/ {ud=NR}
      /\} else if \(warthog_boot_guard_usb_failed\(\)\) \{/ {uf=NR}
-     /!safe && warthog_cfg_get_mesh_bridge\(\)/ {b=NR} /while \(1\) \{/ {l=NR} /warthog_boot_guard_tick\(\);/ {t=NR}
+     /warthog_halow_radio_up\(\) && warthog_cfg_get_mesh_bridge\(\)/ {b=NR} /while \(1\) \{/ {l=NR} /warthog_boot_guard_tick\(\);/ {t=NR}
      END {exit (g && g < n && n < s && s < hs && hs < h && h < hn && hn < w && w < u && uc == u + 1 && ud > uc && ud <= uc + 2 && uf == ud + 1 && u < b && b < l && l < t) ? 0 : 1}' || \
-  why65="${why65:-app_main does not count the boot first, start safe mode without the chip, stop an armed hang before the HaLow start, end the watchdog right after USB starts (or in safe mode), report a failed USB start to the guard, keep the bridge out of safe mode, or tick the guard}"
+  why65="${why65:-app_main does not count the boot first, start safe mode without the chip, stop an armed hang before the HaLow start, end the watchdog right after USB starts (or in safe mode), report a failed USB start to the guard, keep the bridge off a chip that never booted (safe mode, a held region), or tick the guard}"
 grep -q '"boot_guard.c"' ../../../main/CMakeLists.txt || why65="${why65:-main/boot_guard.c is not built}"
 HS=$(awk '/^esp_err_t warthog_halow_start_safe\(void\)/,/^}/' "$HL")
 case "$HS" in *'halow_base_start_()'*'xEventGroupSetBits(s_halow_events, HALOW_LINK_BIT);'*) ;; *) why65="${why65:-safe mode does not start the event loop and netif, or leaves the link bit clear}" ;; esac
@@ -5240,7 +5240,7 @@ grep -q '^#define LWIP_DHCP 1$' lwip_napt/lwipopts.h && grep -q 'dhcp.c' lwip_na
 grep -q '^all:.* lwip-napt' Makefile && grep -q '^include lwip_napt.mk$' Makefile || why70="${why70:-make all does not run lwip-napt}"
 grep -q 'make -C components/halow_mesh_compat/test lwip-napt LWIP_NAPT_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
   grep -q 'make -C components/halow_mesh_compat/test clean lwip-napt SAN=1 LWIP_NAPT_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
-  awk '/run: pio run -e warthog-us$/ {b=NR} /lwip-napt LWIP_NAPT_REQUIRED=1$/ && !l {l=NR} END {exit (b && l > b) ? 0 : 1}' ../../../.github/workflows/ci.yml || \
+  awk '/run: pio run -e warthog-station$/ {b=NR} /lwip-napt LWIP_NAPT_REQUIRED=1$/ && !l {l=NR} END {exit (b && l > b) ? 0 : 1}' ../../../.github/workflows/ci.yml || \
   why70="${why70:-CI does not run lwip-napt after its PlatformIO build}"
 awk '/^static void cmd_mtu\(void\)/,/^}/' ../../../main/at.c | grep -q '"+MTU: ip_reass=%lu ip_reass_drop=%lu ip_short_drop=%lu\\r\\n"' || \
   why70="${why70:-AT+MTU? does not print the counts of the hook}"
@@ -5259,21 +5259,21 @@ else
 fi
 
 # 71. The USB network class: every generated sdkconfig.warthog-* builds CDC-NCM, sdkconfig.defaults'
-#     choice, except warthog-us-ecm (sdkconfig.ecm). PlatformIO keeps an explicit line of an existing
+#     choice, except warthog-station-ecm (sdkconfig.ecm). PlatformIO keeps an explicit line of an existing
 #     generated file over the defaults, so one written before NCM became the default (1b3e608) builds
 #     ECM until it is edited or deleted (warthog-eu/jp/kr/au did until 2026-10-03). sdkconfig.ecm must
 #     be tracked: .gitignore's sdkconfig.* hid it, and IDF stops at CMake configure when a file named
-#     in SDKCONFIG_DEFAULTS is missing, so warthog-us-ecm built only on the machine that had it.
+#     in SDKCONFIG_DEFAULTS is missing, so the ECM env built only on the machine that had it.
 #     esp_tinyusb's default configuration descriptor has CDC and NCM functions only, so under ECM
 #     usb_net.c must hand it its own CDC + ECM one (until 2026-10-03 it passed NULL and the ECM image
-#     enumerated a console and no network). CI builds warthog-us-ecm and checks its ELF holds that
+#     enumerated a console and no network). CI builds warthog-station-ecm and checks its ELF holds that
 #     descriptor (154 bytes: TinyUSB's TUD_CDC_ECM_DESC_LEN is 79, not the 71 its comment says).
 why71=""
 grep -q '^CONFIG_TINYUSB_NET_MODE_NCM=y$' ../../../sdkconfig.defaults || why71="sdkconfig.defaults does not choose NCM"
 grep -q '^  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ecm"$' ../../../platformio.ini || \
-  why71="${why71:-platformio.ini does not give warthog-us-ecm sdkconfig.ecm}"
+  why71="${why71:-platformio.ini does not give warthog-station-ecm sdkconfig.ecm}"
 if [ ! -f ../../../sdkconfig.ecm ]; then
-  why71="${why71:-sdkconfig.ecm is missing; warthog-us-ecm names it in SDKCONFIG_DEFAULTS}"
+  why71="${why71:-sdkconfig.ecm is missing; warthog-station-ecm names it in SDKCONFIG_DEFAULTS}"
 elif ! grep -q '^CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=y$' ../../../sdkconfig.ecm; then
   why71="${why71:-sdkconfig.ecm does not choose ECM}"
 fi
@@ -5281,8 +5281,8 @@ grep -qx '!sdkconfig.ecm' ../../../.gitignore || why71="${why71:-.gitignore does
 if git -C ../../.. rev-parse --is-inside-work-tree >/dev/null 2>&1 && git -C ../../.. check-ignore -q sdkconfig.ecm; then
   why71="${why71:-git ignores sdkconfig.ecm}"
 fi
-grep -q '^ *pio run -e warthog-us-ecm$' ../../../.github/workflows/ci.yml || why71="${why71:-CI does not build warthog-us-ecm}"
-grep -qF "xtensa-esp32s3-elf-nm -S .pio/build/warthog-us-ecm/firmware.elf | grep ' 0000009a [dr] s_desc_fs_config\$'" ../../../.github/workflows/ci.yml || \
+grep -q '^ *pio run -e warthog-station-ecm$' ../../../.github/workflows/ci.yml || why71="${why71:-CI does not build warthog-station-ecm}"
+grep -qF "xtensa-esp32s3-elf-nm -S .pio/build/warthog-station-ecm/firmware.elf | grep ' 0000009a [dr] s_desc_fs_config\$'" ../../../.github/workflows/ci.yml || \
   why71="${why71:-CI does not check that the ECM image holds the usb_net.c configuration descriptor}"
 U71=../../../main/usb_net.c
 awk '/^#if CFG_TUD_ECM_RNDIS$/,/^#endif$/' "$U71" | tr -d '\n' | \
@@ -5293,12 +5293,12 @@ n71=0
 for g71 in ../../../sdkconfig.warthog-*; do
   [ -f "$g71" ] || continue
   n71=$((n71 + 1))
-  case "${g71##*/}" in sdkconfig.warthog-us-ecm) w71=ECM_RNDIS ;; *) w71=NCM ;; esac
+  case "${g71##*/}" in sdkconfig.warthog-*-ecm) w71=ECM_RNDIS ;; *) w71=NCM ;; esac
   grep -q "^CONFIG_TINYUSB_NET_MODE_$w71=y$" "$g71" || \
     why71="${why71:-${g71##*/}: not CONFIG_TINYUSB_NET_MODE_$w71 (PlatformIO keeps a generated sdkconfig)}"
 done
 if [ -z "$why71" ]; then
-  ok "USB network class: NCM in all $n71 generated sdkconfigs but warthog-us-ecm's ECM; sdkconfig.ecm not gitignored; under ECM usb_net.c hands esp_tinyusb a CDC + ECM descriptor; CI builds warthog-us-ecm and checks its ELF holds it"
+  ok "USB network class: NCM in all $n71 generated sdkconfigs but the -ecm env's ECM; sdkconfig.ecm not gitignored; under ECM usb_net.c hands esp_tinyusb a CDC + ECM descriptor; CI builds warthog-station-ecm and checks its ELF holds it"
 else
   bad "USB network class: $why71"
 fi
@@ -5377,7 +5377,7 @@ for d72 in $(sed -n 's/^ *-DSDKCONFIG_DEFAULTS="\(.*\)"$/\1/p' ../../../platform
 done
 for g72 in ../../../sdkconfig.warthog-*; do
   [ -f "$g72" ] || continue
-  case "${g72##*/}" in sdkconfig.warthog-us-ecm) continue ;; esac
+  case "${g72##*/}" in sdkconfig.warthog-*-ecm) continue ;; esac
   for k72 in 'OUT_NTB_BUFFS_COUNT=3' 'IN_NTB_BUFFS_COUNT=3' 'OUT_NTB_BUFF_MAX_SIZE=3200' 'IN_NTB_BUFF_MAX_SIZE=3200'; do
     grep -q "^CONFIG_TINYUSB_NCM_$k72$" "$g72" || why72="${why72:-${g72##*/}: not CONFIG_TINYUSB_NCM_$k72, which the host test models}"
   done
@@ -5385,9 +5385,9 @@ done
 grep -q '^all:.* usbnet$' Makefile || why72="${why72:-make all does not run usbnet}"
 grep -q 'make -C components/halow_mesh_compat/test usbnet USBNET_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
   grep -q 'make -C components/halow_mesh_compat/test clean usbnet SAN=1 USBNET_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
-  awk '/run: pio run -e warthog-us$/ {b=NR} /usbnet USBNET_REQUIRED=1$/ && !l {l=NR} END {exit (b && l > b) ? 0 : 1}' ../../../.github/workflows/ci.yml || \
+  awk '/run: pio run -e warthog-station$/ {b=NR} /usbnet USBNET_REQUIRED=1$/ && !l {l=NR} END {exit (b && l > b) ? 0 : 1}' ../../../.github/workflows/ci.yml || \
   why72="${why72:-CI does not run usbnet after its PlatformIO build}"
-awk '/run: pio run -e warthog-us$/ {b=NR} /run: make -C components\/halow_mesh_compat\/test glueguard$/ {g=NR}
+awk '/run: pio run -e warthog-station$/ {b=NR} /run: make -C components\/halow_mesh_compat\/test glueguard$/ {g=NR}
   END {exit (b && g > b) ? 0 : 1}' ../../../.github/workflows/ci.yml || why72="${why72:-CI does not re-run the glue guard after its builds}"
 awk '/^static void cmd_status\(void\)/,/^}/' ../../../main/at.c | grep -q '"+USBNET: tx_queued=%lu txq=%lu/%u txq_hw=%lu tx_stall_ms=%lu tx_busy_ms=%lu' && \
   awk '/^static void cmd_status\(void\)/,/^}/' ../../../main/at.c | grep -q 'rx_idle_ms=%lu' || \
@@ -5631,7 +5631,7 @@ for k73 in 'AT+HANG?' 'AT+HANGTEST' 'reason=HANG' 'TASK_WDT' "$ls73 s" "$tw73 s"
   case "$TH73" in *"$k73"*) ;; *) why73="${why73:-the Hangs section of Troubleshooting does not name $k73}" ;; esac
 done
 for k73 in mmwlan_loop_ping mmwlan_hang_health health_check.wakes g_warthog_hang_block tcpip_timeouts_mbox_fetch \
-           'Re-check the fifteen entries'; do
+           'Re-check the seventeen entries'; do
   grep -qF "$k73" ../../../docs/fork-inventory.md || why73="${why73:-the fork inventory does not name $k73}"
 done
 if [ -z "$why73" ]; then
@@ -5694,6 +5694,905 @@ if [ -z "$why74" ]; then
   ok "ROM download mode: one entry (chip reset, boot guard marked, RTC watchdog armed to reset the RTC domain after ${back74} s, USB reset exemption cleared, off the bus 100 ms, then the flag and a core reset), used by AT+DLMODE and both devloop triggers; no esp_restart; only boot_guard.c and dlmode.c touch the RTC watchdog; the return named DLMODE; documented"
 else
   bad "download mode: $why74"
+fi
+
+# 75a. AT+REGION's storage (main/cfg.c), compiled out and run against a fake NVS that keeps the
+#      default partition and regnvs apart, with IDF's semantics (a short buffer is
+#      ESP_ERR_NVS_INVALID_LENGTH, a read-only open of a namespace never written is NOT_FOUND,
+#      nvs_erase_all clears only its own partition's namespace): nothing stored is absent; set("AU")
+#      stores exactly 'AU' in regnvs and reads back valid; lower case, 3 letters, '' and NULL are
+#      refused with the store untouched; a stored 'u$', 'AUS', a control byte or an 8+ byte value
+#      read invalid (printable raw, or '(unreadable)'), never as a code; an init that finds no free
+#      pages or a newer format leaves regnvs untouched and reads invalid ('(unreadable)', unreadable),
+#      boot after boot, so the radio is held rather than run as US; only a set reformats it (regnvs
+#      alone), after refusing a bad code untouched, and then reads back valid; no regnvs partition
+#      reads absent and refuses a set (NOT_SUPPORTED); another init error reads invalid;
+#      AT+ERASE (warthog_cfg_erase) wipes the default partition's namespace and keeps the region.
+CF75=../../../main/cfg.c
+FW75=../../halow/components/mm-iot-sdk/framework
+why75a=""
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{
+  grep '^static const char \*NS = ' "$CF75"
+  grep '^#define REGION_PART ' "$CF75"
+  grep '^enum { REGION_PART_OK' "$CF75"
+  grep '^static int s_region_part ' "$CF75"
+  for f in warthog_cfg_init cc_upper_ warthog_cfg_get_region warthog_cfg_set_region warthog_cfg_erase; do
+    awk -v f="$f" '$0 ~ ("^[a-z_0-9 ]+[ *]" f "\\(") && !/;$/ {p=1} p {print} p && /^}/ {exit}' "$CF75"
+  done
+} > "$T/cfg_fn.c"
+cat > "$T/t.c" <<'EOF75A'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "region.h"
+typedef int esp_err_t;
+typedef int nvs_handle_t;
+#define ESP_OK 0
+#define ESP_FAIL (-1)
+#define ESP_ERR_INVALID_ARG 0x102
+#define ESP_ERR_NOT_FOUND 0x105
+#define ESP_ERR_NOT_SUPPORTED 0x106
+#define ESP_ERR_NVS_NOT_INITIALIZED 0x1101
+#define ESP_ERR_NVS_NOT_FOUND 0x1102
+#define ESP_ERR_NVS_READ_ONLY 0x1107
+#define ESP_ERR_NVS_INVALID_LENGTH 0x110c
+#define ESP_ERR_NVS_NO_FREE_PAGES 0x110d
+#define ESP_ERR_NVS_NEW_VERSION_FOUND 0x1110
+#define ESP_LOGI(t, ...) ((void)(t))
+#define ESP_LOGW(t, ...) ((void)(t))
+#define ESP_LOGE(t, ...) ((void)(t))
+static const char *TAG = "t";
+static const char *esp_err_to_name(esp_err_t e) { (void)e; return "err"; }
+enum { NVS_READONLY, NVS_READWRITE };
+struct ent { char part[16], ns[16], key[16], val[16]; size_t len; int used; };
+static struct ent e_[16];
+static struct { char part[16], ns[16]; int rw; } h_[8];
+static int nh_, part_ok_, erased_, inits_;
+static esp_err_t init_ret_[4];
+static void store_clear_(const char *part)
+{
+    for (int i = 0; i < 16; i++) if (e_[i].used && (!part || !strcmp(e_[i].part, part))) e_[i].used = 0;
+}
+static struct ent *find_(const char *part, const char *ns, const char *key)
+{
+    for (int i = 0; i < 16; i++)
+        if (e_[i].used && !strcmp(e_[i].part, part) && !strcmp(e_[i].ns, ns) && (!key || !strcmp(e_[i].key, key))) return &e_[i];
+    return NULL;
+}
+static void raw_(const char *part, const char *key, const char *v, size_t len)
+{
+    struct ent *x = find_(part, "warthog", key);
+    for (int i = 0; !x && i < 16; i++) if (!e_[i].used) x = &e_[i];
+    memset(x, 0, sizeof(*x));
+    x->used = 1; snprintf(x->part, 16, "%s", part); snprintf(x->ns, 16, "warthog"); snprintf(x->key, 16, "%s", key);
+    memcpy(x->val, v, len); x->len = len;
+}
+static esp_err_t nvs_flash_init_partition(const char *p)
+{
+    esp_err_t r = strcmp(p, "regnvs") ? ESP_ERR_NOT_FOUND : init_ret_[inits_ < 4 ? inits_ : 3];
+    inits_++;
+    part_ok_ = r == ESP_OK;
+    return r;
+}
+static esp_err_t nvs_flash_erase_partition(const char *p) { erased_++; store_clear_(p); return ESP_OK; }
+static esp_err_t open_(const char *part, const char *ns, int m, nvs_handle_t *h)
+{
+    if (!strcmp(part, "regnvs") && !part_ok_) return ESP_ERR_NVS_NOT_INITIALIZED;
+    if (m == NVS_READONLY && !find_(part, ns, NULL)) return ESP_ERR_NVS_NOT_FOUND;
+    const int i = nh_++ % 8; /* every handle is closed before the next open */
+    snprintf(h_[i].part, 16, "%s", part); snprintf(h_[i].ns, 16, "%s", ns); h_[i].rw = m == NVS_READWRITE;
+    *h = i;
+    return ESP_OK;
+}
+static esp_err_t nvs_open(const char *ns, int m, nvs_handle_t *h) { return open_("nvs", ns, m, h); }
+static esp_err_t nvs_open_from_partition(const char *p, const char *ns, int m, nvs_handle_t *h) { return open_(p, ns, m, h); }
+static void nvs_close(nvs_handle_t h) { (void)h; }
+static esp_err_t nvs_commit(nvs_handle_t h) { (void)h; return ESP_OK; }
+static esp_err_t nvs_get_str(nvs_handle_t h, const char *k, char *out, size_t *len)
+{
+    struct ent *x = find_(h_[h].part, h_[h].ns, k);
+    if (!x) return ESP_ERR_NVS_NOT_FOUND;
+    if (out && *len < x->len) return ESP_ERR_NVS_INVALID_LENGTH;
+    if (out) memcpy(out, x->val, x->len);
+    *len = x->len;
+    return ESP_OK;
+}
+static esp_err_t nvs_set_str(nvs_handle_t h, const char *k, const char *v)
+{
+    if (!h_[h].rw) return ESP_ERR_NVS_READ_ONLY;
+    raw_(h_[h].part, k, v, strlen(v) + 1);
+    return ESP_OK;
+}
+static esp_err_t nvs_erase_all(nvs_handle_t h)
+{
+    for (int i = 0; i < 16; i++) if (e_[i].used && !strcmp(e_[i].part, h_[h].part) && !strcmp(e_[i].ns, h_[h].ns)) e_[i].used = 0;
+    return ESP_OK;
+}
+#include "cfg_fn.c"
+static int fails;
+#define CHECK(c, ...) do { if (!(c)) { fails++; printf(__VA_ARGS__); printf(" | "); } } while (0)
+static bool raw_is_(const char *v) { struct ent *x = find_("regnvs", "warthog", "region"); return x && x->len == strlen(v) + 1 && !memcmp(x->val, v, x->len); }
+static void boot_(esp_err_t a, esp_err_t b) { init_ret_[0] = a; init_ret_[1] = b; inits_ = 0; erased_ = 0; (void)warthog_cfg_init(); }
+int main(void)
+{
+    struct warthog_rg_stored s;
+    boot_(ESP_OK, ESP_OK);
+    warthog_cfg_get_region(&s);
+    CHECK(s.state == WARTHOG_RG_ABSENT && !s.unreadable && !s.no_partition, "nothing stored: not absent");
+    CHECK(warthog_cfg_set_region("AU") == ESP_OK && raw_is_("AU"), "set(AU) did not store exactly 'AU'");
+    warthog_cfg_get_region(&s);
+    CHECK(s.state == WARTHOG_RG_VALID && !strcmp(s.cc, "AU"), "AU stored: not read back valid AU");
+    static const char *bad[] = { "au", "Au", "USA", "", "A", "A1" };
+    for (unsigned i = 0; i < 6; i++) CHECK(warthog_cfg_set_region(bad[i]) == ESP_ERR_INVALID_ARG && raw_is_("AU"), "set(%s) not refused, or touched the store", bad[i]);
+    CHECK(warthog_cfg_set_region(NULL) == ESP_ERR_INVALID_ARG && raw_is_("AU"), "set(NULL) not refused");
+    static const struct { const char *v; size_t n; const char *raw; } inv[] = {
+        { "u$", 3, "u$" }, { "us", 3, "us" }, { "AUS", 4, "AUS" }, { "A\x01", 3, "A?" }, { "", 1, "" },
+        { "ABCDEFGH", 9, "(unreadable)" }, { "ABCDEFG", 8, "ABCDEFG" },
+    };
+    for (unsigned i = 0; i < sizeof(inv) / sizeof(inv[0]); i++) {
+        raw_("regnvs", "region", inv[i].v, inv[i].n);
+        warthog_cfg_get_region(&s);
+        CHECK(s.state == WARTHOG_RG_INVALID && !strcmp(s.raw, inv[i].raw) && s.cc[0] == 0, "stored '%s' not read invalid('%s'): state %d raw '%s'", inv[i].v, inv[i].raw, (int)s.state, s.raw);
+    }
+    static const esp_err_t refused[2] = { ESP_ERR_NVS_NO_FREE_PAGES, ESP_ERR_NVS_NEW_VERSION_FOUND };
+    for (unsigned i = 0; i < 2; i++) {
+        const char *n = i ? "NEW_VERSION_FOUND" : "NO_FREE_PAGES";
+        raw_("nvs", "dns", "1.1.1.1", 8);
+        raw_("regnvs", "region", "KR", 3);
+        for (int b = 0; b < 2; b++) {
+            boot_(refused[i], ESP_OK);
+            warthog_cfg_get_region(&s);
+            CHECK(erased_ == 0 && inits_ == 1 && s.state == WARTHOG_RG_INVALID && !strcmp(s.raw, "(unreadable)") && s.unreadable &&
+                  !s.no_partition && s.cc[0] == 0 && raw_is_("KR") && find_("nvs", "warthog", "dns"),
+                  "%s, boot %d: regnvs touched, or not read invalid('(unreadable)') unreadable (state %d raw '%s')", n, b + 1,
+                  (int)s.state, s.raw);
+        }
+        CHECK(warthog_cfg_set_region("kr") == ESP_ERR_INVALID_ARG && erased_ == 0 && raw_is_("KR"), "%s: a refused code reformatted regnvs", n);
+        CHECK(warthog_cfg_set_region("AU") == ESP_OK && erased_ == 1 && inits_ == 2 && raw_is_("AU") && find_("nvs", "warthog", "dns"),
+              "%s: AT+REGION=AU did not reformat regnvs alone and store AU", n);
+        warthog_cfg_get_region(&s);
+        CHECK(s.state == WARTHOG_RG_VALID && !strcmp(s.cc, "AU") && !s.unreadable, "%s: AU not read back valid after the set", n);
+        CHECK(warthog_cfg_set_region("NZ") == ESP_OK && erased_ == 1 && raw_is_("NZ"), "%s: a second set reformatted again", n);
+    }
+    raw_("regnvs", "region", "KR", 3);
+    boot_(ESP_ERR_NVS_NO_FREE_PAGES, ESP_ERR_NVS_NO_FREE_PAGES);
+    CHECK(warthog_cfg_set_region("AU") == ESP_ERR_NVS_NO_FREE_PAGES && !find_("regnvs", "warthog", NULL), "a reformat that does not init: the set does not fail");
+    warthog_cfg_get_region(&s);
+    CHECK(s.state == WARTHOG_RG_INVALID && s.unreadable, "a reformat that does not init: not still invalid (unreadable)");
+    boot_(ESP_ERR_NOT_FOUND, ESP_OK);
+    warthog_cfg_get_region(&s);
+    CHECK(erased_ == 0 && s.state == WARTHOG_RG_ABSENT && s.no_partition, "no regnvs partition: not absent with no_partition");
+    CHECK(warthog_cfg_set_region("US") == ESP_ERR_NOT_SUPPORTED && !find_("regnvs", "warthog", NULL), "no partition: set not NOT_SUPPORTED");
+    boot_(ESP_FAIL, ESP_OK);
+    warthog_cfg_get_region(&s);
+    CHECK(s.state == WARTHOG_RG_INVALID && !strcmp(s.raw, "(unreadable)") && !s.no_partition, "a failed init: not invalid");
+    boot_(ESP_OK, ESP_OK);
+    CHECK(warthog_cfg_set_region("NZ") == ESP_OK, "set(NZ) failed");
+    CHECK(warthog_cfg_erase() == ESP_OK && !find_("nvs", "warthog", "dns") && raw_is_("NZ"), "AT+ERASE did not wipe the default partition and keep the region");
+    printf(fails ? "\n" : "ok");
+    return 0;
+}
+EOF75A
+r75a=""
+if ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} $SIMNODE_INCS -I"$T" -I../../../main -o "$T/t" "$T/t.c" 2>"$T/err"; then
+  r75a=$("$T/t")
+else
+  r75a="did not build: $(head -3 "$T/err" | tr '\n' ' ')"
+fi
+rm -rf "$T"
+[ "$r75a" = ok ] || why75a="${r75a:-the harness printed nothing (crashed)}"
+grep -q '^regnvs, *data, *nvs, *0x420000, *12K,$' ../../../partitions.csv && grep -q '^#define REGION_PART "regnvs"$' "$CF75" || \
+  why75a="${why75a:-REGION_PART in cfg.c is not the regnvs partition of partitions.csv}"
+awk '/^esp_err_t warthog_cfg_erase\(void\)/,/^}/' "$CF75" | grep -q 'REGION_PART\|_from_partition' && \
+  why75a="${why75a:-warthog_cfg_erase reaches the region partition}"
+if [ -z "$why75a" ]; then
+  ok "AT+REGION's storage: exactly [A-Z]{2} in regnvs; anything else stored reads invalid, never a code; a partition NVS refuses is never erased at boot and reads invalid until AT+REGION= reformats it; none reads absent and refuses a set; AT+ERASE keeps it"
+else
+  bad "the region's storage (cfg.c): $why75a"
+fi
+
+# 75b. AT+REGION= and AT+REGION? (main/at.c), compiled out and run with the real region.c, mmregdb.c
+#      and linked BCF (region_bcf.h) on the shipped HW list and band, against a fake cfg: exact
+#      transcripts for a stored code (case and spaces folded), a stored AT+MESHCHAN the new country
+#      has no row for (kept: neither cleared nor rewritten), each refusal (not offered, not a code,
+#      no partition, NVS) with the store untouched, and the query's running / next_boot / stored,
+#      allowed, hold and partition lines. Also the region renders: AT+STATUS?'s +REGION line,
+#      AT+MESHCFG?'s region and channel lines and AT+MESHCHAN?, in safe mode (no plan), held, on the
+#      full list, on the default with a refused stored set, and after a first start the chip refused.
+why75b=""
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+for f in reply_ok reply_error trim status_region_line_ meshcfg_region_line_ meshcfg_chan_lines_ cmd_region_set cmd_region_query \
+         cmd_meshchan_set cmd_meshchan_query; do
+  awk -v f="$f" '$0 ~ ("^static [a-z ]+[*]?" f "\\(") && !/;$/ {p=1} p {print} p && /^}/ {exit}' "$A"
+done > "$T/at_fn.c"
+DF75=../../../sdkconfig.defaults
+HW75=$(sed -n 's/^CONFIG_WARTHOG_HW_REGIONS=//p' "$DF75")
+LO75=$(sed -n 's/^CONFIG_WARTHOG_HW_BAND_LO_KHZ=//p' "$DF75")
+HI75=$(sed -n 's/^CONFIG_WARTHOG_HW_BAND_HI_KHZ=//p' "$DF75")
+cat > "$T/fake.h" <<'EOF75B'
+#include <ctype.h>
+#include <strings.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "region.h"
+#include "mmregdb.h"
+#include "region_bcf.h"
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_FAIL (-1)
+#define ESP_ERR_INVALID_ARG 0x102
+#define ESP_ERR_NOT_SUPPORTED 0x106
+static char out_[2048];
+static void cdc_write(const char *s) { strncat(out_, s, sizeof(out_) - strlen(out_) - 1); }
+static struct warthog_rg_stored f_st;
+static char f_raw[8];
+static esp_err_t f_set_ret;
+static bool f_have_mc;
+static struct warthog_mesh_chan f_mc, f_set_mc;
+static int f_set_n, f_clear_n;
+static esp_err_t f_mc_ret;
+static struct warthog_region_plan f_plan;
+static bool f_plan_set;
+void warthog_cfg_get_region(struct warthog_rg_stored *o) { *o = f_st; }
+uint8_t warthog_cfg_get_mesh_enable(void) { return 0; }
+bool warthog_cfg_get_mesh_chan(struct warthog_mesh_chan *o) { if (f_have_mc) *o = f_mc; return f_have_mc; }
+static esp_err_t warthog_cfg_set_region(const char *cc) { if (f_set_ret == ESP_OK) snprintf(f_raw, sizeof(f_raw), "%s", cc); return f_set_ret; }
+static esp_err_t warthog_cfg_set_mesh_chan(const struct warthog_mesh_chan *c) { f_set_n++; f_set_mc = *c; return f_mc_ret; }
+static esp_err_t warthog_cfg_clear_mesh_chan(void) { f_clear_n++; return ESP_OK; }
+struct warthog_region_ctx warthog_region_ctx_get(void)
+{
+    struct warthog_region_ctx c = { get_regulatory_db(), k_region_bcf, sizeof(k_region_bcf), HW, LO * 1000u, HI * 1000u };
+    return c;
+}
+static const struct warthog_region_plan *warthog_region_running(void) { return f_plan_set ? &f_plan : NULL; }
+int g_warthog_chan_pin_status = -1;
+uint32_t g_warthog_applied_freq_hz;
+uint16_t g_warthog_applied_chan;
+int16_t g_warthog_applied_gclass, g_warthog_applied_sclass;
+uint8_t g_warthog_applied_bw_mhz;
+volatile int32_t g_warthog_mesh_chan_st;
+EOF75B
+cat > "$T/t.c" <<'EOF75C'
+#include "fake.h"
+#include "at_fn.c"
+static int fails;
+#define CHECK(c, ...) do { if (!(c)) { fails++; printf(__VA_ARGS__); printf(" [%s] | ", out_); } } while (0)
+static void run_set_(const char *arg) { char a[64]; snprintf(a, sizeof(a), "%s", arg); out_[0] = 0; cmd_region_set(a); }
+static void run_mc_(const char *arg) { char a[64]; snprintf(a, sizeof(a), "%s", arg); out_[0] = 0; cmd_meshchan_set(a); }
+static void stored_(enum warthog_rg_state s, const char *cc, const char *raw)
+{
+    memset(&f_st, 0, sizeof(f_st)); f_st.state = s;
+    if (cc) snprintf(f_st.cc, 3, "%s", cc);
+    if (raw) snprintf(f_st.raw, sizeof(f_st.raw), "%s", raw);
+}
+static void running_(const char *cc, enum warthog_hold h)
+{
+    memset(&f_plan, 0, sizeof(f_plan)); f_plan_set = true; f_plan.hold = h;
+    if (cc) snprintf(f_plan.cc, 3, "%s", cc);
+}
+#define USAGE "+ERR: usage: AT+REGION=<AU|JP|KR|NZ|US>\r\nERROR\r\n"
+#define ALLOWED "+REGION: allowed=AU,JP,KR,NZ,US default=US\r\n"
+int main(void)
+{
+    f_set_ret = ESP_OK;
+    run_set_("au");
+    CHECK(!strcmp(out_, "+INFO: stored. AT+RESET to apply.\r\nOK\r\n") && !strcmp(f_raw, "AU"), "AT+REGION=au");
+    run_set_("  jp ");
+    CHECK(!strcmp(out_, "+INFO: stored. AT+RESET to apply.\r\nOK\r\n") && !strcmp(f_raw, "JP"), "AT+REGION=' jp '");
+    f_have_mc = true; f_mc = (struct warthog_mesh_chan){ 923000000, 42, 69, 2, 2 };
+    f_clear_n = 0; f_set_n = 0;
+    run_set_("AU");
+    CHECK(!strcmp(out_, "+INFO: stored AT+MESHCHAN chan=42 freq=923000000 bw=2 is not in the AU table; with mesh on the AU "
+                        "default channel is used\r\n+INFO: stored. AT+RESET to apply.\r\nOK\r\n") && !strcmp(f_raw, "AU") &&
+          f_clear_n == 0 && f_set_n == 0, "AT+REGION=AU with US ch42 stored (the set kept in NVS: clear %d, set %d)", f_clear_n, f_set_n);
+    run_set_("NZ");
+    CHECK(!strcmp(out_, "+INFO: stored. AT+RESET to apply.\r\nOK\r\n") && f_clear_n == 0 && f_set_n == 0,
+          "AT+REGION=NZ with US ch42 stored (NZ has 923.0 @ 2; clear %d, set %d)", f_clear_n, f_set_n);
+    f_have_mc = false;
+    static const char *refused[] = { "EU", "IN", "CA", "GB", "eu" };
+    for (unsigned i = 0; i < 5; i++) {
+        snprintf(f_raw, sizeof(f_raw), "AU");
+        run_set_(refused[i]);
+        char want[160];
+        snprintf(want, sizeof(want), "+ERR: %c%c is not offered on this module; AT+REGION=<AU|JP|KR|NZ|US>\r\nERROR\r\n",
+                 toupper((unsigned char)refused[i][0]), toupper((unsigned char)refused[i][1]));
+        CHECK(!strcmp(out_, want) && !strcmp(f_raw, "AU"), "AT+REGION=%s not refused as not offered, or stored", refused[i]);
+    }
+    static const char *usage[] = { "SG", "ZZ", "USA", "", "1A", "U" };
+    for (unsigned i = 0; i < 6; i++) {
+        run_set_(usage[i]);
+        CHECK(!strcmp(out_, USAGE) && !strcmp(f_raw, "AU"), "AT+REGION=%s not refused with the usage", usage[i]);
+    }
+    f_set_ret = ESP_ERR_NOT_SUPPORTED;
+    run_set_("US");
+    CHECK(!strcmp(out_, "+ERR: no region partition: reflash the factory image\r\nERROR\r\n"), "no partition");
+    f_set_ret = ESP_FAIL;
+    run_set_("US");
+    CHECK(!strcmp(out_, "+ERR: nvs write\r\nERROR\r\n"), "nvs write failure");
+    f_set_ret = ESP_OK;
+
+    running_("AU", WARTHOG_HOLD_NONE); stored_(WARTHOG_RG_VALID, "AU", NULL);
+    out_[0] = 0; cmd_region_query();
+    CHECK(!strcmp(out_, "+REGION: running=AU next_boot=AU stored=AU\r\n" ALLOWED "OK\r\n"), "query: running AU, stored AU");
+    running_("US", WARTHOG_HOLD_NONE); stored_(WARTHOG_RG_ABSENT, NULL, NULL);
+    out_[0] = 0; cmd_region_query();
+    CHECK(!strcmp(out_, "+REGION: running=US next_boot=US stored=none\r\n" ALLOWED "OK\r\n"), "query: nothing stored");
+    running_("AU", WARTHOG_HOLD_NONE); stored_(WARTHOG_RG_VALID, "KR", NULL);
+    out_[0] = 0; cmd_region_query();
+    CHECK(!strcmp(out_, "+REGION: running=AU next_boot=KR stored=KR\r\n" ALLOWED "OK\r\n"), "query: KR stored after an AU boot");
+    running_(NULL, WARTHOG_HOLD_REGION_INVALID); stored_(WARTHOG_RG_INVALID, NULL, "u$");
+    out_[0] = 0; cmd_region_query();
+    CHECK(!strcmp(out_, "+REGION: running=none next_boot=none stored=invalid('u$')\r\n" ALLOWED
+                        "+REGION: radio held: the stored region is not a valid code; AT+REGION=<AU|JP|KR|NZ|US> then AT+RESET\r\nOK\r\n"),
+          "query: held on an invalid value");
+    f_plan_set = false; stored_(WARTHOG_RG_VALID, "EU", NULL);
+    out_[0] = 0; cmd_region_query();
+    CHECK(!strcmp(out_, "+REGION: running=none next_boot=none stored=EU\r\n" ALLOWED
+                        "+REGION: the next boot holds the radio: the stored region is not offered on this module; "
+                        "AT+REGION=<AU|JP|KR|NZ|US> then AT+RESET\r\nOK\r\n"), "query: safe mode with EU stored");
+    stored_(WARTHOG_RG_ABSENT, NULL, NULL); f_st.no_partition = true;
+    out_[0] = 0; cmd_region_query();
+    CHECK(!strcmp(out_, "+REGION: running=none next_boot=US stored=none\r\n" ALLOWED
+                        "+REGION: region partition missing (reflash the factory image)\r\nOK\r\n"), "query: no partition");
+    running_(NULL, WARTHOG_HOLD_REGION_INVALID); stored_(WARTHOG_RG_INVALID, NULL, "(unreadable)"); f_st.unreadable = true;
+    out_[0] = 0; cmd_region_query();
+    CHECK(!strcmp(out_, "+REGION: running=none next_boot=none stored=invalid('(unreadable)')\r\n" ALLOWED
+                        "+REGION: radio held: the stored region is not a valid code; AT+REGION=<AU|JP|KR|NZ|US> then AT+RESET\r\n"
+                        "+REGION: region partition unreadable; AT+REGION=<CC> reformats it\r\nOK\r\n"), "query: regnvs unreadable");
+
+    /* 75c's half: AT+MESHCHAN= against the next boot's region. */
+    f_mc_ret = ESP_OK;
+    stored_(WARTHOG_RG_VALID, "AU", NULL); f_set_n = 0;
+    run_mc_("42,923000000,69,2,2");
+    CHECK(!strcmp(out_, "+ERR: not a row of the AU table\r\nERROR\r\n") && f_set_n == 0, "MESHCHAN US ch42 under AU");
+    run_mc_("41,922500000,51,23,2");
+    CHECK(!strcmp(out_, "+MESHCHAN: stored; applied on next boot (mesh on, or pins the station)\r\nOK\r\n") && f_set_n == 1 &&
+          f_set_mc.chan == 41 && f_set_mc.freq_hz == 922500000 && f_set_mc.global_op_class == 51 && f_set_mc.op_class == 23 &&
+          f_set_mc.bw_mhz == 2, "MESHCHAN AU ch41 under AU");
+    stored_(WARTHOG_RG_ABSENT, NULL, NULL); f_set_n = 0;
+    run_mc_("42,923000000,1,1,2");
+    CHECK(!strcmp(out_, "+ERR: US ch42 @ 2 MHz has classes 69,2\r\nERROR\r\n") && f_set_n == 0, "MESHCHAN US ch42 classes 1,1");
+    run_mc_("42,923000000,69,27,2");
+    CHECK(!strcmp(out_, "+ERR: US ch42 @ 2 MHz has classes 69,2\r\nERROR\r\n") && f_set_n == 0, "MESHCHAN US ch42 s1g class 27");
+    run_mc_("2,903000000,69,2,2");
+    CHECK(!strcmp(out_, "+ERR: US ch2 @ 2 MHz is flagged by Morse as possibly non-compliant\r\nERROR\r\n") && f_set_n == 0, "MESHCHAN US ch2");
+    stored_(WARTHOG_RG_VALID, "NZ", NULL);
+    run_mc_("42,923000000,69,2,2");
+    CHECK(!strcmp(out_, "+ERR: NZ ch42 @ 2 MHz has classes 69,27\r\nERROR\r\n") && f_set_n == 0, "MESHCHAN US ch42 under NZ");
+    stored_(WARTHOG_RG_ABSENT, NULL, NULL);
+    static const char *neg[] = { "42,999000000,69,2,2", "42,923000000,69,2,3" };
+    for (unsigned i = 0; i < 2; i++) { run_mc_(neg[i]); CHECK(strstr(out_, "ERROR\r\n") && f_set_n == 0, "MESHCHAN %s stored", neg[i]); }
+    /* Each would alias a US ch42 field once truncated (65578 = 42 + 65536, 258 = 2 + 256, 5217967296 = 923 MHz + 2^32). */
+    static const char *use[] = { "42,923000000,325,2,2", "x", "42,923000000,69,2", "65578,923000000,69,2,2",
+                                 "42,923000000,69,258,2", "42,923000000,69,2,258", "42,5217967296,69,2,2", "298,923000000,69,2,2" };
+    for (unsigned i = 0; i < 8; i++) {
+        run_mc_(use[i]);
+        CHECK((i < 7 ? !strcmp(out_, "+ERR: usage: AT+MESHCHAN=<chan>,<freq_hz>,<global_class>,<s1g_class>,<bw_mhz>\r\nERROR\r\n")
+                     : !strcmp(out_, "+ERR: not a row of the US table\r\nERROR\r\n")) && f_set_n == 0, "MESHCHAN %s", use[i]);
+    }
+    stored_(WARTHOG_RG_VALID, "KR", NULL);
+    run_mc_("22,928500000,74,14,1");
+    CHECK(!strcmp(out_, "+ERR: KR ch22 @ 1 MHz is outside this module's 902-928 MHz band\r\nERROR\r\n") && f_set_n == 0, "MESHCHAN KR ch22");
+    stored_(WARTHOG_RG_VALID, "EU", NULL);
+    run_mc_("42,923000000,69,2,2");
+    CHECK(!strcmp(out_, "+ERR: no usable region for the next boot; set AT+REGION first\r\nERROR\r\n") && f_set_n == 0, "MESHCHAN with EU stored");
+    stored_(WARTHOG_RG_ABSENT, NULL, NULL); f_mc_ret = ESP_ERR_INVALID_ARG;
+    run_mc_("42,923000000,69,2,2");
+    CHECK(!strcmp(out_, "+ERR: rejected: freq must be 750-950 MHz, bw 1|2|4|8, chan/classes non-zero\r\nERROR\r\n"), "MESHCHAN cfg refusal");
+    f_clear_n = 0;
+    run_mc_("default");
+    CHECK(!strcmp(out_, "+MESHCHAN: cleared; the region's default mesh channel on next boot\r\nOK\r\n") && f_clear_n == 1, "MESHCHAN=default");
+
+    /* The renders that report the region and the channel: AT+STATUS?'s +REGION line, AT+MESHCFG?'s
+     * region and channel lines, AT+MESHCHAN?. Safe mode is no plan at all. */
+    f_have_mc = false; f_plan_set = false; g_warthog_chan_pin_status = -1; g_warthog_applied_chan = 0; g_warthog_mesh_chan_st = 0;
+    stored_(WARTHOG_RG_VALID, "AU", NULL);
+    out_[0] = 0; status_region_line_();
+    CHECK(!strcmp(out_, "+REGION: running=none stored=AU\r\n"), "AT+STATUS? in safe mode, AU stored");
+    out_[0] = 0; meshcfg_region_line_(); meshcfg_chan_lines_();
+    CHECK(!strcmp(out_, "+MESHCFG: region=none country=none next_boot=AU (AT+RESET)\r\n"
+                        "+MESHCFG: applied chan=NONE -- radio held: no region plan this boot (safe mode) src=held (set_channel_list=-1)\r\n"),
+          "AT+MESHCFG? in safe mode, AU stored");
+    out_[0] = 0; cmd_meshchan_query();
+    CHECK(!strcmp(out_, "+MESHCHAN: none stored | applied=NO src=held (set_channel_list=-1)\r\nOK\r\n"), "AT+MESHCHAN? in safe mode");
+
+    running_(NULL, WARTHOG_HOLD_REGION_INVALID); f_plan.chan_src = WARTHOG_CHAN_HELD; stored_(WARTHOG_RG_INVALID, NULL, "u$");
+    out_[0] = 0; status_region_line_();
+    CHECK(!strcmp(out_, "+REGION: running=none stored=invalid\r\n"), "AT+STATUS? held on an invalid value");
+    out_[0] = 0; meshcfg_region_line_(); meshcfg_chan_lines_();
+    CHECK(!strcmp(out_, "+MESHCFG: region=none country=none held=region-invalid\r\n"
+                        "+MESHCFG: applied chan=NONE -- radio held: the stored region is not a valid code src=held (set_channel_list=-1)\r\n"),
+          "AT+MESHCFG? held on an invalid value");
+
+    running_("US", WARTHOG_HOLD_NONE); f_plan.chan_src = WARTHOG_CHAN_FULL_LIST; stored_(WARTHOG_RG_ABSENT, NULL, NULL);
+    g_warthog_chan_pin_status = 0;
+    out_[0] = 0; status_region_line_();
+    CHECK(!strcmp(out_, "+REGION: running=US stored=none (not set: US default)\r\n"), "AT+STATUS? nothing stored");
+    out_[0] = 0; meshcfg_region_line_(); meshcfg_chan_lines_();
+    CHECK(!strcmp(out_, "+MESHCFG: region=US country=US (not set: US default)\r\n"
+                        "+MESHCFG: applied chan=NONE -- full US regulatory list, operating channel not pinned and not observable "
+                        "src=full-list (set_channel_list=0)\r\n"), "AT+MESHCFG? station on the full US list, nothing stored");
+    stored_(WARTHOG_RG_VALID, "AU", NULL);
+    out_[0] = 0; meshcfg_region_line_();
+    CHECK(!strcmp(out_, "+MESHCFG: region=US country=US next_boot=AU (AT+RESET)\r\n"), "AT+MESHCFG? AU stored after a US boot");
+
+    running_("AU", WARTHOG_HOLD_NONE); f_plan.chan_src = WARTHOG_CHAN_DEFAULT; f_plan.chan_flags = WARTHOG_CHAN_F_STORED_REFUSED;
+    f_have_mc = true; f_mc = (struct warthog_mesh_chan){ 923000000, 42, 69, 2, 2 };
+    g_warthog_applied_chan = 41; g_warthog_applied_freq_hz = 922500000; g_warthog_applied_bw_mhz = 2;
+    g_warthog_applied_gclass = 51; g_warthog_applied_sclass = 23;
+    out_[0] = 0; status_region_line_();
+    CHECK(!strcmp(out_, "+REGION: running=AU stored=AU\r\n"), "AT+STATUS? AU stored and running");
+    out_[0] = 0; meshcfg_region_line_(); meshcfg_chan_lines_();
+    CHECK(!strcmp(out_, "+MESHCFG: region=AU country=AU\r\n"
+                        "+MESHCFG: applied chan=41 freq=922500000 bw=2 gclass=51 sclass=23 src=default+stored-refused (set_channel_list=0)\r\n"
+                        "+MESHCFG: stored chan=42 freq=923000000 bw=2 is not in the AU table -- the AU default in use\r\n"),
+          "AT+MESHCFG? AU mesh on its default with US ch42 stored");
+    out_[0] = 0; cmd_meshchan_query();
+    CHECK(!strcmp(out_, "+MESHCHAN: stored chan=42 freq=923000000 gclass=69 sclass=2 bw=2 | applied=yes src=default+stored-refused "
+                        "(set_channel_list=0)\r\nOK\r\n"), "AT+MESHCHAN? AU default with US ch42 stored");
+    g_warthog_mesh_chan_st = 1;
+    out_[0] = 0; meshcfg_chan_lines_();
+    CHECK(strstr(out_, "-- the AU default in use\r\n+MESHCFG: mesh not started: the chip refused the channel (st=1)\r\n") != NULL &&
+          !strncmp(out_ + strlen(out_) - 2, "\r\n", 2), "AT+MESHCFG? a first mesh start the chip refused (st=1)");
+    g_warthog_mesh_chan_st = 0;
+    f_plan.chan_src = WARTHOG_CHAN_FULL_LIST; g_warthog_applied_chan = 0;
+    out_[0] = 0; meshcfg_chan_lines_();
+    CHECK(!strcmp(out_, "+MESHCFG: applied chan=NONE -- full AU regulatory list, operating channel not pinned and not observable "
+                        "src=full-list+stored-refused (set_channel_list=0)\r\n"
+                        "+MESHCFG: stored chan=42 freq=923000000 bw=2 is not in the AU table -- the AU full list in use\r\n"),
+          "AT+MESHCFG? AU station with US ch42 stored");
+    f_plan.chan_src = WARTHOG_CHAN_STORED; f_plan.chan_flags = WARTHOG_CHAN_F_CLASSES_FIXED; g_warthog_applied_chan = 41;
+    out_[0] = 0; meshcfg_chan_lines_();
+    CHECK(!strstr(out_, "is not in the") && strstr(out_, " src=stored+classes-fixed (set_channel_list=0)\r\n"),
+          "AT+MESHCFG? a stored set used with the row's classes: no refused line");
+    f_have_mc = false;
+    printf(fails ? "\n" : "ok");
+    return 0;
+}
+EOF75C
+r75b=""
+if ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -DHW="$HW75" -DLO="${LO75}u" -DHI="${HI75}u" $SIMNODE_INCS -I"$T" -I. -I../../../main \
+     -I"$FW75/src/mmregdb" -o "$T/t" "$T/t.c" ../../../main/region.c "$FW75/src/mmregdb/mmregdb.c" 2>"$T/err"; then
+  r75b=$("$T/t")
+else
+  r75b="did not build: $(head -3 "$T/err" | tr '\n' ' ')"
+fi
+rm -rf "$T"
+[ "$r75b" = ok ] || why75b="${r75b:-the harness printed nothing (crashed)}"
+awk '/^static void dispatch\(/,/^}/' "$A" | tr -d ' \n' | \
+  grep -q 'elseif(strcasecmp(verb,"REGION")==0&&terminator==.?.){cmd_region_query();}elseif(strcasecmp(verb,"REGION")==0&&terminator==.=.){cmd_region_set(args);}' || \
+  why75b="${why75b:-AT+REGION? and AT+REGION= are not dispatched}"
+awk '/^static void dispatch\(/,/^}/' "$A" | tr -d ' \n' | \
+  grep -q 'elseif(strcasecmp(verb,"MESHCHAN")==0&&terminator==.=.){cmd_meshchan_set(args);}' || \
+  why75b="${why75b:-AT+MESHCHAN= is not dispatched to cmd_meshchan_set}"
+awk '/^static void cmd_region_set\(/,/^}/' "$A" | awk '/warthog_region_allowed\(&ctx, cc\)/ && !a {a=NR} /warthog_cfg_set_region\(/ {s=NR}
+  END {exit (a && s && a < s) ? 0 : 1}' || why75b="${why75b:-AT+REGION= stores before it asks warthog_region_allowed}"
+if [ -z "$why75b" ]; then
+  ok "AT+REGION= stores only an offered code (+INFO lines as the flasher shows them), AT+REGION? reports running, next boot, stored, offered and holds; AT+MESHCHAN= stores only an in-band, unflagged row of the next boot's region, all five equal; AT+STATUS?, AT+MESHCFG? and AT+MESHCHAN? report the region, the hold and the channel's source; exact transcripts"
+else
+  bad "AT+REGION / AT+MESHCHAN= (at.c): $why75b"
+fi
+
+# 75d. The boot decides the region before the chip boots, and the chip gets only that decision:
+#      warthog_halow_start makes the plan first, returns into safe mode (chip held in reset) on a
+#      hold before anything touches the chip, and only then hands mmhalow the plan's list and boots
+#      it, marking the radio up after; s_plan is static (mmwlan keeps the list pointer).
+#      mmhalow.c reads no cfg or region and builds no channel row: it applies the list it is handed,
+#      once, before mmwlan_boot. The bridge waits for a booted radio (check 65). region.c's
+#      boot_plan passes the stored state, mesh on and the stored set it reads. The mesh's chip
+#      start bails when the chip refuses the channel (simnode test_simnode_restart (26)) or the list is
+#      empty ((27)); the NOT PEERED log prints region.c's region and refused-set lines (test_region); and the
+#      status AT+MESHCFG? reads is defined app-side in at.c (morselib is mangled: a definition
+#      there never reaches main/) and only declared in umac_mesh.c.
+HL75=../../../main/halow.c
+MH75=../../halow/mmhalow.c
+why75d=""
+awk '/^esp_err_t warthog_halow_start\(void\)/,/^}/' "$HL75" | awk '
+  /warthog_region_boot_plan\(&s_plan\);/ && !p {p=NR}
+  /if \(s_plan\.hold != WARTHOG_HOLD_NONE\) \{/ && !h {h=NR; inh=1; next}
+  inh && /return warthog_halow_start_safe\(\);/ {r=NR}
+  inh && /^    }/ {inh=0; he=NR}
+  /halow_base_start_\(\)/ && !b {b=NR}
+  /mmhalow_use_channel_list\(s_plan\.list\);/ && !u {u=NR}
+  /mmhalow_init\(NULL\)/ && !i {i=NR}
+  /s_radio_up = true;/ && !up {up=NR}
+  /(mmhal_|mmwlan_|mmhalow_)/ && !c {c=NR}
+  END {exit (p && h && p < h && r > h && r < he && he < b && b < u && u < i && i < up && c >= u) ? 0 : 1}' || \
+  why75d="warthog_halow_start does not plan first, return into safe mode on a hold before touching the chip, then hand mmhalow the plan's list before mmhalow_init and mark the radio up after"
+grep -q '^static struct warthog_region_plan s_plan;$' "$HL75" || why75d="${why75d:-the plan is not static storage}"
+grep -Eq '#include "(region|cfg)\.h"|warthog_cfg_|WARTHOG_PIN_|max_tx_eirp_dbm *=|duty_cycle_sta *=|struct mmwlan_s1g_channel [a-z_]+\[|struct mmwlan_s1g_channel [a-z_]+ *=' "$MH75" && \
+  why75d="${why75d:-mmhalow.c reads cfg or the region, or builds a channel row of its own}"
+[ "$(grep -c 'mmwlan_set_channel_list(' "$MH75")" = 1 ] && \
+  awk '/^esp_err_t mmhalow_init\(/,/^}/' "$MH75" | awk '/MMOSAL_ASSERT\(s_boot_list != NULL\);/ {a=NR}
+    /mmwlan_set_channel_list\(s_boot_list\)/ {s=NR} /mmwlan_boot\(/ {b=NR} END {exit (a && s && b && a < s && s < b) ? 0 : 1}' || \
+  why75d="${why75d:-mmhalow_init does not apply the handed list, once, before mmwlan_boot}"
+awk '/^void warthog_region_boot_plan\(/,/^}/' ../../../main/region.c | tr -d ' \n' | \
+  grep -q 'warthog_cfg_get_region(&st);structwarthog_mesh_chanmc;constboolhave=warthog_cfg_get_mesh_chan(&mc);warthog_region_plan(&ctx,&st,warthog_cfg_get_mesh_enable()!=0,have?&mc:NULL,plan);' || \
+  why75d="${why75d:-boot_plan does not pass the stored region, mesh on and the stored set}"
+grep -E '^#include' ../../../main/region.c | grep -Evq '^#include (<string\.h>|<stdio\.h>|"region\.h"|"mbin\.h")$' && \
+  why75d="${why75d:-region.c includes more than libc, region.h and mbin.h (the host test links it as is)}"
+awk '/^void app_main\(void\)/,/^}/' ../../../main/main.c | awk '/ESP_ERROR_CHECK\(warthog_cfg_init\(\)\);/ {c=NR}
+  /if \(safe\) \{/ {s=NR} END {exit (c && s && c < s) ? 0 : 1}' || why75d="${why75d:-the region partition is not opened before safe mode}"
+UM75=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh.c
+awk '/^static enum mmwlan_status mesh_chip_start_\(/ {c=NR} c && NR == c + 1 && /\)$/ {on=1} on && /^}/ {exit} on' "$UM75" | awk '
+  /= umac_interface_set_channel_from_regdb\(umacd, mesh_chan, false\);/ {c=NR}
+  c && /if \(ch_status != MMWLAN_SUCCESS\)/ && !i {i=NR}
+  i && /g_warthog_mesh_chan_st = \(int32_t\)ch_status;/ && !g {g=NR}
+  g && /return ch_status;/ && !r {r=NR}
+  /SET_CHANNEL OK/ && !k {k=NR}
+  END {exit (c && i && g && r && r < k) ? 0 : 1}' || why75d="${why75d:-the mesh start carries on after a refused channel}"
+awk '/^static void mesh_report_unpeered\(/,/^}/' ../../../main/mesh.c | awk '/warthog_region_report_text\(rp, rg, sizeof\(rg\), rf, sizeof\(rf\)\);/ {t=NR}
+  t && /ESP_LOGE\(TAG, "  region    %s", rg\);/ {r=NR} r && /if \(rf\[0\] != .\\0.\) \{/ {i=NR} i && NR == i + 1 && /ESP_LOGE\(TAG, "  %s", rf\);/ {f=1}
+  END {exit f ? 0 : 1}' || why75d="${why75d:-the NOT PEERED log does not print the region and refused-set lines from warthog_region_report_text}"
+awk '/^void warthog_mesh_smoke_test\(void\)/,/^}/' ../../../main/mesh.c | awk '/^#ifndef WARTHOG_SKIP_SCAN_PROBE$/ {on=1}
+  on && /if \(probe_rp != NULL && warthog_region_restricted\(probe_rp->list\)\) \{/ {g=NR} g && /\} else \{/ && !e {e=NR}
+  /warthog_mesh_scan_probe\(\);/ {n++; p=NR} on && /^#else$/ {exit} END {exit (g && e && n == 1 && p == e + 1) ? 0 : 1}' || \
+  why75d="${why75d:-the mesh scan probe is not skipped for a plan whose rows ration airtime}"
+SC75=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/scan/hw_scan.c
+awk '/^static enum mmwlan_status hw_scan_start\(/,/^}/' "$SC75" | awk 'NR == 3 && /enum mmwlan_status status = hw_scan_program_restriction\(umacd\);/ {p=1}
+  p && /if \(status != MMWLAN_SUCCESS\)/ && !i {i=NR} i && /return status;/ && !r {r=NR} /mmdrv_execute_command\(/ {x=NR}
+  END {exit (p && i && r && x > r) ? 0 : 1}' || why75d="${why75d:-hw_scan_start does not program the restriction first and give up when it fails}"
+[ "$(grep -c 'hw_scan_start(umacd)' "$SC75")" = 1 ] || why75d="${why75d:-a HW_SCAN START is sent from somewhere other than hw_scan_start}"
+grep -q '^volatile int32_t g_warthog_mesh_chan_st = 0;$' "$A" && grep -q '^extern volatile int32_t g_warthog_mesh_chan_st;$' "$UM75" && \
+  ! grep -Eq '^volatile int32_t g_warthog_mesh_chan_st' "$UM75" || why75d="${why75d:-g_warthog_mesh_chan_st is not defined in at.c and declared in umac_mesh.c}"
+if [ -z "$why75d" ]; then
+  ok "the boot plans the region first and holds the chip on a hold before touching it; mmhalow applies only the list it is handed, before mmwlan_boot; the mesh never starts on a refused channel"
+else
+  bad "region boot structure: $why75d"
+fi
+
+# 75e. No compile-time region is left: none of the per-region flags, the build-time pin or the old
+#      Kconfig country appears in main/, components/halow (sources, Kconfig, CMakeLists.txt),
+#      platformio.ini, sdkconfig.defaults, the workflows or the docs (README, wiki, docs/ outside
+#      history), morselib's sources name no warthog-us, and make all runs test_region in place of the
+#      old test_region_map.sh target.
+why75e=""
+hits75=$(grep -nE 'WARTHOG_REGION_(US|EU|JP|KR|AU|NAME)|WARTHOG_COUNTRY_CODE|WARTHOG_PIN_S1G_|HALOW_COUNTRY_CODE' \
+           ../../../main/*.c ../../../main/*.h ../../../main/CMakeLists.txt ../../halow/*.c ../../halow/*.h \
+           ../../halow/Kconfig ../../halow/CMakeLists.txt ../../../platformio.ini ../../../sdkconfig.defaults \
+           ../../../.github/workflows/*.yml ../../../README.md ../../../wiki/*.md ../../../docs/*.md 2>/dev/null | head -3 | tr '\n' ' ')
+[ -z "$hits75" ] || why75e="a compile-time region is still named: $hits75"
+grep -rn 'warthog-us' ../../halow/components/mm-iot-sdk/framework/morselib/src >/dev/null 2>&1 && \
+  why75e="${why75e:-the morselib sources still name warthog-us}"
+grep -q '^region:' Makefile && why75e="${why75e:-the Makefile still has the region target}"
+awk '/^TESTS +:=/ {on=1} on {print} on && !/\\$/ {exit}' Makefile | grep -q ' test_region test_region_au2020$' || why75e="${why75e:-make all does not run test_region and test_region_au2020}"
+if [ -z "$why75e" ]; then
+  ok "no compile-time region: no per-region flag, build-time pin or Kconfig country in main/, components/halow, platformio.ini, sdkconfig.defaults, the workflows or the docs; test_region runs in make all"
+else
+  bad "compile-time region: $why75e"
+fi
+
+# 75f. One variant list: release.yml's matrix is the set of the flasher's VARIANTS up to its v0.1.0 comment,
+#      each an [env:warthog-<key>], and after it the flasher keeps v0.1.0's us and au images; default_envs and
+#      CI build warthog-station; platformio.ini, the workflows, the scripts and the flasher name no retired
+#      env, and every pio -e in README, wiki and docs is an env platformio.ini defines. The release body is
+#      the annotated tag's message (the tag object fetched, then body_path: notes.md). The station leg,
+#      and CI after its station build, make the region images with scripts/region-images.sh from
+#      CONFIG_WARTHOG_HW_REGIONS under one exact generator pin, named as the flasher and flash.sh find them.
+why75f=""
+R75=../../../.github/workflows/release.yml
+C75=../../../.github/workflows/ci.yml
+P75=../../../platformio.ini
+WF75=../../../web-flasher/index.html
+FS75=../../../scripts/flash.sh
+RI75=../../../scripts/region-images.sh
+rv75=$(sed -n 's/^ *variant: \[\(.*\)\]$/\1/p' "$R75" | tr -d ' ' | tr ',' '\n' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+fv75=$(awk '/^const VARIANTS = \[/ {on=1; next} on && (/^ *\/\/ v0\.1\.0/ || /^\];/) {exit}
+  on && match($0, /key: "[a-z0-9-]+"/) {print substr($0, RSTART + 6, RLENGTH - 7)}' "$WF75" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+[ -n "$rv75" ] && [ "$rv75" = "$fv75" ] || why75f="release.yml builds [$rv75], the flasher lists [$fv75]"
+for v75 in $rv75; do
+  grep -qx "\[env:warthog-$v75\]" "$P75" || why75f="${why75f:-release.yml builds $v75, and platformio.ini has no [env:warthog-$v75]}"
+done
+lv75=$(awk '/^const VARIANTS = \[/ {on=1; next} on && /^\];/ {exit} on && /^ *\/\/ v0\.1\.0/ {l=1; next}
+  l && match($0, /key: "[a-z0-9-]+"/) {print substr($0, RSTART + 6, RLENGTH - 7)}' "$WF75" | tr '\n' ' ')
+[ "$lv75" = "us au " ] || why75f="${why75f:-the flasher does not keep the v0.1.0 us and au images after its v0.1.0 comment ($lv75)}"
+grep -qx 'default_envs = warthog-station' "$P75" || why75f="${why75f:-default_envs is not warthog-station}"
+grep -q '^ *run: pio run -e warthog-station$' "$C75" || why75f="${why75f:-CI does not build warthog-station}"
+ret75=$(grep -nE 'warthog-(us|eu|jp|kr|au)(-ecm)?([^a-z0-9-]|$)' "$P75" "$C75" "$R75" "$WF75" ../../../scripts/*.sh 2>/dev/null | head -3 | tr '\n' ' ')
+[ -z "$ret75" ] || why75f="${why75f:-a retired env is still named: $ret75}"
+envs75=$(sed -n 's/^\[env:\(.*\)\]$/\1/p' "$P75")
+for e75 in $(grep -ohE 'pio [a-z ]+-e [a-z0-9][a-z0-9-]*' ../../../README.md ../../../wiki/*.md ../../../docs/*.md 2>/dev/null | sed 's/.* -e //' | sort -u); do
+  printf '%s\n' "$envs75" | grep -qx "$e75" || why75f="${why75f:-the docs run pio -e $e75, which platformio.ini does not define}"
+done
+grep -qx '          body_path: notes.md' "$R75" || why75f="${why75f:-the release body is not body_path: notes.md}"
+grep -qF 'git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"' "$R75" && \
+  grep -qF "git tag -l --format='%(contents:subject)%0a%0a%(contents:body)' \"\${GITHUB_REF_NAME}\" > notes.md" "$R75" || \
+  why75f="${why75f:-the release job does not write notes.md from the fetched tag object}"
+awk '/- name: Release notes from the tag message/ {n=NR} /- name: Publish GitHub release/ {p=NR} END {exit (n && p > n) ? 0 : 1}' "$R75" || \
+  why75f="${why75f:-notes.md is not written before the release is published}"
+pin75=$(grep -ho '"esp-idf-nvs-partition-gen==[0-9][0-9.]*"' "$R75" "$C75" | sort -u)
+[ "$(printf '%s\n' "$pin75" | grep -c .)" = 1 ] && [ "$(grep -c 'esp-idf-nvs-partition-gen' "$R75")" = 1 ] && \
+  [ "$(grep -c 'esp-idf-nvs-partition-gen' "$C75")" = 1 ] || why75f="${why75f:-release.yml and ci.yml do not install one exact esp-idf-nvs-partition-gen}"
+awk '/- name: Region NVS images/ {on=1} on && /if: matrix.variant == .station./ {i=1}
+  on && /scripts\/region-images.sh "\$TAG" dist$/ {r=1} on && /- name: Upload/ {exit} END {exit (i && r) ? 0 : 1}' "$R75" || \
+  why75f="${why75f:-the station leg does not make the region images into dist}"
+awk '/run: pio run -e warthog-station$/ {b=NR} /scripts\/region-images.sh / {r=NR} END {exit (b && r > b) ? 0 : 1}' "$C75" || \
+  why75f="${why75f:-CI does not make the region images after the station build}"
+grep -q "^HW=\$(sed -n 's/^CONFIG_WARTHOG_HW_REGIONS=" "$RI75" && grep -qF 'BIN="$OUT/warthog-${TAG}-region-${CC}.bin"' "$RI75" || \
+  why75f="${why75f:-region-images.sh does not name warthog-<tag>-region-<CC>.bin for each CONFIG_WARTHOG_HW_REGIONS code}"
+grep -qF 'pre = `warthog-${rel?.tag_name}-region-`' "$WF75" && grep -qF '/warthog-*-region-"$REGION".bin' "$FS75" || \
+  why75f="${why75f:-the flasher or flash.sh does not look for warthog-<tag>-region-<CC>.bin}"
+if [ -z "$why75f" ]; then
+  ok "one variant list in release.yml and the flasher (v0.1.0's us and au kept), each a pio env; warthog-station is the default and CI's; no retired env named, every documented pio -e real; the release body is the tag message; region images from the HW list under one pinned generator, named as the flasher and flash.sh find them"
+else
+  bad "variants and release: $why75f"
+fi
+
+# 75g. regnvs (partitions.csv) is its own 12K NVS partition at 0x420000, inside the 8 MB flash and
+#      past every other partition, so a factory image (bootloader, table and app from 0x0), the NVS
+#      reformat and AT+ERASE never reach it; every factory image built here ends below it. The flasher
+#      (REGNVS_OFFSET/_SIZE), flash.sh and region-images.sh use its offset and size; doFlash and flash.sh
+#      write the region image at it in the same write as the factory image; the Configure tab reads
+#      AT+REGION?, saves with AT+REGION= and disables Save with the rest; the flasher script parses
+#      (node --check, when node is installed); the AT reference has both AT+REGION rows.
+why75g=""
+pt75=$(awk -F, '/^[a-z]/ {
+    gsub(/ /, ""); o = $4; s = $5
+    if (o ~ /^0x/) { v = 0; o = tolower(substr(o, 3)); for (i = 1; i <= length(o); i++) v = v * 16 + index("0123456789abcdef", substr(o, i, 1)) - 1 } else v = o
+    if (s ~ /K$/) s = substr(s, 1, length(s) - 1) * 1024; else if (s ~ /M$/) s = substr(s, 1, length(s) - 1) * 1048576
+    print $1, v, v + s }' ../../../partitions.csv)
+rg75=$(printf '%s\n' "$pt75" | awk '$1 == "regnvs" {print $2, $3}')
+[ "$rg75" = "4325376 4337664" ] || why75g="regnvs is not 12K at 0x420000 (${rg75:-missing})"
+printf '%s\n' "$pt75" | awk -v lo=4325376 '$1 != "regnvs" && $3 > lo {bad=1} $3 > 8388608 {bad=1} END {exit bad ? 1 : 0}' || \
+  why75g="${why75g:-a partition ends past the start of regnvs or the 8 MB flash}"
+printf '%s\n' "$pt75" | sort -k2 -n | awk 'NR > 1 && $2 < e {bad=1} {e = $3} END {exit bad ? 1 : 0}' || why75g="${why75g:-partitions overlap}"
+for f75 in ../../../.pio/build/*/firmware.factory.bin; do
+  [ -f "$f75" ] || continue
+  [ "$(wc -c < "$f75" | tr -d ' ')" -lt 4325376 ] || why75g="${why75g:-${f75#../../../} reaches regnvs}"
+done
+ro75=$(printf '%s\n' "$pt75" | awk '$1 == "regnvs" {printf "0x%x", $2}')
+rs75=$(printf '%s\n' "$pt75" | awk '$1 == "regnvs" {print $3 - $2}')
+rx75=$(printf '%s\n' "$pt75" | awk '$1 == "regnvs" {printf "0x%x", $3 - $2}')
+WF75=../../../web-flasher/index.html
+FS75=../../../scripts/flash.sh
+grep -qx "const REGNVS_OFFSET = $ro75;" "$WF75" && grep -qx "const REGNVS_SIZE = $rx75;" "$WF75" || \
+  why75g="${why75g:-the flasher REGNVS_OFFSET/REGNVS_SIZE are not those of regnvs ($ro75/$rx75)}"
+grep -qx "REGNVS_OFFSET=$ro75" "$FS75" && grep -qx "REGNVS_SIZE=$rs75" "$FS75" || why75g="${why75g:-flash.sh REGNVS_OFFSET/SIZE are not those of regnvs ($ro75/$rs75)}"
+grep -qx "SIZE=$rx75" ../../../scripts/region-images.sh || why75g="${why75g:-region-images.sh does not make $rx75-byte images}"
+awk '/^async function doFlash\(/,/^}/' "$WF75" | awk '/fileArray\.push\(\{ data: await fetchRegion\(src, cc\), address: REGNVS_OFFSET \}\);/ {p=NR}
+  /await loader\.writeFlash\(\{/ {w=NR} /^ *fileArray,$/ && w {f=1} END {exit (p && w > p && f) ? 0 : 1}' || \
+  why75g="${why75g:-doFlash does not write the region image at REGNVS_OFFSET in the same writeFlash}"
+grep -qF 'write_flash 0x0 "$BIN" "$REGNVS_OFFSET" "$REGION_BIN"' "$FS75" || why75g="${why75g:-flash.sh --region does not write the region image at REGNVS_OFFSET with the firmware}"
+awk '/^function setCfgEnabled\(/,/^}/' "$WF75" | grep -q '"regionSave"' || why75g="${why75g:-setCfgEnabled does not cover regionSave}"
+awk '/^async function readStatus\(/,/^}/' "$WF75" | grep -qF 'at("AT+REGION?")' || why75g="${why75g:-the Configure tab does not read AT+REGION?}"
+awk '/^\$\("regionSave"\)\.addEventListener\("click"/,/^}\);/' "$WF75" | grep -qF 'await at(`AT+REGION=${cc}`)' || \
+  why75g="${why75g:-Save region does not send AT+REGION=}"
+if command -v node >/dev/null 2>&1; then
+  T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+  awk '/<script type="module">/ {on=1; next} /<\/script>/ {on=0} on' "$WF75" > "$T/flasher.mjs"
+  node --check "$T/flasher.mjs" 2>/dev/null || why75g="${why75g:-the flasher script does not parse (node --check)}"
+  rm -rf "$T"
+fi
+grep -q '^| `AT+REGION=<CC>` |' ../../../wiki/AT-Command-Reference.md && grep -q '^| `AT+REGION?` |' ../../../wiki/AT-Command-Reference.md || \
+  why75g="${why75g:-the AT reference lacks the AT+REGION=<CC> or AT+REGION? row}"
+if [ -z "$why75g" ]; then
+  ok "regnvs is its own 12K NVS partition at 0x420000, past every partition and every factory image built here; the flasher, flash.sh and region-images.sh use it, the region written with the firmware; Configure reads and sets AT+REGION; the flasher parses; documented"
+else
+  bad "the region partition: $why75g"
+fi
+
+# 75h. The HW list and band are the module's, kept beside the BCF they pair with: sdkconfig.defaults
+#      pairs bcf_fgh100mhaamd.mbin (FGH100M-H, 902-928 MHz) with AU,JP,KR,NZ,US, CMake refuses a
+#      malformed list or one without US, and every generated sdkconfig.warthog-* carries the same
+#      BCF, list and band (PlatformIO keeps an old line over the defaults). test_region runs the
+#      list on the real BCF bytes, which make region-bcf compares with the fetched component.
+why75h=""
+bcf75=$(sed -n 's/^CONFIG_MM_BCF_FILE=//p' "$DF75")
+case "$bcf75" in
+  '"bcf_fgh100mhaamd.mbin"') [ "$HW75" = '"AU,JP,KR,NZ,US"' ] && [ "$LO75" = 902000 ] && [ "$HI75" = 928000 ] || \
+                              why75h="bcf_fgh100mhaamd.mbin is not paired with AU,JP,KR,NZ,US at 902-928 MHz ($HW75, $LO75-$HI75)" ;;
+  *) why75h="no HW list is reviewed for $bcf75" ;;
+esac
+grep -q 'MATCHES "^\[A-Z\]\[A-Z\](,\[A-Z\]\[A-Z\])\*\$"' ../../halow/CMakeLists.txt && grep -q 'MATCHES ",US,"' ../../halow/CMakeLists.txt || \
+  why75h="${why75h:-components/halow/CMakeLists.txt does not refuse a malformed HW list or one without US}"
+awk '/^if\(NOT CMAKE_BUILD_EARLY_EXPANSION\)$/ {on=1; next} on && /^endif\(\)$/ {exit}
+  on && /^    if\(NOT CONFIG_WARTHOG_HW_BAND_LO_KHZ LESS CONFIG_WARTHOG_HW_BAND_HI_KHZ\)$/ {b=1; next}
+  b && /message\(FATAL_ERROR "warthog: CONFIG_WARTHOG_HW_BAND_LO_KHZ must be below CONFIG_WARTHOG_HW_BAND_HI_KHZ"\)/ {f=1}
+  b && /^    endif\(\)$/ {b=0} END {exit f ? 0 : 1}' ../../halow/CMakeLists.txt || \
+  why75h="${why75h:-components/halow/CMakeLists.txt does not refuse a band whose low edge is not below its high edge}"
+grep -q "$(printf '%s' "$bcf75" | tr -d '"') from morsemicro/firmware" region_bcf.h || why75h="${why75h:-region_bcf.h is not the linked BCF}"
+rw75=$(grep '^| `AT+REGION=<CC>` |' ../../../wiki/AT-Command-Reference.md)
+cl75=$(printf '%s' "$HW75" | tr -d '"' | awk -F, '{for (i = 1; i <= NF; i++) printf "%s`%s`", (i == 1 ? "" : i == NF ? " or " : ", "), $i}')
+ul75=$(printf '%s' "$HW75" | tr -d '"' | sed 's/,/\\|/g')
+case "$rw75" in *": $cl75 on the "*'+ERR: usage: AT+REGION=<'"$ul75"'>`'*) ;;
+  *) why75h="${why75h:-the AT+REGION= row does not list exactly $cl75 (and <$ul75> in its usage error)}" ;; esac
+for c75 in $(printf '%s' "$HW75" | tr -d '"' | tr ',' ' '); do
+  grep -q "^  .*$c75: \"$c75 — " ../../../web-flasher/index.html || why75h="${why75h:-the flasher has no REGION_LABELS entry for $c75}"
+done
+for g75 in ../../../sdkconfig.warthog-*; do
+  [ -f "$g75" ] || continue
+  for k75 in "CONFIG_MM_BCF_FILE=$bcf75" "CONFIG_WARTHOG_HW_REGIONS=$HW75" "CONFIG_WARTHOG_HW_BAND_LO_KHZ=$LO75" "CONFIG_WARTHOG_HW_BAND_HI_KHZ=$HI75"; do
+    grep -qxF "$k75" "$g75" || { why75h="${why75h:-${g75##*/} lacks $k75 (PlatformIO keeps a generated sdkconfig: delete it)}"; break; }
+  done
+done
+if [ -z "$why75h" ]; then
+  ok "the HW list and band pair with the linked BCF (bcf_fgh100mhaamd.mbin: AU,JP,KR,NZ,US, 902-928 MHz) in sdkconfig.defaults and every generated sdkconfig; CMake refuses a list without US and an empty band; the AT reference and the flasher name every offered code"
+else
+  bad "HW regions: $why75h"
+fi
+
+# 75i. AU runs the REVMF channelisation (Kconfig's default): the AU default mesh row, ch41 @ 2 MHz,
+#      exists in REVMF and 2024 only, and test_region_au2020 shows a 2020 build holds its mesh.
+why75i=""
+for g75 in "$DF75" ../../../sdkconfig.warthog-*; do
+  [ -f "$g75" ] || continue
+  grep -Eq '^CONFIG_WIFI_MORSE_AU_CHANNELISATION_2020=y' "$g75" && why75i="${why75i:-${g75##*/} selects the 2020 AU channelisation}"
+  case "$g75" in *defaults) ;; *) grep -q '^CONFIG_WIFI_MORSE_AU_CHANNELISATION_REVMF=y$' "$g75" || why75i="${why75i:-${g75##*/} is not REVMF}" ;; esac
+done
+if [ -z "$why75i" ]; then
+  ok "AU runs REVMF everywhere, where its default mesh row exists"
+else
+  bad "AU channelisation: $why75i"
+fi
+
+# 75j. region.c's warning table is mmregdb.c's: every row marked "Warning: regulatory requirements
+#      may not be met" (country from its s1g_channels_XX array, channel and bandwidth its 6th and 7th
+#      fields) is in k_warning, and k_warning holds nothing else.
+RD75="$FW75/src/mmregdb/mmregdb.c"
+w75a=$(awk '/s1g_channels_[A-Z][A-Z]\[\] = \{/ {match($0, /s1g_channels_[A-Z][A-Z]/); cc = substr($0, RSTART + 13, 2)}
+  /Warning: regulatory requirements may not be met/ {l = $0; sub(/^[^{]*\{/, "", l); sub(/\}.*/, "", l); gsub(/ /, "", l)
+    split(l, f, ","); print cc, f[6] + 0, f[7] + 0}' "$RD75" | LC_ALL=C sort)
+w75b=$(awk '/^static const struct .* k_warning\[\] = \{/ {on=1; next} on && /^};/ {exit}
+  on {while (match($0, /\{ *"[A-Z][A-Z]", *[0-9]+, *[0-9]+ *\}/)) {e = substr($0, RSTART, RLENGTH); $0 = substr($0, RSTART + RLENGTH)
+    gsub(/[{}" ]/, "", e); split(e, f, ","); print f[1], f[2] + 0, f[3] + 0}}' ../../../main/region.c | LC_ALL=C sort)
+if [ -n "$w75a" ] && [ "$w75a" = "$w75b" ] && [ "$(printf '%s\n' "$w75a" | wc -l | tr -d ' ')" = 10 ]; then
+  ok "region.c's warning table is mmregdb.c's 10 warning rows exactly"
+else
+  bad "region.c's warning table differs from mmregdb.c's: mmregdb [$(printf '%s' "$w75a" | tr '\n' ';')] region.c [$(printf '%s' "$w75b" | tr '\n' ';')]"
+fi
+
+# 75k. The mesh pick keys on warthog_cfg_get_mesh_enable (cfg.c), compiled out and run twice: on a
+#      station build nothing stored is 0, a stored 0 or 1 is kept and anything else is 0; on a mesh
+#      env (WARTHOG_MESH_SMOKE) it is 1 whatever is stored.
+why75k=""
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+for f in warthog_cfg_get_mesh_enable warthog_cfg_set_mesh_enable; do
+  awk -v f="$f" '$0 ~ ("^[a-z_0-9 ]+[ *]" f "\\(") && !/;$/ {p=1} p {print} p && /^}/ {exit}' "$CF75"
+done > "$T/cfg_fn.c"
+cat > "$T/t.c" <<'EOF75K'
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef int esp_err_t;
+typedef int nvs_handle_t;
+#define ESP_OK 0
+#define ESP_ERR_INVALID_ARG 0x102
+#define ESP_ERR_NVS_NOT_FOUND 0x1102
+enum { NVS_READONLY, NVS_READWRITE };
+static const char *NS = "warthog";
+static int have; static uint8_t val;
+static esp_err_t nvs_open(const char *ns, int m, nvs_handle_t *h) { (void)ns; (void)m; *h = 1; return ESP_OK; }
+static void nvs_close(nvs_handle_t h) { (void)h; }
+static esp_err_t nvs_commit(nvs_handle_t h) { (void)h; return ESP_OK; }
+static esp_err_t nvs_get_u8(nvs_handle_t h, const char *k, uint8_t *v)
+{ (void)h; if (strcmp(k, "mesh_en") || !have) return ESP_ERR_NVS_NOT_FOUND; *v = val; return ESP_OK; }
+static esp_err_t nvs_set_u8(nvs_handle_t h, const char *k, uint8_t v) { (void)h; if (strcmp(k, "mesh_en")) return 1; have = 1; val = v; return ESP_OK; }
+#include "cfg_fn.c"
+int main(void)
+{
+#ifdef WARTHOG_MESH_SMOKE
+    const unsigned w[4] = { 1, 1, 1, 1 };
+#else
+    const unsigned w[4] = { 0, 0, 1, 0 };
+#endif
+    unsigned g[4];
+    have = 0; g[0] = warthog_cfg_get_mesh_enable();
+    have = 1; val = 0; g[1] = warthog_cfg_get_mesh_enable();
+    val = 1; g[2] = warthog_cfg_get_mesh_enable();
+    val = 2; g[3] = warthog_cfg_get_mesh_enable();
+    if (memcmp(g, w, sizeof(g))) { printf("none/0/1/2 read %u/%u/%u/%u", g[0], g[1], g[2], g[3]); return 0; }
+    if (warthog_cfg_set_mesh_enable(2) != ESP_ERR_INVALID_ARG) { printf("set(2) accepted"); return 0; }
+    printf("ok");
+    return 0;
+}
+EOF75K
+for d75 in "" "-DWARTHOG_MESH_SMOKE=1"; do
+  r75k=""
+  ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} $d75 -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null && r75k=$("$T/t")
+  [ "$r75k" = ok ] || why75k="${why75k:-${d75:-station}: ${r75k:-did not build or run}}"
+done
+rm -rf "$T"
+if [ -z "$why75k" ]; then
+  ok "mesh on/off, which the region's channel pick keys on: a station build reads 0 unless 1 is stored, a mesh env always 1"
+else
+  bad "warthog_cfg_get_mesh_enable: $why75k"
+fi
+
+# 75l. The board's region context (main/halow.c warthog_region_ctx_get), compiled out with the real BCF
+#      read (components/halow/components/shims/mmhal_wlan_binaries.c) over the linked BCF's bytes
+#      (region_bcf.h), the real regdb and region.c, and sdkconfig.defaults' CONFIG_WARTHOG_HW_*: it
+#      hands the decision the whole BCF from its start, the regdb, the HW list and the rated band in
+#      Hz, so the offered list is the HW list and every offered row's occupied band lies inside
+#      902-928 MHz; a BCF read that would need freeing yields no BCF (nothing offered), freed once.
+why75l=""
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+awk '/^void mmhal_wlan_read_bcf_file\(/ && !/;$/ {p=1} p {print} p && /^}/ {exit}' ../../halow/components/shims/mmhal_wlan_binaries.c > "$T/shim_fn.c"
+awk '/^struct warthog_region_ctx warthog_region_ctx_get\(void\)/ && !/;$/ {p=1} p {print} p && /^}/ {exit}' "$HL75" > "$T/ctx_fn.c"
+cat > "$T/t.c" <<'EOF75L'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "mmhal_wlan.h"
+#include "mmregdb.h"
+#include "region.h"
+#include "region_bcf.h"
+static uint8_t bcf_[sizeof(k_region_bcf) + 16];
+uint8_t *k_fake_start = bcf_, *k_fake_end = bcf_ + sizeof(k_region_bcf);
+static int mode_, freed_;
+static void free_(void *arg) { freed_ += arg == (void *)bcf_; }
+void real_read_bcf_(uint32_t offset, uint32_t requested_len, struct mmhal_robuf *robuf);
+void mmhal_wlan_read_bcf_file(uint32_t offset, uint32_t requested_len, struct mmhal_robuf *robuf)
+{
+    real_read_bcf_(offset, requested_len, robuf);
+    if (mode_) { robuf->free_cb = free_; robuf->free_arg = bcf_; }
+}
+#define mmhal_wlan_read_bcf_file real_read_bcf_
+#include "shim_fn.c"
+#undef mmhal_wlan_read_bcf_file
+#include "ctx_fn.c"
+void warthog_cfg_get_region(struct warthog_rg_stored *o) { memset(o, 0, sizeof(*o)); }
+uint8_t warthog_cfg_get_mesh_enable(void) { return 0; }
+bool warthog_cfg_get_mesh_chan(struct warthog_mesh_chan *o) { (void)o; return false; }
+static int fails;
+#define CHECK(c, ...) do { if (!(c)) { fails++; printf(__VA_ARGS__); printf(" | "); } } while (0)
+int main(void)
+{
+    memcpy(bcf_, k_region_bcf, sizeof(k_region_bcf));
+    memset(bcf_ + sizeof(k_region_bcf), 0xee, 16);
+    struct warthog_region_ctx c = warthog_region_ctx_get();
+    CHECK(c.db == get_regulatory_db(), "the context is not the compiled regdb");
+    CHECK(c.bcf == bcf_ && c.bcf_len == sizeof(k_region_bcf), "the context's BCF is not the linked BCF whole (%p+%zu, want %p+%zu)",
+          (const void *)c.bcf, c.bcf_len, (void *)bcf_, sizeof(k_region_bcf));
+    CHECK(c.hw != NULL && !strcmp(c.hw, WANT_HW), "the context's HW list is '%s', sdkconfig.defaults says '%s'", c.hw ? c.hw : "(null)", WANT_HW);
+    CHECK(c.band_lo_hz == WANT_LO_HZ && c.band_hi_hz == WANT_HI_HZ, "the context's band is %lu-%lu Hz, sdkconfig.defaults says %lu-%lu",
+          (unsigned long)c.band_lo_hz, (unsigned long)c.band_hi_hz, (unsigned long)WANT_LO_HZ, (unsigned long)WANT_HI_HZ);
+    char got[64];
+    (void)warthog_region_allowed_list(&c, ',', got, sizeof(got));
+    CHECK(!strcmp(got, WANT_HW) && !strcmp(got, "AU,JP,KR,NZ,US"), "the board offers '%s', not its HW list '%s'", got, WANT_HW);
+    const struct mmwlan_regulatory_db *db = get_regulatory_db();
+    for (unsigned i = 0; i < db->num_domains; i++) {
+        const struct mmwlan_s1g_channel_list *l = db->domains[i];
+        const char cc[3] = { (char)l->country_code[0], (char)l->country_code[1], 0 };
+        if (!warthog_region_allowed(&c, cc)) continue;
+        struct mmwlan_s1g_channel rows[WARTHOG_PLAN_MAX_ROWS];
+        const unsigned n = warthog_region_band_rows(&c, l, rows, WARTHOG_PLAN_MAX_ROWS);
+        for (unsigned j = 0; j < n; j++) {
+            const uint64_t h = (uint64_t)rows[j].bw_mhz * 500000u;
+            CHECK(rows[j].centre_freq_hz - h >= 902000000u && rows[j].centre_freq_hz + h <= 928000000u,
+                  "%s ch%u @ %u MHz (%lu Hz) is offered outside 902-928 MHz", cc, (unsigned)rows[j].s1g_chan_num,
+                  (unsigned)rows[j].bw_mhz, (unsigned long)rows[j].centre_freq_hz);
+        }
+    }
+    mode_ = 1;
+    c = warthog_region_ctx_get();
+    (void)warthog_region_allowed_list(&c, ',', got, sizeof(got));
+    CHECK(c.bcf == NULL && c.bcf_len == 0 && freed_ == 1 && got[0] == '\0',
+          "a BCF read that needs freeing: BCF %p+%zu, freed %d, offered '%s' (want none, freed once, nothing offered)",
+          (const void *)c.bcf, c.bcf_len, freed_, got);
+    printf(fails ? "\n" : "ok");
+    return 0;
+}
+EOF75L
+r75l=""
+if ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -D'bcf_binary_start=(*k_fake_start)' -D'bcf_binary_end=(*k_fake_end)' \
+     -DCONFIG_WARTHOG_HW_REGIONS="$HW75" -DCONFIG_WARTHOG_HW_BAND_LO_KHZ="$LO75" -DCONFIG_WARTHOG_HW_BAND_HI_KHZ="$HI75" \
+     -DWANT_HW="$HW75" -DWANT_LO_HZ="$((LO75 * 1000))u" -DWANT_HI_HZ="$((HI75 * 1000))u" $SIMNODE_INCS -I"$T" -I. -I../../../main \
+     -I"$FW75/src/mmregdb" -o "$T/t" "$T/t.c" ../../../main/region.c "$FW75/src/mmregdb/mmregdb.c" 2>"$T/err"; then
+  r75l=$("$T/t")
+else
+  r75l="did not build: $(head -3 "$T/err" | tr '\n' ' ')"
+fi
+rm -rf "$T"
+[ "$r75l" = ok ] || why75l="${r75l:-the harness printed nothing (crashed)}"
+if [ -z "$why75l" ]; then
+  ok "the board's region context is the whole linked BCF, the regdb, the HW list and the band in Hz from sdkconfig: it offers exactly AU,JP,KR,NZ,US, every offered row inside 902-928 MHz; a BCF read needing a free offers nothing"
+else
+  bad "the region context (halow.c warthog_region_ctx_get): $why75l"
 fi
 
 [ $fail -eq 0 ] && echo "GLUE INVARIANTS OK" || echo "GLUE INVARIANTS FAILED"

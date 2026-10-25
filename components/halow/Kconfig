@@ -12,9 +12,19 @@ menu "Wi-Fi HaLow Connection Manager"
         default y
         select MBEDTLS_NIST_KW_C
 
-    config HALOW_COUNTRY_CODE
-        string "Country code to use for Wi-Fi HaLow"
-        default "??"
+    config WARTHOG_HW_REGIONS
+        string "Countries this module's RF front end and BCF are qualified for"
+        default "US"
+        help
+            Comma list of two-letter codes; AT+REGION offers those also in the regdb and the BCF.
+
+    config WARTHOG_HW_BAND_LO_KHZ
+        int "Lowest frequency the module is rated for (kHz)"
+        default 902000
+
+    config WARTHOG_HW_BAND_HI_KHZ
+        int "Highest frequency the module is rated for (kHz)"
+        default 928000
 
 	config HALOW_PS_MODE
 		bool "Enable Morse Micro HaLow Powersave Mode"

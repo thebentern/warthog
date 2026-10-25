@@ -485,7 +485,7 @@ them (`chippn`); a key re-install never starts below them. This count applies
 with `AT+HOSTFRAG=0` too. The setting persists and applies to the next frame. A
 node that never stored one runs `auto` on the chip-key builds (`AT+HOSTFRAG?`
 `stored=auto`) and off on every other build: host CCMP, `-nochipkey`, and the
-builds without SAE (`warthog-us`, the region builds, `warthog-mesh-smoke`). A
+builds without SAE (`warthog-station`, `warthog-mesh-smoke`). A
 stored value keeps applying.
 
 **Block Ack.** mac80211 never fragments under A-MPDU; it sends the frame whole
@@ -980,7 +980,7 @@ cause. The same thing is available on demand:
 AT+MESHCFG?
 +MESHCFG: region=US country=US
 +MESHCFG: enable=1 secure=1 pmf=off dhcp=1 fwd=0 bridge=0 grp=replicate batman=0 id='openmanet-mesh' pass=12 chars
-+MESHCFG: applied chan=42 freq=923000000 bw=2 gclass=69 sclass=2 (set_channel_list=0)
++MESHCFG: applied chan=42 freq=923000000 bw=2 gclass=69 sclass=2 src=default (set_channel_list=0)
 +MESHCFG: peers=0 beacons_heard=0
 +MESHCFG: chip_vif=mesh(5) vif_id=0 built=mesh fallback=0 add_st=0 bssid_refused=0(st=0) mesh_config_refused=0(st=0)
 +MESHCFG: chip_refused beacon_config=0(st=0) sta_state=0/0/0/0/0(st=0) install_key=0(st=0) keyidx_mismatch=0 mesh_config_sent=beaconless(2)
@@ -999,8 +999,10 @@ reading first:
 
 | Reading | Means | Check |
 |---|---|---|
-| `applied chan=NONE` | The radio has the whole country list; its operating channel is neither chosen nor observable | Region builds ship unpinned. Set `AT+MESHCHAN=<chan>,<freq_hz>,<gclass>,<sclass>,<bw>` to match the peer and reboot. An unpinned radio meeting a mesh is luck, not configuration. |
-| `set_channel_list` non-zero | The build's own channel pin was refused (a stored channel the table refuses is discarded at boot); the radio is **not** on the channel printed above | Check the region build: the pin must exist in the country's regulatory table. `AT+MESHCHAN=default` does not help here. |
+| `applied chan=NONE` | Mesh is off (the station holds the whole country list), or the radio is held | `AT+MESHEN=1` and `AT+RESET`; check `AT+REGION?` for `radio held:`. |
+| `set_channel_list` non-zero | morselib refused the channel list; the radio is **not** on the channel printed above | A firmware fault, not configuration: read the boot log. `AT+MESHCHAN=default` does not help here. |
+| `src=default+stored-refused` | The stored `AT+MESHCHAN` is not in this region's table, so the region default runs | Store a row of the running region's table to match the peer, or `AT+MESHCHAN=default`. |
+| `mesh not started: the chip refused the channel` | The chip refused the mesh channel at the first start, so the mesh sends nothing | A chip or firmware fault, not configuration: read the boot log, then `AT+RESET`. |
 | `beacons_heard=0` | Nothing is audible | Channel, bandwidth, or range. Compare `applied chan`/`bw` against `uci get wireless.radio1.channel` on the peer — `radio1` is the HaLow device and `channel` lives on the device, not the iface; `radio0` is the 5 GHz radio and `default_radio0.channel` is unset. Fix this before looking at anything else. A peer in beaconless mode sends no beacons at all; when its probe requests name our mesh, the diagnosis line says so. |
 | `beacons_heard>0`, `peers=0` | The mesh is audible and Warthog will not join it | Mesh ID (exact match, case included), operating class, or security mode. An open Warthog will not peer with an SAE mesh, and vice versa. Signal: an OpenMANET node takes no candidate it hears at or below its `mesh_rssi_threshold` (-80 dBm), and Warthog starts no peering at or below its own floor (`AT+MESHRSSI`, also -80), which the diagnosis line reports. Management frame protection is **not** on this list — peering is measured working with it off; it governs path selection (see the PMF note below). |
 | `peers>0` but no traffic | Peered; this is a data-plane question | `AT+RXCHAN?` and `AT+MPING=<peer>,8`. |

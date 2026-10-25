@@ -104,6 +104,14 @@
  *      next post; NO_MEM leaves none waiting; a loop down or stopping is UNAVAILABLE and forgets the waiting
  *      one, which, kept in the queue, still runs after; the handler waits only on AT+HANGTEST=loop's block.
  *  (19) also: (red) a request posted while the driver is stopped is dropped by the loop, counted.
+ *  (26) (red) a FIRST start whose channel the chip refuses fails: mmwlan_mesh_enable is not SUCCESS,
+ *      g_warthog_mesh_chan_st (AT+MESHCFG?) holds the refusal, and neither BSS_BEACON_CONFIG nor
+ *      MESH_CONFIG(START) reaches the chip, nor does the host beacon timer start: the mesh never beacons
+ *      on a channel the chip did not take. It used to carry on ("the chip MIGHT still RX"); the restore
+ *      path already failed this way ((16)). The next start that takes the channel clears the status.
+ *  (27) (red) a FIRST start with no row in the channel list fails the same way: not SUCCESS,
+ *      g_warthog_mesh_chan_st is MMWLAN_ERROR, and no channel push, BSS_BEACON_CONFIG, MESH_CONFIG(START)
+ *      or beacon timer; the next start with the list back clears the status and starts.
  */
 #include <stdio.h>
 #include <string.h>
@@ -170,6 +178,7 @@ enum mmwlan_status umac_chip_restart_request(struct umac_data *umacd); /* umac_m
 enum mmwlan_status umac_assert_test_request(struct umac_data *umacd);  /* umac_mmdrv_shim.c */
 enum mmwlan_status umac_loop_ping_request(struct umac_data *umacd);    /* umac_mmdrv_shim.c */
 extern volatile uint32_t g_warthog_loop_pongs, g_warthog_hang_block;
+extern volatile int32_t g_warthog_mesh_chan_st;
 unsigned simnode_asserts_caught(void);                                  /* fake_rtos.c */
 void simnode_set_identity(const uint8_t mac[6], uint16_t vif_id); /* fake_config.c */
 void simnode_evt_discard(void);
@@ -1403,6 +1412,60 @@ static void t_loop_ping(void)
     simnode_evt_discard();
 }
 
+static void t_first_start_channel_refused(void)
+{
+    printf("--- (26) a first start whose channel the chip refuses fails closed ---\n");
+    stop_();
+    reset_counters_();
+    const struct simnode_chipstate *s = simnode_chipstate();
+    const unsigned boots0 = s->boots;
+    simnode_chipcmd_clear();
+    g_warthog_mesh_chan_st = 0;
+    simnode_set_channel_status(MMWLAN_ERROR);
+    const bool started = simnode_start_sae(W);
+    simnode_set_channel_status(0);
+    CHECK(!started, "(26) (red) mmwlan_mesh_enable does not return SUCCESS");
+    CHECK(g_warthog_mesh_chan_st == (int32_t)MMWLAN_ERROR, "(26) (red) g_warthog_mesh_chan_st holds the chip's refusal (%ld)",
+          (long)g_warthog_mesh_chan_st);
+    s = simnode_chipstate();
+    CHECK(s->boots > boots0 && !s->mesh_started && !s->mesh_beaconing && !s->bss_beacon && s->beacon_period_ms == 0u,
+          "(26) (red) the chip booted for the start holds no MESH_CONFIG(START), no BSS_BEACON_CONFIG, no beacon timer");
+    CHECK(simnode_chipcmd_n(MORSE_CMD_ID_MESH_CONFIG, UINT32_MAX) == 0u &&
+          simnode_chipcmd_n(MORSE_CMD_ID_BSS_BEACON_CONFIG, UINT32_MAX) == 0u,
+          "(26) (red) neither command was sent (MESH_CONFIG %u, BSS_BEACON_CONFIG %u)",
+          simnode_chipcmd_n(MORSE_CMD_ID_MESH_CONFIG, UINT32_MAX), simnode_chipcmd_n(MORSE_CMD_ID_BSS_BEACON_CONFIG, UINT32_MAX));
+    CHECK(start_sae_() && g_warthog_mesh_chan_st == 0 && simnode_chipstate()->mesh_started,
+          "(26) the next start takes the channel: the status reads 0 and the mesh starts");
+}
+
+static void t_first_start_no_channel(void)
+{
+    printf("--- (27) a first start with an empty channel list fails closed ---\n");
+    stop_();
+    reset_counters_();
+    const struct simnode_chipstate *s = simnode_chipstate();
+    const unsigned boots0 = s->boots;
+    simnode_chipcmd_clear();
+    g_warthog_mesh_chan_st = 0;
+    const unsigned ch0 = simnode_stub_hits("umac_interface_set_channel_from_regdb");
+    simnode_set_channel_list_empty(true);
+    const bool started = simnode_start_sae(W);
+    simnode_set_channel_list_empty(false);
+    const unsigned pushes = simnode_stub_hits("umac_interface_set_channel_from_regdb") - ch0;
+    CHECK(!started, "(27) (red) mmwlan_mesh_enable does not return SUCCESS");
+    CHECK(g_warthog_mesh_chan_st == (int32_t)MMWLAN_ERROR, "(27) (red) g_warthog_mesh_chan_st is MMWLAN_ERROR (%ld)",
+          (long)g_warthog_mesh_chan_st);
+    s = simnode_chipstate();
+    CHECK(s->boots > boots0 && !s->mesh_started && !s->mesh_beaconing && !s->bss_beacon && s->beacon_period_ms == 0u,
+          "(27) (red) the chip booted for the start holds no MESH_CONFIG(START), no BSS_BEACON_CONFIG, no beacon timer");
+    CHECK(simnode_chipcmd_n(MORSE_CMD_ID_MESH_CONFIG, UINT32_MAX) == 0u &&
+          simnode_chipcmd_n(MORSE_CMD_ID_BSS_BEACON_CONFIG, UINT32_MAX) == 0u && pushes == 0u,
+          "(27) (red) no channel push, MESH_CONFIG or BSS_BEACON_CONFIG (pushes %u, MESH_CONFIG %u, BSS_BEACON_CONFIG %u)", pushes,
+          simnode_chipcmd_n(MORSE_CMD_ID_MESH_CONFIG, UINT32_MAX), simnode_chipcmd_n(MORSE_CMD_ID_BSS_BEACON_CONFIG, UINT32_MAX));
+    CHECK(start_sae_() && g_warthog_mesh_chan_st == 0 && simnode_chipstate()->mesh_started,
+          "(27) the next start with the list back: the status reads 0 and the mesh starts");
+}
+
 int main(void)
 {
     printf("=== chip restart under the mesh (MESH VIF %d, chip keys %d, PN base %d) ===\n",
@@ -1423,6 +1486,8 @@ int main(void)
     t_ba_wait_restart();
     t_loop_requests();
     t_loop_ping();
+    t_first_start_channel_refused();
+    t_first_start_no_channel();
     stop_();
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("test_simnode_restart: all passed\n");

@@ -20,6 +20,7 @@ idf_component_register(
         "cdc_out.c"
         "led.c"
         "cfg.c"
+        "region.c"
         "at.c"
         "bat_mode.c"
         "bat_port.c"

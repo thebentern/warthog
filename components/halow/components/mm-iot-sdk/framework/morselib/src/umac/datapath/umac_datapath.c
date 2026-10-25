@@ -74,7 +74,7 @@ static const uint8_t snap_802_1h[] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
 /* Declared unconditionally on purpose. The storage lives in main/at.c and is
  * not guarded, but these declarations used to sit inside
  * #ifdef WARTHOG_MESH_RX_TAP while every USE below stayed unguarded -- so any
- * env without that flag (warthog-us and every region build) failed to compile
+ * env without that flag (the station build) failed to compile
  * this file. A declaration costs nothing; hiding it only breaks the build. */
 /* Warthog receive-path counters, reported by AT+MESHSTAT?.
  *
@@ -1832,7 +1832,7 @@ static bool umac_datapath_rx_frame_filter(struct umac_data *umacd, struct mmpktv
  * 64 bytes of every data frame and writes a ring entry, which is a developer
  * diagnostic rather than something a shipping image should pay for. The
  * counters were unguarded because they are single increments and because
- * hiding them made AT+DATASTAT? / AT+RXCHAN? read zero on every region build,
+ * hiding them made AT+DATASTAT? / AT+RXCHAN? read zero on the station build,
  * which reads as a dead data plane rather than as absent instrumentation. */
 #ifdef WARTHOG_MESH_RX_TAP
     /* Warthog RX tap -- the earliest point in the host datapath.
