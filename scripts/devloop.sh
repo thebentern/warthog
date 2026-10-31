@@ -9,7 +9,7 @@
 #     LACKS both, you still need the manual BOOT+RESET dance once.
 #   - uhubctl is installed and the Plugable USBC-HUB7BC is connected.
 #   - pyserial is available via PlatformIO's venv at:
-#         $HOME/.platformio/penv/bin/python3
+#         ${PLATFORMIO_CORE_DIR:-$HOME/.platformio}/penv/bin/python3
 #
 # Usage:
 #   scripts/devloop.sh                              # both boards, default env
@@ -29,8 +29,11 @@ BOARDS="A B"
 SKIP_BUILD=0
 SKIP_VERIFY=0
 # Derive everything from this script rather than one developer's checkout.
-PIO="${PIO:-$HOME/.platformio/penv/bin/pio}"
-PY="${PIO_PYTHON:-$HOME/.platformio/penv/bin/python3}"
+# PlatformIO's core dir as pio reads it: a leading ~ expanded, a relative one made absolute.
+core=${PLATFORMIO_CORE_DIR:-$HOME/.platformio}
+case $core in "~"/*) core=$HOME/${core#"~/"} ;; /*) ;; *) core=$PWD/$core ;; esac
+PIO="${PIO:-$core/penv/bin/pio}"
+PY="${PIO_PYTHON:-$core/penv/bin/python3}"
 PROJECT="${PROJECT:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 while [[ $# -gt 0 ]]; do

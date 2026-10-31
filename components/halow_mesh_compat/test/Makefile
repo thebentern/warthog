@@ -121,6 +121,7 @@ all: $(TESTS) linkcheck freestanding region-bcf glueguard flasher bat-freestandi
 	  if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
 
 # region_bcf.h is the BCF sdkconfig.defaults links, byte for byte: compared once a build fetched it.
+# REGION_BCF_REQUIRED=1 (CI, after its builds) fails instead of skipping when it is not fetched.
 CFG_DEFAULTS := ../../../sdkconfig.defaults
 cfg_val = $(shell sed -n 's/^$(1)=\(.*\)$$/\1/p' $(CFG_DEFAULTS))
 REGION_BCF_FILE := $(patsubst "%",%,$(call cfg_val,CONFIG_MM_BCF_FILE))
@@ -132,7 +133,9 @@ region_bcf_gen = { printf '/* SPDX-License-Identifier: LicenseRef-MorseMicroBDL 
   printf '};\n'; }
 region-bcf:
 	@echo "=== region_bcf.h is the linked BCF ==="
-	@if [ ! -f $(REGION_BCF_SRC) ]; then echo "skip $(REGION_BCF_SRC) not fetched (a pio build fetches it)"; \
+	@if [ ! -f $(REGION_BCF_SRC) ]; then \
+	  if [ "$(REGION_BCF_REQUIRED)" = 1 ]; then echo "FAIL $(REGION_BCF_SRC) not fetched (a pio build fetches it)"; exit 1; fi; \
+	  echo "skip $(REGION_BCF_SRC) not fetched (a pio build fetches it)"; \
 	elif $(call region_bcf_gen,$(REGION_BCF_SRC)) | cmp -s - region_bcf.h; then echo "ok   region_bcf.h is $(REGION_BCF_FILE) byte for byte"; \
 	else echo "FAIL region_bcf.h is not $(REGION_BCF_SRC): make region-bcf-regen"; exit 1; fi
 region-bcf-regen:

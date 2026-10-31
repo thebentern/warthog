@@ -7,17 +7,17 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # A dry run: builds, checks and uploads the variant bundles; the release job runs on tag pushes only.
+  workflow_dispatch:
 
+# Build legs read; only the release job, which publishes, gets contents: write.
 permissions:
-  contents: write   # softprops/action-gh-release needs this to publish
-
-env:
-  PIO_VERSION: 6.1.19
+  contents: read
 
 jobs:
   build:
     name: build ${{ matrix.variant }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -26,12 +26,22 @@ jobs:
         variant: [station, mesh-smoke, mesh-sae-meshvif, mesh-sae-swccmp-meshvif]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      # The pins (scripts/ci/pins.env), the directory the cache paths below name, and RELEASE_NAME: the tag on a
+      # tag push, dryrun-<sha> on a dispatch (a branch name can hold a '/').
+      - name: Pins, PlatformIO core dir and release name
+        run: |
+          grep -E '^[A-Z][A-Z0-9_]*=' scripts/ci/pins.env >> "$GITHUB_ENV"
+          echo "PLATFORMIO_CORE_DIR=$HOME/.platformio" >> "$GITHUB_ENV"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then n=$GITHUB_REF_NAME; else n=dryrun-${GITHUB_SHA:0:7}; fi
+          echo "RELEASE_NAME=$n" >> "$GITHUB_ENV"
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -40,28 +50,50 @@ jobs:
       - name: Install PlatformIO
         run: pip install "platformio==${PIO_VERSION}"
 
+      # The cache key names PIO_PLATFORM, so it must be the release platformio.ini installs.
+      - name: Platform pin
+        run: scripts/ci/check-platform-pin.sh
+
+      # Keyed as in ci.yml, so a restore never mixes two pins' packages.
       - name: Cache PlatformIO toolchain + packages
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.platformio/.cache
             ~/.platformio/packages
             ~/.platformio/platforms
-          key: pio-${{ runner.os }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml') }}
+          key: pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml', 'components/halow/idf_component.yml') }}
           restore-keys: |
-            pio-${{ runner.os }}-${{ env.PIO_VERSION }}-
+            pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-
 
       - name: Build warthog-${{ matrix.variant }}
         env:
-          # Bakes the tag into the firmware so AT+VERSION? reports e.g. "v0.1.0".
-          WARTHOG_VERSION: ${{ github.ref_name }}
+          # Bakes the release name into the firmware so AT+VERSION? reports e.g. "v0.1.0".
+          WARTHOG_VERSION: ${{ env.RELEASE_NAME }}
         run: pio run -e warthog-${{ matrix.variant }}
+
+      # The same checks as ci.yml's, on the images this leg bundles.
+      - name: Image checks
+        run: scripts/ci/check-image.sh warthog-${{ matrix.variant }}
+
+      - name: sdkconfig landing
+        run: scripts/ci/check-sdkconfig-landing.sh warthog-${{ matrix.variant }}
+
+      # Prints the resolved dependencies.lock into the release log.
+      - name: Lock check
+        run: scripts/ci/check-lock.sh
+
+      - name: Platform pin (installed)
+        run: scripts/ci/check-platform-pin.sh --installed
+
+      - name: Clean tree
+        run: scripts/ci/check-clean-tree.sh .pio/build/warthog-${{ matrix.variant }}/firmware.elf
 
       - name: Bundle variant artifacts
         run: |
           set -euo pipefail
           mkdir -p dist
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${RELEASE_NAME}"
           VARIANT="${{ matrix.variant }}"
           BUILD=".pio/build/warthog-${VARIANT}"
           STEM="warthog-${TAG}-${VARIANT}"
@@ -82,13 +114,13 @@ jobs:
           # Its own venv: the generator's click must not move PlatformIO's.
           python -m venv "$RUNNER_TEMP/nvsgen"
           "$RUNNER_TEMP/nvsgen/bin/pip" install "esp-idf-nvs-partition-gen==0.3.0"
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${RELEASE_NAME}"
           PYTHON="$RUNNER_TEMP/nvsgen/bin/python" scripts/region-images.sh "$TAG" dist
           ( cd dist && sha256sum warthog-${TAG}-region-*.bin > "warthog-${TAG}-region.SHA256SUMS" )
           ls -la dist/
 
       - name: Upload variant bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: warthog-${{ matrix.variant }}
           path: dist/
@@ -98,18 +130,21 @@ jobs:
   release:
     name: publish release
     needs: build
-    runs-on: ubuntu-latest
+    # A dispatch run started on a tag ref has refs/tags/v* too; it must not publish.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: write   # softprops/action-gh-release needs this to publish
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      # checkout leaves a tag event's ref lightweight; fetch the tag object to read its message.
+      # checkout v7 fetches the tag by ref (v6 and older fetched its commit), so an annotated tag's message is local.
       - name: Release notes from the tag message
         run: |
           set -euo pipefail
-          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
           if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" = tag ]; then
             git tag -l --format='%(contents:subject)%0a%0a%(contents:body)' "${GITHUB_REF_NAME}" > notes.md
           else
@@ -118,7 +153,7 @@ jobs:
           cat notes.md
 
       - name: Download all variant bundles
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
@@ -142,7 +177,7 @@ jobs:
           fi
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
           body_path: notes.md

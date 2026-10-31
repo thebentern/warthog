@@ -6,7 +6,9 @@
 # generated sdkconfigs.
 
 # --- Partition layout ---------------------------------------------------------
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+# The same table PlatformIO builds from board_build.partitions.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # --- Flash size ---------------------------------------------------------------
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
@@ -14,7 +16,7 @@ CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 
 # --- ESP32-S3 native USB OTG --------------------------------------------------
-# Required for TinyUSB RNDIS net device. USB-OTG only takes over the USB pins
+# Required for the TinyUSB NCM/ECM net device. USB-OTG only takes over the USB pins
 # once tinyusb_driver_install() runs, so until then USB-Serial-JTAG carries the
 # console.
 CONFIG_USB_OTG_SUPPORTED=y
@@ -41,7 +43,6 @@ CONFIG_TINYUSB_NCM_OUT_NTB_BUFFS_COUNT=3
 CONFIG_TINYUSB_NCM_IN_NTB_BUFFS_COUNT=3
 CONFIG_TINYUSB_NCM_OUT_NTB_BUFF_MAX_SIZE=3200
 CONFIG_TINYUSB_NCM_IN_NTB_BUFF_MAX_SIZE=3200
-CONFIG_TINYUSB_TASK_STACK_SIZE=8192
 CONFIG_TINYUSB_CDC_ENABLED=y
 CONFIG_TINYUSB_CDC_COUNT=1
 

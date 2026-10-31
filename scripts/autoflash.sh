@@ -14,11 +14,14 @@
 #   window -- observed directly: chip-id connected, and the write-flash that followed
 #   then failed with "No serial data received". Go straight to write-flash.
 cd "$(dirname "$0")/.."
-PY="${PIO_PYTHON:-$HOME/.platformio/penv/bin/python3}"
+# PlatformIO's core dir as pio reads it: a leading ~ expanded, a relative one made absolute.
+core=${PLATFORMIO_CORE_DIR:-$HOME/.platformio}
+case $core in "~"/*) core=$HOME/${core#"~/"} ;; /*) ;; *) core=$PWD/$core ;; esac
+PY="${PIO_PYTHON:-$core/penv/bin/python3}"
 IMG=.pio/build/warthog-mesh-smoke/firmware.factory.bin
 
 [ -f "$IMG" ] || { echo "[autoflash] missing $IMG - build first:"; \
-                   echo "  ~/.platformio/penv/bin/pio run -e warthog-mesh-smoke"; exit 1; }
+                   echo "  pio run -e warthog-mesh-smoke"; exit 1; }
 
 echo "[autoflash] waiting for ROM download mode (hold BOOT, tap RESET, release BOOT)..."
 while :; do

@@ -12,6 +12,31 @@ M=../../halow/components/mm-iot-sdk/framework/morselib/src/umac/mesh/umac_mesh.c
 fail=0
 ok()   { echo "ok   $1"; }
 bad()  { echo "FAIL $1"; fail=1; }
+# GLUEGUARD_UPSTREAM_REQUIRED=1 (CI, after its builds): guards 70, 71, 73, 75 and 76 fail without the IDF and
+# TinyUSB packages and the generated sdkconfigs they compare, instead of passing on what is present.
+GG_STRICT=${GLUEGUARD_UPSTREAM_REQUIRED:-0}
+# PlatformIO's core dir as pio reads it: a leading ~ expanded, a relative one from the repo root.
+PIO_CORE=${PLATFORMIO_CORE_DIR:-$HOME/.platformio}
+case $PIO_CORE in "~"/*) PIO_CORE=$HOME/${PIO_CORE#"~/"} ;; /*) ;; *) PIO_CORE=$(pwd)/../../../$PIO_CORE ;; esac
+# ci_after_station LINE...: each LINE is a whole line of ci.yml (indent and "run: " dropped) after its
+# `run: pio run -e warthog-station`. Comment lines do not count.
+ci_after_station() {
+  printf '%s\n' "$@" | awk 'NR == FNR { w[++n] = $0; next }
+    /^[ \t]*#/ { next }
+    { l = $0; sub(/^[ \t]+/, "", l); sub(/^(- )?run: /, "", l) }
+    l == "pio run -e warthog-station" { b = 1; next }
+    b { for (i = 1; i <= n; i++) if (l == w[i]) got[i] = 1 }
+    END { for (i = 1; i <= n; i++) if (!got[i]) exit 1 }' - ../../../.github/workflows/ci.yml
+}
+# Prints the ESP-IDF version of the package whose components/<name> dir is $1: version.txt, else version.cmake.
+idf_version() {
+  if [ -f "$1/../../version.txt" ]; then sed -n '1{s/^v//;p;}' "$1/../../version.txt"
+  elif [ -f "$1/../../tools/cmake/version.cmake" ]; then
+    awk '/^set\(IDF_VERSION_(MAJOR|MINOR|PATCH) [0-9]+\)/ {k = substr($1, 17); sub(/\)$/, "", $2); v[k] = $2}
+         END {if (("MAJOR" in v) && ("MINOR" in v) && ("PATCH" in v)) print v["MAJOR"] "." v["MINOR"] "." v["PATCH"]}' \
+      "$1/../../tools/cmake/version.cmake"
+  fi
+}
 # Prints why not, or nothing: every function in $1 calling lwIP ($3, an awk regex without
 # backslashes, which awk -v strips) is one esp_netif_tcpip_exec runs, and $2 is among them.
 lwip_only_in_tcpip() {
@@ -5186,8 +5211,9 @@ fi
 #     against the package's ip4.c when present; a UDP packet without its destination port is dropped
 #     wherever it goes, as ip4_input reads that port for DHCP, which the host test's lwIP has on.
 #     make all runs lwip-napt, and CI runs it (plain and SAN=1) after the PlatformIO build with
-#     LWIP_NAPT_REQUIRED=1. AT+MTU? prints the hook's counts, ip_short_drop among them; the AT reference,
-#     Troubleshooting, OpenMANET Interop, napt-notes and the fork inventory say so.
+#     LWIP_NAPT_REQUIRED=1, also against esp-lwip c6f2f878 (IDF 5.5.6). AT+MTU? prints the hook's
+#     counts, ip_short_drop among them; the AT reference, Troubleshooting, OpenMANET Interop,
+#     napt-notes and the fork inventory say so.
 why70=""
 for k70 in '^CONFIG_LWIP_IP4_REASSEMBLY=y$' '^CONFIG_LWIP_IP_REASS_MAX_PBUFS=10$' '^CONFIG_LWIP_IPV4_NAPT=y$' \
            '^CONFIG_LWIP_IP_FORWARD=y$'; do
@@ -5229,19 +5255,30 @@ awk '/^static int napt_recv_\(/,/^}/' "$NF" | grep -q '^    return !inp->napt &&
 CS70=$(awk '/^static int cut_short_\(/,/^}/' "$NF")
 case "$CS70" in *'proto == IP_PROTO_UDP && have < hlen + 4'*'return napt_recv_(&dst, inp) || to_(h, inp) == TO_OURS;'*) ;;
   *) why70="${why70:-cut_short_ does not drop UDP without its port, then whatever napt_recv_ or to_ says NAPT reads}" ;; esac
-I70="${IDF_LWIP:-$HOME/.platformio/packages/framework-espidf/components/lwip}/lwip/src/core/ipv4/ip4.c"
+I70="${IDF_LWIP:-$PIO_CORE/packages/framework-espidf/components/lwip}/lwip/src/core/ipv4/ip4.c"
+v70=$(idf_version "${I70%/lwip/src/core/ipv4/ip4.c}")
+up70="none present"
 if [ -f "$I70" ]; then
   [ "$(grep -c 'ip_napt_recv(' "$I70")" = 1 ] && \
     grep -A1 -x '  if (!inp->napt && ip4_addr_cmp(&iphdr->dest, netif_ip4_addr(inp)))' "$I70" | grep -qx '    ip_napt_recv(p, iphdr);' || \
     why70="${why70:-ip4.c in the IDF package calls ip_napt_recv on another condition than napt_recv_ copies}"
+  up70="ip4.c, IDF ${v70:-version unread}"
+fi
+if [ "$GG_STRICT" = 1 ]; then
+  [ -f "$I70" ] || why70="${why70:-GLUEGUARD_UPSTREAM_REQUIRED=1 and no IDF lwIP ip4.c at $I70}"
+  [ -n "$v70" ] || why70="${why70:-GLUEGUARD_UPSTREAM_REQUIRED=1 and no IDF version.txt or version.cmake above ${I70%/lwip/src/core/ipv4/ip4.c}}"
+  [ "$n70" -gt 0 ] || why70="${why70:-GLUEGUARD_UPSTREAM_REQUIRED=1 and no generated sdkconfig.warthog-*}"
 fi
 grep -q '^#define LWIP_DHCP 1$' lwip_napt/lwipopts.h && grep -q 'dhcp.c' lwip_napt.mk || \
   why70="${why70:-the host test builds lwIP without DHCP, so the UDP port read of ip4_input never runs}"
 grep -q '^all:.* lwip-napt' Makefile && grep -q '^include lwip_napt.mk$' Makefile || why70="${why70:-make all does not run lwip-napt}"
-grep -q 'make -C components/halow_mesh_compat/test lwip-napt LWIP_NAPT_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
-  grep -q 'make -C components/halow_mesh_compat/test clean lwip-napt SAN=1 LWIP_NAPT_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
-  awk '/run: pio run -e warthog-station$/ {b=NR} /lwip-napt LWIP_NAPT_REQUIRED=1$/ && !l {l=NR} END {exit (b && l > b) ? 0 : 1}' ../../../.github/workflows/ci.yml || \
+ci_after_station 'make -C components/halow_mesh_compat/test lwip-napt LWIP_NAPT_REQUIRED=1' \
+  'make -C components/halow_mesh_compat/test clean lwip-napt SAN=1 LWIP_NAPT_REQUIRED=1' || \
   why70="${why70:-CI does not run lwip-napt after its PlatformIO build}"
+ci_after_station 'git -C "$d/lwip" fetch -q --depth 1 https://github.com/espressif/esp-lwip c6f2f878e7b0f86033214b85547d579be43351e3' \
+  'make -C components/halow_mesh_compat/test clean lwip-napt IDF_LWIP="$d" LWIP_NAPT_REQUIRED=1' \
+  'make -C components/halow_mesh_compat/test clean lwip-napt IDF_LWIP="$d" LWIP_NAPT_REQUIRED=1 SAN=1' || \
+  why70="${why70:-CI does not run lwip-napt against esp-lwip c6f2f878 (IDF 5.5.6) after its PlatformIO build}"
 awk '/^static void cmd_mtu\(void\)/,/^}/' ../../../main/at.c | grep -q '"+MTU: ip_reass=%lu ip_reass_drop=%lu ip_short_drop=%lu\\r\\n"' || \
   why70="${why70:-AT+MTU? does not print the counts of the hook}"
 for w70 in ip_reass_drop ip_short_drop; do
@@ -5253,7 +5290,7 @@ grep -q 'ip_reass' ../../../wiki/OpenMANET-Interop.md || why70="${why70:-OpenMAN
 grep -q 'nat_frag.c' ../../../docs/napt-notes.md || why70="${why70:-napt-notes does not cover fragments}"
 grep -q 'ESP_IDF_LWIP_HOOK_FILENAME' ../../../docs/fork-inventory.md || why70="${why70:-the fork inventory does not list the lwIP hook}"
 if [ -z "$why70" ]; then
-  ok "IP fragments: IPv4 reassembly on (IPv6 off), 10 pbufs, in sdkconfig.defaults and all $n70 generated sdkconfigs; the input hook wired into lwIP, dropping short whole packets on ip4_input's own NAPT condition, holding heap copies and handing datagrams back through the mailbox; lwip-napt (lwIP with DHCP) in make all and CI; AT+MTU? counts; documented"
+  ok "IP fragments: IPv4 reassembly on (IPv6 off), 10 pbufs, in sdkconfig.defaults and all $n70 generated sdkconfigs; the input hook wired into lwIP, dropping short whole packets on ip4_input's own NAPT condition, holding heap copies and handing datagrams back through the mailbox; lwip-napt (lwIP with DHCP) in make all and CI, also against esp-lwip c6f2f878; AT+MTU? counts; documented (upstream compared: $up70)"
 else
   bad "IP fragments: $why70"
 fi
@@ -5281,8 +5318,10 @@ grep -qx '!sdkconfig.ecm' ../../../.gitignore || why71="${why71:-.gitignore does
 if git -C ../../.. rev-parse --is-inside-work-tree >/dev/null 2>&1 && git -C ../../.. check-ignore -q sdkconfig.ecm; then
   why71="${why71:-git ignores sdkconfig.ecm}"
 fi
-grep -q '^ *pio run -e warthog-station-ecm$' ../../../.github/workflows/ci.yml || why71="${why71:-CI does not build warthog-station-ecm}"
-grep -qF "xtensa-esp32s3-elf-nm -S .pio/build/warthog-station-ecm/firmware.elf | grep ' 0000009a [dr] s_desc_fs_config\$'" ../../../.github/workflows/ci.yml || \
+sed '/^[[:space:]]*#/d' ../../../.github/workflows/ci.yml | grep -Eq '^[[:space:]]*(- )?(run: )?pio run -e warthog-station-ecm$' || \
+  why71="${why71:-CI does not build warthog-station-ecm}"
+sed '/^[[:space:]]*#/d' ../../../.github/workflows/ci.yml | \
+  grep -qF "xtensa-esp32s3-elf-nm -S .pio/build/warthog-station-ecm/firmware.elf | grep ' 0000009a [dr] s_desc_fs_config\$'" || \
   why71="${why71:-CI does not check that the ECM image holds the usb_net.c configuration descriptor}"
 U71=../../../main/usb_net.c
 awk '/^#if CFG_TUD_ECM_RNDIS$/,/^#endif$/' "$U71" | tr -d '\n' | \
@@ -5297,6 +5336,7 @@ for g71 in ../../../sdkconfig.warthog-*; do
   grep -q "^CONFIG_TINYUSB_NET_MODE_$w71=y$" "$g71" || \
     why71="${why71:-${g71##*/}: not CONFIG_TINYUSB_NET_MODE_$w71 (PlatformIO keeps a generated sdkconfig)}"
 done
+[ "$GG_STRICT" = 1 ] && [ "$n71" = 0 ] && why71="${why71:-GLUEGUARD_UPSTREAM_REQUIRED=1 and no generated sdkconfig.warthog-*}"
 if [ -z "$why71" ]; then
   ok "USB network class: NCM in all $n71 generated sdkconfigs but the -ecm env's ECM; sdkconfig.ecm not gitignored; under ECM usb_net.c hands esp_tinyusb a CDC + ECM descriptor; CI builds warthog-station-ecm and checks its ELF holds it"
 else
@@ -5383,12 +5423,10 @@ for g72 in ../../../sdkconfig.warthog-*; do
   done
 done
 grep -q '^all:.* usbnet$' Makefile || why72="${why72:-make all does not run usbnet}"
-grep -q 'make -C components/halow_mesh_compat/test usbnet USBNET_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
-  grep -q 'make -C components/halow_mesh_compat/test clean usbnet SAN=1 USBNET_REQUIRED=1$' ../../../.github/workflows/ci.yml && \
-  awk '/run: pio run -e warthog-station$/ {b=NR} /usbnet USBNET_REQUIRED=1$/ && !l {l=NR} END {exit (b && l > b) ? 0 : 1}' ../../../.github/workflows/ci.yml || \
+ci_after_station 'make -C components/halow_mesh_compat/test usbnet USBNET_REQUIRED=1' \
+  'make -C components/halow_mesh_compat/test clean usbnet SAN=1 USBNET_REQUIRED=1' || \
   why72="${why72:-CI does not run usbnet after its PlatformIO build}"
-awk '/run: pio run -e warthog-station$/ {b=NR} /run: make -C components\/halow_mesh_compat\/test glueguard$/ {g=NR}
-  END {exit (b && g > b) ? 0 : 1}' ../../../.github/workflows/ci.yml || why72="${why72:-CI does not re-run the glue guard after its builds}"
+ci_after_station 'make -C components/halow_mesh_compat/test glueguard' || why72="${why72:-CI does not re-run the glue guard after its builds}"
 awk '/^static void cmd_status\(void\)/,/^}/' ../../../main/at.c | grep -q '"+USBNET: tx_queued=%lu txq=%lu/%u txq_hw=%lu tx_stall_ms=%lu tx_busy_ms=%lu' && \
   awk '/^static void cmd_status\(void\)/,/^}/' ../../../main/at.c | grep -q 'rx_idle_ms=%lu' || \
   why72="${why72:-AT+STATUS? does not print +USBNET with all three stall indicators}"
@@ -5579,7 +5617,7 @@ awk '/^static void cmd_coredump\(void\)/,/^}/' "$A" | awk '/static char reason\[
   /"\+COREDUMP: reason=%s\\r\\n", reason/ {p=NR} END {exit (r && r < c && c < p) ? 0 : 1}' || \
   why73="${why73:-AT+COREDUMP? does not put the abort reason on one line before it prints it}"
 up73=""
-IDFS73=${IDF_ESP_SYSTEM:-$HOME/.platformio/packages/framework-espidf/components/esp_system}
+IDFS73=${IDF_ESP_SYSTEM:-$PIO_CORE/packages/framework-espidf/components/esp_system}
 if [ -f "$IDFS73/task_wdt/task_wdt.c" ]; then
   ic73=$(awk '/const char \*caption = /,/;/' "$IDFS73/task_wdt/task_wdt.c" | grep -o '"[^"]*"' | tr -d '"\n')
   oc73=$(awk '/^static const char k_twdt_caption\[\] = /,/;/' "$HC73" | grep -o '"[^"]*"' | tr -d '"\n')
@@ -5608,6 +5646,24 @@ if [ -d "$TU73/src/device" ]; then
     why73="${why73:-the TinyUSB defer queue or its empty test is not what warthog_usb_net_ping relies on}"
   up73="$up73 tinyusb"
 fi
+v73=$(idf_version "$IDFS73")
+vs73=""
+case "$up73" in *task_wdt.c* | *sys_arch.c*) vs73="IDF ${v73:-version unread}" ;; esac
+case "$up73" in *tinyusb*)
+  tv73=$(awk '/^#define TUSB_VERSION_(MAJOR|MINOR|REVISION)[ \t]/ {v[$2] = $3}
+              END {if (v["TUSB_VERSION_REVISION"] != "") print v["TUSB_VERSION_MAJOR"] "." v["TUSB_VERSION_MINOR"] "." v["TUSB_VERSION_REVISION"]}' \
+          "$TU73/src/tusb_option.h" 2>/dev/null)
+  cv73=$(sed -n "s/^version: *[\"']*\([^\"']*\)[\"']* *$/\1/p" "$TU73/idf_component.yml" 2>/dev/null)
+  vs73="${vs73:+$vs73, }TinyUSB ${tv73:-version unread}${cv73:+ ($cv73)}" ;;
+esac
+if [ "$GG_STRICT" = 1 ]; then
+  [ "$up73" = ' task_wdt.c sys_arch.c tcpip.c tinyusb' ] || \
+    why73="${why73:-GLUEGUARD_UPSTREAM_REQUIRED=1 and the upstream compared is${up73:- none}, not task_wdt.c sys_arch.c tcpip.c tinyusb}"
+  [ -n "$v73" ] || why73="${why73:-GLUEGUARD_UPSTREAM_REQUIRED=1 and no IDF version.txt or version.cmake above $IDFS73}"
+  n73=0
+  for g73 in ../../../sdkconfig.warthog-*; do [ -f "$g73" ] && n73=$((n73 + 1)); done
+  [ "$n73" -gt 0 ] || why73="${why73:-GLUEGUARD_UPSTREAM_REQUIRED=1 and no generated sdkconfig.warthog-*}"
+fi
 R73=../../../wiki/AT-Command-Reference.md
 rh73=$(grep '^| `AT+HANG?`' "$R73")
 rt73=$(grep '^| `AT+HANGTEST=' "$R73")
@@ -5635,7 +5691,7 @@ for k73 in mmwlan_loop_ping mmwlan_hang_health health_check.wakes g_warthog_hang
   grep -qF "$k73" ../../../docs/fork-inventory.md || why73="${why73:-the fork inventory does not name $k73}"
 done
 if [ -z "$why73" ]; then
-  ok "hang guard: the task watchdog panics at 60 s (main and both idle tasks), a stale sdkconfig refused; main ticks the guard every second after USB, waiting on nothing, and aborts on a probe past its limit; one ping each to the loop, tiT and TinyUSB, none waits, each probe's post and answer exact; tiT beats from one lwIP timeout too; health counts the health task's wakes, its wait never wraps; .noinit record taken first in app_main, ROM console silenced, libc-free reason; nothing in main/ stops the loop or reconfigures the watchdog; test blocks hold only their task; AT+HANG? and AT+HANGTEST documented (upstream compared:${up73:- none present})"
+  ok "hang guard: the task watchdog panics at 60 s (main and both idle tasks), a stale sdkconfig refused; main ticks the guard every second after USB, waiting on nothing, and aborts on a probe past its limit; one ping each to the loop, tiT and TinyUSB, none waits, each probe's post and answer exact; tiT beats from one lwIP timeout too; health counts the health task's wakes, its wait never wraps; .noinit record taken first in app_main, ROM console silenced, libc-free reason; nothing in main/ stops the loop or reconfigures the watchdog; test blocks hold only their task; AT+HANG? and AT+HANGTEST documented (upstream compared:${up73:- none present}${vs73:+; $vs73})"
 else
   bad "hang guard: $why73"
 fi
@@ -6270,8 +6326,8 @@ fi
 #      each an [env:warthog-<key>], and after it the flasher keeps v0.1.0's us and au images; default_envs and
 #      CI build warthog-station; platformio.ini, the workflows, the scripts and the flasher name no retired
 #      env, and every pio -e in README, wiki and docs is an env platformio.ini defines. The release body is
-#      the annotated tag's message (the tag object fetched, then body_path: notes.md). The station leg,
-#      and CI after its station build, make the region images with scripts/region-images.sh from
+#      the annotated tag's message (checkout v7 fetches the tag object by ref; then body_path: notes.md). The
+#      station leg, and CI after its station build, make the region images with scripts/region-images.sh from
 #      CONFIG_WARTHOG_HW_REGIONS under one exact generator pin, named as the flasher and flash.sh find them.
 why75f=""
 R75=../../../.github/workflows/release.yml
@@ -6299,9 +6355,10 @@ for e75 in $(grep -ohE 'pio [a-z ]+-e [a-z0-9][a-z0-9-]*' ../../../README.md ../
   printf '%s\n' "$envs75" | grep -qx "$e75" || why75f="${why75f:-the docs run pio -e $e75, which platformio.ini does not define}"
 done
 grep -qx '          body_path: notes.md' "$R75" || why75f="${why75f:-the release body is not body_path: notes.md}"
-grep -qF 'git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"' "$R75" && \
+sed -n '/^  release:$/,$p' "$R75" | grep -Eq 'uses: actions/checkout@[0-9a-f]{40} # v([7-9]|[1-9][0-9])\.' && \
+  grep -qF 'if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" = tag ]; then' "$R75" && \
   grep -qF "git tag -l --format='%(contents:subject)%0a%0a%(contents:body)' \"\${GITHUB_REF_NAME}\" > notes.md" "$R75" || \
-  why75f="${why75f:-the release job does not write notes.md from the fetched tag object}"
+  why75f="${why75f:-the release job does not write notes.md from the tag object a checkout v7 or later fetches}"
 awk '/- name: Release notes from the tag message/ {n=NR} /- name: Publish GitHub release/ {p=NR} END {exit (n && p > n) ? 0 : 1}' "$R75" || \
   why75f="${why75f:-notes.md is not written before the release is published}"
 pin75=$(grep -ho '"esp-idf-nvs-partition-gen==[0-9][0-9.]*"' "$R75" "$C75" | sort -u)
@@ -6409,6 +6466,8 @@ for g75 in ../../../sdkconfig.warthog-*; do
     grep -qxF "$k75" "$g75" || { why75h="${why75h:-${g75##*/} lacks $k75 (PlatformIO keeps a generated sdkconfig: delete it)}"; break; }
   done
 done
+[ "$GG_STRICT" = 1 ] && [ -z "$(find ../../.. -maxdepth 1 -name 'sdkconfig.warthog-*' -type f)" ] && \
+  why75h="${why75h:-GLUEGUARD_UPSTREAM_REQUIRED=1 and no generated sdkconfig.warthog-*}"
 if [ -z "$why75h" ]; then
   ok "the HW list and band pair with the linked BCF (bcf_fgh100mhaamd.mbin: AU,JP,KR,NZ,US, 902-928 MHz) in sdkconfig.defaults and every generated sdkconfig; CMake refuses a list without US and an empty band; the AT reference and the flasher name every offered code"
 else
@@ -6593,6 +6652,52 @@ if [ -z "$why75l" ]; then
   ok "the board's region context is the whole linked BCF, the regdb, the HW list and the band in Hz from sdkconfig: it offers exactly AU,JP,KR,NZ,US, every offered row inside 902-928 MHz; a BCF read needing a free offers nothing"
 else
   bad "the region context (halow.c warthog_region_ctx_get): $why75l"
+fi
+
+# 76. sdkconfig landing (scripts/ci/check-sdkconfig-landing.sh): every CONFIG_ line of sdkconfig.defaults, and of
+#     sdkconfig.ecm for an -ecm env, is in each generated sdkconfig.warthog-* of a platformio.ini env, as the
+#     value or as "is not set". PlatformIO applies the defaults only when it writes a new one, and a symbol
+#     Kconfig does not have lands nowhere; both build without a word. Under ECM, Kconfig hides sdkconfig.defaults'
+#     NCM symbols. No generated sdkconfig is ok, except under GLUEGUARD_UPSTREAM_REQUIRED=1 (CI, after its builds).
+n76=0
+for g76 in ../../../sdkconfig.warthog-*; do
+  [ -f "$g76" ] && grep -qxF "[env:${g76##*/sdkconfig.}]" ../../../platformio.ini && n76=$((n76 + 1))
+done
+if [ "$n76" = 0 ]; then
+  if [ "$GG_STRICT" = 1 ]; then
+    bad "sdkconfig landing: GLUEGUARD_UPSTREAM_REQUIRED=1 and no generated sdkconfig.warthog-* of a platformio.ini env"
+  else
+    ok "sdkconfig landing: none generated"
+  fi
+elif o76=$(sh ../../../scripts/ci/check-sdkconfig-landing.sh 2>&1); then
+  ok "sdkconfig landing: sdkconfig.defaults (and sdkconfig.ecm for -ecm) landed in all $n76 generated sdkconfigs"
+else
+  f76=$(printf '%s\n' "$o76" | sed -n 's/^FAIL //p' | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+  bad "sdkconfig landing: ${f76:-$o76} (a stale generated sdkconfig: rm -f sdkconfig.warthog-* and rebuild; PlatformIO applies sdkconfig.defaults and sdkconfig.ecm only to a new one)"
+fi
+
+# 77. CI keeps its strict switches: ci.yml's glue guard step sets GLUEGUARD_UPSTREAM_REQUIRED: 1 and region-bcf
+#     runs with REGION_BCF_REQUIRED=1, both after the station build, and the Makefile's region-bcf reads it.
+#     Comment lines do not count. This catches a dropped or lenient strict line, not a step gated on purpose
+#     (if:, continue-on-error, a shell override): workflow edits are covered by review.
+why77=""
+ci_after_station 'make -C components/halow_mesh_compat/test glueguard' || \
+  why77="ci.yml does not run make -C components/halow_mesh_compat/test glueguard after the station build"
+awk 'function step() { if (e && r) ok = 1; e = r = 0 }
+  /^[ \t]*#/ { next }
+  /^ *- / { step() }
+  /^ *GLUEGUARD_UPSTREAM_REQUIRED: "?1"?$/ { e = 1 }
+  /^ *run: make -C components\/halow_mesh_compat\/test glueguard$/ { r = 1 }
+  END { step(); exit !ok }' ../../../.github/workflows/ci.yml || \
+  why77="${why77:-the glue guard step of ci.yml does not set GLUEGUARD_UPSTREAM_REQUIRED: 1}"
+ci_after_station 'make -C components/halow_mesh_compat/test region-bcf REGION_BCF_REQUIRED=1' || \
+  why77="${why77:-ci.yml does not run region-bcf with REGION_BCF_REQUIRED=1 after the station build}"
+grep -qF 'if [ "$(REGION_BCF_REQUIRED)" = 1 ]; then echo "FAIL $(REGION_BCF_SRC) not fetched' Makefile || \
+  why77="${why77:-make region-bcf ignores REGION_BCF_REQUIRED}"
+if [ -z "$why77" ]; then
+  ok "CI strictness: the glue guard re-run with GLUEGUARD_UPSTREAM_REQUIRED=1 and region-bcf with REGION_BCF_REQUIRED=1, after the station build; region-bcf honours it"
+else
+  bad "CI strictness: $why77"
 fi
 
 [ $fail -eq 0 ] && echo "GLUE INVARIANTS OK" || echo "GLUE INVARIANTS FAILED"
