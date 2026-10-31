@@ -6595,5 +6595,59 @@ else
   bad "the region context (halow.c warthog_region_ctx_get): $why75l"
 fi
 
+# 78. The USB reattach (measured on air 2026-10-30: after AT+ASSERTTEST=at the host kept the old device in 5 of
+#     34 v0.1.0 panic reboots and in 0 of 24 with this change, because IDF's panic restart resets only the CPUs
+#     and dcd_init's own detach lasts microseconds): warthog_usb_net_start installs TinyUSB, leaves the bus right
+#     after the install error block, sets up the CDC, stays off for 100 ms and then reconnects. Each call is a
+#     top-level statement, none sits under a braceless if/else/loop, nothing returns and no preprocessor line
+#     (outside the CDC config initializer) sits between the install and the reconnect, and nothing else in main/
+#     reconnects. Comments, multi-line ones included, are stripped first.
+U78=../../../main/usb_net.c
+M78=../../../main
+# Prints $1 with // and /* */ comments (across lines too) removed; string literals are not special-cased.
+strip_c78() {
+  awk '{
+    out = ""; s = $0
+    while (s != "") {
+      if (inc) { i = index(s, "*/"); if (!i) break; s = substr(s, i + 2); inc = 0; continue }
+      i = index(s, "/*"); j = index(s, "//")
+      if (j && (!i || j < i)) { out = out substr(s, 1, j - 1); break }
+      if (i) { out = out substr(s, 1, i - 1); s = substr(s, i + 2); inc = 1; continue }
+      out = out s; break
+    }
+    print out
+  }' "$1"
+}
+why78=$(strip_c78 "$U78" | awk '/^esp_netif_t \*warthog_usb_net_start\(void\)$/,/^}$/' | awk '
+  function okprev(p) { return p ~ /[;{}][ \t]*$/ }
+  BEGIN { L0 = "    esp_err_t err = tinyusb_driver_install(&tusb_cfg);"; L1 = "    (void)tud_disconnect();"
+          L3 = "    vTaskDelay(pdMS_TO_TICKS(100));"; L4 = "    (void)tud_connect();" }
+  { seen = 1 }
+  $0 == L0 { if (st != 0) r = r " the install is not the first step;"; st = 1; prev = $0; next }
+  $0 == L1 { if (st != 1 || !closed) r = r " tud_disconnect is not the first step after the install error block;"
+             else if (!okprev(prev)) r = r " tud_disconnect sits under a braceless if/else/loop;"
+             st = 2; prev = $0; next }
+  $0 == L3 { if (st != 3) r = r " the 100 ms hold does not follow the CDC setup;"
+             else if (!okprev(prev)) r = r " the 100 ms hold sits under a braceless if/else/loop;"
+             st = 4; prev = $0; next }
+  $0 == L4 { if (st != 4 || prev != L3) r = r " tud_connect does not directly follow the 100 ms hold;"
+             st = 5; prev = $0; next }
+  /tinyusb_driver_install\(|tud_disconnect\(|tud_connect\(|pdMS_TO_TICKS\(100\)/ { r = r " a call outside its top-level line: " $0 ";" }
+  st == 1 && $0 == "    }" { closed = 1 }
+  /tinyusb_cdcacm_init\(&cdc_cfg\)/ { if (st == 2) st = 3; else r = r " the CDC setup is not between the disconnect and the hold;" }
+  st >= 1 && st < 5 && /^    const tinyusb_config_cdcacm_t cdc_cfg = \{$/ { incfg = 1 }
+  st >= 1 && st < 5 && /^[ \t]*#/ && !incfg { r = r " a preprocessor line between the install and the reconnect: " $0 ";" }
+  incfg && /^    \};$/ { incfg = 0 }
+  st >= 2 && st < 5 && /(^|[^A-Za-z_0-9])return([^A-Za-z_0-9]|$)/ { r = r " a return between the disconnect and the reconnect;" }
+  /[^ \t]/ { prev = $0 }
+  END { if (!seen) r = " warthog_usb_net_start not found;"; else if (st != 5) r = r " the sequence stops at step " st ";"; printf "%s", r }')
+n78=$(for f78 in "$M78"/*.c; do strip_c78 "$f78"; done | grep -c 'tud_connect(')
+[ "$n78" = 1 ] || why78="$why78 main/ calls tud_connect $n78 times (want 1, the reattach);"
+if [ -z "$why78" ]; then
+  ok "warthog_usb_net_start leaves the bus after the TinyUSB install, sets up the CDC, waits 100 ms and reconnects"
+else
+  bad "main/usb_net.c warthog_usb_net_start USB reattach:$why78"
+fi
+
 [ $fail -eq 0 ] && echo "GLUE INVARIANTS OK" || echo "GLUE INVARIANTS FAILED"
 exit $fail
