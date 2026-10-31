@@ -80,13 +80,22 @@ pio run -e warthog-mesh-smoke -t upload
 ```sh
 # Download new firmware
 curl -O https://raw.githubusercontent.com/MorseMicro/morse-firmware/main/firmware/mm6108.bin
-# Convert
-~/.platformio/penv/bin/python scripts/firmware/elf_to_mmfw.py mm6108.bin mm6108.mbin
+# Convert (stdlib only; needs a RISC-V objcopy, below)
+python3 scripts/firmware/elf_to_mmfw.py mm6108.bin mm6108.mbin
 ```
+
+objcopy is `--objcopy PATH`, else `$OBJCOPY`, else the newest `toolchain-riscv32-esp*` under
+`${PLATFORMIO_CORE_DIR:-$HOME/.platformio}/packages`. Warthog builds never install a RISC-V toolchain
+(pioarduino adds one only for a project with a `ulp/` directory). Install one there at the version the
+pinned platform's `platform.json` lists, or `scripts/ci/check-platform-pin.sh --installed` fails on it
+(55.03.38-1: `pio pkg install -g -t platformio/toolchain-riscv32-esp@14.2.0+20260121`), or take Espressif's
+`riscv32-esp-elf` release (github.com/espressif/crosstool-NG) and pass its `bin/riscv32-esp-elf-objcopy` as
+`--objcopy`. The script fails, writing nothing, when objcopy fails on a section (an Xtensa objcopy does) or
+no segment is extracted.
 
 ### Decompose an MMFW for analysis
 ```sh
-~/.platformio/penv/bin/python scripts/firmware/mmfw_extract.py mm6108.mbin /tmp/mm6108_segments
+python3 scripts/firmware/mmfw_extract.py mm6108.mbin /tmp/mm6108_segments
 ls /tmp/mm6108_segments
 ```
 

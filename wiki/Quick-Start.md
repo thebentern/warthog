@@ -21,6 +21,9 @@ PlatformIO 6.2 does not build this project from a fresh install: it adds SCons 4
 the 4.8.1 the pinned pioarduino platform installs, and the build stops with
 `No module named 'SCons.Tool.FortranCommon'`.
 
+Component versions are pinned exactly. After pulling a change to `sdkconfig.defaults` or `sdkconfig.ecm`,
+run `rm -f sdkconfig.warthog-*`, since PlatformIO applies them only to a new sdkconfig.
+
 ## 3. Choose a build
 
 One station image serves every region the module offers (AU, JP, KR, NZ, US):

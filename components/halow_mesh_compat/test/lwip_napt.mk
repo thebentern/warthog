@@ -5,7 +5,10 @@
 # with main/nat_frag.c, for the host. Without the package (`pio run` fetches it) `make lwip-napt`
 # says SKIP, unless LWIP_NAPT_REQUIRED=1: CI runs it that way after its PlatformIO build.
 
-IDF_LWIP ?= $(HOME)/.platformio/packages/framework-espidf/components/lwip
+# PlatformIO's core dir as pio reads it: a leading ~ expanded, a relative one from the repo root.
+PIO_CORE := $(or $(PLATFORMIO_CORE_DIR),$(HOME)/.platformio)
+PIO_CORE := $(if $(filter ~/%,$(PIO_CORE)),$(HOME)/$(patsubst ~/%,%,$(PIO_CORE)),$(if $(filter /%,$(PIO_CORE)),$(PIO_CORE),$(abspath ../../../$(PIO_CORE))))
+IDF_LWIP ?= $(PIO_CORE)/packages/framework-espidf/components/lwip
 LWIP_SRC := $(IDF_LWIP)/lwip/src
 LWIP_NAPT_SRCS = $(addprefix $(LWIP_SRC)/core/,init.c def.c inet_chksum.c ip.c mem.c memp.c netif.c pbuf.c \
                    timeouts.c udp.c tcp.c tcp_in.c tcp_out.c) \

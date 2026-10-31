@@ -15,26 +15,36 @@ The MMFW format (from morselib/include/mbin.h):
 The SDK MMFW splits its segments at 32KB boundaries. We mirror that.
 
 Usage:
-  elf_to_mmfw.py <input.elf> <output.mbin> [--bcf-addr=0x8011fa80]
+  elf_to_mmfw.py [--bcf-addr ADDR] [--objcopy PATH] <input.elf> <output.mbin>
+
+objcopy is --objcopy, else $OBJCOPY, else the newest riscv32-esp-elf-objcopy under
+$PLATFORMIO_CORE_DIR (default $HOME/.platformio)/packages/toolchain-riscv32-esp*/bin; warthog
+builds install none (README.md says where to get one). Exits non-zero, writing nothing, when objcopy
+fails on a section or no segment is extracted.
 """
-import struct, sys, subprocess, os
+import argparse, glob, os, shutil, struct, subprocess, sys
 
-if len(sys.argv) < 3:
-    print(__doc__)
-    sys.exit(1)
+ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("input_elf")
+ap.add_argument("output_mbin")
+ap.add_argument("--bcf-addr", type=lambda v: int(v, 0), default=0x8011fa80)
+ap.add_argument("--objcopy")
+args = ap.parse_args()
+input_elf, output_mbin, bcf_addr = args.input_elf, args.output_mbin, args.bcf_addr
+if os.path.realpath(output_mbin) == os.path.realpath(input_elf) or \
+        (os.path.exists(output_mbin) and os.path.exists(input_elf) and os.path.samefile(output_mbin, input_elf)):
+    sys.exit(f"error: the output {output_mbin} is the input")
 
-input_elf = sys.argv[1]
-output_mbin = sys.argv[2]
-bcf_addr_arg = next((a for a in sys.argv[3:] if a.startswith("--bcf-addr=")), "--bcf-addr=0x8011fa80")
-bcf_addr = int(bcf_addr_arg.split("=")[1], 0)
-
-# Find the RISC-V objcopy
-import glob
-objcopy_candidates = sorted(glob.glob(os.path.expanduser("~/.platformio/packages/toolchain-riscv32-esp*/bin/riscv32-esp-elf-objcopy")))
-if not objcopy_candidates:
-    print("Error: riscv32-esp-elf-objcopy not found")
-    sys.exit(1)
-RISCV_OBJCOPY = objcopy_candidates[-1]
+# Find the RISC-V objcopy: --objcopy, else $OBJCOPY, else the newest in the PlatformIO core.
+RISCV_OBJCOPY = args.objcopy or os.environ.get("OBJCOPY")
+if not RISCV_OBJCOPY:
+    core = os.path.abspath(os.path.expanduser(os.environ.get("PLATFORMIO_CORE_DIR") or "~/.platformio"))
+    objcopy_candidates = glob.glob(os.path.join(core, "packages/toolchain-riscv32-esp*/bin/riscv32-esp-elf-objcopy"))
+    RISCV_OBJCOPY = max(objcopy_candidates, key=os.path.getmtime, default=None)
+RISCV_OBJCOPY = RISCV_OBJCOPY and shutil.which(os.path.expanduser(RISCV_OBJCOPY))
+if not RISCV_OBJCOPY:
+    sys.exit("error: riscv32-esp-elf-objcopy not found (warthog builds install no RISC-V toolchain): "
+             "pass --objcopy PATH or set OBJCOPY; scripts/firmware/README.md says where to get one")
 
 # Section order to match SDK MMFW layout exactly. Load addresses from
 # nm output on the Linux ELF.
@@ -66,8 +76,9 @@ for sec_name, base_addr, max_chunk in SECTIONS_LAYOUT:
         capture_output=True, text=True
     )
     if result.returncode != 0:
-        print(f"  warn: failed to extract {sec_name}: {result.stderr.strip()}")
-        continue
+        # An absent section exits 0 with an empty file, so this is a real error (wrong objcopy, bad ELF).
+        shutil.rmtree(tmpdir)
+        sys.exit(f"error: {RISCV_OBJCOPY} failed on {sec_name} (rc={result.returncode}): {result.stderr.strip()}")
     if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
         print(f"  skip: {sec_name} (empty or absent)")
         continue
@@ -81,6 +92,10 @@ for sec_name, base_addr, max_chunk in SECTIONS_LAYOUT:
         seg_addr = base_addr + offset
         segments.append((seg_addr, chunk))
         offset += len(chunk)
+
+shutil.rmtree(tmpdir)
+if not segments:
+    sys.exit(f"error: no segment extracted from {input_elf}; {output_mbin} not written")
 
 # Now build the MMFW container
 print(f"\nBuilding MMFW container at {output_mbin}")
@@ -111,7 +126,3 @@ with open(output_mbin, "wb") as f:
 
 print(f"\nWrote {len(out)} bytes to {output_mbin}")
 print(f"  vs reference SDK mm6108.mbin (~399KB)")
-
-# Cleanup
-import shutil
-shutil.rmtree(tmpdir)

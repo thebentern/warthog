@@ -1,5 +1,5 @@
 dependencies:
-  idf: '>=5.4.2'
+  idf: '>=5.4.2,<6.0'
   morsemicro/firmware: ==2.10.4-esp32-1
 description: Morse Micro HaLow WLAN component for esp32
 license: Apache-2.0

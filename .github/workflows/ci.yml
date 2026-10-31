@@ -8,31 +8,40 @@ on:
 permissions:
   contents: read
 
-env:
-  PIO_VERSION: 6.1.19
-
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# The pio envs the build job builds and checks; the variants job builds every other env platformio.ini defines.
+env:
+  BUILD_JOB_ENVS: warthog-station warthog-station-ecm warthog-mesh-smoke warthog-mesh-sae warthog-mesh-sae-swccmp
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # inject_version.py runs `git describe --tags`; shallow clones break it.
           fetch-depth: 0
+          persist-credentials: false
+
+      # The pins (PIO_VERSION, PIO_PLATFORM, PARTITIONS_SHA256) and the directory the cache paths below name; the
+      # scripts and host tests find PlatformIO's packages through it.
+      - name: Pins and PlatformIO core dir
+        run: |
+          grep -E '^[A-Z][A-Z0-9_]*=' scripts/ci/pins.env >> "$GITHUB_ENV"
+          echo "PLATFORMIO_CORE_DIR=$HOME/.platformio" >> "$GITHUB_ENV"
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
       # make all runs the web flasher's script under node (test_flasher.mjs) and fails without it in CI.
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '20'
 
@@ -61,16 +70,22 @@ jobs:
       - name: Install PlatformIO
         run: pip install "platformio==${PIO_VERSION}"
 
+      # The cache key names PIO_PLATFORM, so it must be the release platformio.ini installs.
+      - name: Platform pin
+        run: scripts/ci/check-platform-pin.sh
+
+      # Keyed on the platform pin first: no other pin's restore prefix, nor an older workflow's
+      # pio-<os>-<PIO_VERSION>-, matches it. dependencies.lock is untracked, so not in the key.
       - name: Cache PlatformIO toolchain + packages
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.platformio/.cache
             ~/.platformio/packages
             ~/.platformio/platforms
-          key: pio-${{ runner.os }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml') }}
+          key: pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml', 'components/halow/idf_component.yml') }}
           restore-keys: |
-            pio-${{ runner.os }}-${{ env.PIO_VERSION }}-
+            pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-
 
       # One station image serves every region (AT+REGION at runtime); test_region covers the countries.
       - name: Smoke build (warthog-station)
@@ -81,7 +96,7 @@ jobs:
       - name: Smoke build (warthog-station-ecm)
         run: |
           pio run -e warthog-station-ecm
-          ~/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-nm -S .pio/build/warthog-station-ecm/firmware.elf | grep ' 0000009a [dr] s_desc_fs_config$'
+          "$PLATFORMIO_CORE_DIR"/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-nm -S .pio/build/warthog-station-ecm/firmware.elf | grep ' 0000009a [dr] s_desc_fs_config$'
 
       # release.yml's region images, from the station build's sdkconfig with the same pinned generator.
       - name: Region NVS images
@@ -89,11 +104,6 @@ jobs:
           python -m venv "$RUNNER_TEMP/nvsgen"
           "$RUNNER_TEMP/nvsgen/bin/pip" install "esp-idf-nvs-partition-gen==0.3.0"
           PYTHON="$RUNNER_TEMP/nvsgen/bin/python" scripts/region-images.sh ci "$RUNNER_TEMP/region"
-
-      # The glue guard again: its checks of the generated sdkconfig.warthog-* files found none in a fresh
-      # checkout, and the two builds above have now written warthog-station's and warthog-station-ecm's.
-      - name: Glue guard (generated sdkconfigs)
-        run: make -C components/halow_mesh_compat/test glueguard
 
       # IDF's own lwIP with main/nat_frag.c (lwip_napt.mk): IP fragments, reassembly and NAPT. The
       # host tests above skip it, since it builds from the ESP-IDF package the build just fetched.
@@ -103,19 +113,31 @@ jobs:
           make -C components/halow_mesh_compat/test clean lwip-napt SAN=1 LWIP_NAPT_REQUIRED=1
 
       # TinyUSB's own NCM and ECM class drivers with main/usbnet_core.c (usbnet.mk): one owner of the
-      # USB network class. Built from the managed_components/ the build just fetched.
+      # USB network class. Built from the managed_components/ the build just fetched (0.21.0~2 is
+      # espressif/tinyusb 894ea014, the commit esp_tinyusb 3.0.0 bundles).
       - name: Host tests (TinyUSB NCM/ECM, USB network class)
         run: |
           make -C components/halow_mesh_compat/test usbnet USBNET_REQUIRED=1
           make -C components/halow_mesh_compat/test clean usbnet SAN=1 USBNET_REQUIRED=1
+
+      # lwip-napt against IDF 5.5.6's esp-lwip pin (5.5.4 and 5.5.5 pin fd432e4ee2cf). The path goes
+      # to make, not the environment: the glue guard below reads IDF_LWIP from there.
+      - name: Host tests (esp-lwip c6f2f878, IDF 5.5.6's lwIP)
+        run: |
+          d="$RUNNER_TEMP/lwip-c6f2f878"
+          git init -q "$d/lwip"
+          git -C "$d/lwip" fetch -q --depth 1 https://github.com/espressif/esp-lwip c6f2f878e7b0f86033214b85547d579be43351e3
+          git -C "$d/lwip" checkout -q FETCH_HEAD
+          make -C components/halow_mesh_compat/test clean lwip-napt IDF_LWIP="$d" LWIP_NAPT_REQUIRED=1
+          make -C components/halow_mesh_compat/test clean lwip-napt IDF_LWIP="$d" LWIP_NAPT_REQUIRED=1 SAN=1
 
       # warthog-station compiles the mesh sources too (mesh is a runtime switch). This
       # env adds the code behind its own flags: the RX tap and the USB devloop helpers.
       - name: Smoke build (warthog-mesh-smoke)
         run: pio run -e warthog-mesh-smoke
 
-      # WARTHOG_MESH_SAE, which starts the mesh with SAE/AMPE, is set only in the
-      # mesh-sae envs, and release.yml ships this one.
+      # WARTHOG_MESH_SAE, which starts the mesh with SAE/AMPE, is set only in the mesh-sae
+      # envs. release.yml ships warthog-mesh-sae-meshvif, which the variants job builds.
       - name: Smoke build (warthog-mesh-sae)
         run: pio run -e warthog-mesh-sae
 
@@ -123,8 +145,45 @@ jobs:
       - name: Smoke build (warthog-mesh-sae-swccmp)
         run: pio run -e warthog-mesh-sae-swccmp
 
+      # The glue guard over the generated sdkconfig.warthog-* files, strict: guards 70, 71, 73, 75 and 76 fail
+      # without the IDF lwIP, esp_system and TinyUSB sources or the generated sdkconfigs they compare.
+      - name: Glue guard (generated sdkconfigs)
+        env:
+          GLUEGUARD_UPSTREAM_REQUIRED: 1
+        run: make -C components/halow_mesh_compat/test glueguard
+
+      # region_bcf.h against the morsemicro/firmware BCF the builds fetched; make all ran before it existed.
+      - name: Region BCF (fetched firmware)
+        run: make -C components/halow_mesh_compat/test region-bcf REGION_BCF_REQUIRED=1
+
+      # pioarduino reports a failed merge-bin and carries on: check each factory image's layout and flash header.
+      # A BUILD_JOB_ENVS env with no build step above has no image, and fails here.
+      - name: Image checks
+        run: |
+          for e in $BUILD_JOB_ENVS; do set -- "$@" "$e"; done
+          scripts/ci/check-image.sh "$@"
+
+      # PlatformIO merges sdkconfig.defaults into a generated sdkconfig once; every line must have landed.
+      - name: sdkconfig landing
+        run: |
+          for e in $BUILD_JOB_ENVS; do set -- "$@" "$e"; done
+          scripts/ci/check-sdkconfig-landing.sh "$@"
+
+      # dependencies.lock stays untracked: print what resolved and check it against the manifest's pins.
+      - name: Lock check
+        run: scripts/ci/check-lock.sh
+
+      - name: Platform pin (installed)
+        run: scripts/ci/check-platform-pin.sh --installed
+
+      # A tree dirty during the build stamps -dirty into WARTHOG_VERSION and esp_app_desc.version (git describe).
+      - name: Clean tree
+        run: |
+          for e in $BUILD_JOB_ENVS; do set -- "$@" ".pio/build/$e/firmware.elf"; done
+          scripts/ci/check-clean-tree.sh "$@"
+
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: warthog-station-${{ github.sha }}
           path: |
@@ -135,3 +194,119 @@ jobs:
             .pio/build/warthog-station/partitions.bin
           retention-days: 14
           if-no-files-found: error
+
+      # Its own artifact: a root-level path would make the workspace the image artifact's root.
+      - name: Upload dependencies.lock
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: warthog-lock-${{ github.sha }}
+          path: dependencies.lock
+          retention-days: 14
+          if-no-files-found: error
+
+  # The variants matrix: pio's own reading of platformio.ini (extends, extra_configs, inline comments), so a
+  # new env is built without a workflow edit. Fails on an env not named warthog-*, and unless every env is in
+  # BUILD_JOB_ENVS or the list.
+  envs:
+    runs-on: ubuntu-24.04
+    outputs:
+      variants: ${{ steps.envs.outputs.variants }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pins
+        run: grep -E '^[A-Z][A-Z0-9_]*=' scripts/ci/pins.env >> "$GITHUB_ENV"
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install "platformio==${PIO_VERSION}"
+
+      - name: Env list
+        id: envs
+        run: |
+          pio project config --json-output > "$RUNNER_TEMP/config.json"
+          python - "$RUNNER_TEMP/config.json" >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, os, re, sys
+          envs = [s[4:] for s, _ in json.load(open(sys.argv[1])) if s.startswith("env:")]
+          built = os.environ["BUILD_JOB_ENVS"].split()
+          rest = [e for e in envs if e not in built]
+          bad = ["BUILD_JOB_ENVS names %s, which platformio.ini does not define" % e for e in built if e not in envs]
+          bad += ["%s is in neither BUILD_JOB_ENVS nor the variants list" % e for e in envs if e not in built + rest]
+          bad += ["env name %r is not warthog-[a-z0-9-]+" % e for e in envs if not re.fullmatch(r"warthog-[a-z0-9-]+", e)]
+          if not rest:
+              bad.append("no env is left for the variants job")
+          for b in bad:
+              print("FAIL " + b, file=sys.stderr)
+          if bad:
+              sys.exit(1)
+          print("build job: %s; variants: %s" % (" ".join(built), " ".join(rest)), file=sys.stderr)
+          print("variants=" + json.dumps(rest))
+          EOF
+
+  # Every env outside BUILD_JOB_ENVS: release.yml's two meshvif images and the envs nothing ships.
+  # Builds and the post-build checks; the host tests run in build.
+  variants:
+    needs: envs
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.envs.outputs.variants) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pins and PlatformIO core dir
+        run: |
+          grep -E '^[A-Z][A-Z0-9_]*=' scripts/ci/pins.env >> "$GITHUB_ENV"
+          echo "PLATFORMIO_CORE_DIR=$HOME/.platformio" >> "$GITHUB_ENV"
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install "platformio==${PIO_VERSION}"
+
+      - name: Platform pin
+        run: scripts/ci/check-platform-pin.sh
+
+      - name: Cache PlatformIO toolchain + packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml', 'components/halow/idf_component.yml') }}
+          restore-keys: |
+            pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-
+
+      - name: Build ${{ matrix.env }}
+        run: pio run -e ${{ matrix.env }}
+
+      - name: Image checks
+        run: scripts/ci/check-image.sh ${{ matrix.env }}
+
+      - name: sdkconfig landing
+        run: scripts/ci/check-sdkconfig-landing.sh ${{ matrix.env }}
+
+      - name: Lock check
+        run: scripts/ci/check-lock.sh
+
+      - name: Platform pin (installed)
+        run: scripts/ci/check-platform-pin.sh --installed
+
+      - name: Clean tree
+        run: scripts/ci/check-clean-tree.sh .pio/build/${{ matrix.env }}/firmware.elf

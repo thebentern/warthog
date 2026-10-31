@@ -409,13 +409,6 @@ void warthog_usb_net_stats(struct usbnet_stats *out)
     usbnet_stats(&s_usbnet, out);
 }
 
-/* These two are declared (non-weak) in TinyUSB's net_device.h, so we must
- * define them even though TinyUSB's NCM path never calls them. LED state on
- * host attach/detach is driven via the tinyusb_event_cb_t hook on the
- * tinyusb_config_t instead. */
-void tud_network_init_cb(void) {}
-void tud_network_link_state_cb(uint8_t rhport, bool state) { (void)rhport; (void)state; }
-
 /* NCM link state.
  *
  * ECM came up implicitly; NCM does not. The host leaves the interface down

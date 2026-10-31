@@ -459,9 +459,11 @@ CDC-NCM binds with the in-box driver on macOS, Linux (`cdc_ncm`), Windows 10+
 - Two Warthogs on one host collide: both serve `192.168.4.1/24`, and the second
   falls back to a link-local address.
 - `warthog-station-ecm` serves CDC-ECM for a host that binds ECM but not NCM.
-- NCM needs TinyUSB ≥ 0.21.0 (pinned in `main/idf_component.yml`) and the
-  configuration descriptor built by `esp_tinyusb`; a hand-built NCM descriptor is
-  rejected by the host.
+- NCM needs TinyUSB 0.21.0~2, pinned exactly with `esp_tinyusb` 2.2.1 in
+  `main/idf_component.yml`: iOS needs ≥ 0.21.0, and Windows since KB5124008
+  refuses 0.21.0~1's NTB divisors of 1. It also needs the configuration
+  descriptor built by `esp_tinyusb`; a hand-built NCM descriptor is rejected by
+  the host.
 
 ## Troubleshooting
 
