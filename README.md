@@ -75,8 +75,13 @@ About $30 in parts.
 **1. Build**
 
 ```bash
+pip install platformio==6.2.0
+export UV_CONSTRAINT="$PWD/scripts/ci/penv-constraints.txt"
 pio run -e warthog-station
 ```
+
+PlatformIO and `UV_CONSTRAINT` are pinned for the pioarduino platform; see
+[Quick Start](wiki/Quick-Start.md#2-install-the-toolchain).
 
 ![Building warthog](docs/img/usb-build.svg)
 
@@ -459,8 +464,8 @@ CDC-NCM binds with the in-box driver on macOS, Linux (`cdc_ncm`), Windows 10+
 - Two Warthogs on one host collide: both serve `192.168.4.1/24`, and the second
   falls back to a link-local address.
 - `warthog-station-ecm` serves CDC-ECM for a host that binds ECM but not NCM.
-- NCM needs TinyUSB 0.21.0~2, pinned exactly with `esp_tinyusb` 2.2.1 in
-  `main/idf_component.yml`: iOS needs ≥ 0.21.0, and Windows since KB5124008
+- NCM needs TinyUSB 0.21.0~2, which `esp_tinyusb` 3.0.0 bundles (pinned exactly
+  in `main/idf_component.yml`): iOS needs ≥ 0.21.0, and Windows since KB5124008
   refuses 0.21.0~1's NTB divisors of 1. It also needs the configuration
   descriptor built by `esp_tinyusb`; a hand-built NCM descriptor is rejected by
   the host.
@@ -597,15 +602,19 @@ file with an SPDX identifier is under that licence; a file without one is under
 | Morse Micro `morselib` (`mm-iot-sdk/framework/morselib`) | `GPL-3.0-or-later OR LicenseRef-MorseMicroCommercial`, distributed here under the GPL |
 | Other Morse Micro SDK sources | Mostly Apache-2.0 |
 | Third-party SDK components | Apache-2.0, MIT, MIT-0, BSD-3-Clause, GPL-2.0-or-later; mbedtls `Apache-2.0 OR GPL-2.0-or-later` |
-| HaLow firmware and board-config blobs (`*.mbin`) | `LicenseRef-MorseMicroBDL` (Binary Distribution Licence) |
+| HaLow firmware and board-config blobs: `*.mbin` (mm-iot-sdk `framework/morsefirmware/`, including the FGH100M-H BCF `framework/morsefirmware/mm6108/bcfs/bcf_fgh100mhaamd.mbin`) and `components/halow/components/firmware/morse-firmware/**/*.bin` | `LicenseRef-MorseMicroBDL` (Binary Distribution Licence). The `.mbin` files by `framework/morsefirmware/REUSE.toml`. The morse-firmware `.bin` files by `morse-firmware/LICENSE`, which defers to the per-vendor `LICENSE` files: `firmware/`, `bcf/azurewave/` and `bcf/morsemicro/` carry the BDL; `bcf/quectel/` and `bcf/netprisma/` carry none, so which licence covers them is unverified |
 
-Licences are per-file SPDX headers; the texts are in
-[`components/halow/components/mm-iot-sdk/LICENSES/`](components/halow/components/mm-iot-sdk/LICENSES/).
+Licences are per-file SPDX headers or `REUSE.toml` annotations; the texts are in
+[`components/halow/components/mm-iot-sdk/LICENSES/`](components/halow/components/mm-iot-sdk/LICENSES/),
+and morse-firmware's in its own `LICENSE` files.
 
 The firmware blobs are redistributed complete and unmodified, as the Binary
 Distribution Licence permits, solely for use with hardware containing a Morse
-Micro HaLow chip. Forks must keep them unmodified, with the `LICENSES/`
-directory. The GPL does not apply to them.
+Micro HaLow chip. The FGH100M-H BCF is a byte copy of the one Morse Micro
+publishes in the registry package `morsemicro/firmware` 2.10.4-esp32-1 (540 B,
+sha256 `9553cadb…f54f765`). Forks must keep them unmodified, with the
+`LICENSES/` directory and morse-firmware's `LICENSE` files. The GPL does not
+apply to them.
 
 ## Regulatory
 

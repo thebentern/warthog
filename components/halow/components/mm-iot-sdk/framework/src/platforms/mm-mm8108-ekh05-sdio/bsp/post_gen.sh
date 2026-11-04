@@ -6,4 +6,4 @@
 [ -d "Drivers/" ] && rm -r Drivers/
 
 # Modify generated line endings to UNIX style
-find . -name '*.[hc]' | xargs dos2unix
+find . -name '*.[hc]' -o -name '*.ioc' | xargs dos2unix

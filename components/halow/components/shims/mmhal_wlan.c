@@ -11,12 +11,16 @@
 #include "mmhal_wlan.h"
 #include "mmosal.h"
 #include "mmutils.h"
+#include "warthog_shim.h"
 
 #include "esp_system.h"
+#include "esp_log.h"
 #include "driver/gpio.h"
 #include "esp_mac.h"
 #include "driver/spi_master.h"
 #include "driver/spi_common.h"
+
+static const char *TAG = "MMHaLow";
 
 /**
  * The number of bytes to send as part of @ref mmhal_wlan_send_training_seq for SD over SPI.
@@ -35,6 +39,8 @@ static mmhal_irq_handler_t busy_irq_handler = NULL;
 
 static spi_device_handle_t spi_handle;
 
+/* warthog: WAKE and BUSY are wired, so morselib's wake handshake drives them with or without
+ * CONFIG_HALOW_PS_MODE: WAKE stays high while the driver is awake, as on 2.10.4. */
 static void wlan_hal_gpio_init(void)
 {
     gpio_config_t io_conf = {};
@@ -79,7 +85,7 @@ static void wlan_hal_spi_init(void)
     ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK)
     {
-        printf("spi_bus_initialize failed\n");
+        ESP_LOGE(TAG, "spi_bus_initialize failed\n");
     }
 
     /* Selected the highest available SPI clock speed that is still below the MM6108's maximum of
@@ -93,7 +99,7 @@ static void wlan_hal_spi_init(void)
     ret = spi_bus_add_device(SPI2_HOST, &dev_cfg, &spi_handle);
     if (ret != ESP_OK)
     {
-        printf("spi_bus_add_device failed\n");
+        ESP_LOGE(TAG, "spi_bus_add_device failed\n");
     }
 
     /* The actual clock frequency may not be the one that was set as it is re-calculated by the
@@ -101,7 +107,7 @@ static void wlan_hal_spi_init(void)
      * could be above the value set. */
     int actual_freq_khz = 0;
     spi_device_get_actual_freq(spi_handle, &actual_freq_khz);
-    printf("Actual SPI CLK %dkHz\n", actual_freq_khz);
+    ESP_LOGD(TAG, "Actual SPI CLK %dkHz\n", actual_freq_khz);
 }
 
 static void wlan_hal_spi_deinit(void)
@@ -109,13 +115,13 @@ static void wlan_hal_spi_deinit(void)
     esp_err_t ret = spi_bus_remove_device(spi_handle);
     if (ret != ESP_OK)
     {
-        printf("spi_bus_remove_device failed\n");
+        ESP_LOGE(TAG, "spi_bus_remove_device failed\n");
     }
 
     ret = spi_bus_free(SPI2_HOST);
     if (ret != ESP_OK)
     {
-        printf("spi_bus_initialize failed\n");
+        ESP_LOGE(TAG, "spi_bus_initialize failed\n");
     }
 }
 
@@ -164,7 +170,20 @@ void mmhal_wlan_hard_reset(void)
     gpio_set_level(CONFIG_MM_RESET_N, 0);
     mmosal_task_sleep(5);
     gpio_set_level(CONFIG_MM_RESET_N, 1);
-    mmosal_task_sleep(20);
+    mmosal_task_sleep(CONFIG_MM_RESET_SETTLE_MS);
+}
+
+/* warthog: asserting holds the chip as safe mode does, its interrupts off (SPI_IRQ sits low in reset). */
+void mmhal_wlan_assert_reset(bool assert_reset)
+{
+    if (assert_reset)
+    {
+        warthog_chip_hold_reset();
+    }
+    else
+    {
+        gpio_set_level(CONFIG_MM_RESET_N, 1);
+    }
 }
 
 void mmhal_wlan_spi_cs_assert(void)
@@ -210,6 +229,12 @@ void mmhal_wlan_send_training_seq(void)
 void mmhal_wlan_register_spi_irq_handler(mmhal_irq_handler_t handler)
 {
     spi_irq_handler = handler;
+    /* warthog: morse_trns_stop unregisters with NULL; adding a NULL handler would re-enable the interrupt. */
+    if (handler == NULL)
+    {
+        gpio_isr_handler_remove(CONFIG_MM_SPI_IRQ);
+        return;
+    }
     gpio_isr_handler_add(CONFIG_MM_SPI_IRQ, (gpio_isr_t)spi_irq_handler, NULL);
 }
 
@@ -329,9 +354,11 @@ const struct mmhal_chip *mmhal_get_chip(void)
 {
     /* This is a define that is set by the build system in idf.py menuconfig to select the Morse
      * chip type. See the API documentation for mmhal_get_chip() for more information. */
-#if CONFIG_MMHAL_CHIP_TYPE_MM6108
+#if CONFIG_MM_CHIP_MM6108
     return &mmhal_mm6108;
-#elif CONFIG_MMHAL_CHIP_TYPE_MM8108
+#elif CONFIG_MM_CHIP_MM8108
     return &mmhal_mm8108;
+#else
+#error "set CONFIG_MM_CHIP_MM6108 or CONFIG_MM_CHIP_MM8108"
 #endif
 }

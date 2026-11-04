@@ -48,6 +48,8 @@ static void on_sta_state(enum mmwlan_sta_state state)
         break;
     case MMWLAN_STA_CONNECTING:
         ESP_LOGI(TAG, "STA connecting");
+        /* LOST_IP alone misses a quick re-association: IDF re-arms its timer on every DHCP start. */
+        warthog_led_set(WARTHOG_LED_HALOW_CONNECTING);
         break;
     case MMWLAN_STA_CONNECTED:
         ESP_LOGI(TAG, "STA connected (waiting for DHCP)");
@@ -109,6 +111,21 @@ static esp_err_t halow_base_start_(void)
     return ESP_OK;
 }
 
+/* mmhalow_init's attempts ran out: run on without the radio, the chip held in reset (AT+RADIO?). */
+static void halow_radio_down_(void)
+{
+    warthog_chip_hold_reset();
+    ESP_LOGE(TAG, "radio down: the chip did not boot; running without HaLow (AT+RADIO?, AT+RESET retries)");
+    xEventGroupSetBits(s_halow_events, HALOW_LINK_BIT);
+}
+
+/* MMWLAN thread, umac already shut down: no MMWLAN call, and args points into a dead stack frame. */
+static void halow_fatal_(struct mmwlan_fatal_error_args *args)
+{
+    (void)args;
+    esp_system_abort("UMAC fatal error");
+}
+
 esp_err_t warthog_halow_start_safe(void)
 {
     warthog_chip_hold_reset(); /* a panic's CPU-only reset left the chip running */
@@ -166,8 +183,12 @@ esp_err_t warthog_halow_start(void)
     ESP_RETURN_ON_ERROR(halow_base_start_(), TAG, "base start");
 
     mmhalow_use_channel_list(s_plan.list);
-    ESP_RETURN_ON_ERROR(mmhalow_init(NULL), TAG, "mmhalow init");
+    if (mmhalow_init(NULL) != ESP_OK) {
+        halow_radio_down_();
+        return ESP_OK;
+    }
     s_radio_up = true;
+    mmwlan_register_fatal_error_handler(halow_fatal_, NULL);
     mmhalow_print_version_info();
 
 #if HALOW_MAX_TX_DBM > 0

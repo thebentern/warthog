@@ -1,15 +1,12 @@
 """
 Hooks that work around PlatformIO + morsemicro/halow build-ordering bugs:
 
-  * objcopy mm6108.mbin and the BCF into ELF blob objects (the local
-    components/firmware/ custom-command doesn't fire under PlatformIO).
   * Run ar -M + ranlib + librarymangler.py to produce libmorse.a (PlatformIO's
     section scanner reads .a files before CMake's custom command produces it).
-  * Patch managed_components/.../morselib/CMakeLists.txt to mark libmorse.a as
-    a dep of the IMPORTED morselib target so consumers don't need PlatformIO
-    discovery.
-  * Append libmorse.a + blob objects to firmware.elf's link line (NOT to the
-    bootloader's — its smaller linker script chokes on libmorse's sections).
+  * Patch components/halow/components/morselib/CMakeLists.txt to wrap libmorse.a
+    in --whole-archive for consumers (a no-op while its marker is in the tree).
+  * Append libmorse.a to firmware.elf's link line (NOT to the bootloader's —
+    its smaller linker script chokes on libmorse's sections).
 """
 
 import os
@@ -38,21 +35,10 @@ libmmhostap = os.path.join(
     build_dir, "esp-idf", "halow", "components", "hostap", "libmmhostap.a"
 )
 
-firmware_build_dir = os.path.join(build_dir, "esp-idf", "firmware")
-fw_blob_dir = os.path.join(
-    project_dir, "managed_components", "morsemicro__firmware", "mm6108"
-)
-# Filenames must track CONFIG_MM_BCF_FILE / CONFIG_MM_FW_FILE in sdkconfig.defaults.
-fw_mbin = os.path.join(fw_blob_dir, "mm6108.mbin")
-bcf_mbin = os.path.join(fw_blob_dir, "bcf_fgh100mhaamd.mbin")
-fw_obj = os.path.join(firmware_build_dir, "mm6108.mbin.o")
-bcf_obj = os.path.join(firmware_build_dir, "bcf_fgh100mhaamd.mbin.o")
-
 cc = env.subst("$CC")
 toolchain_bin = os.path.dirname(cc)
 ar = os.path.join(toolchain_bin, "xtensa-esp32s3-elf-ar")
 ranlib = os.path.join(toolchain_bin, "xtensa-esp32s3-elf-ranlib")
-objcopy_bin = os.path.join(toolchain_bin, "xtensa-esp32s3-elf-objcopy")
 toolchain_prefix = os.path.join(toolchain_bin, "xtensa-esp-elf-")
 
 mm_sdk_tools = os.path.join(
@@ -67,28 +53,6 @@ protected_syms_path = os.path.join(mm_sdk_tools, "metadata", "protected_syms.txt
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _c_identifier(path):
-    return "".join(ch if ch.isalnum() else "_" for ch in path)
-
-
-def _make_blob_object(src_mbin, dst_obj, prefix):
-    if os.path.isfile(dst_obj):
-        return
-    os.makedirs(os.path.dirname(dst_obj), exist_ok=True)
-    ident = _c_identifier(src_mbin)
-    cmd = [
-        objcopy_bin,
-        "-I", "binary", "-O", "elf32-xtensa-le", "-B", "xtensa",
-        src_mbin, dst_obj,
-        "--redefine-sym", f"_binary_{ident}_start={prefix}_start",
-        "--redefine-sym", f"_binary_{ident}_size={prefix}_size",
-        "--redefine-sym", f"_binary_{ident}_end={prefix}_end",
-        "--rename-section", ".data=.rodata._fw_mbin,contents,alloc,load,readonly,data",
-    ]
-    print(f"warthog: objcopy {os.path.basename(src_mbin)} -> {prefix}")
-    subprocess.check_call(cmd)
-
-
 def _load_protected_syms():
     if not os.path.isfile(protected_syms_path):
         return []
@@ -102,8 +66,8 @@ def _load_protected_syms():
 
 
 def _patch_morselib_cmake():
-    """Make IMPORTED morselib depend on the custom-command that produces
-    libmorse.a, and wrap that .a in --whole-archive when consumers link it."""
+    """Wrap libmorse.a in --whole-archive when consumers link IMPORTED morselib
+    (no dependency added: see the NOTE below)."""
     cmake_path = os.path.join(
         project_dir, "components", "halow",
         "components", "morselib", "CMakeLists.txt",
@@ -138,10 +102,6 @@ def _patch_morselib_cmake():
 # ---------------------------------------------------------------------------
 
 def build_libmorse(target, source, env):
-    if os.path.isfile(fw_mbin) and os.path.isfile(bcf_mbin):
-        _make_blob_object(fw_mbin, fw_obj, "firmware_binary")
-        _make_blob_object(bcf_mbin, bcf_obj, "bcf_binary")
-
     if not (os.path.isfile(liblibmorse) and os.path.isfile(libmmhostap)
             and os.path.isfile(ar_script)):
         return
@@ -180,10 +140,9 @@ def build_libmorse(target, source, env):
 
 
 def append_firmware_link_flags(target, source, env):
-    """Append libmorse.a + blob objects to firmware.elf's link (only)."""
+    """Append libmorse.a to firmware.elf's link (only)."""
     env.Append(LINKFLAGS=[
         "-Wl,--whole-archive", libmorse, "-Wl,--no-whole-archive",
-        fw_obj, bcf_obj,
     ])
 
 
@@ -192,15 +151,6 @@ def append_firmware_link_flags(target, source, env):
 # ---------------------------------------------------------------------------
 
 _patch_morselib_cmake()
-
-# Blob objects need to exist before bootloader.elf links — pre-actions only
-# fire for firmware-side targets in this PIO env.
-try:
-    if os.path.isfile(fw_mbin) and os.path.isfile(bcf_mbin):
-        _make_blob_object(fw_mbin, fw_obj, "firmware_binary")
-        _make_blob_object(bcf_mbin, bcf_obj, "bcf_binary")
-except Exception as e:
-    print(f"warthog: script-load objcopy failed (will retry): {e}")
 
 env.AddPreAction("$BUILD_DIR/sections.ld", build_libmorse)
 env.AddPreAction("$BUILD_DIR/${PROGNAME}.elf", build_libmorse)

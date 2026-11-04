@@ -213,6 +213,7 @@ void bin_clear_free(void *bin, size_t len)
 }
 
 void wpabuf_free(struct wpabuf *buf) { os_free(buf); }
+void wpabuf_clear_free(struct wpabuf *buf) { os_free(buf); }
 
 /* ---- the supplicant around the shim ------------------------------------ */
 
@@ -308,7 +309,7 @@ const uint8_t *umac_mesh_ies_supported_rates(uint8_t *len_out) { *len_out = 0; r
 void warthog_sae_trace(uint32_t n) { (void)n; }
 struct sae_pt *sae_derive_pt(const int *groups, const u8 *ssid, size_t ssid_len,
                              const u8 *password, size_t password_len,
-                             const char *identifier) { s_unexpected++; return NULL; }
+                             const u8 *identifier, size_t identifier_len) { s_unexpected++; return NULL; }
 void sae_deinit_pt(struct sae_pt *pt) { if (pt != NULL) { s_unexpected++; } }
 int pbkdf2_sha1(const char *passphrase, const u8 *ssid, size_t ssid_len, int iterations,
                 u8 *buf, size_t buflen) { s_unexpected++; return -1; }

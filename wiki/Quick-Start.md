@@ -12,17 +12,27 @@ and **GND** pads. Skipping this produces resets that look like firmware bugs.
 ## 2. Install the toolchain
 
 ```bash
-pip install platformio==6.1.19
+pip install platformio==6.2.0
 git clone https://github.com/thebentern/warthog.git
 cd warthog
+export UV_CONSTRAINT="$PWD/scripts/ci/penv-constraints.txt"
 ```
 
-PlatformIO 6.2 does not build this project from a fresh install: it adds SCons 4.11.1 beside
-the 4.8.1 the pinned pioarduino platform installs, and the build stops with
-`No module named 'SCons.Tool.FortranCommon'`.
+The pinned pioarduino platform needs PlatformIO 6.2: with 6.1.x its SCons 4.11.1 sits beside
+6.1's 4.8.1 and the build stops with `No module named 'SCons.Tool.FortranCommon'`. The platform
+also installs PlatformIO into its own environment (`penv` in the PlatformIO core dir) as
+`pioarduino>=6.2.0`, which PyPI resolves past 6.2.0; `UV_CONSTRAINT` holds it at 6.2.0, so keep it
+set in the shell you build from. uv reads `UV_CONSTRAINT` as a list of files separated by spaces,
+so the checkout path must not contain one. `scripts/ci/check-platform-pin.sh --installed` prints
+the penv's version. A penv that already holds another version, or one made by an older platform
+(`pioarduino-core` 6.1.19), keeps it: delete the penv directory and the next build recreates it.
 
 Component versions are pinned exactly. After pulling a change to `sdkconfig.defaults` or `sdkconfig.ecm`,
-run `rm -f sdkconfig.warthog-*`, since PlatformIO applies them only to a new sdkconfig.
+run `rm -f sdkconfig.warthog-*`: an existing sdkconfig keeps every value it sets itself (a line with no
+`# default:` above it), the ones it took from them included.
+
+If an existing checkout fails its first build after a HaLow component update, see
+[Troubleshooting](Troubleshooting#build-fails-on-the-first-build-after-a-halow-component-update).
 
 ## 3. Choose a build
 

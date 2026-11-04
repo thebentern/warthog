@@ -6,18 +6,14 @@ dependencies:
     version: ">=5.5.4,<6.0"
   morsemicro/halow:
     # override_path builds the fork; version is provenance only.
-    version: "2.10.4-esp32-1"
+    version: "2.11.2-esp32-2"
     # Local fork: adds an 802.11s mesh mode (umac/mesh/) the registry build
-    # lacks. The fork is the 2.10.4-esp32-1 tree with non-ESP32 BSPs + docs
-    # stripped. See docs/history/mesh-port-scope.md / mesh-port-audit.md.
+    # lacks. The fork is esp-halow main @4e9ba9b855 (2.11.2-esp32-2 + 6 commits;
+    # mm-iot-sdk 2.12.3; morse-firmware ea18605f), stripped.
+    # See docs/history/mesh-port-scope.md / mesh-port-audit.md.
     # Directory is named `halow` (the dependency short name) so the IDF
     # component graph resolves `main`'s `REQUIRES halow` to the fork.
     override_path: "../components/halow"
-  morsemicro/firmware:
-    # Provides the firmware_binary_start/end + bcf_binary_start/end symbols
-    # the halow shim looks up at link time. Version-match the halow component.
-    version: "==2.10.4-esp32-1"
-  espressif/esp_tinyusb: "==2.2.1"
-  # iOS NCM needs >=0.21.0 (hathach/tinyusb#3630); Windows since KB5124008
-  # refuses 0.21.0~1's NTB divisor of 1.
-  espressif/tinyusb: "==0.21.0~2"
+  # Bundles TinyUSB 0.21.0~2: iOS NCM needs >=0.21.0 (hathach/tinyusb#3630); Windows since
+  # KB5124008 refuses 0.21.0~1's NTB divisor of 1.
+  espressif/esp_tinyusb: "==3.0.0"

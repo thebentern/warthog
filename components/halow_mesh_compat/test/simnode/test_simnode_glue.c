@@ -1102,7 +1102,7 @@ int main(void)
         snap(&s1);
         simnode_outbox_clear();
         /* Our own frame coming back. This one is handed to the glue DIRECTLY:
-         * the datapath's own filter (umac_datapath_rx_frame_filter, "Bcast
+         * the datapath's own filter (umac_datapath_rx_frame_preprocess, "Bcast
          * frame which AP relayed for us") already discards any frame whose
          * 802.11 SA is our address, one layer before the engine sees it, so
          * through simnode_rx() the counter could never move and an assertion

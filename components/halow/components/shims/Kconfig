@@ -3,49 +3,67 @@
 menu "Morse Micro Shim Configuration"
     config MM_RESET_N
         int "RESET_N pin for MM chip"
-        default 2
+        default -1
         help
             Output gpio pin used to control the RESET_N line.
 
+    config MM_RESET_SETTLE_MS
+        int "Delay after releasing RESET_N, in milliseconds"
+        default 20
+        range 1 1000
+        help
+            Delay between releasing RESET_N and the first SPI clocking. This must cover the
+            transceiver's boot, not just its reset pulse.
+
+            The startup handshake clocks a training sequence and then polls for the command
+            response. A transceiver that is still booting when that clocking starts can latch
+            onto a bit phase that is not byte aligned with the host's framing and hold it for
+            the rest of the boot, so the handshake reads a correct response at the wrong
+            alignment and the driver rejects it as an invalid ack. The failure is intermittent
+            and looks like absent or faulty hardware.
+
+            Adjust this based on the boot time measured on your particular board to ensure
+            that the transceiver has sufficient time to boot.
+
     config MM_WAKE
         int "WAKE pin for MM chip"
-        default 3
+        default -1
         help
             Output gpio pin used to control the WAKE line.
 
     config MM_BUSY
         int "BUSY pin for the MM chip"
-        default 6
+        default -1
         help
             Input pin used as a rising edge interrupt.
 
     config MM_SPI_SCK
         int "SCK pin for MM chip"
-        default 8
+        default -1
         help
             SPI clock pin.
 
     config MM_SPI_MOSI
         int "MOSI pin for MM chip"
-        default 10
+        default -1
         help
             SPI master out slave in pin.
 
     config MM_SPI_MISO
         int "MISO pin for MM chip"
-        default 9
+        default -1
         help
             SPI master in slave out pin.
 
     config MM_SPI_CS
         int "SPI CS pin for MM chip"
-        default 5
+        default -1
         help
             SPI chip select pin.
 
     config MM_SPI_IRQ
         int "SPI IRQ pin for MM chip"
-        default 4
+        default -1
         help
             Out of band interupt pin used to indicate that
             the MM chip has data for the host.

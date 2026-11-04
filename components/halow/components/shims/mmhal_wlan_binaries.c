@@ -5,6 +5,9 @@
  */
 
 #include "mmhal_wlan.h"
+#include "esp_log.h"
+
+static const char* TAG = "MMHaLow";
 
 /*
  * ---------------------------------------------------------------------------------------------
@@ -18,12 +21,12 @@
 
 void mmhal_wlan_read_bcf_file(uint32_t offset, uint32_t requested_len, struct mmhal_robuf *robuf)
 {
-    /** Points to the start of the BCF binary image. Defined as part of the Makefile */
-    extern uint8_t bcf_binary_start;
-    /** Points to the end of the BCF binary image. Defined as part of the Makefile */
-    extern uint8_t bcf_binary_end;
-
-    size_t bcf_len = &bcf_binary_end - &bcf_binary_start;
+    /* Start/end of the BCF binary image. Embedded by the firmware CMake.
+     * Length is derived from the symbols rather than reading the embedded
+     * `bcf_binary_length` word, which is not guaranteed to be word-aligned. */
+    extern const uint8_t bcf_binary[];
+    extern const uint8_t _binary_bcf_binary_end[];
+    const uint32_t bcf_binary_length = (uint32_t)(_binary_bcf_binary_end - bcf_binary);
 
     /* Initialise robuf */
     robuf->buf = NULL;
@@ -32,14 +35,14 @@ void mmhal_wlan_read_bcf_file(uint32_t offset, uint32_t requested_len, struct mm
     robuf->free_cb = NULL;
 
     /* Sanity check */
-    if (bcf_len < offset)
+    if (bcf_binary_length < offset)
     {
-        printf("Detected an attempt to start reading off the end of the bcf file.\n");
+        ESP_LOGE(TAG, "Detected an attempt to start reading off the end of the bcf file.");
         return;
     }
 
-    robuf->buf = (uint8_t *)&bcf_binary_start + offset;
-    robuf->len = bcf_len - offset;
+    robuf->buf = (uint8_t *)bcf_binary + offset;
+    robuf->len = ((size_t)bcf_binary_length) - offset;
     robuf->len = (robuf->len < requested_len) ? robuf->len : requested_len;
 }
 
@@ -48,22 +51,25 @@ void mmhal_wlan_read_bcf_file(uint32_t offset, uint32_t requested_len, struct mm
  *                                    Firmware Retrieval
  * ---------------------------------------------------------------------------------------------
  */
-/** Points to the start of the firmware binary image. Defined as part of the Makefile */
-extern uint8_t firmware_binary_start;
-/** Points to the end of the firmware binary image. Defined as part of the Makefile */
-extern uint8_t firmware_binary_end;
+/* Start/end of the firmware binary image. Embedded by the firmware CMake.
+ * Length is derived from the symbols rather than reading the embedded
+ * `firmware_binary_length` word, which is not guaranteed to be word-aligned. */
+extern const uint8_t firmware_binary[];
+extern const uint8_t _binary_firmware_binary_end[];
 
 void mmhal_wlan_read_fw_file(uint32_t offset, uint32_t requested_len, struct mmhal_robuf *robuf)
 {
-    uint32_t firmware_len = &firmware_binary_end - &firmware_binary_start;
-    if (offset > firmware_len)
+    const uint32_t firmware_binary_length =
+        (uint32_t)(_binary_firmware_binary_end - firmware_binary);
+    uint32_t firmware_len = firmware_binary_length;
+    if (offset > firmware_binary_length)
     {
-        printf("Detected an attempt to start read off the end of the firmware file.\n");
+        ESP_LOGE(TAG, "Detected an attempt to start read off the end of the firmware file.");
         robuf->buf = NULL;
         return;
     }
 
-    robuf->buf = (&firmware_binary_start + offset);
+    robuf->buf = (uint8_t *)firmware_binary + offset;
     firmware_len -= offset;
 
     robuf->len = (firmware_len < requested_len) ? firmware_len : requested_len;

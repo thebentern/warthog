@@ -774,7 +774,7 @@ int main(void)
     }
 
     /* ---- 13. Nothing fell through into code the simulator does not model  */
-    CHECK(simnode_stub_hits("umac_connection_get_state") == 0,
+    CHECK(simnode_sta_mode_hits() == 0,
           "peering never entered STA-mode connection code");
     CHECK(simnode_stub_hits("umac_supp_mesh_new_peer") == 0,
           "and never reached hostap's SAE peering, which is stubbed here");

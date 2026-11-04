@@ -12,9 +12,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd -P)
 LOCK="${LOCK:-$ROOT/dependencies.lock}"
 MANIFEST="$ROOT/main/idf_component.yml"
 # name version component_hash, from the Espressif registry; a pin bump updates this too.
-HASHES='espressif/esp_tinyusb 2.2.1 9a73a76a6bc17907f6e523342ff6b1e440023e8aac2c11f4691212106ec24e66
-espressif/tinyusb 0.21.0~2 16c8d774dab1f484d3e0c0f61105624d2424bbae864efd19818baf7b451b41e7
-morsemicro/firmware 2.10.4-esp32-1 a5758df1db4c7c39a0f6e29012355791568ef62146c796dd519b91b72eb9fd73'
+HASHES='espressif/esp_tinyusb 3.0.0 0ff29f6113c4922691b3d7eee2f29af5fb98b799ef8b198a2956328f7c2296a9'
 
 [ -f "$LOCK" ] || { echo "error: no lock: run a pio build first ($LOCK)" >&2; exit 2; }
 [ -f "$MANIFEST" ] || { echo "error: no $MANIFEST" >&2; exit 2; }

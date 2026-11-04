@@ -14,8 +14,9 @@ instability.
 
 In mesh mode a HaLow chip restart (a failed chip health check) reloads the
 chip and puts the mesh back instead of resetting the board: measured on air on
-2026-10-03 on both `-meshvif` builds with `AT+CHIPRESTART`, back in about 1.1 s
-with USB and the peer links up, 12 of 12 restarts in a soak. It still resets
+2026-10-03, before the rebase (chip firmware 1.17.6, not re-measured on 1.17.9),
+on both `-meshvif` builds with `AT+CHIPRESTART`, back in about 1.1 s with USB
+and the peer links up, 12 of 12 restarts in a soak. It still resets
 the board when the reload fails, the chip interface cannot come back at its id,
 the channel cannot be set, or `BSS_CONFIG` or `MESH_CONFIG` cannot be sent.
 `AT+CHIPRESTART?` counts restarts and what did not go back
@@ -69,6 +70,11 @@ AT+COREDUMP?
 +COREDUMP: reason=MMOSAL_ASSERT pc=<hex> fileid=<hex> line=<n>
 ```
 
+`+COREDUMP: reason=UMAC fatal error` is not an assert: in client mode
+morselib's chip restart failed a step and shut the HaLow stack down, and the
+handler `main/halow.c` registers resets the board (a crash boot). In mesh mode a
+failed restore asserts instead.
+
 `tools/assert_fileid.py <fileid>` names the source file;
 `xtensa-esp32s3-elf-addr2line -pfiaC -e firmware.elf <pc> <lr>`, with the ELF of
 the build that ran, names the assert and its caller. `AT+ASSERT=0` clears the
@@ -99,10 +105,13 @@ boots, then safe mode (`crash_boots=3 safe=1`).
 
 From the USB start on, `main` (the loop of `app_main`) ticks every second. Each
 tick posts one probe, without waiting, to the umac event loop, lwIP's thread
-and TinyUSB, and checks a 1 s `esp_timer` and the chip health task. A probe
-unanswered for 180 s (`health`: its interval plus 90 s, at least 180 s) aborts
-with `reset=PANIC` and `reason=HANG <probe>: ...`, and the core dump holds
-every task. The task watchdog resets with `reset=TASK_WDT` when `main` misses
+and TinyUSB, and checks a 1 s `esp_timer` and the chip health check, a timeout
+on the umac event loop. A probe unanswered for 180 s (`health`: its interval
+plus 90 s, at least 180 s) aborts with `reset=PANIC` and
+`reason=HANG <probe>: ...`, and the core dump holds every task. A stalled event
+loop stops `loop` and `health` together; `health`'s age already runs from its
+last run, up to 90 s earlier, so it usually trips first and the reason names it
+(derived, not re-measured). The task watchdog resets with `reset=TASK_WDT` when `main` misses
 60 s, or when a CPU's idle task has not run for 60 s.
 
 After the board is back:
@@ -112,11 +121,11 @@ AT+ASSERT?
 +ASSERT: count=<n> kept=<n> reset=PANIC up_s=<s> crash_boots=1 safe=0
 AT+COREDUMP?
 +COREDUMP: task=main pc=<hex>
-+COREDUMP: reason=HANG loop: loop=180 tcpip=0 usb=0 timer=0 health=40 up=<s>
++COREDUMP: reason=HANG health: loop=<s> tcpip=0 usb=0 timer=0 health=180 up=<s>
 AT+HANG?
 +HANG: limit_s=180 twdt_s=60 up_s=<s> idle0_max_ms=<n> idle1_max_ms=<n> test=-
 ...
-+HANG: prev reset=PANIC up_s=<s> loop=180 tcpip=0 usb=0 timer=0 health=40 idle0_ms=<n> idle1_ms=<n> test=-
++HANG: prev reset=PANIC up_s=<s> loop=<s> tcpip=0 usb=0 timer=0 health=180 idle0_ms=<n> idle1_ms=<n> test=-
 ```
 
 - The probe after `HANG` waited longest; the other ages show what else had
@@ -134,20 +143,18 @@ AT works between reboots. A stop in `app_main` before its loop has run 60 s is
 caught by the task watchdog and counts toward safe mode, as a panic does.
 `AT+HANGTEST` blocks a probed task, `main` or the AT task on demand
 ([AT reference](AT-Command-Reference#mesh)); every case was measured on air on
-2026-10-07.
+2026-10-07, before the rebase moved the health check onto the event loop.
 
 ### Task stacks
 
-`AT+STACKS?` reports the least free stack of each task, in bytes; `drv`,
-`spi_irq` and `health` start again with every chip restart, and their `_min`
-fields keep the least of every instance (`health_min` after `AT+CHIPRESTART`
-shows what the failure path left). The `health` task has 1024 words (4096
-bytes): a restart takes it to about 1740 bytes used, and at 400 words
-`AT+CHIPRESTART` ended in `stack overflow in task health` (the core dump's
-reason). Measured on air on 2026-10-03, least free: `health` 2356 bytes during
-`AT+CHIPRESTART` on the `-meshvif` builds; on both boards ESP-IDF's `wifi` task
-4192-4388 and `warthog_led` 68-72 of 2048, and 1092-1096 of the 3072 bytes it
-now has.
+`AT+STACKS?` reports the least free stack of each task, in bytes; `drv` and
+`spi_irq` start again with every chip restart, and their `_min` fields keep
+the least of every instance. The health check and the whole chip restart run on
+`evtloop` (6144 words, 24576 bytes): read `evtloop` after `AT+CHIPRESTART` to
+see what the failure path left; not measured on this base (the separate
+`health` task it replaces needed 1024 words). Measured on air on 2026-10-03,
+before the rebase, least free on both boards: ESP-IDF's `wifi` task 4192-4388
+and `warthog_led` 68-72 of 2048, and 1092-1096 of the 3072 bytes it now has.
 The stack canary (`CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY`) checks the
 lowest 16 bytes of a task's stack each time it is switched out and panics on an
 overflow, so after a run read `AT+ASSERT?` `reset=` and `AT+COREDUMP?` too.
@@ -174,6 +181,34 @@ valid code, or is not offered by this image. USB, the AP and the console run.
 Store an offered country with `AT+REGION=<CC>`, then `AT+RESET`. With mesh on,
 `radio held: mesh is on and the region has no default mesh channel` needs
 `AT+MESHCHAN=` set to a row of the region's table, or `AT+MESHEN=0`.
+
+## The radio is down after boot
+
+```
+AT+RADIO?
++RADIO: down boot_attempts=3 boot_status=<n>
+```
+
+The chip did not boot. The boot tries `mmwlan_boot` 3 times, holding the chip
+in reset between attempts (100 ms, then 200 ms); after the third failure it
+keeps the chip in reset and runs without HaLow: USB, AT, the Wi-Fi AP and NAT
+come up, nothing aborts, and the boot is not a crash boot (except a chip
+firmware that lacks the flags the driver requires, which asserts). `boot_status` is the
+last attempt's `mmwlan_status`. The boot console (USB-Serial-JTAG, before the
+hand-off to USB-OTG) shows `mmwlan_boot attempt <n>/3 failed - <status>` and
+`radio down: the chip did not boot`.
+
+- A chip that never answers fails every attempt: check that the add-on is
+  seated and the capacitor fitted ([above](#the-board-resets-at-random)).
+- `AT+RESET` tries again; a power cycle also resets the chip from power-on.
+- `boot_attempts=1` with `boot_status=4` (`CHANNEL_LIST_NOT_SET`) or `2`
+  (`INVALID_ARGUMENT`) is not a chip fault and is not retried: read
+  `AT+REGION?` and `AT+MESHCHAN?` (`set_channel_list=` is the status of the
+  channel list the boot applied).
+- `down boot_attempts=0` means the boot never ran: safe mode (`AT+ASSERT?`
+  `safe=1`) or a held region (above).
+
+The retries and this path are not measured on air.
 
 ## The link is up but nothing routes
 
@@ -354,8 +389,8 @@ without `AT+DEFRAG?` does not reassemble; flash a current one); see
 The other direction: large frames from the Warthog to a node are lost while small
 ones arrive, on a slow link or with `AT+FRAG` set, and the node counts `RX MPDUs
 with MIC fail` or decrypts only part of each frame. The Warthog's chip
-(firmware 1.17.6) is fragmenting them, and it delivers only part of what it
-fragments (measured on air 2026-10-01 to 03):
+(firmware 1.17.6 as measured; not re-measured on 1.17.9) is fragmenting them,
+and it delivers only part of what it fragments (measured on air 2026-10-01 to 03):
 
 - with host CCMP, fragments after the first that the Warthog cut are
   re-encapsulated by its chip, so the receiver finds no CCMP header or a MIC
@@ -443,13 +478,14 @@ hook):
   with its datagram (`AT+BATSTAT?` `q_tx_full`).
 
 Measured on air 2026-10-03, both boards: from a Pi at MTU 1460 and at 1500,
-pings to the Warthog up to `-s 14392` 5/5. Host-tested on IDF 5.5.4's lwIP
-(`make -C components/halow_mesh_compat/test lwip-napt`); bat0's wait on the host
-harness only. Check:
+pings to the Warthog up to `-s 14392` 5/5. Host-tested on IDF 5.5.6's lwIP, the
+package the firmware links
+(`make -C components/halow_mesh_compat/test lwip-napt`); bat0's wait on the
+host harness only. Check:
 
 - `grep REASS sdkconfig.<env>`: `CONFIG_LWIP_IP4_REASSEMBLY=y`,
-  `CONFIG_LWIP_IP_REASS_MAX_PBUFS=10`. An older generated file says `is not
-  set`; PlatformIO keeps it until it is edited or deleted.
+  `CONFIG_LWIP_IP_REASS_MAX_PBUFS=10`. An older generated file that sets it off
+  itself (no `# default:` line above) keeps it until it is edited or deleted.
 - On the node, `ping -M do -s 1432 <warthog>` passes and `ping -s 1472
   <warthog>` fails: the image predates reassembly.
 - `AT+MTU?` `ip_reass` rises by one per fragmented ping to the Warthog, in every
@@ -528,6 +564,29 @@ in `AT+SWCCMP?`.
 | `delivered` flat in `AT+DATASTAT?` while traffic runs | Real. It counts every data frame handed to the network stack, on every delivery path; flat means none is. |
 | `rx_data=0` in `AT+DATASTAT?` | Expected on `warthog-station`, which lacks `WARTHOG_MESH_RX_TAP`. On `warthog-mesh-smoke` and the `warthog-mesh-sae*` builds it counts every data frame the chip hands up and climbs with traffic. |
 | `parse_fail` climbing on `AT+HWMPSTAT?` | Real. Investigate with `AT+HWMPDUMP?`. |
+
+## Build fails on the first build after a HaLow component update
+
+Configure loads `sdkconfig.defaults` first and an existing `sdkconfig.warthog-*`
+over it. A value the old file sets itself (a line with no `# default:` line
+above it, every value it once took from `sdkconfig.defaults` included) is kept,
+so a value `sdkconfig.defaults` changes never reaches it; a symbol it does not
+name, or names only as a Kconfig default (`# default:`), takes
+`sdkconfig.defaults`. An sdkconfig from before the rebase onto esp-halow main
+@4e9ba9b855 names neither `CONFIG_HALOW_AP_MODE` nor `CONFIG_MM_CHIP_MM6108`, so
+both come from `sdkconfig.defaults`:
+`warthog: CONFIG_HALOW_AP_MODE must be set; ...` stops configure only for an
+sdkconfig that turns `CONFIG_HALOW_AP_MODE` off itself, and
+`warthog: set CONFIG_MM_CHIP_MM6108 or CONFIG_MM_CHIP_MM8108` only if
+`sdkconfig.defaults` selects no chip (an sdkconfig cannot deselect it). The
+component manager also keeps what it resolved: `dependencies.lock` and
+`managed_components/morsemicro__firmware`, a dependency the manifest no longer
+names. Clear the old state once, then build:
+
+```bash
+rm -f sdkconfig.warthog-*
+rm -rf managed_components/morsemicro__firmware dependencies.lock .pio/build
+```
 
 ## Build fails right after adding a source file
 

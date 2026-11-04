@@ -39,8 +39,7 @@
 #include "umac/config/umac_config.h"   /* default QoS params */
 /* Call the supplicant shim after MESH_CONFIG(START). */
 #include "umac/supplicant_shim/umac_supp_shim.h"
-/* install mesh-mode datapath ops on mesh startup so frames
- * pass the data->ops NULL check in umac_datapath_rx_frame_filter. */
+/* datapath_ops_mesh, bound to the mesh VIF by umac_interface_add. */
 #include "umac/datapath/umac_datapath.h"
 #include "umac/datapath/umac_datapath_private.h" /* umac_datapath_mesh_find_peer */
 /* set the per-VIF operating channel via regdb. */
@@ -232,18 +231,18 @@ extern volatile int32_t g_warthog_mesh_chan_st;
 
 /* A command the mesh carries on without: at a start its answer is kept, at a restore (@p restore)
  * a failure, or a refusal other than the start's on the same interface type, is counted. */
-static void mesh_chip_answer_(bool restore, int32_t *start, int ret, int32_t st)
+static void mesh_chip_answer_(bool restore, int32_t *start, enum mmwlan_status ret, int32_t st)
 {
     if (!restore)
     {
         if (start != NULL)
         {
-            *start = ret == 0 ? st : 0;
+            *start = ret == MMWLAN_SUCCESS ? st : 0;
         }
         return;
     }
     const bool same_vif = s_start_st.vif_type == (uint32_t)umac_interface_get_chip_vif_type(s_mesh_umacd);
-    if (ret != 0 || (st != 0 && (start == NULL || (same_vif && st != *start))))
+    if (ret != MMWLAN_SUCCESS || (st != 0 && (start == NULL || (same_vif && st != *start))))
     {
         g_warthog_chiprestart_cmdfail++;
     }
@@ -262,38 +261,30 @@ enum mmwlan_status umac_mesh_enable_mesh(struct umac_data *umacd,
               args->mesh_id_len,
               (args->security_type == MMWLAN_SAE) ? "SAE" : "OPEN");
 
-    /* ADD_INTERFACE(type=MESH). Passing NULL for the MAC lets the
-     * interface layer use the chip's device MAC. This call is also the
-     * diagnostic for whether the bundled mm6108.mbin firmware supports a
-     * mesh VIF at all — morselib's morse_commands.h carries the
-     * MORSE_CMD_INTERFACE_TYPE_MESH enum value but none of the mesh-specific
-     * commands (MESH_CONFIG etc.), so the firmware build's mesh support is
-     * unconfirmed until this ADD_INTERFACE is exercised on hardware. */
-    uint16_t vif_id = UMAC_INTERFACE_VIF_ID_INVALID;
-    enum mmwlan_status status = umac_interface_add(umacd, UMAC_INTERFACE_MESH, NULL, &vif_id);
+    /* The mesh datapath is ready before its ops are bound: umac_interface_add binds them, so
+     * no frame the chip delivers once the VIF exists finds them missing. */
+    umac_datapath_configure_mesh_mode(umacd);
+
+    /* ADD_INTERFACE(type=MESH) in the STA slot, the device MAC as its address. This call is
+     * also the diagnostic for whether the bundled mm6108.mbin supports a mesh VIF at all. */
+    enum mmwlan_status status =
+        umac_interface_add(umacd, UMAC_INTERFACE_MESH, &datapath_ops_mesh, NULL);
+    if (status == MMWLAN_UNAVAILABLE)
+    {
+        MMLOG_ERR("mesh: ADD_INTERFACE(type=MESH) refused: another interface (STA, AP or a running "
+                  "scan) is active\n");
+        return status;
+    }
     if (status != MMWLAN_SUCCESS)
     {
         MMLOG_ERR("mesh: ADD_INTERFACE(type=MESH) failed (status=%d) — the bundled "
                   "mm6108.mbin is likely a STA/AP-only firmware build\n", (int)status);
         return status;
     }
+    uint16_t vif_id = umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH);
 
     MMLOG_INF("mesh: interface up (vif_id=%u, chip VIF type %u)\n", vif_id,
               (unsigned)umac_interface_get_chip_vif_type(umacd));
-
-    /* Install the mesh datapath ops HERE, immediately after the vif exists and
-     * BEFORE any command that can make the chip start delivering frames.
-     *
-     * The reference port binds umac_datapath_ops_mesh at umac_interface_add()
-     * time for exactly this reason. Warthog used to install them near the end
-     * of this function -- after MESH_CONFIG(START) -- which leaves a window
-     * where the chip is already beaconing/receiving while data->ops is still
-     * NULL, and umac_datapath_rx_frame_filter() drops every frame with
-     * "Frame received before datapath configured".
-     *
-     * Idempotent (it just assigns a pointer), so the later call is harmless. */
-    umac_datapath_configure_mesh_mode(umacd);
-    MMLOG_INF("mesh: datapath ops installed early (before any RX can arrive)\n");
 
     uint8_t own_addr[6];
     s_cryptohost_set = 0; /* the chip booted with none */
@@ -394,10 +385,10 @@ static enum mmwlan_status mesh_chip_start_(struct umac_data *umacd, uint16_t vif
         {
             for (int aci = 0; aci < MMWLAN_QOS_QUEUE_NUM_ACIS; aci++)
             {
-                int qret = mmdrv_cfg_qos_queue(&qos_params[aci]);
-                if (qret != 0)
+                const enum mmwlan_status qret = mmdrv_cfg_qos_queue(&qos_params[aci]);
+                if (qret != MMWLAN_SUCCESS)
                 {
-                    MMLOG_WRN("mesh: cfg_qos_queue ACI=%d ret=%d\n", aci, qret);
+                    MMLOG_WRN("mesh: cfg_qos_queue ACI=%d ret=%d\n", aci, (int)qret);
                     mesh_chip_answer_(restore, NULL, qret, 0);
                 }
             }
@@ -443,15 +434,15 @@ static enum mmwlan_status mesh_chip_start_(struct umac_data *umacd, uint16_t vif
     /* BSS_BEACON_CONFIG enable=true, the chip's "arm the beacon timer" command. Linux sends it
      * only when beaconing restarts (morse_driver mac.c:4221-4232), after a first start has
      * sent BSS_CONFIG: a fresh MESH VIF gets none, as Linux's first start; the STA VIF keeps it. */
-    int ret = 0;
+    enum mmwlan_status ret = MMWLAN_SUCCESS;
     int32_t chip_st = 0;
     if (umac_interface_chip_vif_is_mesh(umacd))
     {
         MMLOG_INF("mesh: no BSS_BEACON_CONFIG on the new MESH VIF, as Linux's first start\n");
     }
-    else if ((ret = mmdrv_cfg_bss_beacon(vif_id, /*enable=*/true, &chip_st)) != 0)
+    else if ((ret = mmdrv_cfg_bss_beacon(vif_id, /*enable=*/true, &chip_st)) != MMWLAN_SUCCESS)
     {
-        MMLOG_WRN("mesh: BSS_BEACON_CONFIG(enable=1) rejected: %d\n", ret);
+        MMLOG_WRN("mesh: BSS_BEACON_CONFIG(enable=1) rejected: %d\n", (int)ret);
     }
     else if (chip_st != 0)
     {
@@ -538,14 +529,14 @@ static enum mmwlan_status mesh_chip_start_(struct umac_data *umacd, uint16_t vif
     /* mac80211 gives a mesh bss_conf.bssid = zero_addr and never raises BSS_CHANGED_BSSID at
      * mesh start, so a Linux MESH VIF gets no BSSID_SET; the STA VIF keeps the derived one. */
     const bool send_bssid = !umac_interface_chip_vif_is_mesh(umacd);
-    ret = send_bssid ? mmdrv_set_bssid(vif_id, shared_bssid, &chip_st) : 0;
+    ret = send_bssid ? mmdrv_set_bssid(vif_id, shared_bssid, &chip_st) : MMWLAN_SUCCESS;
     if (!send_bssid)
     {
         MMLOG_INF("mesh: no BSSID_SET on the MESH VIF, as Linux\n");
     }
-    else if (ret != 0)
+    else if (ret != MMWLAN_SUCCESS)
     {
-        MMLOG_WRN("mesh: [step32] BSSID_SET(shared) rejected: %d\n", ret);
+        MMLOG_WRN("mesh: [step32] BSSID_SET(shared) rejected: %d\n", (int)ret);
     }
     else if (chip_st != 0)
     {
@@ -587,11 +578,11 @@ static enum mmwlan_status mesh_chip_start_(struct umac_data *umacd, uint16_t vif
      * WARTHOG_MESH_CSSID_NONZERO restores the old behaviour for A/B testing. */
     ret = mmdrv_cfg_bss(vif_id, beacon_int, /*dtim_period=*/1, /*cssid=*/0);
 
-    if (ret != 0)
+    if (ret != MMWLAN_SUCCESS)
     {
         MMLOG_ERR("mesh: BSS_CONFIG rejected by firmware: %d "
                   "(beacon_int=%u dtim=1 cssid=0x%08lx)\n",
-                  ret, beacon_int, (unsigned long)cssid);
+                  (int)ret, beacon_int, (unsigned long)cssid);
         return MMWLAN_ERROR;
     }
     MMLOG_INF("mesh: [step27] BSS_CONFIG OK — beacon_int=%u dtim=1 cssid=0x%08lx "
@@ -653,11 +644,11 @@ static enum mmwlan_status mesh_chip_start_(struct umac_data *umacd, uint16_t vif
 #endif
     ret = mmdrv_start_beaconing_period(vif_id, bcn_period_ms);
     mesh_chip_answer_(restore, NULL, ret, 0);
-    if (ret != 0)
+    if (ret != MMWLAN_SUCCESS)
     {
         MMLOG_ERR("mesh: mmdrv_start_beaconing(vif_id=%u) failed: %d — "
                   "chip's beacon IRQ remains disabled for mesh VIF\n",
-                  vif_id, ret);
+                  vif_id, (int)ret);
         /* Don't bail: MESH_CONFIG(START) already succeeded; the chip
          * may still beacon internally (just without a host-provided
          * template). We continue so the rest of the host stack comes
@@ -684,13 +675,13 @@ static enum mmwlan_status mesh_chip_start_(struct umac_data *umacd, uint16_t vif
      * board about 2 s after the firmware started (on air, 2026-09-30). A STA VIF keeps it. */
     const bool beaconing = !umac_interface_chip_vif_is_mesh(umacd);
     ret = mmdrv_mesh_config(vif_id, /*start=*/true, beaconing, &chip_st);
-    if (ret != 0)
+    if (ret != MMWLAN_SUCCESS)
     {
-        MMLOG_ERR("mesh: MESH_CONFIG(START) rejected by firmware: %d\n", ret);
+        MMLOG_ERR("mesh: MESH_CONFIG(START) rejected by firmware: %d\n", (int)ret);
         return MMWLAN_ERROR;
     }
     g_warthog_chipcmd_meshcfg_mode = beaconing ? 1u : 2u;
-    mesh_chip_answer_(restore, &s_start_st.meshcfg, 0, chip_st);
+    mesh_chip_answer_(restore, &s_start_st.meshcfg, MMWLAN_SUCCESS, chip_st);
     /* A refusal was invisible before (morse_cmd_tx returned 0): counted, the mesh carries on. */
     if (chip_st != 0)
     {
@@ -710,11 +701,13 @@ static enum mmwlan_status mesh_enable_rest_(struct umac_data *umacd, uint16_t vi
                                             const struct mmwlan_mesh_args *args,
                                             const uint8_t *own_addr)
 {
-    /* Already installed right after ADD_INTERFACE above; re-asserting is
-     * idempotent. The ops (umac_datapath_mesh.c) carry the peer table, the
-     * per-peer TX queues and the mesh management dispatch. */
-    umac_datapath_configure_mesh_mode(umacd);
-    MMLOG_INF("mesh: datapath ops set to mesh — RX filter will now pass frames\n");
+    /* Frames from a node with no slot (beacons, SAE, a first Open) run against the common stad. */
+    enum mmwlan_status common_status = umac_datapath_mesh_common_start(
+        umacd, vif_id, own_addr, args->security_type == MMWLAN_SAE);
+    if (common_status != MMWLAN_SUCCESS)
+    {
+        return common_status;
+    }
 
     /* ===================================================================
      * DIRECT CHIP-TX-PATH VERIFICATION via manual probe req.
@@ -766,10 +759,10 @@ static enum mmwlan_status mesh_enable_rest_(struct umac_data *umacd, uint16_t vi
             tx_md->vif_id = vif_id;
             umac_rc_init_rate_table_mgmt(umacd, &tx_md->rc_data, false);
 
-            int tx_ret = mmdrv_tx_frame(probe, /*is_mgmt=*/true);
-            if (tx_ret < 0)
+            enum mmwlan_status tx_ret = mmdrv_tx_frame(probe, /*is_mgmt=*/true);
+            if (tx_ret != MMWLAN_SUCCESS)
             {
-                MMLOG_ERR("mesh: [step29] mmdrv_tx_frame(probe_request) FAILED: %d\n", tx_ret);
+                MMLOG_ERR("mesh: [step29] mmdrv_tx_frame(probe_request) FAILED: %d\n", (int)tx_ret);
             }
             else
             {
@@ -826,9 +819,14 @@ enum mmwlan_status umac_mesh_handle_hw_restarted(struct umac_data *umacd, bool *
         return MMWLAN_UNAVAILABLE; /* the start never got this far */
     }
     const uint32_t cmdfail = g_warthog_chiprestart_cmdfail;
-    uint16_t vif_id = UMAC_INTERFACE_VIF_ID_INVALID;
-    if (umac_interface_reinstall_vif(umacd, UMAC_INTERFACE_MESH, &vif_id) != MMWLAN_SUCCESS ||
-        mesh_chip_start_(umacd, vif_id, &s_mesh_args, NULL) != MMWLAN_SUCCESS)
+    if (umac_interface_reinstall_vif(umacd, MMWLAN_VIF_STA) != MMWLAN_SUCCESS)
+    {
+        return MMWLAN_ERROR;
+    }
+    /* The reinstalled VIF may carry a new id: every frame and station of ours takes it. */
+    const uint16_t vif_id = umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH);
+    s_mesh_vif_id = vif_id;
+    if (mesh_chip_start_(umacd, vif_id, &s_mesh_args, NULL) != MMWLAN_SUCCESS)
     {
         return MMWLAN_ERROR;
     }
@@ -838,10 +836,10 @@ enum mmwlan_status umac_mesh_handle_hw_restarted(struct umac_data *umacd, bool *
         mesh_chip_answer_(true, NULL, mmdrv_set_crypto_in_host(vif_id, s_cryptohost_set == 1, &val), 0);
     }
     /* As the STA path does (umac_connection_handle_hw_restarted): AT+FRAG's threshold, or off. */
-    if (mmdrv_set_frag_threshold(umac_config_get_frag_threshold(umacd)) != 0)
+    if (mmdrv_set_frag_threshold(umac_config_get_frag_threshold(umacd)) != MMWLAN_SUCCESS)
     {
         MMLOG_WRN("mesh: fragmentation threshold not restored after a chip restart\n");
-        mesh_chip_answer_(true, NULL, -1, 0);
+        mesh_chip_answer_(true, NULL, MMWLAN_ERROR, 0);
     }
     const bool keys = umac_datapath_mesh_chip_restored(vif_id);
     *complete = keys && g_warthog_chiprestart_cmdfail == cmdfail &&
@@ -890,7 +888,7 @@ static void mesh_service_cryptohost_(void)
     }
     g_warthog_cryptohost_req = 0;
     uint32_t val = 0xffffffffu;
-    int rc = 0;
+    enum mmwlan_status rc = MMWLAN_SUCCESS;
     if (req == 3)
     {
         rc = mmdrv_get_crypto_in_host(s_mesh_vif_id, &val);
@@ -898,12 +896,14 @@ static void mesh_service_cryptohost_(void)
     else
     {
         rc = mmdrv_set_crypto_in_host(s_mesh_vif_id, req == 1, &val);
-        if (rc == 0)
+        if (rc == MMWLAN_SUCCESS)
         {
             s_cryptohost_set = req;
             (void)mmdrv_get_crypto_in_host(s_mesh_vif_id, &val);
         }
     }
+    /* rc is an mmwlan_status (0 taken, 14 refused, 6 timed out, 10 not running, 5 no memory); a
+     * failed request leaves value at 0xffffffff, with no read-back. */
     g_warthog_cryptohost_rc = (uint32_t)rc;
     g_warthog_cryptohost_val = val;
     g_warthog_cryptohost_done++;
@@ -995,12 +995,12 @@ static void mesh_probe_evt_(struct umac_data *umacd, const struct umac_evt *evt)
     tx_md->vif_id = s_mesh_vif_id;
     umac_rc_init_rate_table_mgmt(s_mesh_umacd, &tx_md->rc_data, false);
 
-    int ret = mmdrv_tx_frame(probe, /*is_mgmt=*/true);
-    if (log_this || ret < 0)
+    const enum mmwlan_status ret = mmdrv_tx_frame(probe, /*is_mgmt=*/true);
+    if (log_this || ret != MMWLAN_SUCCESS)
     {
         ESP_LOGW("umac_mesh", "tx_broadcast_probe#%lu: mmdrv_tx_frame returned %d "
                  "(vif=%u ssid_len=%u probe=%p)",
-                 (unsigned long)s_probe_count, ret,
+                 (unsigned long)s_probe_count, (int)ret,
                  (unsigned)s_mesh_vif_id, (unsigned)s_mesh_args.mesh_id_len, probe);
     }
 }
@@ -1096,18 +1096,15 @@ int umac_mesh_tx_probe_response(const uint8_t *da)
     tx_md->vif_id = s_mesh_vif_id;
     umac_rc_init_rate_table_mgmt(s_mesh_umacd, &tx_md->rc_data, false);
 
-    int ret = mmdrv_tx_frame(rsp, /*is_mgmt=*/true);
-    if (ret >= 0)
-    {
-        g_warthog_prsp_tx++;
-        extern volatile uint8_t g_warthog_prsp_last_da[6];
-        memcpy((void *)g_warthog_prsp_last_da, da, 6);
-    }
-    else
+    if (mmdrv_tx_frame(rsp, /*is_mgmt=*/true) != MMWLAN_SUCCESS)
     {
         g_warthog_prsp_fail++;
+        return -4;
     }
-    return ret;
+    g_warthog_prsp_tx++;
+    extern volatile uint8_t g_warthog_prsp_last_da[6];
+    memcpy((void *)g_warthog_prsp_last_da, da, 6);
+    return 0;
 }
 
 /* Beaconless-peer discovery (not Morse "dynamic peering", which is RSSI-based
@@ -1617,11 +1614,12 @@ uint16_t umac_mesh_mpm_11n_to_s1g(const uint8_t *body, uint16_t body_len,
     return off;
 }
 
-static int mesh_tx_action_raw_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
+static enum mmwlan_status mesh_tx_action_raw_(const uint8_t *da, const uint8_t *body,
+                                              uint16_t body_len)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL || body == NULL || body_len == 0)
     {
-        return -1;
+        return MMWLAN_UNAVAILABLE;
     }
     /* AMPE interop forensics: keep the exact bytes hostap protected (the MIC
      * covers this body), so AT+PLINKTX? can be diffed against the peer's view. */
@@ -1663,12 +1661,13 @@ static int mesh_tx_action_raw_(const uint8_t *da, const uint8_t *body, uint16_t 
     struct mmpkt *frm = build_mgmt_frame(s_mesh_umacd, frame_action_build, &act);
     if (frm == NULL)
     {
-        return -3;
+        return MMWLAN_NO_MEM;
     }
     return umac_mesh_tx_mgmt_mmpkt(frm);
 }
 
-static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_len);
+static enum mmwlan_status mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_len,
+                                        bool *queued);
 
 /** Path lifetime we advertise, in TUs. 4882 TU ~= 5 s, vanilla mac80211's
  *  dot11MeshHWMPactivePathTimeout; OpenMANET's 999-0027 uses 50 s. */
@@ -1779,12 +1778,12 @@ static void mpm_publish_(const struct mpm_link *l)
     mpm_table_render(&s_mpm, (char *)g_warthog_mpm_links, sizeof(g_warthog_mpm_links));
 }
 
-static int mesh_tx_mpm_(const uint8_t *da, uint8_t action, uint16_t llid, uint16_t plid,
-                        uint16_t reason, uint16_t aid)
+static enum mmwlan_status mesh_tx_mpm_(const uint8_t *da, uint8_t action, uint16_t llid,
+                                       uint16_t plid, uint16_t reason, uint16_t aid)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL)
     {
-        return -1;
+        return MMWLAN_UNAVAILABLE;
     }
 
     /* S1G Capabilities. The far side's Morse driver validates this on every
@@ -1806,7 +1805,7 @@ static int mesh_tx_mpm_(const uint8_t *da, uint8_t action, uint16_t llid, uint16
                                               s1g_caps, s1g_caps_len);
     if (n == 0)
     {
-        return -2; /* unsupported action (CLOSE) or bad arguments */
+        return MMWLAN_INVALID_ARGUMENT; /* unsupported action (CLOSE) or bad arguments */
     }
 
     struct frame_data_action act = {
@@ -1833,7 +1832,7 @@ static int mesh_tx_mpm_(const uint8_t *da, uint8_t action, uint16_t llid, uint16
     struct mmpkt *frm = build_mgmt_frame(s_mesh_umacd, frame_action_build, &act);
     if (frm == NULL)
     {
-        return -3;
+        return MMWLAN_NO_MEM;
     }
 
     struct mmdrv_tx_metadata *tx_md = mmdrv_get_tx_metadata(frm);
@@ -1880,11 +1879,11 @@ static uint32_t s_hwmp_last_preq_ms;
  * frames ever left the antenna was unprovable. This uses the exact metadata
  * recipe of mesh_tx_hwmp_(), whose frames demonstrably fly between boards.
  */
-int umac_mesh_tx_mgmt_mmpkt(struct mmpkt *frm)
+enum mmwlan_status umac_mesh_tx_mgmt_mmpkt(struct mmpkt *frm)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid || frm == NULL)
     {
-        return -1;
+        return MMWLAN_UNAVAILABLE;
     }
     struct mmdrv_tx_metadata *tx_md = mmdrv_get_tx_metadata(frm);
     tx_md->flags = MMDRV_TX_FLAG_IMMEDIATE_REPORT;
@@ -1894,10 +1893,21 @@ int umac_mesh_tx_mgmt_mmpkt(struct mmpkt *frm)
     return mmdrv_tx_frame(frm, /*is_mgmt=*/true);
 }
 
-static int mesh_tx_action_raw_(const uint8_t *da, const uint8_t *body, uint16_t body_len);
+static enum mmwlan_status mesh_tx_action_raw_(const uint8_t *da, const uint8_t *body,
+                                              uint16_t body_len);
 
-int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len)
+enum mmwlan_status umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len)
 {
+    return umac_mesh_tx_action_queued(da, body, body_len, NULL);
+}
+
+enum mmwlan_status umac_mesh_tx_action_queued(const uint8_t *da, const uint8_t *body,
+                                              uint16_t body_len, bool *queued)
+{
+    if (queued != NULL)
+    {
+        *queued = false;
+    }
     /* Category 15 (Self-protected) bodies must go out BYTE-FOR-BYTE.
      *
      * mesh_tx_hwmp_ appends an S1G Capabilities element, which the vendor MPM
@@ -1910,7 +1920,7 @@ int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_le
     {
         return mesh_tx_action_raw_(da, body, body_len);
     }
-    return mesh_tx_hwmp_(da, body, body_len);
+    return mesh_tx_hwmp_(da, body, body_len, queued);
 }
 
 extern volatile uint32_t g_warthog_hwmp_tx_prot, g_warthog_hwmp_tx_gp, g_warthog_hwmp_tx_plain;
@@ -1960,7 +1970,8 @@ static unsigned s_grp_out_head, s_grp_out_n;
 static bool s_grp_out_posted; /* an event is queued that will drain s_grp_out */
 extern volatile uint32_t g_warthog_hwmp_tx_qdrop, g_warthog_hwmp_tx_qfail;
 
-static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t body_len);
+static enum mmwlan_status mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body,
+                                            uint16_t body_len);
 
 static void mesh_grp_out_reset_(void)
 {
@@ -2019,7 +2030,7 @@ static void mesh_grp_out_evt_(struct umac_data *umacd, const struct umac_evt *ev
             return;
         }
         mesh_grp_restamp_(body, len);
-        if (mesh_tx_hwmp_now_(da, body, len) < 0)
+        if (mesh_tx_hwmp_now_(da, body, len) != MMWLAN_SUCCESS)
         {
             g_warthog_hwmp_tx_qfail++;
         }
@@ -2030,9 +2041,9 @@ static void mesh_grp_out_evt_(struct umac_data *umacd, const struct umac_evt *ev
     }
 }
 
-/* Queue a group frame for mesh_grp_out_evt_: 1 once queued, not yet sent (the loop reports
- * it to the glue when it is), negative (counted) if dropped. */
-static int mesh_grp_defer_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
+/* Queue a group frame for mesh_grp_out_evt_: MMWLAN_SUCCESS once queued, not yet sent (the loop
+ * reports it to the glue when it is), MMWLAN_NO_MEM (counted) if dropped. */
+static enum mmwlan_status mesh_grp_defer_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
 {
     bool queued = false, post = false;
     MMOSAL_TASK_ENTER_CRITICAL();
@@ -2051,7 +2062,7 @@ static int mesh_grp_defer_(const uint8_t *da, const uint8_t *body, uint16_t body
     if (!queued)
     {
         g_warthog_hwmp_tx_qdrop++;
-        return -5;
+        return MMWLAN_NO_MEM;
     }
     const struct umac_evt evt = UMAC_EVT_INIT(mesh_grp_out_evt_);
     if (post && !umac_core_evt_queue(s_mesh_umacd, &evt))
@@ -2062,30 +2073,38 @@ static int mesh_grp_defer_(const uint8_t *da, const uint8_t *body, uint16_t body
         s_grp_out_n = 0;
         s_grp_out_posted = false;
         MMOSAL_TASK_EXIT_CRITICAL();
-        return -5;
+        return MMWLAN_NO_MEM;
     }
-    return 1;
+    return MMWLAN_SUCCESS;
 }
 
-/* 0: handed to the radio. 1: group path selection queued for the event loop. <0: dropped. */
-static int mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
+/* MMWLAN_SUCCESS: handed to the radio, or (@p queued set, may be NULL) group path selection
+ * queued for the event loop. Anything else: dropped. */
+static enum mmwlan_status mesh_tx_hwmp_(const uint8_t *da, const uint8_t *body, uint16_t body_len,
+                                        bool *queued)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL || body == NULL || body_len == 0)
     {
-        return -1;
+        return MMWLAN_UNAVAILABLE;
     }
     if (body[0] == 13u && (da[0] & 0x01u) != 0u && !umac_core_evtloop_is_active(s_mesh_umacd))
     {
-        return mesh_grp_defer_(da, body, body_len);
+        const enum mmwlan_status st = mesh_grp_defer_(da, body, body_len);
+        if (queued != NULL)
+        {
+            *queued = st == MMWLAN_SUCCESS;
+        }
+        return st;
     }
     return mesh_tx_hwmp_now_(da, body, body_len);
 }
 
-static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t body_len)
+static enum mmwlan_status mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body,
+                                            uint16_t body_len)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid || da == NULL || body == NULL || body_len == 0)
     {
-        return -1;
+        return MMWLAN_UNAVAILABLE;
     }
 
     uint8_t s1g_caps[64];
@@ -2105,7 +2124,7 @@ static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t bo
     if ((uint32_t)body_len + s1g_caps_len > UMAC_MESH_ACTION_BODY_MAX + sizeof(s1g_caps))
     {
         g_warthog_mesh_act_oversize++;
-        return -2;
+        return MMWLAN_INVALID_ARGUMENT;
     }
     /* Under SAE a peer running MFP drops unprotected path selection (mac80211 rx.c). */
     struct umac_mesh_hwmp_txkey k = { .how = UMAC_MESH_HWMP_PROT_NONE };
@@ -2136,7 +2155,7 @@ static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t bo
     struct mmpkt *frm = build_mgmt_frame(s_mesh_umacd, frame_action_build, &act);
     if (frm == NULL)
     {
-        return -3;
+        return MMWLAN_NO_MEM;
     }
 
     struct mmdrv_tx_metadata *tx_md = mmdrv_get_tx_metadata(frm);
@@ -2148,12 +2167,13 @@ static int mesh_tx_hwmp_now_(const uint8_t *da, const uint8_t *body, uint16_t bo
     if (k.how != UMAC_MESH_HWMP_PROT_NONE && !mesh_hwmp_protect_(frm, &k, tx_md))
     {
         mmpkt_release(frm);
-        return -4;
+        return MMWLAN_ERROR;
     }
     /* One the chip seals waits for a host fragment run it could break (AT+HOSTFRAG). */
-    int rc = k.how == UMAC_MESH_HWMP_PROT_CHIP ? umac_datapath_mesh_tx_chip_mgmt(frm)
-                                               : mmdrv_tx_frame(frm, /*is_mgmt=*/true);
-    if (umac_mesh_sae_active() && body[0] == 13u && rc >= 0)
+    enum mmwlan_status rc = k.how == UMAC_MESH_HWMP_PROT_CHIP ?
+                                umac_datapath_mesh_tx_chip_mgmt(frm) :
+                                mmdrv_tx_frame(frm, /*is_mgmt=*/true);
+    if (umac_mesh_sae_active() && body[0] == 13u && rc == MMWLAN_SUCCESS)
     {
         if (k.how == UMAC_MESH_HWMP_PROT_CHIP || k.how == UMAC_MESH_HWMP_PROT_HOST)
         {
@@ -2202,12 +2222,12 @@ int umac_mesh_hwmp_send_preq(const uint8_t *da)
     {
         return -1;
     }
-    int rc = mesh_tx_hwmp_(da, body, n);
-    if (rc >= 0)
+    if (mesh_tx_hwmp_(da, body, n, NULL) != MMWLAN_SUCCESS)
     {
-        g_warthog_hwmp_preq_tx++;
+        return -1;
     }
-    return rc;
+    g_warthog_hwmp_preq_tx++;
+    return 0;
 }
 
 /* Handle a received mesh action frame (category 13).
@@ -2286,7 +2306,7 @@ void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta,
         return;
     }
     /* Reply to the transmitter, which for a one-hop peer is the originator. */
-    if (mesh_tx_hwmp_(ta != NULL ? ta : preq.orig_addr, prep, n) >= 0)
+    if (mesh_tx_hwmp_(ta != NULL ? ta : preq.orig_addr, prep, n, NULL) == MMWLAN_SUCCESS)
     {
         g_warthog_hwmp_prep_tx++;
     }
@@ -2382,14 +2402,15 @@ void umac_mesh_maybe_initiate_mpm(const uint8_t *ta, int16_t rssi, bool floored)
      * and it is all we can cite while our own plid is still unknown. */
     if (l->opens >= MPM_OPEN_RETRY_MAX)
     {
-        if (mesh_tx_mpm_(ta, MPM_ACTION_CLOSE, 0, l->llid, MPM_REASON_PEER_CANCELED, 0) >= 0)
+        if (mesh_tx_mpm_(ta, MPM_ACTION_CLOSE, 0, l->llid, MPM_REASON_PEER_CANCELED, 0) ==
+            MMWLAN_SUCCESS)
         {
             g_warthog_mpm_close_tx++;
         }
         mpm_table_release(&s_mpm, l);
         return;
     }
-    if (mesh_tx_mpm_(ta, MPM_ACTION_OPEN, l->llid, 0, 0, 0) >= 0)
+    if (mesh_tx_mpm_(ta, MPM_ACTION_OPEN, l->llid, 0, 0, 0) == MMWLAN_SUCCESS)
     {
         g_warthog_mpm_open_tx++;
         l->opens++;
@@ -2439,7 +2460,8 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
         uint8_t idle[MPM_ADDR_LEN];
         uint16_t idle_llid = 0;
         if (mpm_table_make_room(&s_mpm, ta, idle, &idle_llid) &&
-            mesh_tx_mpm_(idle, MPM_ACTION_CLOSE, 0, idle_llid, MPM_REASON_PEER_CANCELED, 0) >= 0)
+            mesh_tx_mpm_(idle, MPM_ACTION_CLOSE, 0, idle_llid, MPM_REASON_PEER_CANCELED, 0) ==
+                MMWLAN_SUCCESS)
         {
             g_warthog_mpm_close_tx++;
         }
@@ -2452,7 +2474,7 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
              * nothing. plid is the requester's llid; ours is 0, we have none. */
             if (peer_llid != 0 &&
                 mesh_tx_mpm_(ta, MPM_ACTION_CLOSE, 0, peer_llid,
-                             UMAC_MESH_REASON_MAX_PEERS, 0) >= 0)
+                             UMAC_MESH_REASON_MAX_PEERS, 0) == MMWLAN_SUCCESS)
             {
                 g_warthog_mpm_close_tx++;
             }
@@ -2486,12 +2508,13 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
          * and the exchange stops. */
         if (!l->estab)
         {
-            if (mesh_tx_mpm_(ta, MPM_ACTION_OPEN, l->llid, 0, 0, 0) >= 0)
+            if (mesh_tx_mpm_(ta, MPM_ACTION_OPEN, l->llid, 0, 0, 0) == MMWLAN_SUCCESS)
             {
                 g_warthog_mpm_open_tx++;
             }
         }
-        if (mesh_tx_mpm_(ta, MPM_ACTION_CONFIRM, l->llid, l->plid, 0, mpm_aid_for_(l)) >= 0)
+        if (mesh_tx_mpm_(ta, MPM_ACTION_CONFIRM, l->llid, l->plid, 0, mpm_aid_for_(l)) ==
+            MMWLAN_SUCCESS)
         {
             g_warthog_mpm_conf_tx++;
         }
@@ -2528,7 +2551,7 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
                     g_warthog_mesh_peer_add_fail++;
                     uint16_t their = (peer_llid != 0) ? peer_llid : l->plid;
                     if (mesh_tx_mpm_(ta, MPM_ACTION_CLOSE, l->llid, their,
-                                     UMAC_MESH_REASON_MAX_PEERS, 0) >= 0)
+                                     UMAC_MESH_REASON_MAX_PEERS, 0) == MMWLAN_SUCCESS)
                     {
                         g_warthog_mpm_close_tx++;
                     }
@@ -2560,7 +2583,8 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
          * MPM quiesces after ESTAB, so stop once the peer has echoed our llid. */
         if (l->plid != 0 && !l->estab)
         {
-            if (mesh_tx_mpm_(ta, MPM_ACTION_CONFIRM, l->llid, l->plid, 0, mpm_aid_for_(l)) >= 0)
+            if (mesh_tx_mpm_(ta, MPM_ACTION_CONFIRM, l->llid, l->plid, 0, mpm_aid_for_(l)) ==
+                MMWLAN_SUCCESS)
             {
                 g_warthog_mpm_conf_tx++;
             }

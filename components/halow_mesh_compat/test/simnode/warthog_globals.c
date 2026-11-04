@@ -264,6 +264,7 @@ volatile uint32_t g_warthog_chiprestart_keys = 0, g_warthog_chiprestart_keyfail 
 volatile uint32_t g_warthog_chiprestart_cmdfail = 0, g_warthog_chiprestart_retried = 0;
 volatile uint32_t g_warthog_chiprestart_pending = 0, g_warthog_chiprestart_ms = 0;
 volatile uint32_t g_warthog_loop_pongs = 0, g_warthog_hang_block = 0;
+volatile uint32_t g_warthog_mesh_eapol_drop = 0, g_warthog_mesh_unknown_ta = 0, g_warthog_skbq_stale_drop = 0;
 volatile uint32_t g_warthog_filt_reason = 0, g_warthog_filt_drop = 0;
 volatile uint32_t g_warthog_filt_hist[10] = { 0 };
 volatile uint32_t g_warthog_filt_mgmt_nours = 0;

@@ -1276,7 +1276,8 @@ int main(void)
     t_sta_fallback();
 
     simnode_del_peer(NULL);
-    CHECK(simnode_live_allocs() == 0, "no packet buffer was orphaned (%u live)", simnode_live_allocs());
+    CHECK(simnode_live_allocs() == simnode_kept_allocs(), "no packet buffer was orphaned (%u live)",
+          simnode_live_allocs());
     simnode_stop();
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("test_simnode_peergtk: all passed\n");

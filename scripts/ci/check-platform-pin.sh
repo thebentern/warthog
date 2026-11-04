@@ -41,21 +41,33 @@ bad()  { echo "FAIL $1"; fail=1; }
 if ! cfg=$(cd "$ROOT" && "$PIO" project config --json-output); then
   bad "$PIO project config failed"
 elif ! envs=$(printf '%s\n' "$cfg" | "${PYTHON:-python3}" -I -c '
-import json, sys
+import json, re, sys
 for s, opts in json.load(sys.stdin):
     if s.startswith("env:"):
-        print(s, dict(opts).get("platform") or "(none)")'); then
+        o = dict(opts)
+        pk = o.get("platform_packages") or []
+        pk = [pk] if isinstance(pk, str) else pk
+        idf = [re.sub(r"^framework-espidf\s*@\s*", "", p.strip()) for p in pk if re.match(r"^framework-espidf\s*@", p.strip())]
+        print(s, o.get("platform") or "(none)", idf[0] if idf else "-")'); then
   bad "$PIO project config printed no JSON the env list could be read from"
 elif [ -z "$envs" ]; then
   bad "platformio.ini has no env"
 else
   wrong=$(printf '%s\n' "$envs" | awk -v want="$URL" '$2 != want')
   if [ -n "$wrong" ]; then
-    printf '%s\n' "$wrong" | while read -r s p; do echo "FAIL platformio.ini [$s] platform = $p (want $URL)"; done
+    printf '%s\n' "$wrong" | while read -r s p _; do echo "FAIL platformio.ini [$s] platform = $p (want $URL)"; done
     fail=1
   else
     ok "platformio.ini: all $(printf '%s\n' "$envs" | wc -l | tr -d ' ') envs pin $WANT_PLATFORM"
   fi
+  # A framework-espidf override in platform_packages replaces the platform's IDF; every env must name the same one.
+  IDF_URL=$(printf '%s\n' "$envs" | awk '{print $3}' | sort -u)
+  case $IDF_URL in
+    *"
+"*) bad "platformio.ini envs override framework-espidf differently: $(printf '%s' "$IDF_URL" | tr '\n' ' ')" ;;
+    -) IDF_URL="" ;;
+    *) ok "platformio.ini: every env takes framework-espidf from $IDF_URL" ;;
+  esac
 fi
 
 pio_is() {
@@ -64,6 +76,25 @@ pio_is() {
   else bad "$2 --version printed '$got', want 'PlatformIO Core, version $WANT_PIO'"; fi
 }
 pio_is "$PIO" "$PIO"
+
+# The platform installs an unpinned pioarduino into its penv; UV_CONSTRAINT names this file to hold it at the pin.
+CONS="$ROOT/scripts/ci/penv-constraints.txt"
+if ! cons=$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$CONS" 2>/dev/null) && [ ! -r "$CONS" ]; then
+  bad "no readable $CONS"
+elif [ "$cons" = "pioarduino==$WANT_PIO" ]; then
+  ok "penv-constraints.txt: pioarduino==$WANT_PIO"
+else
+  bad "penv-constraints.txt holds '${cons:-nothing}', want exactly pioarduino==$WANT_PIO"
+fi
+if [ -z "${UV_CONSTRAINT:-}" ]; then
+  [ "${GITHUB_ACTIONS:-}" != true ] || bad "UV_CONSTRAINT is not set; CI must set it to $CONS"
+else
+  case $UV_CONSTRAINT in
+    *" "*) bad "UV_CONSTRAINT '$UV_CONSTRAINT' holds a space; uv reads it as a list of files, so use a checkout path without one" ;;
+    *) uvc=$(cd "$(dirname "$UV_CONSTRAINT")" 2>/dev/null && pwd -P)/$(basename "$UV_CONSTRAINT")
+       [ "$uvc" = "$CONS" ] || bad "UV_CONSTRAINT is $UV_CONSTRAINT, want $CONS" ;;
+  esac
+fi
 
 if [ "$INSTALLED" = 1 ]; then
   count=0 plat=""
@@ -84,10 +115,12 @@ if [ "$INSTALLED" = 1 ]; then
   else bad "no $CORE/penv/bin/pio"; fi
   # Each installed package against platform.json: framework-espidf by its download URL (and version.txt), the
   # idf_tools-installed ones by package-version, as platform.py compares them. platform.json lists others as info.
-  out=$("${PYTHON:-python3}" -I - "$CORE" "$plat/platform.json" <<'EOF'
+  out=$("${PYTHON:-python3}" -I - "$CORE" "$plat/platform.json" "${IDF_URL:-}" <<'EOF'
 import json, os, re, sys
-core, pj = sys.argv[1], sys.argv[2]
+core, pj, idf_url = sys.argv[1], sys.argv[2], sys.argv[3]
 pk = json.load(open(pj))["packages"]
+if idf_url:
+    pk["framework-espidf"] = dict(pk.get("framework-espidf", {}), version=idf_url)
 def load(p):
     try:
         return json.load(open(p))
@@ -116,9 +149,9 @@ for n in names:
         want = spec["version"]
         uri = ((load(os.path.join(d, ".piopm")) or {}).get("spec") or {}).get("uri") or ""
         if uri != want:
-            print("FAIL packages/%s was installed from %s, platform.json pins %s" % (n, uri or "an unknown uri (no .piopm)", want))
+            print("FAIL packages/%s was installed from %s, %s %s" % (n, uri or "an unknown uri (no .piopm)", "platformio.ini overrides it with" if n == "framework-espidf" and idf_url else "platform.json pins", want))
             continue
-        line = "ok   packages/%s from %s, platform.json's pin" % (n, want)
+        line = "ok   packages/%s from %s, %s" % (n, want, "platformio.ini's override" if n == "framework-espidf" and idf_url else "platform.json's pin")
         if n == "framework-espidf":
             m = re.search(r"/v(\d+\.\d+\.\d+)/", want)
             try:

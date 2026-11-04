@@ -23,7 +23,7 @@
  * accepts them.
  *
  * Two engine verdicts are deliberately absent. UMAC_MESH_FWD_DROP_OWN cannot be
- * reached through the real receive path: umac_datapath_rx_frame_filter drops a
+ * reached through the real receive path: umac_datapath_rx_frame_preprocess drops a
  * frame whose SA is our own address (addr4 on a 4-address frame, addr3 on a
  * 3-address one) before the Mesh Control is ever parsed. Measured here -- both
  * shapes are refused upstream with filt_reason 7 -- so the engine's own check
@@ -208,7 +208,7 @@ static void t_tx_unicast_4addr(void)
           (unsigned long)seq0,
           (unsigned long)(g != NULL && g->len > 38u ? rd32le(&g->bytes[34]) : seq0));
 
-    CHECK(simnode_stub_hits("umac_connection_get_state") == 0,
+    CHECK(simnode_sta_mode_hits() == 0,
           "nothing fell through into STA-mode connection code");
 }
 
@@ -1738,6 +1738,52 @@ static void t_rx_not_ours(void)
     simnode_set_ampdu(false);
 }
 
+/* ---- 12a. receive: what the mesh datapath ops refuse -------------------------
+ *
+ * Upstream's per-VIF datapath ops hand two frames to the mode's own handlers: a data frame
+ * from a sender with no station record (handle_frame_unknown_sta) and an EAPOL frame for us
+ * (supp_l2_sock_receive). The mesh has no EAPOL and learns peers only through peering, so
+ * both are dropped and counted (AT+RXCHAN?'s unknown_ta= and eapol_drop=), with nothing
+ * delivered, relayed, crashed or leaked. */
+extern volatile uint32_t g_warthog_mesh_unknown_ta, g_warthog_mesh_eapol_drop;
+
+static void t_rx_mesh_ops_refuse(void)
+{
+    printf("--- RX: an unknown sender's data and a 3-address EAPOL frame for us are dropped, counted ---\n");
+    uint8_t frame[256];
+    struct umac_mesh_ctrl mc = { .flags = 0, .ttl = 31, .seq = 700 };
+    fresh(/*fwd=*/false, /*bridge=*/false, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    const unsigned live0 = simnode_live_allocs();
+
+    const uint32_t u0 = g_warthog_mesh_unknown_ta, f0 = g_warthog_filt_hist[6];
+    uint16_t n = mk_uni(frame, W, E, W, E, &mc, PAY, sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    CHECK(g_warthog_mesh_unknown_ta == u0 + 1u && g_warthog_filt_hist[6] == f0 + 1u && g_warthog_filt_reason == 6u &&
+              simnode_host_rx_count() == 0 && simnode_outbox_count() == 0,
+          "data from E, which has no station record: dropped by the filter (reason 6), counted unknown_ta "
+          "(%lu), nothing delivered or sent", (unsigned long)(g_warthog_mesh_unknown_ta - u0));
+
+    const uint32_t e0 = g_warthog_mesh_eapol_drop;
+    mc.seq++;
+    n = umac_mesh_ies_build_data_hdr3_group(frame, BC, A, A);
+    frame[n++] = 0x00;
+    frame[n++] = 0x01;
+    n = (uint16_t)(n + umac_mesh_ctrl_build(&frame[n], 18u, &mc));
+    memcpy(&frame[n], SNAP_EAPOL, sizeof(SNAP_EAPOL));
+    n = (uint16_t)(n + sizeof(SNAP_EAPOL));
+    memcpy(&frame[n], PAY, sizeof(PAY));
+    n = (uint16_t)(n + sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    CHECK(g_warthog_mesh_eapol_drop == e0 + 1u && g_warthog_rxdrop_reason == 10u &&
+              simnode_host_rx_count() == 0 && simnode_outbox_count() == 0,
+          "a 3-address EAPOL frame from A, no relay in force: handed to the mesh's l2 receive, which "
+          "drops it, counted eapol_drop (%lu, reason %lu)", (unsigned long)(g_warthog_mesh_eapol_drop - e0),
+          (unsigned long)g_warthog_rxdrop_reason);
+    CHECK(simnode_live_allocs() == live0, "and both receive buffers are released (%u -> %u live)", live0,
+          simnode_live_allocs());
+}
+
 /* ---- 12b. receive: a unicast management frame whose RA is another station ------
  *
  * Whether the MM6108 hands these up as it does data is not measured. Until it is, the
@@ -1886,12 +1932,14 @@ int main(void)
     t_rx_drops();
     t_rx_not_ours();
     t_rx_mgmt_not_ours();
+    t_rx_mesh_ops_refuse();
 
     /* Peer records are the only other thing on this heap, and del_peer frees
      * them (and drains their queues). With every peer gone, anything still
-     * allocated is a packet buffer the datapath orphaned. */
+     * allocated past the mesh's common record is a packet buffer the datapath
+     * orphaned. */
     simnode_del_peer(NULL);
-    CHECK(simnode_live_allocs() == 0,
+    CHECK(simnode_live_allocs() == simnode_kept_allocs(),
           "no packet buffer was orphaned across the whole run (%u live)",
           simnode_live_allocs());
     CHECK(simnode_frees_in_critical() == 0,

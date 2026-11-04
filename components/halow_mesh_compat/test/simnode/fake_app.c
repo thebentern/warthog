@@ -75,15 +75,30 @@ static struct { uint32_t due; umac_core_timeout_handler_t h; void *a1, *a2; bool
 static unsigned s_timeouts;
 static bool s_fail_next_to;
 
-/* The next registration fails, as it does when the core's timeout pool is empty. */
+/* umac_health_check.c's handler (sta_data_seam.c): its timeout is armed for as long as the
+ * check runs, so the counts below leave it out and simnode_health_check_armed() reports it. */
+umac_core_timeout_handler_t simnode_health_timeout_handler(void);
+static bool health_to_(umac_core_timeout_handler_t h) { return h == simnode_health_timeout_handler(); }
+
+bool simnode_health_check_armed(void)
+{
+    for (unsigned i = 0; i < SIMNODE_TIMEOUTS_MAX; i++)
+    {
+        if (s_to[i].used && health_to_(s_to[i].h)) { return true; }
+    }
+    return false;
+}
+
+/* The next registration (the health check's aside) fails, as it does when the core's timeout
+ * pool is empty. */
 void simnode_fail_next_timeout(void) { s_fail_next_to = true; }
 
 bool umac_core_register_timeout(struct umac_data *umacd, uint32_t delta_ms,
                                 umac_core_timeout_handler_t handler, void *arg1, void *arg2)
 {
     (void)umacd;
-    if (s_fail_next_to) { s_fail_next_to = false; return false; }
-    s_timeouts++;
+    if (s_fail_next_to && !health_to_(handler)) { s_fail_next_to = false; return false; }
+    s_timeouts += health_to_(handler) ? 0u : 1u;
     for (unsigned i = 0; i < SIMNODE_TIMEOUTS_MAX; i++)
     {
         if (!s_to[i].used)
@@ -113,7 +128,8 @@ int umac_core_deplete_timeout(struct umac_data *umacd, uint32_t delta_ms,
     return -1;
 }
 
-/* umac_timeoutq_cancel_protected: every match goes, and the count is returned. */
+/* umac_timeoutq_cancel_protected: every match goes (UMAC_CORE_TIMEOUT_ARG_ANY matches any), and the
+ * count is returned. */
 int umac_core_cancel_timeout(struct umac_data *umacd, umac_core_timeout_handler_t handler,
                              void *arg1, void *arg2)
 {
@@ -121,7 +137,8 @@ int umac_core_cancel_timeout(struct umac_data *umacd, umac_core_timeout_handler_
     int n = 0;
     for (unsigned i = 0; i < SIMNODE_TIMEOUTS_MAX; i++)
     {
-        if (s_to[i].used && s_to[i].h == handler && s_to[i].a1 == arg1 && s_to[i].a2 == arg2)
+        if (s_to[i].used && s_to[i].h == handler && (arg1 == UMAC_CORE_TIMEOUT_ARG_ANY || s_to[i].a1 == arg1) &&
+            (arg2 == UMAC_CORE_TIMEOUT_ARG_ANY || s_to[i].a2 == arg2))
         {
             s_to[i].used = false;
             n++;
@@ -135,7 +152,10 @@ unsigned simnode_timeouts_registered(void) { return s_timeouts; }
 unsigned simnode_timeouts_pending(void)
 {
     unsigned n = 0;
-    for (unsigned i = 0; i < SIMNODE_TIMEOUTS_MAX; i++) { n += s_to[i].used ? 1u : 0u; }
+    for (unsigned i = 0; i < SIMNODE_TIMEOUTS_MAX; i++)
+    {
+        n += (s_to[i].used && !health_to_(s_to[i].h)) ? 1u : 0u;
+    }
     return n;
 }
 
@@ -176,6 +196,17 @@ bool umac_core_evtloop_is_active(struct umac_data *umacd)
 {
     (void)umacd;
     return s_on_loop != 0u;
+}
+
+/* The event loop's task exists from simnode_start to simnode_stop (umac_evtloop.c), so a
+ * health check started in between registers its timeout. */
+static bool s_core_running;
+void simnode_core_set_running(bool on) { s_core_running = on; }
+
+bool umac_core_is_running(struct umac_data *umacd)
+{
+    (void)umacd;
+    return s_core_running;
 }
 
 /* Fire every timeout due by now, earliest first, including any a handler registers. */

@@ -47,12 +47,25 @@
  *  (12) BSSID_SET goes out with the derived BSSID, and a refusal is counted;
  *  (13) a peer leaving: NOTEXIST, then every survivor re-walked 2 -> 3 -> 4;
  *  (14) a refused MESH_CONFIG is counted and the mesh still comes up; it beacons, the
- *      tuple unchanged by the MESH-VIF work;
+ *      tuple unchanged by the MESH-VIF work; refused with -17, as the STA VIF answers on air at
+ *      every start (mmdrv_mesh_config: SUCCESS, the -17 in its status), it still peers;
  *  (15) BSS_BEACON_CONFIG, BSSID_SET, BSS_CONFIG, MESH_CONFIG in that order, and a refused
  *      BSS_BEACON_CONFIG is counted with its status;
  *  (16) refused SET_STA_STATEs (NOTEXIST, a survivor's AUTHORIZED) and a refused own MGTK
  *      are counted.
+ * Both builds:
+ *  (17) a scan while the mesh is up runs on the mesh's VIF and keeps the mesh's datapath ops in
+ *      the STA slot, as umac_interface_add keeps a slot's ops for a SCAN (hw_scan.c hands it the
+ *      STA ops); its end leaves the mesh up on the same VIF, still carrying data;
+ *  (18) a boot whose ADD_INTERFACE the chip refuses (-17), or whose transport times out, returns
+ *      the status with no assert (upstream asserts: a crash boot), the driver down and no VIF
+ *      claimed, so mmhalow_init can retry; the next boot boots the chip again and adds the VIF;
+ *  (19) a mesh start while a scan is running is refused (MMWLAN_UNAVAILABLE) before anything
+ *      reaches the chip: no REMOVE_INTERFACE of the scan's VIF on -meshvif, and no mesh under the
+ *      scan's TX pause on either build; the slot stays as the scan left it. Once the scan ends the
+ *      mesh comes up, on the build's chip VIF type.
  */
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -61,7 +74,12 @@
 #include "mmpkt.h"
 #include "common/morse_commands.h"
 #include "umac/data/umac_data.h"
+#include "umac/datapath/umac_datapath.h"
+#include "umac/datapath/umac_datapath_private.h"
+#include "umac/health_check/umac_health_check.h"
 #include "umac/interface/umac_interface.h"
+#include "umac/interface/umac_interface_data.h"
+#include "umac/mesh/umac_mesh.h"
 #include "umac/mesh/umac_mesh_beacon.h"
 
 #ifndef WARTHOG_MESH_CHIP_VIF_MESH
@@ -145,7 +163,8 @@ static unsigned cmds_(uint16_t id, const struct simnode_chipcmd **out, unsigned 
     return n;
 }
 
-/* The order of the interface commands in the log, as "A1 R A5 C" (Add type, Remove, Caps). */
+/* The order of the interface commands in the log, as "Cx A1 R A5 C" (Add type, Remove, Caps;
+ * Cx the capabilities read with no VIF, at boot). */
 static void if_sequence_(char *buf, size_t len)
 {
     size_t off = 0;
@@ -165,7 +184,8 @@ static void if_sequence_(char *buf, size_t len)
         }
         else if (c->id == MORSE_CMD_ID_GET_CAPABILITIES)
         {
-            n = snprintf(buf + off, len - off, "%sC", off ? " " : "");
+            n = snprintf(buf + off, len - off, "%sC%s", off ? " " : "",
+                         c->vif_id == MMDRV_VIF_ID_INVALID ? "x" : "");
         }
         if (n > 0 && off + (size_t)n < len) { off += (size_t)n; }
     }
@@ -270,8 +290,9 @@ static void t_mesh_vif_added(void)
     char seq[96];
     CHECK(start_(false), "(1) the mesh starts");
     if_sequence_(seq, sizeof(seq));
-    CHECK(strcmp(seq, "A1 C R A5 C") == 0,
-          "(1) boot STA VIF, then REMOVE and ADD_INTERFACE(MESH) with its capabilities (%s)", seq);
+    CHECK(strcmp(seq, "Cx A1 R A5 C") == 0,
+          "(1) boot capabilities (no VIF) and STA VIF, then REMOVE and ADD_INTERFACE(MESH) with "
+          "its capabilities (%s)", seq);
     const struct simnode_chipcmd *add[4];
     unsigned n = cmds_(MORSE_CMD_ID_ADD_INTERFACE, add, 4);
     CHECK(n == 2 && add[1]->status == 0 && add[1]->ret == 0 && memcmp(add[1]->addr, W, 6) == 0,
@@ -287,8 +308,8 @@ static void t_mesh_vif_added(void)
 
     CHECK(start_(true), "(1) the mesh starts after the boot scan probe");
     if_sequence_(seq, sizeof(seq));
-    CHECK(strcmp(seq, "A1 C R A1 R A5 C") == 0,
-          "(1) boot STA, scan's STA re-add, then the MESH VIF (%s)", seq);
+    CHECK(strcmp(seq, "Cx A1 R A5 C") == 0,
+          "(1) boot STA, the scan on it (no re-add), then the MESH VIF (%s)", seq);
     CHECK(chip_vif_type_() == MESH, "(1) and the mesh runs on the MESH VIF");
     stop_();
 }
@@ -300,7 +321,7 @@ static void t_mesh_vif_nonzero_id(void)
     simnode_outbox_clear();
     CHECK(start_(false), "(2) the mesh starts with the chip handing the MESH VIF id 2");
     if_sequence_(seq, sizeof(seq));
-    CHECK(strcmp(seq, "A1 C R A5 R A1") == 0,
+    CHECK(strcmp(seq, "Cx A1 R A5 R A1") == 0,
           "(2) the MESH VIF is removed again and a STA VIF added (%s)", seq);
     const struct simnode_chipcmd *rm[4];
     CHECK(cmds_(MORSE_CMD_ID_REMOVE_INTERFACE, rm, 4) == 2 && rm[1]->vif_id == 2,
@@ -327,14 +348,14 @@ static void t_mesh_vif_nonzero_id(void)
     CHECK(host_tx_vif_(0), "(2) data frames are tagged VIF 0");
     stop_();
 
-    simnode_chip_refuse_next_arg(MORSE_CMD_ID_REMOVE_INTERFACE, 2, -5);
+    simnode_chip_refuse_next_arg(MORSE_CMD_ID_REMOVE_INTERFACE, 2, -EIO);
     CHECK(!start_(false), "(2) a remove of the MESH VIF 2 that fails fails the start");
     CHECK(chip_vif_type_() == 0 && g_warthog_chipvif_type == 0 && g_warthog_chipvif_fallback == 0 &&
               g_warthog_chipvif_add_status == -1002,
           "(2) claiming no chip VIF, the id recorded (type %u, fallback %lu, add_st %ld)",
           chip_vif_type_(), (unsigned long)g_warthog_chipvif_fallback,
           (long)g_warthog_chipvif_add_status);
-    CHECK(mesh_vif_() == UMAC_INTERFACE_VIF_ID_INVALID, "(2) nor a mesh interface");
+    CHECK(!umac_interface_mesh_is_active(umac_data_get_umacd()), "(2) nor a mesh interface");
     stop_();
     simnode_chip_set_mesh_vif_id(0);
 }
@@ -356,7 +377,7 @@ static void t_fallback(void)
     simnode_chip_refuse_add_if(MESH, -1, 0);
     CHECK(start_(false), "(4) the mesh comes up though the chip refused a MESH VIF");
     if_sequence_(seq, sizeof(seq));
-    CHECK(strcmp(seq, "A1 C R A5! A1") == 0, "(4) refused MESH add, then a STA VIF again (%s)", seq);
+    CHECK(strcmp(seq, "Cx A1 R A5! A1") == 0, "(4) refused MESH add, then a STA VIF again (%s)", seq);
     CHECK(chip_vif_type_() == STA && g_warthog_chipvif_type == STA,
           "(4) the chip VIF in use is STA (getter %u, AT %lu)", chip_vif_type_(),
           (unsigned long)g_warthog_chipvif_type);
@@ -369,33 +390,35 @@ static void t_fallback(void)
     CHECK(simnode_add_peer(A) && host_tx_vif_(0), "(4) and carries data");
     stop_();
 
-    simnode_chip_refuse_add_if(MESH, 0, -110);
+    simnode_chip_refuse_add_if(MESH, 0, -ETIMEDOUT);
     CHECK(start_(false), "(4) the mesh comes up though ADD_INTERFACE(MESH) timed out");
     CHECK(chip_vif_type_() == STA && g_warthog_chipvif_fallback == 1 &&
-              g_warthog_chipvif_add_status == -110,
-          "(4) STA VIF, the fallback counted with the transport error (%ld)",
+              g_warthog_chipvif_add_status == MMWLAN_TIMED_OUT,
+          "(4) STA VIF, the fallback counted with the transport error, MMWLAN_TIMED_OUT (%ld)",
           (long)g_warthog_chipvif_add_status);
     stop_();
 
-    simnode_chip_refuse_rm_if(-5);
+    simnode_chip_refuse_rm_if(-EIO);
     CHECK(start_(false), "(4) the mesh comes up though REMOVE_INTERFACE failed");
     if_sequence_(seq, sizeof(seq));
-    CHECK(strcmp(seq, "A1 C R!") == 0, "(4) no ADD_INTERFACE after the failed remove (%s)", seq);
-    CHECK(chip_vif_type_() == STA && g_warthog_chipvif_fallback == 1 && g_warthog_chipvif_add_status == -5,
-          "(4) the boot STA VIF carries the mesh, counted (%ld)", (long)g_warthog_chipvif_add_status);
+    CHECK(strcmp(seq, "Cx A1 R!") == 0, "(4) no ADD_INTERFACE after the failed remove (%s)", seq);
+    CHECK(chip_vif_type_() == STA && g_warthog_chipvif_fallback == 1 &&
+              g_warthog_chipvif_add_status == MMWLAN_ERROR,
+          "(4) the boot STA VIF carries the mesh, counted MMWLAN_ERROR (%ld)",
+          (long)g_warthog_chipvif_add_status);
     stop_();
 }
 
 static void t_fallback_fails(void)
 {
     /* The MESH add times out, and so does the STA add that falls back from it. */
-    simnode_chip_refuse_add_if(MESH, 0, -110);
-    simnode_chip_refuse_add_if(0, 0, -110);
+    simnode_chip_refuse_add_if(MESH, 0, -ETIMEDOUT);
+    simnode_chip_refuse_add_if(0, 0, -ETIMEDOUT);
     CHECK(!start_(false), "(5) with the fallback failing too the start fails");
     CHECK(chip_vif_type_() == 0 && g_warthog_chipvif_type == 0 && g_warthog_chipvif_fallback == 1,
           "(5) and no chip VIF is claimed (getter %u, AT %lu)", chip_vif_type_(),
           (unsigned long)g_warthog_chipvif_type);
-    CHECK(mesh_vif_() == UMAC_INTERFACE_VIF_ID_INVALID, "(5) nor a mesh interface");
+    CHECK(!umac_interface_mesh_is_active(umac_data_get_umacd()), "(5) nor a mesh interface");
     stop_();
 }
 
@@ -494,14 +517,14 @@ static void t_baseline_vif(void)
     char seq[96];
     CHECK(start_(false), "(11) the mesh starts");
     if_sequence_(seq, sizeof(seq));
-    CHECK(strcmp(seq, "A1 C") == 0, "(11) the boot STA VIF carries the mesh, nothing re-added (%s)", seq);
+    CHECK(strcmp(seq, "Cx A1") == 0, "(11) the boot STA VIF carries the mesh, nothing re-added (%s)", seq);
     CHECK(chip_vif_type_() == STA && g_warthog_chipvif_type == STA && g_warthog_chipvif_fallback == 0,
           "(11) the chip VIF in use is STA");
     CHECK(beacon_vif_() == 0 && mesh_vif_() == 0, "(11) the beacon template and the mesh share VIF 0");
     stop_();
     CHECK(start_(true), "(11) the mesh starts after the boot scan probe");
     if_sequence_(seq, sizeof(seq));
-    CHECK(strcmp(seq, "A1 C R A1") == 0, "(11) the scan's STA re-add only (%s)", seq);
+    CHECK(strcmp(seq, "Cx A1") == 0, "(11) the scan runs on the boot VIF, nothing re-added (%s)", seq);
     stop_();
 }
 
@@ -543,6 +566,14 @@ static void t_baseline_mesh_config(void)
               g_warthog_chipcmd_meshcfg_mode == 1,
           "(14) MESH_CONFIG(START) beacons (mode %lu)", (unsigned long)g_warthog_chipcmd_meshcfg_mode);
     stop_();
+
+    simnode_chip_refuse_next(MORSE_CMD_ID_MESH_CONFIG, -17);
+    CHECK(start_(false) && g_warthog_chipcmd_meshcfg_refused == 1 && g_warthog_chipcmd_meshcfg_status == -17,
+          "(14) refused with the STA VIF's on-air -17, the mesh starts, the refusal counted (%ld)",
+          (long)g_warthog_chipcmd_meshcfg_status);
+    CHECK(simnode_add_peer(A) && simnode_chip_sta_state(1, NULL) == MORSE_STA_AUTHORIZED && host_tx_vif_(0),
+          "(14) and peers: A's station AUTHORIZED in the chip, keyed data to A reaches it");
+    stop_();
 }
 
 static void t_baseline_bss_beacon(void)
@@ -577,6 +608,120 @@ static void t_baseline_sta_state_refused(void)
 
 #endif
 
+/* hw_scan.c's ops for its SCAN add (umac_datapath_ops_sta), which simnode does not link. */
+static const struct umac_datapath_ops k_scan_ops = { .type = "STA" };
+
+static void t_scan_keeps_mesh_ops(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    CHECK(start_(false) && simnode_add_peer(A), "(17) the mesh starts with a peer");
+    const int vif = mesh_vif_();
+    simnode_chipcmd_clear();
+    CHECK(umac_interface_add(umacd, UMAC_INTERFACE_SCAN, &k_scan_ops, NULL) == MMWLAN_SUCCESS &&
+              umac_interface_get_vif_id(umacd, UMAC_INTERFACE_SCAN) == (uint16_t)vif &&
+              simnode_chipcmd_n(MORSE_CMD_ID_ADD_INTERFACE, UINT32_MAX) == 0,
+          "(17) a scan while the mesh is up runs on the mesh's VIF %d, no interface added", vif);
+    CHECK(umac_interface_get_datapath_ops(umacd, MMWLAN_VIF_STA) == &datapath_ops_mesh &&
+              umac_datapath_mesh_is_active(umacd) && umac_interface_mesh_is_active(umacd),
+          "(17) and the STA slot keeps the mesh's datapath ops, not the scan's");
+    CHECK(host_tx_vif_((uint8_t)vif), "(17) data to A still goes out on VIF %d during the scan", vif);
+    umac_interface_remove(umacd, UMAC_INTERFACE_SCAN);
+    CHECK(umac_interface_get_datapath_ops(umacd, MMWLAN_VIF_STA) == &datapath_ops_mesh && mesh_vif_() == vif &&
+              simnode_chipcmd_n(MORSE_CMD_ID_REMOVE_INTERFACE, UINT32_MAX) == 0 && host_tx_vif_((uint8_t)vif),
+          "(17) its end removes nothing: the mesh, its ops and VIF %d stay, carrying data", vif);
+    stop_();
+}
+
+void simnode_set_identity(const uint8_t mac[6], uint16_t vif_id); /* fake_config.c */
+
+/* The umac state as mmwlan_init leaves it (simnode_start before its boot): nothing added. */
+static struct umac_data *unbooted_(void)
+{
+    simnode_set_identity(W, 0);
+    umac_data_init();
+    struct umac_data *umacd = umac_data_get_umacd();
+    umac_interface_init(umacd);
+    umac_health_check_init(umacd);
+    simnode_core_set_running(true);
+    simnode_chipcmd_clear();
+    reset_counters_();
+    return umacd;
+}
+
+/* mmwlan_boot's add, run under simnode_expect_assert. */
+static enum mmwlan_status s_boot_st;
+static void boot_(void)
+{
+    s_boot_st = umac_interface_add(umac_data_get_umacd(), UMAC_INTERFACE_NONE, NULL, NULL);
+}
+
+static void t_boot_add_fails(int32_t status, int ret, enum mmwlan_status want, const char *what)
+{
+    struct umac_data *umacd = unbooted_();
+    const struct umac_interface_vif_data *sta = umac_data_get_interface_vif(umacd, MMWLAN_VIF_STA);
+    simnode_chip_refuse_add_if(STA, status, ret);
+    const bool asserted = simnode_expect_assert(boot_);
+    CHECK(!asserted, "(18) a boot ADD_INTERFACE %s asserts nothing (the board would crash-boot)", what);
+    if (!asserted)
+    {
+        CHECK(s_boot_st == want && simnode_chipstate()->down && !umac_interface_is_active(umacd) &&
+                  sta->vif_id == MMDRV_VIF_ID_INVALID,
+              "(18) a boot ADD_INTERFACE %s returns %u (want %u), the driver down and no VIF claimed", what,
+              (unsigned)s_boot_st, (unsigned)want);
+        const unsigned boots = simnode_chipstate()->boots;
+        CHECK(!simnode_expect_assert(boot_) && s_boot_st == MMWLAN_SUCCESS &&
+                  simnode_chipstate()->boots == boots + 1u && !simnode_chipstate()->down &&
+                  sta->vif_id != MMDRV_VIF_ID_INVALID,
+              "(18) after a boot ADD_INTERFACE %s the next boot boots the chip again and adds the VIF", what);
+    }
+    simnode_chip_refusals_clear();
+    simnode_core_set_running(false);
+}
+
+static enum mmwlan_status mesh_enable_open_(struct umac_data *umacd)
+{
+    struct mmwlan_mesh_args args;
+    memset(&args, 0, sizeof(args));
+    memcpy(args.mesh_id, "simnode", 7);
+    args.mesh_id_len = 7;
+    args.security_type = MMWLAN_OPEN;
+    args.max_peers = 4;
+    args.beacon_interval_tu = 100;
+    return umac_mesh_enable_mesh(umacd, &args);
+}
+
+static void t_mesh_during_scan(void)
+{
+    struct umac_data *umacd = unbooted_();
+    CHECK(umac_interface_add(umacd, UMAC_INTERFACE_NONE, NULL, NULL) == MMWLAN_SUCCESS &&
+              umac_interface_add(umacd, UMAC_INTERFACE_SCAN, NULL, NULL) == MMWLAN_SUCCESS,
+          "(19) the chip boots and a scan starts");
+    const struct umac_interface_vif_data *sta = umac_data_get_interface_vif(umacd, MMWLAN_VIF_STA);
+    const uint16_t vif = sta->vif_id;
+    const struct umac_datapath_ops *ops = sta->datapath_ops;
+    simnode_chipcmd_clear();
+    enum mmwlan_status st = mesh_enable_open_(umacd);
+    CHECK(st == MMWLAN_UNAVAILABLE, "(19) a mesh start during the scan is refused (status %u)", (unsigned)st);
+    CHECK(simnode_chipcmd_n(MORSE_CMD_ID_REMOVE_INTERFACE, UINT32_MAX) == 0 &&
+              simnode_chipcmd_n(MORSE_CMD_ID_ADD_INTERFACE, UINT32_MAX) == 0 && !simnode_chipstate()->mesh_started,
+          "(19) no REMOVE_INTERFACE, ADD_INTERFACE or MESH_CONFIG(START) reached the chip under the scan "
+          "(rm %u, add %u)", simnode_chipcmd_n(MORSE_CMD_ID_REMOVE_INTERFACE, UINT32_MAX),
+          simnode_chipcmd_n(MORSE_CMD_ID_ADD_INTERFACE, UINT32_MAX));
+    CHECK(sta->active_interface_types == (UMAC_INTERFACE_NONE | UMAC_INTERFACE_SCAN) && sta->vif_id == vif &&
+              sta->datapath_ops == ops && !umac_interface_mesh_is_active(umacd),
+          "(19) the slot stays as the scan left it (active %x, VIF %u)", sta->active_interface_types,
+          sta->vif_id);
+    umac_interface_remove(umacd, UMAC_INTERFACE_SCAN);
+    st = mesh_enable_open_(umacd);
+    CHECK(st == MMWLAN_SUCCESS && umac_interface_mesh_is_active(umacd) &&
+              chip_vif_type_() == (WARTHOG_MESH_CHIP_VIF_MESH ? MESH : STA),
+          "(19) once the scan ends the mesh comes up (status %u, chip VIF type %u)", (unsigned)st,
+          chip_vif_type_());
+    (void)umac_mesh_disable_mesh(umacd);
+    simnode_chip_refusals_clear();
+    simnode_core_set_running(false);
+}
+
 int main(void)
 {
     printf("=== simnode: the mesh's chip VIF type (WARTHOG_MESH_CHIP_VIF_MESH=%d) ===\n",
@@ -601,6 +746,10 @@ int main(void)
     t_baseline_sta_state_refused();
     own_mgtk_refused_("16");
 #endif
+    t_scan_keeps_mesh_ops();
+    t_boot_add_fails(-17, 0, MMWLAN_COMMAND_ERROR, "refused (-17)");
+    t_boot_add_fails(0, -ETIMEDOUT, MMWLAN_TIMED_OUT, "timed out");
+    t_mesh_during_scan();
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("test_simnode_meshvif%s: all passed\n", WARTHOG_MESH_CHIP_VIF_MESH ? "" : "_off");
     return 0;

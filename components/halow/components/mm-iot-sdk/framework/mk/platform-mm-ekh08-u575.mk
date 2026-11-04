@@ -141,8 +141,8 @@ BSP_LD_PREFIX = STM32U575ZITXQ_FLASH
 MM_SHIM_DIR     = $(PLATFORM_PATH)/mm_shims
 MM_SHIM_SRCS_C += $(patsubst $(MMIOT_ROOT)/$(MM_SHIM_DIR)/%,%,$(wildcard $(MMIOT_ROOT)/$(MM_SHIM_DIR)/*.c))
 MM_SHIM_SRCS_H += mmport.h
-MM_SHIM_SRCS_C := $(filter-out mmosal_shim_freertos.c mmosal_shim_libc_stubs.c,$(MM_SHIM_SRCS_C))
-MM_SHIM_OS_SRCS_C ?= mmosal_shim_freertos.c mmosal_shim_libc_stubs.c
+MM_SHIM_SRCS_C := $(filter-out mmosal_shim_freertos.c mmosal_shim_alloc.c mmosal_shim_libc_stubs.c,$(MM_SHIM_SRCS_C))
+MM_SHIM_OS_SRCS_C ?= mmosal_shim_freertos.c mmosal_shim_alloc.c mmosal_shim_libc_stubs.c
 MM_SHIM_SRCS_C += $(MM_SHIM_OS_SRCS_C)
 MM_SHIM_SRCS_H += endian.h
 

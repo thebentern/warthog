@@ -194,7 +194,7 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
     /* SAE groups: a commit we start uses index 0, a peer's is accepted in any listed group.
      * mesh_rsn_sae_group() indexes this without a NULL check. Heap: bss->conf IS
      * conf->bss[0], and hostapd_config_free_bss() os_free()s sae_groups. */
-    static const int k_mesh_sae_groups[] = { 19, 20, 21, -1 };
+    static const int k_mesh_sae_groups[] = { 19, 20, 21, 0 }; /* 0-terminated, as hostap's */
     bss->conf->sae_groups = os_memdup(k_mesh_sae_groups, sizeof(k_mesh_sae_groups));
     if (bss->conf->sae_groups == NULL)
     {
@@ -365,7 +365,7 @@ static int passive_init_ifmsh(struct umac_supp_shim_data *data)
         { 110, 0 }, { 120, HOSTAPD_RATE_BASIC },
         { 180, 0 }, { 240, HOSTAPD_RATE_BASIC },
     };
-    static const int k_mesh_basic_rates[4] = { 60, 120, 240, -1 };
+    static const int k_mesh_basic_rates[4] = { 60, 120, 240, 0 }; /* 0-terminated, as hostap's */
     ifmsh->current_rates = os_memdup(k_mesh_rates, sizeof(k_mesh_rates));
     ifmsh->basic_rates = os_memdup(k_mesh_basic_rates, sizeof(k_mesh_basic_rates));
     if (ifmsh->current_rates == NULL || ifmsh->basic_rates == NULL)

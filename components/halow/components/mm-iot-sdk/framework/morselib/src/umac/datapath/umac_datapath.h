@@ -21,23 +21,28 @@
 #endif
 
 
+struct umac_datapath_ops;
+
+
+extern const struct umac_datapath_ops *const umac_datapath_ops_ap;
+
+extern const struct umac_datapath_ops *const umac_datapath_ops_sta;
+
+/* warthog: defined in umac_datapath_mesh.c. */
+extern const struct umac_datapath_ops datapath_ops_mesh;
+
+
 void umac_datapath_init(struct umac_data *umacd);
 
 
 void umac_datapath_deinit(struct umac_data *umacd);
 
 
-void umac_datapath_configure_sta_mode(struct umac_data *umacd);
-
-
-void umac_datapath_configure_ap_mode(struct umac_data *umacd);
-
-
-/* warthog mesh-support fork. Installs datapath_ops_mesh
- * from umac_datapath_mesh.c — mesh-aware TX/RX with safe stubs for the
- * empty-peer-table case. Called from umac_mesh_enable_mesh() after the
- * chip-side ADD_INTERFACE(MESH) + MESH_CONFIG(START) sequence succeeds. */
+/* warthog: prepares the mesh datapath; assigns no ops (umac_interface_add(MESH) binds them). */
 void umac_datapath_configure_mesh_mode(struct umac_data *umacd);
+
+/** True while the STA slot runs the mesh datapath ops. */
+bool umac_datapath_mesh_is_active(struct umac_data *umacd);
 
 /** Mesh peer slots. AIDs are slot + 1; MPM_MAX_LINKS must not exceed it. */
 #define UMAC_DATAPATH_MESH_MAX_PEERS 4
@@ -116,18 +121,15 @@ bool umac_datapath_mesh_hwmp_rx_ok(const uint8_t *frame, uint32_t len);
 uint64_t umac_datapath_mesh_take_tx_pn(struct umac_sta_data *stad, uint8_t key_id);
 /** As umac_datapath_mesh_take_tx_pn for @p n consecutive PNs at once; returns the first. */
 uint64_t umac_datapath_mesh_take_tx_pns(struct umac_sta_data *stad, uint8_t key_id, uint32_t n);
-/** A management frame the chip seals: held (0) while a host fragment run it could break is in the
- *  chip, dropped (-1, nokey) while a chip restart owes its key, else mmdrv_tx_frame's. Any task. */
-int umac_datapath_mesh_tx_chip_mgmt(struct mmpkt *pkt);
+/** A management frame the chip seals: held (SUCCESS) while a host fragment run it could break is in
+ *  the chip, dropped (UNAVAILABLE) while a chip restart owes its key, else mmdrv_tx_frame's. Any task. */
+enum mmwlan_status umac_datapath_mesh_tx_chip_mgmt(struct mmpkt *pkt);
 uint8_t umac_datapath_mesh_peer_count(void);
 struct mmwlan_mesh_peer_link;
 /** Every slot's peer, keyed or not, with rate control's expected throughput; event loop only. */
 uint8_t umac_datapath_mesh_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max);
 /** True while the mesh peer table has room for one more peer. */
 bool umac_datapath_mesh_has_free_slot(void);
-
-
-void umac_datapath_configure_scan_mode(struct umac_data *umacd);
 
 
 void umac_datapath_stad_init(struct umac_sta_data *stad);
@@ -268,5 +270,25 @@ enum mmwlan_status umac_datapath_register_rx_frame_cb(struct umac_data *umacd,
 
 
 void umac_datapath_set_filter_all_beacons(struct umac_data *umacd, bool filter);
+
+
+struct MM_PACKED umac_8023_hdr
+{
+    struct
+    {
+
+        uint8_t dest_addr[DOT11_MAC_ADDR_LEN];
+
+        uint8_t src_addr[DOT11_MAC_ADDR_LEN];
+
+        uint16_t ethertype_be;
+    };
+};
+
+
+void umac_datapath_generate_8023_header(const uint8_t *dest_addr,
+                                        const uint8_t *src_addr,
+                                        uint16_t ethertype,
+                                        struct umac_8023_hdr *header);
 
 

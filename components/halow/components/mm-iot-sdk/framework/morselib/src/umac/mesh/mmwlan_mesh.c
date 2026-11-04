@@ -26,6 +26,7 @@
 #include "umac_mesh.h"
 #include "umac/core/umac_core.h"
 #include "umac/data/umac_data.h"
+#include "umac/health_check/umac_health_check.h"
 #include "mmdrv.h"
 
 static mmwlan_mesh_peer_event_cb_t s_peer_event_cb;
@@ -155,7 +156,7 @@ enum mmwlan_status mmwlan_loop_ping(void)
 
 bool mmwlan_hang_health(uint32_t *wakes, uint32_t *interval_ms)
 {
-    return mmdrv_hang_health(wakes, interval_ms) == 0;
+    return umac_health_check_hang_view(umac_data_get_umacd(), wakes, interval_ms);
 }
 
 uint8_t mmwlan_mesh_get_peer_links(struct mmwlan_mesh_peer_link *out, uint8_t max)

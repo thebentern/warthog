@@ -627,19 +627,24 @@ open mesh one peering link per peer.
 
 ## Chip restarts
 
-morselib checks the HaLow chip every 90 s, and at once after bus errors. When a
-check fails it pauses TX, reloads the chip's firmware and puts back what the
-node had in the chip. Under a mesh it sends again, in this order:
+morselib checks the HaLow chip from its event loop once 90 s pass with no
+frame received, and at once after bus errors; a check that fails holds the event
+loop about 6 s (2 attempts of 3 tries at 1 s, derived). When a check fails, or
+the chip reports that it stopped, morselib pauses TX, reloads the chip's
+firmware and puts back what the node had in the chip. Under a mesh it sends
+again, in this order:
 
 - the chip interface as the mesh had it, at the same id: MESH on `-meshvif`
   (falling back to STA as at the start), STA elsewhere; then its TX status
-  watermark, health check interval, dynamic power-save timeout and power-save
-  mode;
+  watermark and the dynamic power-save timeout. The power-save mode comes
+  first and sends nothing: never to a MESH interface, and to a STA one only on
+  a change, which chip power save off never makes. The health check, started
+  right after the firmware reload, is started again between the two;
 - the channel (with TX power, duty cycle and MPSW), the four QoS queues, on a
   STA interface `BSS_BEACON_CONFIG` and the derived BSSID, `BSS_CONFIG`, the
   host beacon timer, and `MESH_CONFIG(START)`, beaconless on a MESH interface.
   The beacon template, RSN element included, is kept;
-- the last `AT+CRYPTOHOST` setting and the `AT+FRAG` threshold;
+- the last `AT+CRYPTOHOST` setting the chip took and the `AT+FRAG` threshold;
 - every peer's station record at its AID;
 - the group key at AID 0 (our MGTK under SAE, the shared key on a keyed open
   mesh), each peer's pairwise key where the chip holds pairwise keys (not on
@@ -676,21 +681,24 @@ The probe burst, `AT+CRYPTOHOST`, `AT+CHIPRESTART` and `AT+FRAG=` reach the
 driver only from the umac event loop, which runs the restart, so none reaches a
 driver being reloaded.
 
-`AT+CHIPRESTART` restarts the chip through the same path (a request the event
-loop finds with the driver stopped is dropped and counted `dropped`), and
-`AT+CHIPRESTART?` counts restarts and what they put back
+`AT+CHIPRESTART` restarts the chip through the same path: the next health
+check fails without asking the chip (a request the event loop finds with the
+health check not started, or its interval 0, is dropped and counted
+`dropped`), and `AT+CHIPRESTART?` counts restarts and what they put back
 ([AT reference](AT-Command-Reference#identity-and-lifecycle)). Host-tested
 (`test_simnode_restart*`, against a fake chip that loses everything when it
-boots). Measured on air on 2026-10-03 on `warthog-mesh-sae-meshvif` and
+boots). Measured on air on 2026-10-03, before the rebase (chip firmware 1.17.6,
+not re-measured on 1.17.9), on `warthog-mesh-sae-meshvif` and
 `warthog-mesh-sae-swccmp-meshvif` with two OpenMANET 1.8.0 Pis and a second
 Warthog: back in about 1.1 s (`restarts=1 mesh=1 sta=3`, `keys=7` with chip keys
 and 1 on swccmp, `keyfail=0 cmdfail=0`), USB up, no peer re-peered, the Pis'
 replay counters at 0, our group frames taken, pings Pi to Warthog and Warthog
-to Warthog 10/10 (one run 7/10); in a soak, 12 of 12 restarts on both builds,
-the `health` task at least 2356 bytes free of 4096 during a restart
+to Warthog 10/10 (one run 7/10); in a soak, 12 of 12 restarts on both builds.
+The check's failure path and the restart now run on the event loop
 ([Troubleshooting](Troubleshooting#task-stacks)). Not measured on air: a
 restart the chip starts itself (a failed health check or a bus error), a
-restore the chip refuses, a restart in client mode.
+restore the chip refuses, a restart in client mode, and any restart on this
+base.
 
 ## Limits
 

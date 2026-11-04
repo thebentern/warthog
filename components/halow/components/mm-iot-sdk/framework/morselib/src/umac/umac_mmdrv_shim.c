@@ -4,14 +4,16 @@
  */
 
 #include "common/common.h"
+#include "mmdrv.h"
 #include "mmlog.h"
 #include "umac/ap/umac_ap.h"
 #include "umac/core/umac_core.h"
 #include "umac/datapath/umac_datapath.h"
 #include "umac/connection/umac_connection.h"
-#include "umac/offload/umac_offload.h"
+#include "umac/health_check/umac_health_check.h"
 #include "umac/regdb/umac_regdb.h"
 #include "umac/stats/umac_stats.h"
+#include "umac/supplicant_shim/umac_supp_shim.h"
 /* mesh-mode beacon template path. When mesh is active,
  * route the chip's beacon-template request to umac_mesh_get_beacon instead
  * of umac_ap_get_beacon (which asserts when no AP context exists). */
@@ -58,6 +60,7 @@ void mmdrv_host_process_rx_frame(struct mmpkt *rxbuf, uint16_t channel)
     if (!umac_core_is_running(umacd))
     {
         g_warthog_shim_rx_notrunning++;
+        MMLOG_WRN("Event loop not running. Dropping frame.\n");
         mmpkt_release(rxbuf);
         return;
     }
@@ -123,13 +126,13 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
     const uint32_t t0 = mmosal_get_time_ms();
     g_warthog_chiprestart_n++;
 
-    if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP) != UMAC_INTERFACE_VIF_ID_INVALID)
+    if (umac_interface_get_vif_id(umacd, UMAC_INTERFACE_AP) != MMDRV_VIF_ID_INVALID)
     {
         MMLOG_ERR("Unable to recover from hardware restart with AP interface active\n");
         MMOSAL_ASSERT(false);
     }
 
-    const bool mesh = umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH) != UMAC_INTERFACE_VIF_ID_INVALID;
+    const bool mesh = umac_interface_mesh_is_active(umacd);
     if (umac_interface_is_active(umacd))
     {
         const char *country_code = umac_regdb_get_country_code(umacd);
@@ -140,14 +143,14 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
         }
 
         mmdrv_deinit();
-        MMOSAL_ASSERT(mmdrv_init(NULL, country_code) == 0);
+        MMOSAL_ASSERT(mmdrv_init(NULL, country_code) == MMWLAN_SUCCESS);
         {
             /* warthog: a chip that boots holds no key; the mesh forgets what it held. */
             extern void umac_datapath_mesh_chip_booted(bool restart);
             umac_datapath_mesh_chip_booted(true);
         }
 
-        umac_interface_configure_periodic_health_check(umacd);
+        umac_health_check_start(umacd);
         umac_stats_increment_hw_restart_counter(umacd);
         umac_scan_handle_hw_restarted(umacd);
         bool complete = false;
@@ -172,15 +175,14 @@ static void hw_restart_evt_handler(struct umac_data *umacd, const struct umac_ev
     mmdrv_hw_restart_completed();
 }
 
-/* AT+CHIPRESTART: the request reaches the driver on this loop, as the restart handler does. */
+/* AT+CHIPRESTART: the request fails the health check on this loop, which the check runs on. */
 static void chip_restart_request_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
 {
-    MM_UNUSED(umacd);
     MM_UNUSED(evt);
-    if (mmdrv_force_health_check_fail() != 0)
+    if (!umac_health_check_force_fail(umacd))
     {
         g_warthog_chiprestart_dropped++;
-        MMLOG_WRN("Chip restart request dropped: the driver is stopped\n");
+        MMLOG_WRN("Chip restart request dropped: the health check is not running\n");
     }
 }
 
@@ -261,6 +263,8 @@ void mmdrv_host_hw_restart_required(void)
 {
     struct umac_data *umacd = umac_data_get_umacd();
 
+    mmdrv_host_set_tx_paused(MMDRV_PAUSE_SOURCE_MASK_HW_RESTART, true);
+
     struct umac_evt evt = UMAC_EVT_INIT(hw_restart_evt_handler);
     bool ok = umac_core_evt_queue_at_start(umacd, &evt);
     if (!ok)
@@ -268,6 +272,24 @@ void mmdrv_host_hw_restart_required(void)
 
         MMLOG_ERR("Failed to queue HW_RESTARTED event.\n");
         MMOSAL_ASSERT(false);
+    }
+}
+
+static void health_check_required_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
+{
+    MM_UNUSED(evt);
+    umac_health_check_demand_check(umacd);
+}
+
+void mmdrv_host_health_check_required(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+
+    struct umac_evt evt = UMAC_EVT_INIT(health_check_required_evt_handler);
+    bool ok = umac_core_evt_queue_at_start(umacd, &evt);
+    if (!ok)
+    {
+        MMLOG_WRN("Failed to queue HEALTH_CHECK_REQUIRED event.\n");
     }
 }
 
@@ -313,25 +335,23 @@ void mmdrv_host_connection_loss(uint32_t reason)
     }
 }
 
-static void dhcp_lease_update_evt_handler(struct umac_data *umacd, const struct umac_evt *evt)
-{
-    umac_offload_dhcp_lease_update(umacd, &evt->args.dhcp_offload_lease_update.lease_info);
-}
-
-void mmdrv_host_dhcp_lease_update(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns)
+void mmdrv_host_cqm_event(enum mmdrv_cqm_event event, int16_t rssi)
 {
     struct umac_data *umacd = umac_data_get_umacd();
 
-    struct umac_evt evt = UMAC_EVT_INIT(dhcp_lease_update_evt_handler);
-    evt.args.dhcp_offload_lease_update.lease_info.ip4_addr = ip;
-    evt.args.dhcp_offload_lease_update.lease_info.mask4_addr = mask;
-    evt.args.dhcp_offload_lease_update.lease_info.gw4_addr = gw;
-    evt.args.dhcp_offload_lease_update.lease_info.dns4_addr = dns;
-
-    bool ok = umac_core_evt_queue(umacd, &evt);
-    if (!ok)
+    switch (event)
     {
-        MMLOG_WRN("Failed to queue DHCP_OFFLOAD_LEASE_UPDATE event.\n");
+        case MMDRV_CQM_EVENT_RSSI_THRESHOLD_HIGH:
+        case MMDRV_CQM_EVENT_RSSI_THRESHOLD_LOW:
+
+            umac_supp_notify_signal_change(umacd,
+                                           rssi,
+                                           (event == MMDRV_CQM_EVENT_RSSI_THRESHOLD_HIGH));
+            break;
+
+        default:
+            MMLOG_WRN("Unknown CQM event %u\n", event);
+            break;
     }
 }
 
@@ -364,6 +384,18 @@ void mmdrv_host_stats_increment_datapath_driver_rx_read_failures(void)
 {
     struct umac_data *umacd = umac_data_get_umacd();
     umac_stats_increment_datapath_driver_rx_read_failures(umacd);
+}
+
+void mmdrv_host_stats_increment_datapath_driver_tx_skbq_timeout(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    umac_stats_increment_datapath_driver_tx_skbq_timeout(umacd);
+}
+
+void mmdrv_host_stats_increment_datapath_driver_tx_pending_status_timeout(void)
+{
+    struct umac_data *umacd = umac_data_get_umacd();
+    umac_stats_increment_datapath_driver_tx_pending_status_timeout(umacd);
 }
 
 /* Beacon-handshake counters, reported by AT+BCNSTAT?.

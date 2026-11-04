@@ -145,8 +145,8 @@ MM_SHIM_DIR     = $(APP_DIR)/mm_shims
 MM_SHIM_SRCS_C += $(patsubst $(MM_SHIM_DIR)/%,%,$(wildcard $(MM_SHIM_DIR)/*.c))
 
 MM_SHIM_SRCS_H += mmport.h
-MM_SHIM_SRCS_C := $(filter-out mmosal_shim_freertos.c,$(MM_SHIM_SRCS_C))
-MM_SHIM_OS_SRCS_C ?= mmosal_shim_freertos.c
+MM_SHIM_SRCS_C := $(filter-out mmosal_shim_freertos.c mmosal_shim_alloc.c,$(MM_SHIM_SRCS_C))
+MM_SHIM_OS_SRCS_C ?= mmosal_shim_freertos.c mmosal_shim_alloc.c
 MM_SHIM_SRCS_C += $(MM_SHIM_OS_SRCS_C)
 MM_SHIM_SRCS_H += endian.h
 

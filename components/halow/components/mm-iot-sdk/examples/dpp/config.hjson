@@ -9,9 +9,9 @@
  * To load the settings on to a device, do the following from the `framework` directory:
  *
  *   - Ensure the MMIOT_ROOT environment variable is set to the path to the framework directory
- *     of the MM-IoT-SDK package. This will be set automatically if using Platform IO and is
- *     set by the environment setup script (`tools/setupscripts/env.sh`) if building
- *     using command line make -- for more information see the Getting Started Guide.
+ *     of the MM-IoT-SDK package. This is set by the environment setup script
+ *     (`tools/setupscripts/env.sh`) if building using command line make -- for more information
+ *     see the Getting Started Guide.
  *
  *   - If this is the first time using the config store programmer ensure the pipenv is
  *     synchronised by running the following command in the framework directory:
@@ -30,11 +30,11 @@
      * this is equivalent to the write-string command */
     "strings" : {
         /* The Wi-Fi SSID */
-        "wlan.ssid": "MorseMicro"
+        // "wlan.ssid": "MorseMicro"
         /* The Wi-Fi password, not required if wlan.security is open */
-        "wlan.password": "12345678"
+        // "wlan.password": "12345678"
         /* The Wi-Fi security to use, valid values are sae, owe and open */
-        "wlan.security": "sae"
+        // "wlan.security": "sae"
         /* The 2 letter country code to ensure the correct regulatory domain is used */
         // "wlan.country_code": "XX"
 
@@ -70,12 +70,6 @@
         // "wlan.ampdu_enabled": "true"
         // "wlan.fragment_threshold": "0"
         // "wlan.rts_threshold": "0"
-        /* If true, enables ARP response offload which allows the Morse chip to directly
-         * respond to ARP requests without waking up the host processor. */
-        // "wlan.offload_arp_response": "true"
-        /* If non zero, enables ARP refresh offload with the specified interval in
-         * milliseconds. */
-        // "wlan.offload_arp_refresh_s": "60"
         /* The minimum interval to wait after the last health check before triggering
          * another. If this parameter is 0 then health checks will always happen at the
          * max_interval_ms value. min_interval_ms must always be less than or equal to
@@ -100,10 +94,6 @@
          * ignored otherwise. If set to 0, the device will not return to the home channel
          * during the scan. */
         // "wlan.home_chan_dwell_time_ms": "200"
-        /* If true, enables DHCP offload which allows the Morse chip to directly handle
-         * DHCP discovery and leases without waking up the host processor. Note: this comes
-         * into effect only if ip.dhcp_enabled is also true. */
-        // "ip.dhcp_offload": "true"
         /* Protected Management Frame mode to use (802.11w). Valid values are required and
          * disabled */
         // "wlan.pmf_mode": "required"
@@ -128,7 +118,11 @@
          * duty cycle air time for allocation window is available to consume immediately. */
         // "wlan.duty_cycle_mode": "burst"
 
-        
+        /* The following settings are required only for the dpp app */
+        /* DPP provisioning mode: "pb" for Push Button (default), "qr" for QR Code
+         * Enrollee. */
+        "dpp.mode": "pb"
+
     },
     /* You can specify a list of key/value hex-strings in this section to write to config store
      * this is equivalent to the write-hex command */
@@ -160,6 +154,12 @@
          * to: $MMIOT_ROOT/morsefirmware/mm6108/bcfs/bcf_mf12345.mbin */
         // "bcf_file": "$MMIOT_ROOT/morsefirmware/mm6108/bcfs/bcf_mf08651_us.mbin"
 
-        
+        /* The following files are required only for the dpp app */
+        /* DER-encoded P-256 (prime256v1) private key for DPP QR enrollee bootstrap
+         * identity. If not set, a fresh keypair is generated automatically. Generate with:
+         * `openssl ecparam -name prime256v1 -genkey -noout -outform DER -out
+         * bootstrap.der` */
+        // "dpp.bootstrap_key": ""
+
     }
 }

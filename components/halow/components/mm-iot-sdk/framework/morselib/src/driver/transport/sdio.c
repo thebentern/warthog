@@ -11,7 +11,6 @@
 
 #include "morse_transport.h"
 #include "driver/morse_driver/hw.h"
-#include "driver/health/driver_health.h"
 #include "driver/driver.h"
 
 #include "mmosal.h"
@@ -20,7 +19,7 @@
 
 
 #define SPI_IRQ_TASK_PRIORITY (MMOSAL_TASK_PRI_HIGH)
-/* warthog: 1024 words (was 768), as the health task: a bus error's MMLOG printf runs on this task. */
+/* warthog: 1024 words (was 768): a bus error's MMLOG printf runs on this task. */
 #define SPI_IRQ_TASK_STACK    (1024)
 
 
@@ -135,7 +134,7 @@ static void comms_op_check(struct driver_data *driverd, morse_error_t return_cod
         {
             MMLOG_WRN("%d consecutive comm failures\n", consecutive_comm_failures);
             morse_trns_set_irq_enabled(driverd, false);
-            driver_health_demand_check(driverd);
+            mmdrv_host_health_check_required();
             consecutive_comm_failures = 0;
         }
     }
@@ -499,14 +498,22 @@ morse_error_t morse_trns_read_multi_byte(struct driver_data *driverd,
             size = next_boundary - address;
         }
 
-        morse_cmd53_read(function, address, data, size);
+        result = morse_cmd53_read(function, address, data, size);
+        if (result != MORSE_SUCCESS)
+        {
+            goto exit;
+        }
 
 
         if ((size >= 8) && driverd->cfg->bus_double_read && !memcmp(data, data + 4, 4))
         {
 
-            MMLOG_DBG("Corrupt Payload. Re-Read first 8 bytes\n");
-            morse_cmd53_read(function, address, data, 8);
+            MMLOG_WRN("Corrupt Payload. Re-Read first 8 bytes\n");
+            result = morse_cmd53_read(function, address, data, 8);
+            if (result != MORSE_SUCCESS)
+            {
+                goto exit;
+            }
         }
 
         address += size;
@@ -752,6 +759,7 @@ static morse_error_t morse_trns_reset(struct driver_data *driverd)
     if (ret != 0)
     {
         MMLOG_WRN("Initial communication with chip failed\n");
+        morse_trns_release(driverd);
         return MORSE_FAILED;
     }
 
@@ -822,13 +830,53 @@ void morse_trns_deinit(void)
 }
 
 
+/* warthog: undo a failed morse_trns_start, so a retried mmdrv_init starts clean. */
+static void morse_trns_start_unwind(bool irq_task_started)
+{
+    if (irq_task_started)
+    {
+        spi_irq_task_run = false;
+        mmosal_semb_give(spi_irq_semb);
+        for (int i = 0; i < 50 && !spi_irq_task_has_finished; i++)
+        {
+            mmosal_task_sleep(10);
+        }
+        if (!spi_irq_task_has_finished)
+        {
+            /* The task may still use the lock and semaphore: leak them, and refuse later starts. */
+            MMLOG_ERR("spi_irq task did not stop\n");
+            mmhal_wlan_deinit();
+            return;
+        }
+    }
+
+    mmosal_mutex_delete(bus_lock);
+    bus_lock = NULL;
+
+    if (spi_irq_semb != NULL)
+    {
+        mmosal_semb_delete(spi_irq_semb);
+    }
+    spi_irq_semb = NULL;
+
+    mmhal_wlan_deinit();
+}
+
 morse_error_t morse_trns_start(struct driver_data *driverd)
 {
     uint8_t bic;
     morse_error_t result = MORSE_FAILED;
+    bool irq_task_started = false;
 
     TRANSPORT_FSM_TRACE_INIT();
     ADDR_BASE_FSM_TRACE_INIT();
+
+    /* warthog: a lock left by the unwind is a spi_irq task still running on it: no restart. */
+    if (bus_lock != NULL)
+    {
+        MMLOG_ERR("spi_irq task still running; transport not restarted\n");
+        return MORSE_FAILED;
+    }
 
     bus_lock = mmosal_mutex_create("SPI Bus Lock");
     MMOSAL_ASSERT(bus_lock != NULL);
@@ -858,6 +906,7 @@ morse_error_t morse_trns_start(struct driver_data *driverd)
         result = MORSE_FAILED;
         goto exit;
     }
+    irq_task_started = true;
 
 
     result = morse_cmd52_write(SDIO_CCCR_IEN_ADDR,
@@ -886,6 +935,10 @@ morse_error_t morse_trns_start(struct driver_data *driverd)
     mmhal_wlan_register_spi_irq_handler(morse_spi_irq_handler);
 
 exit:
+    if (result != MORSE_SUCCESS)
+    {
+        morse_trns_start_unwind(irq_task_started);
+    }
     return result;
 }
 
@@ -900,6 +953,9 @@ void morse_trns_stop(struct driver_data *driverd)
         mmosal_task_sleep(1);
     }
 
+
+    mmhal_wlan_register_spi_irq_handler(NULL);
+
     mmosal_mutex_delete(bus_lock);
     bus_lock = NULL;
 
@@ -910,6 +966,8 @@ void morse_trns_stop(struct driver_data *driverd)
     spi_irq_semb = NULL;
 
     mmhal_wlan_deinit();
+
+    mmosal_task_sleep(20);
 }
 
 void morse_trns_set_irq_enabled(struct driver_data *driverd, bool enabled)

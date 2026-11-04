@@ -303,7 +303,7 @@ static void t_band(void)
         { "AU", 26, 26 },
 #endif
         { "JP", 12, 12 }, { "KR", 16, 13 }, { "NZ", 23, 23 }, { "US", 48, 48 }, { "CA", 48, 48 },
-        { "EU", 7, 0 }, { "IN", 3, 0 }, { "GB", 9, 2 },
+        { "EU", 5, 0 }, { "IN", 3, 0 }, { "GB", 7, 2 },
     };
     for (unsigned i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
         const struct mmwlan_s1g_channel_list *l = dom_(want[i].cc);
