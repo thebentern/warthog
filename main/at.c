@@ -3446,7 +3446,7 @@ static void dispatch(char *line)
         if (w <= 0) { cdc_write("+MESHPATH: (empty)\r\n"); } else { cdc_write(big); }
         reply_ok();
     } else if (strcasecmp(verb, "MESHFWDSTAT") == 0 && terminator == '?') {
-        static char line[896]; /* AT task only; kept off its 4 KB stack */
+        static char line[896]; /* AT task only; kept off its stack */
         snprintf(line, sizeof(line),
                  "+MESHFWDSTAT: on=%lu fwd uni=%lu grp=%lu nomem=%lu | drop own=%lu dup=%lu ttl=%lu "
                  "nopath=%lu nofwd=%lu bad=%lu full=%lu tblfull=%lu | perr_tx=%lu preq_tx=%lu | relay preq=%lu prep=%lu perr=%lu "
@@ -3978,7 +3978,8 @@ static void at_task(void *arg)
 
 esp_err_t warthog_at_start(void)
 {
-    BaseType_t ok = xTaskCreatePinnedToCore(at_task, "warthog_at", 4096, NULL,
+    /* AT+MESHCFG? leaves ~116 B of 4 KB on the IDF 5.5.6 build (AT+STACKS?), so 5 KB. */
+    BaseType_t ok = xTaskCreatePinnedToCore(at_task, "warthog_at", 5120, NULL,
                                             tskIDLE_PRIORITY + 2, NULL, 0);
     if (ok != pdPASS) {
         return ESP_ERR_NO_MEM;

@@ -14,9 +14,9 @@ instability.
 
 In mesh mode a HaLow chip restart (a failed chip health check) reloads the
 chip and puts the mesh back instead of resetting the board: measured on air on
-2026-10-03, before the rebase (chip firmware 1.17.6, not re-measured on 1.17.9),
-on both `-meshvif` builds with `AT+CHIPRESTART`, back in about 1.1 s with USB
-and the peer links up, 12 of 12 restarts in a soak. It still resets
+2026-10-03 on chip firmware 1.17.6, on both `-meshvif` builds with `AT+CHIPRESTART`, back in about 1.1 s with USB
+and the peer links up, 12 of 12 restarts in a soak; on 1.17.9
+(2026-11-04, swccmp build only) 4 of 4 back in 943-972 ms. It still resets
 the board when the reload fails, the chip interface cannot come back at its id,
 the channel cannot be set, or `BSS_CONFIG` or `MESH_CONFIG` cannot be sent.
 `AT+CHIPRESTART?` counts restarts and what did not go back
@@ -150,11 +150,10 @@ caught by the task watchdog and counts toward safe mode, as a panic does.
 `AT+STACKS?` reports the least free stack of each task, in bytes; `drv` and
 `spi_irq` start again with every chip restart, and their `_min` fields keep
 the least of every instance. The health check and the whole chip restart run on
-`evtloop` (6144 words, 24576 bytes): read `evtloop` after `AT+CHIPRESTART` to
-see what the failure path left; not measured on this base (the separate
-`health` task it replaces needed 1024 words). Measured on air on 2026-10-03,
-before the rebase, least free on both boards: ESP-IDF's `wifi` task 4192-4388
-and `warthog_led` 68-72 of 2048, and 1092-1096 of the 3072 bytes it now has.
+`evtloop` (24576 bytes): read `evtloop` after `AT+CHIPRESTART` to see what the
+failure path left. Measured on 2026-11-04 after three restarts:
+`evtloop` 19596 free, `drv_min` 760; after every read command, `warthog_at`
+1136 of 5120, ESP-IDF's `wifi` task 4212, `warthog_led` 1116 of 3072.
 The stack canary (`CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY`) checks the
 lowest 16 bytes of a task's stack each time it is switched out and panics on an
 overflow, so after a run read `AT+ASSERT?` `reset=` and `AT+COREDUMP?` too.

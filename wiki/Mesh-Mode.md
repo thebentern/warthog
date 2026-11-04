@@ -687,18 +687,20 @@ health check not started, or its interval 0, is dropped and counted
 `dropped`), and `AT+CHIPRESTART?` counts restarts and what they put back
 ([AT reference](AT-Command-Reference#identity-and-lifecycle)). Host-tested
 (`test_simnode_restart*`, against a fake chip that loses everything when it
-boots). Measured on air on 2026-10-03, before the rebase (chip firmware 1.17.6,
-not re-measured on 1.17.9), on `warthog-mesh-sae-meshvif` and
+boots). Measured on air on 2026-10-03 on chip firmware 1.17.6, on `warthog-mesh-sae-meshvif` and
 `warthog-mesh-sae-swccmp-meshvif` with two OpenMANET 1.8.0 Pis and a second
 Warthog: back in about 1.1 s (`restarts=1 mesh=1 sta=3`, `keys=7` with chip keys
 and 1 on swccmp, `keyfail=0 cmdfail=0`), USB up, no peer re-peered, the Pis'
 replay counters at 0, our group frames taken, pings Pi to Warthog and Warthog
 to Warthog 10/10 (one run 7/10); in a soak, 12 of 12 restarts on both builds.
+On 1.17.9 (2026-11-04, `warthog-mesh-sae-swccmp-meshvif` only): 4 of 4 back
+in 943-972 ms, `mesh` each time, `keyfail=0 cmdfail=0`, peers back within
+2.6 s and `AT+MPING` 3/3 after each.
 The check's failure path and the restart now run on the event loop
 ([Troubleshooting](Troubleshooting#task-stacks)). Not measured on air: a
 restart the chip starts itself (a failed health check or a bus error), a
-restore the chip refuses, a restart in client mode, and any restart on this
-base.
+restore the chip refuses, a restart in client mode, and on this base any build
+other than `warthog-mesh-sae-swccmp-meshvif`.
 
 ## Limits
 
