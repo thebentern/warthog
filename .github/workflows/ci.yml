@@ -28,11 +28,12 @@ jobs:
           persist-credentials: false
 
       # The pins (PIO_VERSION, PIO_PLATFORM, PARTITIONS_SHA256) and the directory the cache paths below name; the
-      # scripts and host tests find PlatformIO's packages through it.
+      # scripts and host tests find PlatformIO's packages through it. UV_CONSTRAINT holds the penv at PIO_VERSION.
       - name: Pins and PlatformIO core dir
         run: |
           grep -E '^[A-Z][A-Z0-9_]*=' scripts/ci/pins.env >> "$GITHUB_ENV"
           echo "PLATFORMIO_CORE_DIR=$HOME/.platformio" >> "$GITHUB_ENV"
+          echo "UV_CONSTRAINT=$GITHUB_WORKSPACE/scripts/ci/penv-constraints.txt" >> "$GITHUB_ENV"
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -65,8 +66,8 @@ jobs:
           command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
           make -C components/halow_mesh_compat/test/batman_vm lint
 
-      # 6.1.x wants the SCons 4.8.1 that pioarduino 55.03.38 installs; PlatformIO 6.2 adds SCons 4.11.1
-      # beside it and the build dies on the mix (No module named 'SCons.Tool.FortranCommon').
+      # pioarduino 55.03.312+ installs SCons 4.11.1 and wants PlatformIO 6.2; 6.1.x wants 4.8.1, and a
+      # mix of the two dies with No module named 'SCons.Tool.FortranCommon'.
       - name: Install PlatformIO
         run: pip install "platformio==${PIO_VERSION}"
 
@@ -113,14 +114,14 @@ jobs:
           make -C components/halow_mesh_compat/test clean lwip-napt SAN=1 LWIP_NAPT_REQUIRED=1
 
       # TinyUSB's own NCM and ECM class drivers with main/usbnet_core.c (usbnet.mk): one owner of the
-      # USB network class. Built from the managed_components/ the build just fetched (0.21.0~2 is
-      # espressif/tinyusb 894ea014, the commit esp_tinyusb 3.0.0 bundles).
+      # USB network class. Built from the TinyUSB 0.21.0~2 that esp_tinyusb 3.0.0 bundles, in the
+      # managed_components/ the build just fetched.
       - name: Host tests (TinyUSB NCM/ECM, USB network class)
         run: |
           make -C components/halow_mesh_compat/test usbnet USBNET_REQUIRED=1
           make -C components/halow_mesh_compat/test clean usbnet SAN=1 USBNET_REQUIRED=1
 
-      # lwip-napt against IDF 5.5.6's esp-lwip pin (5.5.4 and 5.5.5 pin fd432e4ee2cf). The path goes
+      # lwip-napt against IDF 5.5.6's esp-lwip pin, fetched on its own (the build's IDF is 5.5.6 too). The path goes
       # to make, not the environment: the glue guard below reads IDF_LWIP from there.
       - name: Host tests (esp-lwip c6f2f878, IDF 5.5.6's lwIP)
         run: |
@@ -152,8 +153,8 @@ jobs:
           GLUEGUARD_UPSTREAM_REQUIRED: 1
         run: make -C components/halow_mesh_compat/test glueguard
 
-      # region_bcf.h against the morsemicro/firmware BCF the builds fetched; make all ran before it existed.
-      - name: Region BCF (fetched firmware)
+      # region_bcf.h against the SDK's own BCF (morsefirmware/mm6108/bcfs); no build needed, it fails if missing.
+      - name: Region BCF (SDK morsefirmware)
         run: make -C components/halow_mesh_compat/test region-bcf REGION_BCF_REQUIRED=1
 
       # pioarduino reports a failed merge-bin and carries on: check each factory image's layout and flash header.
@@ -270,6 +271,7 @@ jobs:
         run: |
           grep -E '^[A-Z][A-Z0-9_]*=' scripts/ci/pins.env >> "$GITHUB_ENV"
           echo "PLATFORMIO_CORE_DIR=$HOME/.platformio" >> "$GITHUB_ENV"
+          echo "UV_CONSTRAINT=$GITHUB_WORKSPACE/scripts/ci/penv-constraints.txt" >> "$GITHUB_ENV"
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0

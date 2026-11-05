@@ -4,7 +4,7 @@
 # Builds the drivers out of managed_components/, which `pio run` fetches. Without them `make usbnet`
 # says SKIP, unless USBNET_REQUIRED=1: CI runs it that way after its PlatformIO build.
 
-TUSB_DIR ?= ../../../managed_components/espressif__tinyusb
+TUSB_DIR ?= ../../../managed_components/espressif__esp_tinyusb/tinyusb
 USBNET_TESTS := test_usbnet_ncm test_usbnet_ecm
 USBNET_DEPS = test_usbnet.c usbnet_tusb/tusb_config.h ../../../main/usbnet_core.c ../../../main/usbnet_core.h
 # TinyUSB's headers are not this repo's to warn about; the test and usbnet_core.c are (-Werror below).

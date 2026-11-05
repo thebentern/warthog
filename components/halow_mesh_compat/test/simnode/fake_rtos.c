@@ -92,7 +92,7 @@ void simnode_recycle_arm(const void *block, size_t size)
 }
 
 void *mmosal_malloc_(size_t size) { if (take_fail_()) { return NULL; } void *p = malloc(size); if (p) { s_live_allocs++; } return p; }
-void *mmosal_calloc(size_t n, size_t size)
+void *mmosal_calloc_(size_t n, size_t size)
 {
     if (take_fail_()) { return NULL; }
     void *p = NULL;

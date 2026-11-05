@@ -17,7 +17,9 @@
  *  (11) a core dump's reason on one line: IDF's task watchdog caption becomes TASK_WDT;
  *  (12) AT+HANGTEST's names, the probe each needs, its reply lines;
  *  (13) the .noinit record: its fields, an OFF probe as WARTHOG_HANG_NONE, the magic written last;
- *  (14) AT+HANG?'s lines, exact, and the longest within at.c's line[192].
+ *  (14) AT+HANG?'s lines, exact, and the longest within at.c's line[192];
+ *  (15) AT+HANGTEST=health and =loop, modeled over 91 offsets of the check's last run: health named 90 to 180 s
+ *      after the command, loop only for a run in the second before =loop; counted first, =health would name loop.
  */
 #include "hang_guard_core.h"
 
@@ -330,8 +332,8 @@ static void t_tests(void)
           "(12) the probe each test needs: its own; health and drv health; main, spin and none none");
     static const char *const reply[WARTHOG_HANG_TESTS] = {
         "",
-        "+HANGTEST: loop blocks at its next probe; reset=PANIC in about 180 s\r\n",
-        "+HANGTEST: health blocks at its next wake; reset=PANIC in up to 180 s\r\n",
+        "+HANGTEST: loop blocks at its next probe, with the health check; reset=PANIC in 90 to 180 s\r\n",
+        "+HANGTEST: health blocks at its next run, with the event loop; reset=PANIC in 90 to 180 s\r\n",
         "+HANGTEST: drv blocks; the chip restart then blocks loop; reset=PANIC in up to 280 s\r\n",
         "+HANGTEST: tcpip blocks at its next probe; reset=PANIC in about 180 s\r\n",
         "+HANGTEST: usb blocks at its next probe; reset=PANIC in about 180 s\r\n",
@@ -426,6 +428,79 @@ static void t_lines(void)
     CHECK(n + 1 < 192, "(14) the longest line, prev, fits at.c's line[192] (%d)", n + 1);
 }
 
+enum model_block { MODEL_LOOP, MODEL_HEALTH, MODEL_HEALTH_COUNTED_FIRST };
+
+/* One AT+HANGTEST block set at @p t0 ms, the check's last run @p d ms before it: the tick that aborts (UINT32_MAX:
+ * none by 400 s), the probe it names in @p named and the check's last counted run in @p last. */
+static uint32_t model_(enum model_block blk, uint32_t t0, uint32_t d, int *named, uint32_t *last)
+{
+    const uint32_t ran = t0 - d, next = ran + 90000u;
+    const uint32_t first = (t0 / WARTHOG_HANG_TICK_MS + 1u) * WARTHOG_HANG_TICK_MS; /* posts the ping =loop holds */
+    const uint32_t hold = blk == MODEL_LOOP ? first + 1u : next;                     /* the loop runs nothing after */
+    uint32_t pongs = 0, wakes = 0, run = ran % 90000u;
+    reset_();
+    *named = -1;
+    *last = UINT32_MAX;
+    for (uint32_t t = 0; t <= 400000u; t += WARTHOG_HANG_TICK_MS) {
+        if (t > 0 && t - WARTHOG_HANG_TICK_MS + 1u < hold) {
+            pongs++;
+        }
+        while (run < t && (run < hold || (blk == MODEL_HEALTH_COUNTED_FIRST && run == hold))) {
+            wakes++;
+            *last = run;
+            run += 90000u;
+        }
+        warthog_hang_step(&p[WARTHOG_HANG_LOOP], pongs, WARTHOG_HANG_POSTED, t);
+        for (int i = WARTHOG_HANG_TCPIP; i <= WARTHOG_HANG_TIMER; i++) {
+            warthog_hang_step(&p[i], ++answers[i], WARTHOG_HANG_POSTED, t);
+        }
+        p[WARTHOG_HANG_HEALTH].limit_ms = warthog_hang_health_limit_ms(90000u);
+        warthog_hang_step(&p[WARTHOG_HANG_HEALTH], wakes, WARTHOG_HANG_POSTED, t);
+        if ((*named = warthog_hang_stalled(p)) >= 0) {
+            return t;
+        }
+    }
+    return UINT32_MAX;
+}
+
+static void t_model(void)
+{
+    const uint32_t t0 = 100200u, lo = (WARTHOG_HANG_LIMIT_S - 90u) * 1000u;
+    const uint32_t hi = WARTHOG_HANG_LIMIT_S * 1000u + WARTHOG_HANG_TICK_MS;
+    const uint32_t first = (t0 / WARTHOG_HANG_TICK_MS + 1u) * WARTHOG_HANG_TICK_MS;
+    unsigned cases = 0, health_ok = 0, counted_loop = 0, loop_ok = 0, loop_named = 0;
+    uint32_t hmin = UINT32_MAX, hmax = 0, lmin = UINT32_MAX, lmax = 0;
+    for (uint32_t d = 1u; d < 90000u; d += 997u) {
+        int named;
+        uint32_t last;
+        cases++;
+        uint32_t at = model_(MODEL_HEALTH, t0, d, &named, &last);
+        if (at != UINT32_MAX && named == WARTHOG_HANG_HEALTH && at - t0 >= lo && at - t0 <= hi) {
+            health_ok++;
+        }
+        hmin = at - t0 < hmin ? at - t0 : hmin;
+        hmax = at - t0 > hmax ? at - t0 : hmax;
+        at = model_(MODEL_HEALTH_COUNTED_FIRST, t0, d, &named, &last);
+        counted_loop += at != UINT32_MAX && named == WARTHOG_HANG_LOOP;
+        at = model_(MODEL_LOOP, t0, d, &named, &last);
+        const int want = last != UINT32_MAX && last + WARTHOG_HANG_TICK_MS >= first ? WARTHOG_HANG_LOOP : WARTHOG_HANG_HEALTH;
+        if (at != UINT32_MAX && named == want && at - t0 >= lo && at - t0 <= hi) {
+            loop_ok++;
+        }
+        loop_named += named == WARTHOG_HANG_LOOP;
+        lmin = at - t0 < lmin ? at - t0 : lmin;
+        lmax = at - t0 > lmax ? at - t0 : lmax;
+    }
+    CHECK(cases == 91u && health_ok == cases,
+          "(15) =health, its held run not counted: health named, %lu to %lu ms after the command, each of %u offsets",
+          (unsigned long)hmin, (unsigned long)hmax, cases);
+    CHECK(counted_loop == cases, "(15) =health, its held run counted first: loop named for %u of %u offsets", counted_loop,
+          cases);
+    CHECK(loop_ok == cases && loop_named == 2u,
+          "(15) =loop: health named but for the %u offsets whose check ran in the second before the block, %lu to %lu ms "
+          "after the command", loop_named, (unsigned long)lmin, (unsigned long)lmax);
+}
+
 int main(void)
 {
     printf("=== hang guard logic (main/hang_guard_core.c) ===\n");
@@ -443,6 +518,7 @@ int main(void)
     t_tests();
     t_rec();
     t_lines();
+    t_model();
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("test_hang_guard: all passed\n");
     return 0;

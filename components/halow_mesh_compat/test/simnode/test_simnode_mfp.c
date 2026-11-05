@@ -1036,17 +1036,18 @@ static void t_tx_group_on_loop(void)
 
     {
         /* Longer than any group path selection we build: dropped rather than sent from here. */
-        int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len);
+        enum mmwlan_status umac_mesh_tx_action(const uint8_t *da, const uint8_t *body,
+                                               uint16_t body_len);
         uint8_t big[HWMP_PREQ_BODY_LEN + 1] = { 13, 1 };
         simnode_outbox_clear();
         d0 = g_warthog_hwmp_tx_qdrop;
         s = snap_();
-        const int rc = umac_mesh_tx_action(BC, big, sizeof(big));
+        const enum mmwlan_status rc = umac_mesh_tx_action(BC, big, sizeof(big));
         const unsigned ev = simnode_evt_pending();
         simnode_pump();
-        CHECK(rc < 0 && g_warthog_hwmp_tx_qdrop - d0 == 1 && ev == 0u && simnode_outbox_count() == 0 &&
-                  g_warthog_hwmp_tx_gp == s.tgp,
-              "(pin) a group body too long to queue is dropped, counted, never sent off the loop");
+        CHECK(rc == MMWLAN_NO_MEM && g_warthog_hwmp_tx_qdrop - d0 == 1 && ev == 0u &&
+                  simnode_outbox_count() == 0 && g_warthog_hwmp_tx_gp == s.tgp,
+              "(pin) a group body too long to queue is dropped (NO_MEM), counted, never sent off the loop");
     }
 
 #ifdef WARTHOG_MESH_HOST_CCMP
@@ -1779,7 +1780,7 @@ int main(void)
     t_block_ack();
 
     simnode_del_peer(NULL);
-    CHECK(simnode_live_allocs() == 0, "(pin) no packet buffer was orphaned (%u live)",
+    CHECK(simnode_live_allocs() == simnode_kept_allocs(), "(pin) no packet buffer was orphaned (%u live)",
           simnode_live_allocs());
     simnode_stop();
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }

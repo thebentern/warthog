@@ -175,7 +175,7 @@ static void t_tx_replica_ae2(void)
         if (i == 0) { seq0 = seq; }
         CHECK(seq == seq0, "  one Mesh Control sequence number for all replicas (%lu)", (unsigned long)seq);
     }
-    CHECK(simnode_stub_hits("umac_connection_get_state") == 0, "nothing fell into STA-mode code");
+    CHECK(simnode_sta_mode_hits() == 0, "nothing fell into STA-mode code");
 }
 
 /* ---- 2. batman on, MESHGRP=1: one standard group frame ------------------- */
@@ -447,29 +447,32 @@ static void t_rx_linux_group(void)
           "the hook's classifier keeps it for the engine");
 }
 
-/* umac_interface.c keeps an extended callback per VIF; mesh data is looked up on the AP one.
- * bat_port.c registers MMWLAN_VIF_UNSPECIFIED, which sets both. */
+/* umac_interface.c keeps an extended callback per VIF; the mesh lives in the STA slot, so mesh
+ * data is looked up on the STA one and delivered as MMWLAN_VIF_STA. bat_port.c registers
+ * MMWLAN_VIF_UNSPECIFIED, which sets both. */
 static void t_rx_ext_vif(void)
 {
-    printf("--- RX: mesh data reaches the extended callback registered for the AP VIF ---\n");
+    printf("--- RX: mesh data reaches the extended callback registered for the STA VIF ---\n");
     uint8_t frame[256];
     struct umac_mesh_ctrl mc = { .flags = 0, .ttl = 31, .seq = 1300 };
     fresh(W, /*batman=*/true, /*grp_std=*/false, /*ext=*/false); /* clears both VIFs' */
-    simnode_set_rx_ext_cb_vif(true, MMWLAN_VIF_STA);
+    simnode_set_rx_ext_cb_vif(true, MMWLAN_VIF_AP);
     (void)simnode_add_peer(A);
     uint16_t n = mk_grp(frame, BC, A, A, &mc, ELP, sizeof(ELP));
     (void)simnode_rx(frame, n, -55);
     CHECK(simnode_ext_rx_count() == 0 && simnode_host_rx_count() == 0,
-          "registered for the STA VIF only: not delivered (%u / %u)", simnode_ext_rx_count(),
+          "registered for the AP VIF only: not delivered (%u / %u)", simnode_ext_rx_count(),
           simnode_host_rx_count());
 
     simnode_set_rx_ext_cb(false);
-    simnode_set_rx_ext_cb_vif(true, MMWLAN_VIF_AP);
+    simnode_set_rx_ext_cb_vif(true, MMWLAN_VIF_STA);
     mc.seq++;
     n = mk_grp(frame, BC, A, A, &mc, ELP, sizeof(ELP));
     (void)simnode_rx(frame, n, -55);
-    CHECK(simnode_ext_rx_count() == 1, "registered for the AP VIF: delivered (%u)",
-          simnode_ext_rx_count());
+    const struct simnode_extrx *e = simnode_ext_rx_get(0);
+    CHECK(simnode_ext_rx_count() == 1 && e != NULL && e->vif == MMWLAN_VIF_STA,
+          "registered for the STA VIF: delivered, its metadata naming the STA VIF (%u, vif %u)",
+          simnode_ext_rx_count(), e != NULL ? e->vif : 0u);
     simnode_set_rx_ext_cb(false);
 }
 
@@ -847,8 +850,8 @@ int main(void)
 
     simnode_del_peer(NULL);
     simnode_set_rx_ext_cb(false);
-    CHECK(simnode_live_allocs() == 0, "no packet buffer orphaned across the run (%u live)",
-          simnode_live_allocs());
+    CHECK(simnode_live_allocs() == simnode_kept_allocs(),
+          "no packet buffer orphaned across the run (%u live)", simnode_live_allocs());
     CHECK(simnode_frees_in_critical() == 0, "and none freed inside a critical section (%u)",
           simnode_frees_in_critical());
     simnode_stop();

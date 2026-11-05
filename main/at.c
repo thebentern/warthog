@@ -1042,7 +1042,7 @@ volatile uint32_t g_warthog_ba_delba_end = 0, g_warthog_ba_delba_other = 0;
 volatile uint32_t g_warthog_ba_rx_delba = 0, g_warthog_ba_rx_reason = 0;
 
 /* AT+CHIPRESTART?: restarts handled, forced, with the mesh put back in full; requests dropped
- * because the driver was stopped. */
+ * with the health check not started or its interval 0. */
 volatile uint32_t g_warthog_chiprestart_n = 0, g_warthog_chiprestart_forced = 0;
 volatile uint32_t g_warthog_chiprestart_mesh = 0, g_warthog_chiprestart_dropped = 0;
 /* Station records and keys put back and not; other restore commands failed; put back by a retry,
@@ -1053,6 +1053,9 @@ volatile uint32_t g_warthog_chiprestart_cmdfail = 0, g_warthog_chiprestart_retri
 volatile uint32_t g_warthog_chiprestart_pending = 0, g_warthog_chiprestart_ms = 0;
 /* The hang guard (main/hang_guard.c): the event loop's ping answers and the AT+HANGTEST block. */
 volatile uint32_t g_warthog_loop_pongs = 0, g_warthog_hang_block = 0;
+/* AT+RXCHAN? second line: EAPOL the mesh dropped (it has none), data from an unpeered TA, and
+ * frames skbq released past their TX status deadline. */
+volatile uint32_t g_warthog_mesh_eapol_drop = 0, g_warthog_mesh_unknown_ta = 0, g_warthog_skbq_stale_drop = 0;
 
 /* RX frame-filter drop accounting.
  *
@@ -1532,7 +1535,7 @@ static void meshcfg_chan_lines_(void)
         cdc_write(line);
     }
     if (g_warthog_mesh_chan_st != 0) {
-        snprintf(line, sizeof(line), "+MESHCFG: mesh not started: the chip refused the channel (st=%ld)\r\n",
+        snprintf(line, sizeof(line), "+MESHCFG: mesh not started: channel setup failed (st=%ld)\r\n",
                  (long)g_warthog_mesh_chan_st);
         cdc_write(line);
     }
@@ -1834,7 +1837,7 @@ static const char *loop_post_error_(enum mmwlan_status st)
 }
 
 /* AT+CHIPRESTART: the event loop fails the next chip health check, so the chip restarts as after a
- * real failure; with the driver stopped the loop drops the request (dropped in AT+CHIPRESTART?). */
+ * real failure; dropped (AT+CHIPRESTART?) with the health check not started or its interval 0. */
 static void cmd_chiprestart(void)
 {
     const enum mmwlan_status st = mmwlan_force_chip_restart();
@@ -1878,6 +1881,19 @@ static int assert_line_(char *buf, size_t len, uint32_t num, const struct mmosal
                     (unsigned long)r->line, (unsigned long)r->fileid,
                     (unsigned long)r->platform_info[0], (unsigned long)r->platform_info[1],
                     (unsigned long)r->platform_info[2], (unsigned long)r->platform_info[3]);
+}
+
+/* AT+RADIO?: whether the chip booted, mmhalow_init's mmwlan_boot attempts and the last one's status. */
+static void cmd_radio_query(void)
+{
+    extern volatile uint32_t g_warthog_halow_boot_attempts;
+    extern volatile int32_t g_warthog_halow_boot_status;
+    char line[80];
+    snprintf(line, sizeof(line), "+RADIO: %s boot_attempts=%lu boot_status=%ld\r\n",
+             warthog_halow_radio_up() ? "up" : "down", (unsigned long)g_warthog_halow_boot_attempts,
+             (long)g_warthog_halow_boot_status);
+    cdc_write(line);
+    reply_ok();
 }
 
 static void cmd_assert_query(void)
@@ -2369,8 +2385,8 @@ static void cmd_cap_query(unsigned dir)
 /* AT+STACKS?: the least free stack each task has had, in bytes; a task not running is left out. */
 static void cmd_stacks(void)
 {
-    /* Started by the shim; drv, spi_irq and health restart with the chip, so _min spans every instance. */
-    static const char *const shim_names[] = { "evtloop", "drv", "spi_irq", "health" };
+    /* Started by the shim; drv and spi_irq restart with the chip, so _min spans every instance. */
+    static const char *const shim_names[] = { "evtloop", "drv", "spi_irq" };
     static const char *const names[] = {
         "tiT", "warthog_at", "warthog_bat", "warthog_mudp",
         "warthog_nat", "warthog_led", "mesh-probe", "scanloop", "mcast_rx", "TinyUSB", "esp_timer",
@@ -2457,6 +2473,10 @@ static void cmd_rxchan(void)
     };
     static char buf[512]; /* AT task only; 468 at its longest */
     rxchan_line_(buf, sizeof(buf), &s);
+    cdc_write(buf);
+    snprintf(buf, sizeof(buf), "+RXCHAN: eapol_drop=%lu unknown_ta=%lu stale_drop=%lu\r\n",
+             (unsigned long)g_warthog_mesh_eapol_drop, (unsigned long)g_warthog_mesh_unknown_ta,
+             (unsigned long)g_warthog_skbq_stale_drop);
     cdc_write(buf);
     reply_ok();
 }
@@ -2678,8 +2698,8 @@ static void cmd_mudplast(void)
 /* AT+CRYPTOHOST=<0|1> ask the chip to stop decrypting in firmware (the
  * prerequisite for host software CCMP and therefore for per-link keys);
  * AT+CRYPTOHOST? read back what it holds. Serviced from the probe path within
- * ~2 s, like AT+REKEY. rc is the driver return; val is what the chip reports,
- * which is the only evidence the setting actually took. */
+ * ~2 s, like AT+REKEY. rc is the request's mmwlan_status (14: the chip refused it);
+ * val is the chip's read-back, 0xffffffff after a failed request. */
 /* AT+CCMPKAT? -- did AES-CCM pass its known-answer test on THIS chip, through
  * the mbedtls path the firmware actually uses, and what does it cost?
  * ok=1 means the vector, the in-place case and MIC rejection all passed.
@@ -3426,7 +3446,7 @@ static void dispatch(char *line)
         if (w <= 0) { cdc_write("+MESHPATH: (empty)\r\n"); } else { cdc_write(big); }
         reply_ok();
     } else if (strcasecmp(verb, "MESHFWDSTAT") == 0 && terminator == '?') {
-        static char line[896]; /* AT task only; kept off its 4 KB stack */
+        static char line[896]; /* AT task only; kept off its stack */
         snprintf(line, sizeof(line),
                  "+MESHFWDSTAT: on=%lu fwd uni=%lu grp=%lu nomem=%lu | drop own=%lu dup=%lu ttl=%lu "
                  "nopath=%lu nofwd=%lu bad=%lu full=%lu tblfull=%lu | perr_tx=%lu preq_tx=%lu | relay preq=%lu prep=%lu perr=%lu "
@@ -3567,6 +3587,8 @@ static void dispatch(char *line)
         cmd_asserttest(trim(args));
     } else if (strcasecmp(verb, "HANG") == 0 && terminator == '?') {
         cmd_hang_query();
+    } else if (strcasecmp(verb, "RADIO") == 0 && terminator == '?') {
+        cmd_radio_query();
     } else if (strcasecmp(verb, "HANGTEST") == 0 && terminator == '=') {
         cmd_hangtest(trim(args));
     } else if (strcasecmp(verb, "SAESTAGE") == 0 && terminator == '?') {
@@ -3956,7 +3978,8 @@ static void at_task(void *arg)
 
 esp_err_t warthog_at_start(void)
 {
-    BaseType_t ok = xTaskCreatePinnedToCore(at_task, "warthog_at", 4096, NULL,
+    /* AT+MESHCFG? leaves ~116 B of 4 KB on the IDF 5.5.6 build (AT+STACKS?), so 5 KB. */
+    BaseType_t ok = xTaskCreatePinnedToCore(at_task, "warthog_at", 5120, NULL,
                                             tskIDLE_PRIORITY + 2, NULL, 0);
     if (ok != pdPASS) {
         return ESP_ERR_NO_MEM;

@@ -451,6 +451,10 @@ static void on_tinyusb_event(tinyusb_event_t *event, void *arg)
         tud_network_link_state(0, false);
         usbnet_flush(&s_usbnet);
         break;
+    case TINYUSB_EVENT_SUSPENDED:
+    case TINYUSB_EVENT_RESUMED:
+        /* esp_tinyusb 3 always posts these; the link and queues stay as they are across a bus suspend. */
+        break;
     default:
         break;
     }
@@ -579,6 +583,10 @@ esp_netif_t *warthog_usb_net_start(void)
         ESP_LOGE(TAG, "tinyusb_driver_install failed: %s", esp_err_to_name(err));
         return NULL;
     }
+    /* IDF's panic restart resets only the CPUs, so the OTG core kept D+ up and the host may still hold the old
+     * device; dcd_init's own detach lasts microseconds, which a hub can miss. Stay off the bus until the CDC is set
+     * up and long enough that every hub reports the detach (dlmode.c relies on the same 100 ms). */
+    (void)tud_disconnect();
 
     /* Without tinyusb_cdcacm_init the esp_tinyusb CDC dispatcher has no
      * per-interface state, so the first host SET_LINE_CODING control transfer
@@ -608,6 +616,8 @@ esp_netif_t *warthog_usb_net_start(void)
         s_cdc_ready = true;
         s_prev_log_fn = esp_log_set_vprintf(&cdc_vprintf);
     }
+    vTaskDelay(pdMS_TO_TICKS(100));
+    (void)tud_connect();
 
     ESP_LOGI(TAG, "up: gw=%s mask=%s host_mac=%s",
              WARTHOG_USB_GW_IP, WARTHOG_USB_NETMASK, s_mac_str);

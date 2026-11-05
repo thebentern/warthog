@@ -33,10 +33,15 @@ bool umac_mesh_validate_args(struct umac_data *umacd, const struct mmwlan_mesh_a
 
 /** True when the mesh runs SAE/AMPE, so hostap's MPM owns peering. */
 /** TX a fully built mgmt frame (hostap's SAE auth) with mesh VIF metadata. */
-int umac_mesh_tx_mgmt_mmpkt(struct mmpkt *frm);
+enum mmwlan_status umac_mesh_tx_mgmt_mmpkt(struct mmpkt *frm);
 
 /** Register a datapath peer for hostap's mesh MPM (the .sta_add path). */
 enum mmwlan_status umac_mesh_add_datapath_peer(const uint8_t *peer_addr);
+
+/** Mesh start (umac_datapath_mesh.c): the common stad a frame from a node with no slot runs
+ *  against, on @p vif_id with @p own_addr as its BSSID; allocated once. */
+enum mmwlan_status umac_datapath_mesh_common_start(struct umac_data *umacd, uint16_t vif_id,
+                                                   const uint8_t *own_addr, bool sae);
 
 bool umac_mesh_sae_active(void);
 
@@ -93,8 +98,8 @@ enum mmwlan_status umac_assert_test_request(struct umac_data *umacd);
  *  or stopping (forgetting the waiting one), NO_MEM with its queue full. */
 enum mmwlan_status umac_loop_ping_request(struct umac_data *umacd);
 
-/** Send an HWMP PREQ to @p da, targeting @p da itself. Emitting this is what
- *  makes us reachable: a peer installs a path to a PREQ's originator. */
+/** Send an HWMP PREQ to @p da, targeting @p da itself (0 sent or queued, -1 dropped). Emitting
+ *  this is what makes us reachable: a peer installs a path to a PREQ's originator. */
 int umac_mesh_hwmp_send_preq(const uint8_t *da);
 
 /** Handle a received mesh action frame (category 13). Answers a PREQ that
@@ -109,10 +114,15 @@ void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta,
  * so hostap's MPM output cannot go on air without it. Used by the supplicant
  * shim's .send_action driver op.
  *
- * @returns 0 once handed to the radio; 1 when group path selection sent off the
- *          umac event loop was queued for it instead; or a negative error.
+ * @returns MMWLAN_SUCCESS once handed to the radio, or when group path selection sent off
+ *          the umac event loop was queued for it instead; else why it was dropped.
  */
-int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len);
+enum mmwlan_status umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len);
+
+/** As umac_mesh_tx_action; @p queued (may be NULL) is set when a success only queued the frame
+ *  for the event loop, which reports it through umac_mesh_fwd_glue_deferred_sent. */
+enum mmwlan_status umac_mesh_tx_action_queued(const uint8_t *da, const uint8_t *body,
+                                              uint16_t body_len, bool *queued);
 
 /**
  * Bring the mesh interface up: ADD_INTERFACE(type=MESH), BSS config, then

@@ -25,10 +25,6 @@ struct wpabuf * eap_tls_msg_alloc(enum eap_type type, size_t payload_len,
 		return eap_msg_alloc(EAP_VENDOR_UNAUTH_TLS,
 				     EAP_VENDOR_TYPE_UNAUTH_TLS, payload_len,
 				     code, identifier);
-	else if (type == EAP_WFA_UNAUTH_TLS_TYPE)
-		return eap_msg_alloc(EAP_VENDOR_WFA_NEW,
-				     EAP_VENDOR_WFA_UNAUTH_TLS, payload_len,
-				     code, identifier);
 	return eap_msg_alloc(EAP_VENDOR_IETF, type, payload_len, code,
 			     identifier);
 }
@@ -136,7 +132,7 @@ u8 * eap_server_tls_derive_key(struct eap_sm *sm, struct eap_ssl_data *data,
  * eap_server_tls_derive_session_id - Derive a Session-Id based on TLS data
  * @sm: Pointer to EAP state machine allocated with eap_peer_sm_init()
  * @data: Data for TLS processing
- * @eap_type: EAP method used in (EAP_TYPE_TLS/PEAP/TTLS/FAST)
+ * @eap_type: EAP method used in Phase 1 (EAP_TYPE_TLS/PEAP/TTLS/FAST)
  * @len: Pointer to length of the session ID generated
  * Returns: Pointer to allocated Session-Id on success or %NULL on failure
  *
@@ -517,7 +513,7 @@ struct wpabuf * eap_server_tls_encrypt(struct eap_sm *sm,
 
 	buf = tls_connection_encrypt(sm->cfg->ssl_ctx, data->conn, plain);
 	if (buf == NULL) {
-		wpa_printf(MSG_INFO, "SSL: Failed to encrypt data");
+		wpa_printf(MSG_INFO, "SSL: Failed to encrypt Phase 2 data");
 		return NULL;
 	}
 
@@ -540,10 +536,6 @@ int eap_server_tls_process(struct eap_sm *sm, struct eap_ssl_data *data,
 	if (eap_type == EAP_UNAUTH_TLS_TYPE)
 		pos = eap_hdr_validate(EAP_VENDOR_UNAUTH_TLS,
 				       EAP_VENDOR_TYPE_UNAUTH_TLS, respData,
-				       &left);
-	else if (eap_type == EAP_WFA_UNAUTH_TLS_TYPE)
-		pos = eap_hdr_validate(EAP_VENDOR_WFA_NEW,
-				       EAP_VENDOR_WFA_UNAUTH_TLS, respData,
 				       &left);
 	else
 		pos = eap_hdr_validate(EAP_VENDOR_IETF, eap_type, respData,

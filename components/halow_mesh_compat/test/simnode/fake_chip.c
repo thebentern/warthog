@@ -26,9 +26,13 @@
 #include "umac/datapath/umac_datapath.h"
 #include "umac/core/umac_core.h"
 #include "common/morse_commands.h" /* MORSE_CMD_ID_*: the command log's ids */
+#include "common/common.h"          /* errno_to_status: a transport errno as morse_cmd_tx returns it */
 #include "mmhal_wlan.h"
 #include "umac_mesh_ccm.h"      /* the receive model opens frames with the firmware's own CCM */
 #include "umac_mesh_ccmp_hdr.h"
+
+/* As driver.c: the one external definition of mmdrv.h's inline capability test. */
+extern bool morse_caps_supported(const struct morse_caps *caps, enum morse_caps_flags flag);
 
 #ifndef SIMNODE_OUTBOX_MAX
 #define SIMNODE_OUTBOX_MAX 64u
@@ -291,9 +295,9 @@ bool simnode_tx_forget_held(unsigned i)
     return true;
 }
 
-int mmdrv_tx_frame(struct mmpkt *pkt, bool is_mgmt)
+enum mmwlan_status mmdrv_tx_frame(struct mmpkt *pkt, bool is_mgmt)
 {
-    if (pkt == NULL) { return -1; }
+    if (pkt == NULL) { return MMWLAN_INVALID_ARGUMENT; }
     struct mmpktview *v = mmpkt_open(pkt);
     uint32_t len = mmpkt_get_data_length(v);
     const uint8_t *data = mmpkt_get_data_start(v);
@@ -339,17 +343,17 @@ int mmdrv_tx_frame(struct mmpkt *pkt, bool is_mgmt)
     {
         chip_air_(idx, mmdrv_get_tx_metadata(pkt), group_ra, false, 0);
         mmpkt_release(pkt);
-        return 0;
+        return MMWLAN_SUCCESS;
     }
     /* The driver owns it now; the chip sends it and reports its status, at once unless held. */
     if (s_hold && s_held_n < SIMNODE_OUTBOX_MAX)
     {
         s_held_idx[s_held_n] = idx;
         s_held[s_held_n++] = pkt;
-        return 0;
+        return MMWLAN_SUCCESS;
     }
     chip_finish_(pkt, true, idx);
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
 /* The driver's packet allocators. The real ones come from a driver-owned pool;
@@ -424,14 +428,17 @@ struct mmpkt *mmdrv_alloc_mmpkt_for_defrag(uint32_t min_capacity, uint32_t max_c
 
 /* Interface, BSS and station commands, in the order the firmware sent them, each with
  * the status this chip answered. A refusal is armed per command, as a firmware that does
- * not support something answers it. */
+ * not support something answers it. As driver.c and morse_cmd_tx: an armed transport result
+ * (a negative errno) returns errno_to_status of it with no chip status read; a chip status
+ * makes a *_status call return MMWLAN_SUCCESS with that status, and a plain one
+ * MMWLAN_COMMAND_ERROR. */
 #define SIMNODE_CHIPCMD_MAX 256u
 static struct simnode_chipcmd s_cmd[SIMNODE_CHIPCMD_MAX];
 static unsigned s_cmd_n;
 static struct { uint32_t type; int32_t status; int ret; } s_refuse_add[4];
 static unsigned s_refuse_add_n;
 /* Other commands' refusals: the first command with this id (and arg, unless UINT32_MAX).
- * REMOVE_INTERFACE has no status in its response: its "status" is its transport result. */
+ * REMOVE_INTERFACE and DISABLE_KEY read no status: theirs is a transport result. */
 static struct { uint16_t id; uint32_t arg; int32_t status; } s_refuse[8];
 static unsigned s_refuse_n;
 static struct { bool set; uint16_t id; } s_mesh_vif;
@@ -539,7 +546,8 @@ static struct simnode_chipcfg s_cfg;
 const struct simnode_chipcfg *simnode_chipcfg(void) { return &s_cfg; }
 void simnode_chipcfg_clear(void) { memset(&s_cfg, 0, sizeof(s_cfg)); }
 
-int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing, int32_t *chip_status)
+enum mmwlan_status mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing,
+                                     int32_t *chip_status)
 {
     struct simnode_chipcmd *c = chipcmd_log_(MORSE_CMD_ID_MESH_CONFIG, vif_id, start ? 1u : 0u);
     c->beaconing = enable_beaconing;
@@ -553,42 +561,43 @@ int mmdrv_mesh_config(uint16_t vif_id, bool start, bool enable_beaconing, int32_
     s_cfg.mesh_config++;
     s_cfg.mesh_started = start;
     s_cfg.beaconing_enabled = enable_beaconing;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_cfg_bss(uint16_t vif_id, uint16_t beacon_int, uint16_t dtim_period, uint32_t cssid)
+enum mmwlan_status mmdrv_cfg_bss(uint16_t vif_id, uint16_t beacon_int, uint16_t dtim_period,
+                                 uint32_t cssid)
 {
     (void)dtim_period; (void)cssid;
     (void)chipcmd_log_(MORSE_CMD_ID_BSS_CONFIG, vif_id, beacon_int);
     s_now.beacon_int = beacon_int;
     s_cfg.bss_cfg++;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_cfg_bss_beacon(uint16_t vif_id, bool enable, int32_t *chip_status)
+enum mmwlan_status mmdrv_cfg_bss_beacon(uint16_t vif_id, bool enable, int32_t *chip_status)
 {
     struct simnode_chipcmd *c = chipcmd_log_(MORSE_CMD_ID_BSS_BEACON_CONFIG, vif_id, enable ? 1u : 0u);
     c->status = chip_answer_(MORSE_CMD_ID_BSS_BEACON_CONFIG, c->arg);
     if (chip_status != NULL) { *chip_status = c->status; }
     if (c->status == 0) { s_now.bss_beacon = enable; }
     s_cfg.bss_beacon++;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_cfg_qos_queue(const struct mmwlan_qos_queue_params *params)
+enum mmwlan_status mmdrv_cfg_qos_queue(const struct mmwlan_qos_queue_params *params)
 {
     (void)params;
     s_now.qos++;
     s_cfg.qos_queue++;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_start_beaconing_period(uint16_t vif_id, uint32_t host_timer_period_ms)
+enum mmwlan_status mmdrv_start_beaconing_period(uint16_t vif_id, uint32_t host_timer_period_ms)
 {
     (void)vif_id;
     s_now.beacon_period_ms = host_timer_period_ms;
     s_cfg.beaconing_period++;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
 #define SIMNODE_KEYINST_MAX 32u
@@ -807,21 +816,21 @@ bool simnode_rx_air_queued(const uint8_t *frame, uint16_t len, int16_t rssi)
 }
 
 /* A key the chip refuses (simnode_chip_refuse_next_arg(INSTALL_KEY, aid, status)) is not
- * installed and leaves @p key_conf as it was, as driver.c's status read does. */
-int mmdrv_install_key_status(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_conf,
-                             int32_t *chip_status)
+ * installed and leaves @p key_conf as it was, as driver.c's status read does. A failed
+ * transport (simnode_fail_next_install_key: -EIO) writes no chip status. */
+enum mmwlan_status mmdrv_install_key_status(uint16_t vif_id, uint16_t aid,
+                                            struct mmdrv_key_conf *key_conf, int32_t *chip_status)
 {
-    if (chip_status != NULL) { *chip_status = 0; }
     if (s_install_fail_next != 0u)
     {
         s_install_fail_next--;
-        return -5;
+        return errno_to_status(-5);
     }
     const int32_t refused = chip_answer_(MORSE_CMD_ID_INSTALL_KEY, aid);
+    if (chip_status != NULL) { *chip_status = refused; }
     if (refused != 0)
     {
-        if (chip_status != NULL) { *chip_status = refused; }
-        return 0;
+        return MMWLAN_SUCCESS;
     }
     s_cfg.keys_installed++;
     if (key_conf != NULL)
@@ -846,35 +855,51 @@ int mmdrv_install_key_status(uint16_t vif_id, uint16_t aid, struct mmdrv_key_con
         k->tx_pn = key_conf->tx_pn;
         memcpy(k->key, key_conf->key, sizeof(k->key));
     }
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-/* As driver.c: a refusal is returned as the chip's status. */
-int mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_conf)
+/* As driver.c: a refusal is counted and returns MMWLAN_COMMAND_ERROR. */
+extern volatile uint32_t g_warthog_chipcmd_key_refused;
+extern volatile int32_t g_warthog_chipcmd_key_status;
+enum mmwlan_status mmdrv_install_key(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *key_conf)
 {
     int32_t st = 0;
-    int ret = mmdrv_install_key_status(vif_id, aid, key_conf, &st);
-    return ret != 0 ? ret : (int)st;
+    const enum mmwlan_status status = mmdrv_install_key_status(vif_id, aid, key_conf, &st);
+    if (status == MMWLAN_SUCCESS && st != 0)
+    {
+        g_warthog_chipcmd_key_refused++;
+        g_warthog_chipcmd_key_status = st;
+        return MMWLAN_COMMAND_ERROR;
+    }
+    return status;
+}
+
+/* A command whose response the driver does not read: an armed transport result @p ret
+ * (a negative errno) as morse_cmd_tx returns it, any other nonzero one as a chip status. */
+static enum mmwlan_status chip_ret_status_(int ret)
+{
+    return ret < 0 ? errno_to_status(ret) : ret != 0 ? MMWLAN_COMMAND_ERROR : MMWLAN_SUCCESS;
 }
 
 /* As driver.c: nothing goes to the chip for AID 0. Its response carries no status read, so a
  * refusal (simnode_chip_refuse_next_arg(DISABLE_KEY, aid, ret)) fails the transport instead,
  * and the key stays. */
-int mmdrv_disable_key(uint16_t vif_id, uint16_t aid, uint8_t hw_key_idx, bool is_pairwise)
+enum mmwlan_status mmdrv_disable_key(uint16_t vif_id, uint16_t aid, uint8_t hw_key_idx,
+                                     bool is_pairwise)
 {
-    if (aid == 0u) { return 0; }
+    if (aid == 0u) { return MMWLAN_SUCCESS; }
     struct simnode_chipcmd *c = chipcmd_log_(MORSE_CMD_ID_DISABLE_KEY, vif_id, hw_key_idx);
     c->aid = aid;
     c->pairwise = is_pairwise;
     c->ret = (int)chip_answer_(MORSE_CMD_ID_DISABLE_KEY, aid);
-    if (c->ret != 0) { return c->ret; }
+    if (c->ret != 0) { return chip_ret_status_(c->ret); }
     s_cfg.keys_disabled++;
     const int i = chip_key_find_(aid, is_pairwise, hw_key_idx);
     if (i >= 0) { s_key[i].used = false; }
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_set_bssid(uint16_t vif_id, const uint8_t bssid[6], int32_t *chip_status)
+enum mmwlan_status mmdrv_set_bssid(uint16_t vif_id, const uint8_t bssid[6], int32_t *chip_status)
 {
     struct simnode_chipcmd *c = chipcmd_log_(MORSE_CMD_ID_BSSID_SET, vif_id, 0);
     memcpy(c->addr, bssid, 6);
@@ -886,19 +911,20 @@ int mmdrv_set_bssid(uint16_t vif_id, const uint8_t bssid[6], int32_t *chip_statu
         memcpy(s_now.bssid, bssid, 6);
     }
     s_cfg.bssid_set++;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_set_seq_num_spaces(uint16_t vif_id, const uint16_t *tx_seq_num_spaces,
-                             const uint8_t *addr)
+enum mmwlan_status mmdrv_set_seq_num_spaces(uint16_t vif_id, const uint16_t *tx_seq_num_spaces,
+                                            const uint8_t *addr)
 {
     (void)vif_id; (void)tx_seq_num_spaces; (void)addr;
     s_cfg.seq_num_spaces++;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_update_sta_state_status(uint16_t vif_id, uint16_t aid, const uint8_t *addr,
-                                  enum morse_sta_state state, int32_t *chip_status)
+enum mmwlan_status mmdrv_update_sta_state_status(uint16_t vif_id, uint16_t aid,
+                                                 const uint8_t *addr, enum morse_sta_state state,
+                                                 int32_t *chip_status)
 {
     struct simnode_chipcmd *c = chipcmd_log_(MORSE_CMD_ID_SET_STA_STATE, vif_id, (uint32_t)state);
     c->aid = aid;
@@ -907,14 +933,16 @@ int mmdrv_update_sta_state_status(uint16_t vif_id, uint16_t aid, const uint8_t *
     if (chip_status != NULL) { *chip_status = c->status; }
     if (c->status == 0) { chip_sta_note_(aid, addr, (uint32_t)state); }
     s_cfg.sta_state_updates++;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-/* As driver.c: without a status out, a refusal still returns 0. */
-int mmdrv_update_sta_state(uint16_t vif_id, uint16_t aid, const uint8_t *addr,
-                           enum morse_sta_state state)
+/* As driver.c: without a status out, a refusal returns MMWLAN_COMMAND_ERROR. */
+enum mmwlan_status mmdrv_update_sta_state(uint16_t vif_id, uint16_t aid, const uint8_t *addr,
+                                          enum morse_sta_state state)
 {
-    return mmdrv_update_sta_state_status(vif_id, aid, addr, state, NULL);
+    int32_t st = 0;
+    const enum mmwlan_status status = mmdrv_update_sta_state_status(vif_id, aid, addr, state, &st);
+    return (status == MMWLAN_SUCCESS && st != 0) ? MMWLAN_COMMAND_ERROR : status;
 }
 
 /* Driver calls a test asserts reach the chip only from the umac event loop, which runs a restart. */
@@ -924,7 +952,7 @@ static void on_loop_only_(void) { s_off_loop += umac_core_evtloop_is_active(NULL
 
 /* Host CCMP: the chip's one group-key slot is why warthog can do crypto in the
  * host at all, so the setting is honoured rather than ignored. */
-int mmdrv_set_crypto_in_host(uint16_t vif_id, bool enable, uint32_t *out_value)
+enum mmwlan_status mmdrv_set_crypto_in_host(uint16_t vif_id, bool enable, uint32_t *out_value)
 {
     (void)vif_id;
     on_loop_only_();
@@ -932,15 +960,15 @@ int mmdrv_set_crypto_in_host(uint16_t vif_id, bool enable, uint32_t *out_value)
     s_now.crypto_in_host_set = true;
     s_now.crypto_in_host = enable;
     if (out_value != NULL) { *out_value = enable ? 1u : 0u; }
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_get_crypto_in_host(uint16_t vif_id, uint32_t *out_value)
+enum mmwlan_status mmdrv_get_crypto_in_host(uint16_t vif_id, uint32_t *out_value)
 {
     (void)vif_id;
     on_loop_only_();
     if (out_value != NULL) { *out_value = s_now.crypto_in_host ? 1u : 0u; }
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
 /* ---- the chip VIF: what umac_interface.c sends (interface_seam.c) -------- */
@@ -954,8 +982,9 @@ uint16_t simnode_own_vif_id(void);      /* fake_config.c */
  * chip_info), so a restart loses all of it too. */
 static unsigned s_boots, s_restart_done;
 static bool s_down;
+static bool s_fail_health; /* below: the health probe */
 
-int mmdrv_init(struct mmdrv_chip_info *chip_info, const char *country_code)
+enum mmwlan_status mmdrv_init(struct mmdrv_chip_info *chip_info, const char *country_code)
 {
     (void)country_code;
     chip_tables_clear_();
@@ -963,7 +992,8 @@ int mmdrv_init(struct mmdrv_chip_info *chip_info, const char *country_code)
     memset(&s_now, 0, sizeof(s_now));
     s_boots++;
     s_down = false;
-    if (chip_info == NULL) { return 0; }
+    s_fail_health = false;
+    if (chip_info == NULL) { return MMWLAN_SUCCESS; }
     memset(chip_info, 0, sizeof(*chip_info));
     memcpy(chip_info->mac_addr, simnode_own_mac(), 6);
     chip_info->fw_version.major = 1;
@@ -971,7 +1001,7 @@ int mmdrv_init(struct mmdrv_chip_info *chip_info, const char *country_code)
     chip_info->fw_version.patch = 6;
     chip_info->morse_chip_id = 0x0306;
     chip_info->morse_chip_id_string = "MM6108-A2";
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
 /* As driver.c: its queues are purged with no TX status (morse_skbq_finish). */
@@ -985,7 +1015,7 @@ void mmdrv_deinit(void)
     s_down = true;
 }
 
-/* As driver.c: the TX pause the health check set (MMDRV_PAUSE_SOURCE_MASK_HW_RESTART) ends. */
+/* As driver.c: the TX pause mmdrv_host_hw_restart_required set (MMDRV_PAUSE_SOURCE_MASK_HW_RESTART) ends. */
 static void (*s_restart_done_hook)(void);
 void simnode_chip_on_restart_done(void (*cb)(void)) { s_restart_done_hook = cb; }
 
@@ -999,10 +1029,10 @@ void mmdrv_hw_restart_completed(void)
 }
 
 /* As driver.c sends it: 0 is off. */
-int mmdrv_set_frag_threshold(uint32_t frag_threshold)
+enum mmwlan_status mmdrv_set_frag_threshold(uint32_t frag_threshold)
 {
     s_now.frag_threshold = frag_threshold;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
 const struct simnode_chipstate *simnode_chipstate(void)
@@ -1050,10 +1080,10 @@ unsigned simnode_chip_keys(struct simnode_keyinst *out, unsigned max)
 /* The board's HAL has no MAC override: the chip's own address stands. */
 void mmhal_read_mac_addr(uint8_t *mac_addr) { (void)mac_addr; }
 
-/* As driver.c: the transport result, and the VIF id from the response header, which a
- * refusing chip leaves at the request's UNKNOWN_VIF_ID. */
-static int chip_add_if_(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_type type,
-                        int32_t *status)
+/* As driver.c: the transport result (no chip status read), else the chip's status, and the VIF
+ * id from the response header only when it took the interface. */
+static enum mmwlan_status chip_add_if_(uint16_t *vif_id, const uint8_t *addr,
+                                       enum mmdrv_interface_type type, int32_t *status)
 {
     struct simnode_chipcmd *c = chipcmd_log_(MORSE_CMD_ID_ADD_INTERFACE, UINT16_MAX, (uint32_t)type);
     memcpy(c->addr, addr, 6);
@@ -1063,12 +1093,12 @@ static int chip_add_if_(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interf
         c->status = s_refuse_add[0].ret == 0 ? s_refuse_add[0].status : 0;
         memmove(&s_refuse_add[0], &s_refuse_add[1], (--s_refuse_add_n) * sizeof(s_refuse_add[0]));
     }
+    if (c->ret != 0) { return chip_ret_status_(c->ret); }
     if (status != NULL) { *status = c->status; }
-    if (c->ret != 0) { return c->ret; }
     if (c->status != 0)
     {
         c->vif_id = UINT16_MAX;
-        return 0;
+        return MMWLAN_SUCCESS;
     }
     c->vif_id = (type == MMDRV_INTERFACE_TYPE_MESH && s_mesh_vif.set) ? s_mesh_vif.id
                                                                        : simnode_own_vif_id();
@@ -1077,144 +1107,131 @@ static int chip_add_if_(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interf
     s_now.vif = true;
     s_now.vif_type = (uint32_t)type;
     s_now.vif_id = c->vif_id;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_add_if(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_type type)
+/* As driver.c: a refused add returns MMWLAN_COMMAND_ERROR and leaves @p vif_id as it was. */
+enum mmwlan_status mmdrv_add_if(uint16_t *vif_id, const uint8_t *addr,
+                                enum mmdrv_interface_type type)
 {
-    /* As driver.c: without a status out, a refused add still reads the response's VIF id. */
     int32_t st = 0;
-    int ret = chip_add_if_(vif_id, addr, type, &st);
-    if (ret == 0 && st != 0) { *vif_id = UINT16_MAX; }
-    return ret;
+    const enum mmwlan_status status = chip_add_if_(vif_id, addr, type, &st);
+    return (status == MMWLAN_SUCCESS && st != 0) ? MMWLAN_COMMAND_ERROR : status;
 }
 
-int mmdrv_add_if_status(uint16_t *vif_id, const uint8_t *addr, enum mmdrv_interface_type type,
-                        int32_t *chip_status)
+enum mmwlan_status mmdrv_add_if_status(uint16_t *vif_id, const uint8_t *addr,
+                                       enum mmdrv_interface_type type, int32_t *chip_status)
 {
     return chip_add_if_(vif_id, addr, type, chip_status);
 }
 
-int mmdrv_rm_if(uint16_t vif_id)
+enum mmwlan_status mmdrv_rm_if(uint16_t vif_id)
 {
     struct simnode_chipcmd *c = chipcmd_log_(MORSE_CMD_ID_REMOVE_INTERFACE, vif_id, vif_id);
     c->ret = (int)chip_answer_(MORSE_CMD_ID_REMOVE_INTERFACE, c->arg);
     if (c->ret == 0 && s_now.vif && s_now.vif_id == vif_id) { s_now.vif = false; }
-    return c->ret;
+    return chip_ret_status_(c->ret);
 }
 
-int mmdrv_get_capabilities_status(uint16_t vif_id, struct morse_caps *caps, int32_t *chip_status)
+/* Boot reads them with no VIF (MMDRV_VIF_ID_INVALID), a MESH VIF on its own id. */
+enum mmwlan_status mmdrv_get_capabilities_status(uint16_t vif_id, struct morse_caps *caps,
+                                                 int32_t *chip_status)
 {
     (void)chipcmd_log_(MORSE_CMD_ID_GET_CAPABILITIES, vif_id, 0);
     if (chip_status != NULL) { *chip_status = 0; }
     memset(caps, 0, sizeof(*caps));
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_get_capabilities(uint16_t vif_id, struct morse_caps *caps)
+enum mmwlan_status mmdrv_get_capabilities(uint16_t vif_id, struct morse_caps *caps)
 {
-    return mmdrv_get_capabilities_status(vif_id, caps, NULL);
+    int32_t st = 0;
+    const enum mmwlan_status status = mmdrv_get_capabilities_status(vif_id, caps, &st);
+    return (status == MMWLAN_SUCCESS && st != 0) ? MMWLAN_COMMAND_ERROR : status;
 }
 
 /* Per-VIF and global settings umac_interface.c sends at every add: accepted; the TX status flush
  * watermark is kept until the chip boots. */
-int mmdrv_set_param(uint16_t vif_id, enum morse_param_id param_id, uint32_t value)
+enum mmwlan_status mmdrv_set_param(uint16_t vif_id, enum morse_param_id param_id, uint32_t value)
 {
     (void)vif_id;
     if (param_id == MORSE_PARAM_ID_TX_STATUS_FLUSH_WATERMARK) { s_now.flush_wm = value; }
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-/* Setting the interval runs a check at once (driver_health_request_check); an armed failure fails
- * it, and the health task posts a restart as morse_reset_chip does. */
-static bool s_fail_health;
+/* The probe umac_health_check.c's timeout runs on the event loop. An armed failure is a hung chip:
+ * every probe fails, the check's retry with it, until the chip next boots; the check then asks for a
+ * restart (mmdrv_host_hw_restart_required pauses TX itself). */
+static unsigned s_health_checks;
 void simnode_chip_fail_next_health_check(void) { s_fail_health = true; }
-void mmdrv_host_hw_restart_required(void);
-void mmdrv_host_set_tx_paused(uint16_t sources_mask, bool paused);
+unsigned simnode_chip_health_checks(void) { return s_health_checks; }
 
-int mmdrv_set_health_check_interval(uint32_t min_interval_ms, uint32_t max_interval_ms)
+enum mmwlan_status mmdrv_health_check(void)
 {
-    (void)max_interval_ms;
-    s_now.health_ms = min_interval_ms;
-    if (s_fail_health && !s_down)
-    {
-        s_fail_health = false;
-        mmdrv_host_set_tx_paused(MMDRV_PAUSE_SOURCE_MASK_HW_RESTART, true);
-        mmdrv_host_hw_restart_required();
-    }
-    return 0;
+    on_loop_only_();
+    s_health_checks++;
+    if (s_down) { return MMWLAN_NOT_RUNNING; }
+    return s_fail_health ? MMWLAN_ERROR : MMWLAN_SUCCESS;
 }
 
-int mmdrv_set_dynamic_ps_timeout(uint32_t timeout_ms)
+enum mmwlan_status mmdrv_set_dynamic_ps_timeout(uint32_t timeout_ms)
 {
     s_now.dyn_ps_sets++;
     s_now.dyn_ps_ms = timeout_ms;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-/* AT+CHIPRESTART (driver.c, then driver_health.c's task): the next check fails without asking the
- * chip, counted forced, and the task restarts it as after a real failure; refused while stopped. */
-extern volatile uint32_t g_warthog_chiprestart_forced;
-int mmdrv_force_health_check_fail(void)
-{
-    on_loop_only_();
-    if (s_down) { return -19; /* -ENODEV */ }
-    g_warthog_chiprestart_forced++;
-    mmdrv_host_set_tx_paused(MMDRV_PAUSE_SOURCE_MASK_HW_RESTART, true);
-    mmdrv_host_hw_restart_required();
-    return 0;
-}
-
-int mmdrv_set_ndp_probe(uint16_t vif_id, bool enabled)
+enum mmwlan_status mmdrv_set_ndp_probe(uint16_t vif_id, bool enabled)
 {
     (void)vif_id; (void)enabled;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_set_listen_interval_sleep(uint16_t vif, uint16_t listen_interval)
+enum mmwlan_status mmdrv_set_listen_interval_sleep(uint16_t vif, uint16_t listen_interval)
 {
     (void)vif; (void)listen_interval;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_set_control_response_bw(uint16_t vif, enum mmdrv_direction direction, bool cr_1mhz_en)
+enum mmwlan_status mmdrv_set_control_response_bw(uint16_t vif, enum mmdrv_direction direction,
+                                                 bool cr_1mhz_en)
 {
     (void)vif; (void)direction; (void)cr_1mhz_en;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_cfg_scan(bool enabled)
+enum mmwlan_status mmdrv_cfg_scan(bool enabled)
 {
     (void)enabled;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
 /* The channel path is stubbed above the chip (the generated
  * umac_interface_set_channel_from_regdb); these only satisfy the real file's link. */
-int mmdrv_set_channel(uint32_t op_chan_freq_hz, uint8_t pri_1mhz_chan_idx, uint8_t op_bw_mhz,
-                      uint8_t pri_bw_mhz, bool is_off_channel)
+enum mmwlan_status mmdrv_set_channel(uint32_t op_chan_freq_hz, uint8_t pri_1mhz_chan_idx,
+                                     uint8_t op_bw_mhz, uint8_t pri_bw_mhz, bool is_off_channel)
 {
     (void)op_chan_freq_hz; (void)pri_1mhz_chan_idx; (void)op_bw_mhz; (void)pri_bw_mhz;
     (void)is_off_channel;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_set_txpower(int32_t *out_power_dbm, int txpower_dbm)
+enum mmwlan_status mmdrv_set_txpower(int32_t *out_power_dbm, int txpower_dbm)
 {
     if (out_power_dbm != NULL) { *out_power_dbm = txpower_dbm; }
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_set_duty_cycle(uint32_t duty_cycle, bool duty_cycle_omit_ctrl_resp,
-                         enum mmwlan_duty_cycle_mode mode)
+enum mmwlan_status mmdrv_set_duty_cycle(uint32_t duty_cycle, bool duty_cycle_omit_ctrl_resp,
+                                        enum mmwlan_duty_cycle_mode mode)
 {
     (void)duty_cycle; (void)duty_cycle_omit_ctrl_resp; (void)mode;
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 
-int mmdrv_cfg_mpsw(uint32_t airtime_min_us, uint32_t airtime_max_us,
-                   uint32_t packet_space_window_length_us)
+enum mmwlan_status mmdrv_cfg_mpsw(uint32_t airtime_min_us, uint32_t airtime_max_us,
+                                  uint32_t packet_space_window_length_us)
 {
     (void)airtime_min_us; (void)airtime_max_us; (void)packet_space_window_length_us;
-    return 0;
+    return MMWLAN_SUCCESS;
 }

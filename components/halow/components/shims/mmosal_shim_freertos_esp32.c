@@ -199,7 +199,7 @@ void *mmosal_calloc(size_t nitems, size_t size)
 
 /* --------------------------------------------------------------------------------------------- */
 
-/* warthog: AT+STACKS? for the tasks started here; a chip restart ends and restarts drv, spi_irq, health. */
+/* warthog: AT+STACKS? for the tasks started here; a chip restart ends and restarts drv and spi_irq. */
 #define WARTHOG_TASK_SLOTS 8
 
 static struct
@@ -726,8 +726,6 @@ void mmosal_timer_delete(struct mmosal_timer *timer)
 
 bool mmosal_timer_start(struct mmosal_timer *timer)
 {
-    MMOSAL_DEV_ASSERT(timer);
-
     if (timer->auto_reload)
     {
         return esp_timer_start_periodic(timer->handle, timer->period_us) == ESP_OK;
@@ -740,30 +738,22 @@ bool mmosal_timer_start(struct mmosal_timer *timer)
 
 bool mmosal_timer_stop(struct mmosal_timer *timer)
 {
-    MMOSAL_DEV_ASSERT(timer);
-
     return esp_timer_stop(timer->handle) == ESP_OK;
 }
 
 bool mmosal_timer_change_period(struct mmosal_timer *timer, uint32_t new_period_ms)
 {
-    MMOSAL_DEV_ASSERT(timer);
-
     timer->period_us = new_period_ms * 1000ULL;
     return esp_timer_restart(timer->handle, timer->period_us) == ESP_OK;
 }
 
 void *mmosal_timer_get_arg(struct mmosal_timer *timer)
 {
-    MMOSAL_DEV_ASSERT(timer);
-
     return timer->arg;
 }
 
 bool mmosal_is_timer_active(struct mmosal_timer *timer)
 {
-    MMOSAL_DEV_ASSERT(timer);
-
     return esp_timer_is_active(timer->handle);
 }
 

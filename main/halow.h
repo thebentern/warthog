@@ -7,7 +7,8 @@
 
 struct warthog_region_plan;
 
-/* Boot the MM6108 and start STA association. Async — see the log. */
+/* Boot the MM6108 and start STA association. Async — see the log. A chip that does not boot
+ * leaves the radio down (AT+RADIO?) and still returns ESP_OK. */
 esp_err_t warthog_halow_start(void);
 
 /* Safe mode: the event loop and netif warthog_halow_start sets up, the chip held in reset. */
@@ -23,5 +24,5 @@ esp_err_t warthog_halow_wait_link(uint32_t timeout_ms);
 /* This boot's region plan (region.h), or NULL before one was made (safe mode, the hang stop). */
 const struct warthog_region_plan *warthog_region_running(void);
 
-/* The chip was booted with a channel list: false in safe mode and while the region holds it. */
+/* The chip was booted with a channel list: false in safe mode, while the region holds it and when it did not boot. */
 bool warthog_halow_radio_up(void);

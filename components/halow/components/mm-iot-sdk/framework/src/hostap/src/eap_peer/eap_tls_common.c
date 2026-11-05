@@ -23,10 +23,6 @@ static struct wpabuf * eap_tls_msg_alloc(enum eap_type type, size_t payload_len,
 		return eap_msg_alloc(EAP_VENDOR_UNAUTH_TLS,
 				     EAP_VENDOR_TYPE_UNAUTH_TLS, payload_len,
 				     code, identifier);
-	if (type == EAP_WFA_UNAUTH_TLS_TYPE)
-		return eap_msg_alloc(EAP_VENDOR_WFA_NEW,
-				     EAP_VENDOR_WFA_UNAUTH_TLS, payload_len,
-				     code, identifier);
 	return eap_msg_alloc(EAP_VENDOR_IETF, type, payload_len, code,
 			     identifier);
 }
@@ -184,8 +180,6 @@ static int eap_tls_params_from_conf(struct eap_sm *sm,
 		/* RFC 7170 requires TLS v1.2 or newer to be used with TEAP */
 		params->flags |= TLS_CONN_DISABLE_TLSv1_0 |
 			TLS_CONN_DISABLE_TLSv1_1;
-		if (config->teap_anon_dh)
-			params->flags |= TLS_CONN_TEAP_ANON_DH;
 	}
 	if (data->eap_type == EAP_TYPE_FAST ||
 	    data->eap_type == EAP_TYPE_TEAP ||
@@ -197,8 +191,7 @@ static int eap_tls_params_from_conf(struct eap_sm *sm,
 	}
 #ifndef EAP_TLSV1_3
 	if (data->eap_type == EAP_TYPE_TLS ||
-	    data->eap_type == EAP_UNAUTH_TLS_TYPE ||
-	    data->eap_type == EAP_WFA_UNAUTH_TLS_TYPE) {
+	    data->eap_type == EAP_UNAUTH_TLS_TYPE) {
 		/* While the current EAP-TLS implementation is more or less
 		 * complete for TLS v1.3, there has been only minimal
 		 * interoperability testing with other implementations, so
@@ -302,7 +295,7 @@ static int eap_tls_init_connection(struct eap_sm *sm,
  * @sm: Pointer to EAP state machine allocated with eap_peer_sm_init()
  * @data: Data for TLS processing
  * @config: Pointer to the network configuration
- * @eap_type: EAP method used in (EAP_TYPE_TLS/PEAP/TTLS/FAST)
+ * @eap_type: EAP method used in Phase 1 (EAP_TYPE_TLS/PEAP/TTLS/FAST)
  * Returns: 0 on success, -1 on failure
  *
  * This function is used to initialize shared TLS functionality for EAP-TLS,
@@ -406,7 +399,7 @@ u8 * eap_peer_tls_derive_key(struct eap_sm *sm, struct eap_ssl_data *data,
  * eap_peer_tls_derive_session_id - Derive a Session-Id based on TLS data
  * @sm: Pointer to EAP state machine allocated with eap_peer_sm_init()
  * @data: Data for TLS processing
- * @eap_type: EAP method used in (EAP_TYPE_TLS/PEAP/TTLS/FAST)
+ * @eap_type: EAP method used in Phase 1 (EAP_TYPE_TLS/PEAP/TTLS/FAST)
  * @len: Pointer to length of the session ID generated
  * Returns: Pointer to allocated Session-Id on success or %NULL on failure
  *
@@ -930,10 +923,6 @@ const u8 * eap_peer_tls_process_init(struct eap_sm *sm,
 		pos = eap_hdr_validate(EAP_VENDOR_UNAUTH_TLS,
 				       EAP_VENDOR_TYPE_UNAUTH_TLS, reqData,
 				       &left);
-	else if (eap_type == EAP_WFA_UNAUTH_TLS_TYPE)
-		pos = eap_hdr_validate(EAP_VENDOR_WFA_NEW,
-				       EAP_VENDOR_WFA_UNAUTH_TLS, reqData,
-				       &left);
 	else
 		pos = eap_hdr_validate(EAP_VENDOR_IETF, eap_type, reqData,
 				       &left);
@@ -1049,7 +1038,7 @@ int eap_peer_tls_decrypt(struct eap_sm *sm, struct eap_ssl_data *data,
 	*in_decrypted = tls_connection_decrypt(data->ssl_ctx, data->conn, msg);
 	eap_peer_tls_reset_input(data);
 	if (*in_decrypted == NULL) {
-		wpa_printf(MSG_INFO, "SSL: Failed to decrypt data");
+		wpa_printf(MSG_INFO, "SSL: Failed to decrypt Phase 2 data");
 		return -1;
 	}
 	return 0;
@@ -1077,7 +1066,7 @@ int eap_peer_tls_encrypt(struct eap_sm *sm, struct eap_ssl_data *data,
 		data->tls_out = tls_connection_encrypt(data->ssl_ctx,
 						       data->conn, in_data);
 		if (data->tls_out == NULL) {
-			wpa_printf(MSG_INFO, "SSL: Failed to encrypt "
+			wpa_printf(MSG_INFO, "SSL: Failed to encrypt Phase 2 "
 				   "data (in_len=%lu)",
 				   (unsigned long) wpabuf_len(in_data));
 			eap_peer_tls_reset_output(data);
@@ -1184,7 +1173,7 @@ get_defaults:
 
 
 /**
- * eap_peer_tls_phase2_nak - Generate EAP-Nak for 
+ * eap_peer_tls_phase2_nak - Generate EAP-Nak for Phase 2
  * @types: Buffer for returning allocated list of allowed EAP methods
  * @num_types: Buffer for returning number of allocated EAP methods
  * @hdr: EAP-Request header (and the following EAP type octet)
@@ -1198,7 +1187,7 @@ int eap_peer_tls_phase2_nak(struct eap_method_type *types, size_t num_types,
 	size_t i;
 
 	/* TODO: add support for expanded Nak */
-	wpa_printf(MSG_DEBUG, "TLS: Request: Nak type=%d", *pos);
+	wpa_printf(MSG_DEBUG, "TLS: Phase 2 Request: Nak type=%d", *pos);
 	wpa_hexdump(MSG_DEBUG, "TLS: Allowed Phase2 EAP types",
 		    (u8 *) types, num_types * sizeof(struct eap_method_type));
 	*resp = eap_msg_alloc(EAP_VENDOR_IETF, EAP_TYPE_NAK, num_types,

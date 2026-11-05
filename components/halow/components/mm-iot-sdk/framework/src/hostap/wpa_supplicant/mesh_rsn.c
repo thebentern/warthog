@@ -288,7 +288,8 @@ static int index_within_array(const int *array, int idx)
 	int i;
 
 	for (i = 0; i < idx; i++) {
-		if (array[i] == -1)
+		/* Warthog: the group lists are 0-terminated now; sme.c's copy tests <= 0 too. */
+		if (array[i] <= 0)
 			return 0;
 	}
 
@@ -345,9 +346,10 @@ static int mesh_rsn_build_sae_commit(struct wpa_supplicant *wpa_s,
 	}
 
 	if (sta->sae->tmp && !sta->sae->tmp->pw_id && ssid->sae_password_id) {
-		sta->sae->tmp->pw_id = os_strdup(ssid->sae_password_id);
+		sta->sae->tmp->pw_id = (u8 *) os_strdup(ssid->sae_password_id);
 		if (!sta->sae->tmp->pw_id)
 			return -1;
+		sta->sae->tmp->pw_id_len = os_strlen(ssid->sae_password_id);
 	}
 	warthog_sae_trace(56); /* entering sae_prepare_commit (dragonfly ECC) */
 	{

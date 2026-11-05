@@ -40,6 +40,11 @@ crc = "*"
 jsonschema = "*"
 compiledb = "*"
 textual = "*"
+pyopenssl = "*"
+pytz = "*"
+tlv8 = "*"
+pyftdi = "*"
+toml = "*"
 
 [power-measurement]
 joulescope-ui = "*"

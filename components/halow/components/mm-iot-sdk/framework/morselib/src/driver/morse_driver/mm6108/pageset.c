@@ -205,19 +205,6 @@ static struct morse_skbq *skbq_pageset_mgmt_tc_q(struct driver_data *driverd)
     return (driverd->chip_if->to_chip_pageset) ? &driverd->chip_if->to_chip_pageset->mgmt_q : NULL;
 }
 
-static void skbq_pageset_close(struct morse_skbq *mq)
-{
-
-    MM_UNUSED(mq);
-}
-
-static void skbq_pageset_get_tx_qs(struct driver_data *driverd, struct morse_skbq **qs, int *num_qs)
-{
-    struct morse_pageset *pageset = driverd->chip_if->to_chip_pageset;
-    *qs = pageset->data_qs;
-    *num_qs = PAGESET_TX_SKBQ_MAX;
-}
-
 static struct morse_skbq *skbq_pageset_get_rx_data_q(struct driver_data *driverd)
 {
 
@@ -242,11 +229,8 @@ static int morse_pageset_get_rx_buffered_count(struct driver_data *driverd)
 
 const struct chip_if_ops morse_pageset_hw_ops = {
     .init = morse_pager_hw_pagesets_init,
-    .flush_tx_data = morse_pager_hw_pagesets_flush_tx_data,
     .skbq_get_tx_buffered_count = morse_pagesets_get_tx_buffered_count,
     .finish = morse_pager_hw_pagesets_finish,
-    .skbq_get_tx_qs = skbq_pageset_get_tx_qs,
-    .skbq_close = skbq_pageset_close,
     .skbq_bcn_tc_q = skbq_pageset_bcn_tc_q,
     .skbq_mgmt_tc_q = skbq_pageset_mgmt_tc_q,
     .skbq_cmd_tc_q = skbq_pageset_cmd_tc_q,
@@ -292,7 +276,7 @@ static void morse_pageset_to_chip_return_handler_no_lock(struct driver_data *dri
 
     while (fifo_len(&pageset->reserved_pages) < CMD_RSVED_PAGES_MAX)
     {
-        if (pager->ops->pop(pager, &page))
+        if (morse_pager_hw_pop(pager, &page))
         {
             pager_empty = true;
             break;
@@ -315,7 +299,7 @@ static void morse_pageset_to_chip_return_handler_no_lock(struct driver_data *dri
 
     while (popped < max_expected_pops)
     {
-        if (pager->ops->pop(pager, &page))
+        if (morse_pager_hw_pop(pager, &page))
         {
             break;
         }
@@ -333,7 +317,7 @@ static void morse_pageset_to_chip_return_handler_no_lock(struct driver_data *dri
 exit:
     if (popped)
     {
-        pager->ops->notify(pager);
+        morse_pager_hw_notify_pager(pager);
     }
 }
 
@@ -467,11 +451,11 @@ static int morse_pageset_write(struct morse_pageset *pageset, struct mmpkt *mmpk
         goto exit;
     }
 
-    ret = populated_pager->ops->write_page(populated_pager,
-                                           &page,
-                                           0,
-                                           mmpkt_get_data_start(view),
-                                           mmpkt_get_data_length(view));
+    ret = morse_pager_hw_page_write(populated_pager,
+                                    &page,
+                                    0,
+                                    mmpkt_get_data_start(view),
+                                    mmpkt_get_data_length(view));
     if (ret)
     {
         MMLOG_ERR("Failed to write page: %d\n", ret);
@@ -489,18 +473,14 @@ static int morse_pageset_write(struct morse_pageset *pageset, struct mmpkt *mmpk
     }
 
 
-    ret = populated_pager->ops->put(populated_pager, &page);
+    ret = morse_pager_hw_put(populated_pager, &page);
     if (ret)
     {
         MMLOG_ERR("%s failed to return page: %d\n", __func__, ret);
 
         hdr->sync = 0;
-        populated_pager->ops->write_page(populated_pager,
-                                         &page,
-                                         0,
-                                         (const uint8_t *)hdr,
-                                         sizeof(*hdr));
-        populated_pager->ops->put(populated_pager, &page);
+        morse_pager_hw_page_write(populated_pager, &page, 0, (const uint8_t *)hdr, sizeof(*hdr));
+        morse_pager_hw_put(populated_pager, &page);
         goto exit;
     }
 
@@ -544,7 +524,7 @@ static int morse_pageset_get_next_page(struct morse_pager *populated_pager,
     }
 
 
-    int ret = populated_pager->ops->pop(populated_pager, page);
+    int ret = morse_pager_hw_pop(populated_pager, page);
     if (ret)
     {
         return ret;
@@ -596,7 +576,7 @@ static int morse_pageset_read(struct morse_pageset *pageset)
     mmpkt_close(&view);
 
 
-    ret = populated_pager->ops->read_page(populated_pager, &page, 0, buf, mmpkt_len);
+    ret = morse_pager_hw_page_read(populated_pager, &page, 0, buf, mmpkt_len);
 
     if (ret)
     {
@@ -654,7 +634,7 @@ static int morse_pageset_read(struct morse_pageset *pageset)
         {
             break;
         }
-        ret = populated_pager->ops->read_page(populated_pager, &page, 0, buf, mmpkt_len);
+        ret = morse_pager_hw_page_read(populated_pager, &page, 0, buf, mmpkt_len);
         if (ret)
         {
             break;
@@ -687,7 +667,7 @@ static int morse_pageset_read(struct morse_pageset *pageset)
     }
 
 
-    mmpkt_len = sizeof(*hdr) + le16toh(hdr->len);
+    mmpkt_len = sizeof(*hdr) + le16toh(hdr->offset) + le16toh(hdr->len);
     mmpkt_truncate(mmpkt, mmpkt_len);
 
     morse_skbq_process_rx(driverd, mmpkt);
@@ -702,7 +682,7 @@ exit:
     if (page.addr)
     {
 
-        ret = return_pager->ops->put(return_pager, &page);
+        ret = morse_pager_hw_put(return_pager, &page);
         if (ret)
         {
             MMLOG_ERR("page ret fail\n");
@@ -748,9 +728,8 @@ static int morse_pageset_num_pages(struct morse_pageset *pageset, struct mmpkt *
 static void morse_pageset_tx(struct morse_pageset *pageset, struct morse_skbq *mq)
 {
     int ret = 0;
-    int num_pages;
+    int num_pages = 0;
     int num_items = 0;
-    int bytes_sent = 0;
     struct mmpkt *mmpkt;
     struct mmpkt_list skbq_to_send = MMPKT_LIST_INIT;
     struct mmpkt_list skbq_sent = MMPKT_LIST_INIT;
@@ -794,17 +773,15 @@ static void morse_pageset_tx(struct morse_pageset *pageset, struct morse_skbq *m
             ret = -ENOSPC;
         }
         morse_hw_pager_update_consec_failure_cnt(pageset->driverd, ret);
+        mmpkt_list_remove(&skbq_to_send, pfirst);
         if (ret == 0)
         {
             num_pages--;
-            mmpkt_list_remove(&skbq_to_send, pfirst);
             mmpkt_list_append(&skbq_sent, pfirst);
-            bytes_sent += mmpkt_peek_data_length(pfirst);
         }
         else
         {
             PAGESET_TRACE("tx skb failed %x", pfirst);
-            mmpkt_list_remove(&skbq_to_send, pfirst);
             mmpkt_list_append(&skbq_failed, pfirst);
         }
     }
@@ -817,24 +794,13 @@ static void morse_pageset_tx(struct morse_pageset *pageset, struct morse_skbq *m
                   ret,
                   num_items,
                   num_pages);
-        if (mq == &pageset->cmd_q)
-        {
-            morse_skbq_purge(mq, &skbq_failed);
-        }
-        else
-        {
-            morse_skbq_tx_failed(mq, &skbq_failed);
-        }
+        mmpkt_list_clear(&skbq_failed);
     }
 
     if (skbq_sent.len > 0)
     {
         morse_skbq_tx_complete(mq, &skbq_sent);
-    }
-
-    if (bytes_sent)
-    {
-        pageset->populated_pager->ops->notify(pageset->populated_pager);
+        morse_pager_hw_notify_pager(pageset->populated_pager);
     }
 }
 
@@ -912,17 +878,17 @@ static bool morse_pageset_rx_handler(struct morse_pageset *pageset)
         return_notify_req = true;
         if ((count % PAGE_RETURN_NOTIFY_INT) == 0)
         {
-            pageset->return_pager->ops->notify(pageset->return_pager);
+            morse_pager_hw_notify_pager(pageset->return_pager);
             return_notify_req = false;
         }
     } while ((count < MAX_PAGES_PER_RX_TXN) && (ret == 0));
 
     if (return_notify_req)
     {
-        pageset->return_pager->ops->notify(pageset->return_pager);
+        morse_pager_hw_notify_pager(pageset->return_pager);
     }
 
-    pageset->populated_pager->ops->notify(pageset->populated_pager);
+    morse_pager_hw_notify_pager(pageset->populated_pager);
 
     if (ret == -ENOMEM || count == MAX_PAGES_PER_RX_TXN)
     {
@@ -1046,20 +1012,20 @@ void morse_pagesets_work(struct driver_data *driverd)
 
     if (driver_task_notification_check_and_clear(driverd, DRV_EVT_TRAFFIC_PAUSE_PEND))
     {
-        if (driver_task_notification_check(driverd, DRV_EVT_TRAFFIC_PAUSE_PEND))
-        {
-            MMLOG_DBG("Latency to handle traffic pause is too great\n");
-        }
         morse_skbq_data_traffic_pause(driverd);
+    }
+
+
+    if (driver_task_notification_check_and_clear(driverd, DRV_EVT_TRAFFIC_PAUSE_TIMEOUT))
+    {
+        mmdrv_host_set_tx_paused(MMDRV_PAUSE_SOURCE_MASK_TRAFFIC_CTRL, false);
+        driver_task_notify_event(driverd, DRV_EVT_TRAFFIC_RESUME_PEND);
+        MMLOG_WRN("Traffic pause override event fired\n");
     }
 
 
     if (driver_task_notification_check_and_clear(driverd, DRV_EVT_TRAFFIC_RESUME_PEND))
     {
-        if (driver_task_notification_check(driverd, DRV_EVT_TRAFFIC_RESUME_PEND))
-        {
-            MMLOG_DBG("Latency to handle traffic resume is too great\n");
-        }
         morse_skbq_data_traffic_resume(driverd);
     }
 
@@ -1158,26 +1124,6 @@ void morse_pageset_finish(struct morse_pageset *pageset)
     if (pageset->flags & MORSE_CHIP_IF_FLAGS_COMMAND)
     {
         morse_skbq_finish(&pageset->cmd_q);
-    }
-}
-
-void morse_pageset_flush_tx_data(struct morse_pageset *pageset)
-{
-    size_t i;
-
-    if (!(pageset->flags & (MORSE_CHIP_IF_FLAGS_DATA | MORSE_CHIP_IF_FLAGS_BEACON)) ||
-        !(pageset->flags & MORSE_CHIP_IF_FLAGS_DIR_TO_CHIP))
-    {
-        MMLOG_WRN("Invalid pager\n");
-        return;
-    }
-
-    morse_skbq_tx_flush(&pageset->beacon_q);
-    morse_skbq_tx_flush(&pageset->mgmt_q);
-
-    for (i = 0; i < ARRAY_SIZE(pageset->data_qs); i++)
-    {
-        morse_skbq_tx_flush(&pageset->data_qs[i]);
     }
 }
 

@@ -33,8 +33,8 @@ static inline bool datapath_defrag_is_fragment(const struct dot11_hdr *header)
 /* @p rxbufview is positioned at the MPDU's body (after any CCMP header, before its MIC). A
  * whole MSDU returns @p rxbuf unchanged. A fragment is consumed (@p rxbufview and @p rxbuf
  * released, NULL returned) unless it completes its MSDU: then the reassembly buffer is
- * returned, @p data_hdr pointing at the first fragment's header inside it and @p rxbufview
- * at the MSDU body. */
+ * returned, with the first fragment's RX metadata, @p data_hdr pointing at the first
+ * fragment's header inside it and @p rxbufview at the MSDU body. */
 struct mmpkt *datapath_defrag(struct umac_data *umacd,
                               struct datapath_defrag_data *data,
                               const struct dot11_data_hdr **data_hdr,

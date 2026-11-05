@@ -1,6 +1,7 @@
 #!/bin/sh
 # Fails unless every CONFIG_ line of sdkconfig.defaults (then sdkconfig.ecm for an -ecm env) landed in the
-# generated sdkconfig.<env>: PlatformIO applies the defaults only when it first writes one.
+# generated sdkconfig.<env>: an existing sdkconfig keeps the values it sets itself (configure loads
+# sdkconfig.defaults first, then it).
 #
 # Usage: scripts/ci/check-sdkconfig-landing.sh [ENV...]
 #   No ENV: every sdkconfig.warthog-* of an [env:warthog-*] in platformio.ini. SDKCONFIG_DIR (default: the
@@ -120,7 +121,7 @@ done
 
 if [ "$fail" = 0 ]; then echo "SDKCONFIG LANDING OK"
 else
-  [ -z "$missed" ] || echo "info for a stale sdkconfig.<env>: rm -f sdkconfig.warthog-* and rebuild (PlatformIO applies sdkconfig.defaults and sdkconfig.ecm only to a new one)"
+  [ -z "$missed" ] || echo "info for a stale sdkconfig.<env>: rm -f sdkconfig.warthog-* and rebuild (an existing sdkconfig keeps the values it sets itself: configure loads sdkconfig.defaults and sdkconfig.ecm first, then it)"
   echo "SDKCONFIG LANDING FAILED"
 fi
 exit "$fail"

@@ -8,9 +8,17 @@
 
 #include "esp_log.h"
 #include "mmlog.h"
+#include "mmosal.h"
+#include "warthog_shim.h"
 #include <string.h>
 
+/* Total mmwlan_boot attempts; each one resets the chip again inside mmdrv_init. */
+#define WARTHOG_HALOW_BOOT_ATTEMPTS 3u
+
 int g_warthog_chan_pin_status = -1;
+/* AT+RADIO?: mmwlan_boot attempts made and the last one's status (0 = booted). */
+volatile uint32_t g_warthog_halow_boot_attempts = 0;
+volatile int32_t g_warthog_halow_boot_status = 0;
 /* The channel in force when the list mmhalow_init applied is one row; a peer matches on all five. */
 uint32_t g_warthog_applied_freq_hz = 0;
 uint16_t g_warthog_applied_chan = 0;
@@ -177,6 +185,8 @@ void mmhalow_print_version_info(void)
     if (status != MMWLAN_SUCCESS)
     {
         ESP_LOGE(TAG, "Error occured whilst retrieving version info - %d", status);
+        ESP_LOGI(TAG, "-----------------------------------");
+        return;
     }
 
     ESP_LOGI(TAG, "  Morselib version:        %s", version.morselib_version);
@@ -228,7 +238,32 @@ esp_err_t mmhalow_init(const wifi_init_config_t *config)
 
     /* Boot the WLAN interface so that we can retrieve the firmware version. */
     struct mmwlan_boot_args boot_args = MMWLAN_BOOT_ARGS_INIT;
-    (void)mmwlan_boot(&boot_args);
+    enum mmwlan_status boot_status = MMWLAN_ERROR;
+    for (uint32_t attempt = 1; attempt <= WARTHOG_HALOW_BOOT_ATTEMPTS; attempt++)
+    {
+        boot_status = mmwlan_boot(&boot_args);
+        g_warthog_halow_boot_attempts = attempt;
+        g_warthog_halow_boot_status = (int32_t)boot_status;
+        if (boot_status == MMWLAN_SUCCESS || boot_status == MMWLAN_CHANNEL_LIST_NOT_SET ||
+            boot_status == MMWLAN_INVALID_ARGUMENT)
+        {
+            break;
+        }
+        ESP_LOGE(TAG, "mmwlan_boot attempt %u/%u failed - %d", (unsigned)attempt,
+                 WARTHOG_HALOW_BOOT_ATTEMPTS, boot_status);
+        if (attempt < WARTHOG_HALOW_BOOT_ATTEMPTS)
+        {
+            /* Hold RESET_N far longer than mmdrv_init's 5 ms pulse before the next attempt. */
+            warthog_chip_hold_reset();
+            mmosal_task_sleep(100u * attempt);
+        }
+    }
+    if (boot_status != MMWLAN_SUCCESS)
+    {
+        /* There is no teardown path here, so treat this as fatal for the interface. */
+        ESP_LOGE(TAG, "mmwlan_boot failed - %d, transceiver is not usable", boot_status);
+        return ESP_FAIL;
+    }
     mmhalow_print_version_info();
 #if !CONFIG_HALOW_PS_MODE
     mmwlan_set_power_save_mode(MMWLAN_PS_DISABLED);
@@ -307,9 +342,9 @@ static void get_config_sta(struct mmwlan_sta_args *conf)
     mmhalow_netif_driver_t *morse_drv = esp_netif_get_io_driver(halow_netif);
     MMOSAL_ASSERT(morse_drv);
 
-    (void)mmosal_safer_strcpy((char *)conf->ssid,
-                              (char *)morse_drv->sta_args.ssid,
-                              sizeof(conf->ssid));
+    (void)strlcpy((char *)conf->ssid,
+                  (char *)morse_drv->sta_args.ssid,
+                  sizeof(conf->ssid));
 
     /* We cannot safely copy password from sta_args.passphrase into conf->password because:
      * sta_args.passphrase == 100 bytes

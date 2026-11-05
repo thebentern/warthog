@@ -17,8 +17,8 @@ import re
 import subprocess
 import sys
 
-# Hand-written elsewhere: the RTOS (fake_rtos.c) and the chip (fake_chip.c).
-HAND_WRITTEN = re.compile(r'^(mmosal_|mmdrv_|mmhal_|umac_config_get_channel_list$|umac_interface_(get_capabilities|max_supported_bw|get_control_response_bw_1mhz_out_enabled|get_vif_id|get_mac_addr|addr_matches_mac_addr)$|mmwlan_get_vif_mac_addr$|umac_connection_get_sta_args$|umac_interface_add$)')
+# Hand-written elsewhere: the RTOS (fake_rtos.c), the chip (fake_chip.c) and the harness's own (simnode_).
+HAND_WRITTEN = re.compile(r'^(simnode_|mmosal_|mmdrv_|mmhal_|umac_config_get_channel_list$|umac_interface_(get_capabilities|max_supported_bw|get_control_response_bw_1mhz_out_enabled|get_vif_id|get_mac_addr|addr_matches_mac_addr)$|mmwlan_get_vif_mac_addr$|umac_connection_get_sta_args$|umac_interface_add$|umac_core_is_running$)')
 
 # Stubs that also keep their last call's arguments, so a test can assert on
 # what the firmware handed the supplicant, not only that it called it. The
@@ -197,8 +197,13 @@ def main():
              '    for (unsigned i = 0; i < %d; i++)\n'
              '    {\n        if (strcmp(s_names[i], name) == 0) { return s_hits[i]; }\n    }\n'
              '    return 0u;\n}\n\n'
+             '/* Whether @p name is a stub here, so a count of its calls cannot pass for a stub that is gone. */\n'
+             'bool simnode_stub_known(const char *name)\n{\n'
+             '    for (unsigned i = 0; i < %d; i++)\n'
+             '    {\n        if (strcmp(s_names[i], name) == 0) { return true; }\n    }\n'
+             '    return false;\n}\n\n'
              'void simnode_stub_reset(void)\n{\n    memset(s_hits, 0, sizeof(s_hits));\n}\n\n'
-             % max(len(names), 1))
+             % (max(len(names), 1), max(len(names), 1)))
     body += '\n'.join(out)
     body += RECORD_API
     open('fake_radio_stack.c', 'w').write(body)

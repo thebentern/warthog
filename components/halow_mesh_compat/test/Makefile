@@ -17,7 +17,7 @@ endif
 # that it does not recognise them, which buries real diagnostics in CI.
 CLANG_ONLY := $(shell $(CC) --version 2>/dev/null | grep -qi clang && echo -Wno-macro-redefined -Wno-visibility)
 CFLAGS  := -std=gnu11 -Wall -Wextra -Wno-unused-parameter $(CLANG_ONLY) \
-           -Wno-sign-compare -Wno-unused-function -g -O0
+           -Wno-sign-compare -Wno-unused-function -Werror=incompatible-pointer-types -g -O0
 INCS    := -I../src/compat -I../src/dot11ah -I../src
 COMPAT  := ../src/compat/compat.c
 
@@ -35,7 +35,7 @@ DOT11AH := ../src/dot11ah/s1g_ieee80211.c \
            ../src/dot11ah/debug.c
 
 TESTS   := test_s1g_ieee80211 test_ie_codec test_mesh_plink test_mpm_frame \
-           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mesh_addr test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd test_mesh_frag test_mesh_cap sim_mesh test_supp_mesh_conf test_mesh_bip test_bat_mode test_beacon_yield test_chipvif_glue test_chipvif_glue_off test_hang_guard test_hw_scan test_region test_region_au2020
+           test_mesh_ies_golden test_mesh_mpm_parse test_mesh_data_hdr test_mesh_beacon_id test_mesh_plink_tbl test_aes_ccm test_ccm_crosscheck test_ccmp_hdr test_s1g_beacon test_mesh_hwmp test_mesh_diag test_mesh_addr test_mudp_classify test_cdc_out test_mesh_ctrl test_mesh_rmc test_mesh_pathtbl test_mesh_hwmp_relay test_mesh_fwd test_mesh_frag test_mesh_cap sim_mesh test_supp_mesh_conf test_eloop_all_ctx test_mesh_bip test_bat_mode test_beacon_yield test_chipvif_glue test_chipvif_glue_off test_cmd_status test_sdio_start test_hang_guard test_hw_scan test_region test_region_au2020
 
 # ---- simnode: the real stack with only the chip and the RTOS replaced ----
 #
@@ -59,14 +59,17 @@ include lwip_napt.mk
 include usbnet.mk
 FW           := ../../halow/components/mm-iot-sdk/framework
 HAP          := $(FW)/src/hostap/src
-SIMNODE_INCS = -I$(SIMNODE)/hostshim -Ihostcompat -I../../halow/components/shims/include/esp32s3 \
+# shims/include/unknown, not xtensa: its MMPORT_BREAKPOINT is a 'break' instruction. UNIT_TESTS_64 sizes
+# umac_evt for a 64-bit host; UNIT_TESTS would stub out the datapath under test.
+SIMNODE_INCS = -I$(SIMNODE)/hostshim -Ihostcompat -I../../halow/components/shims/include/unknown -DUNIT_TESTS_64 \
                 -I$(SDKMESH)/../.. -I$(FW)/morselib/include -I$(FW)/src -I$(FW)/src/mmutils \
                 -I$(FW)/morselib/src/internal -I$(FW)/morselib/mmrc/src/core \
                 -I$(FW)/morselib/src/umac/rc/mmrc_osal -I$(HAP) -I$(HAP)/utils \
                 -I$(SIMNODE) -I$(SDKMESH) \
                 -DMMPKTMEM_TX_POOL_N_BLOCKS=20 -DMMPKTMEM_RX_POOL_N_BLOCKS=23
 # The shipping code the simulator puts under test. mmpktmem_heap.c is the firmware's TX pool,
-# sized as every mesh sdkconfig sizes it; simnode_tx_pool turns it on.
+# sized as every mesh sdkconfig sizes it; simnode_tx_pool turns it on. common.c's errno_to_status
+# is how fake_chip.c returns a transport errno, as morse_cmd_tx does.
 SIMNODE_REAL = $(addprefix $(SDKMESH)/,umac_mesh.c umac_mesh_fwd_glue.c umac_mesh_fwd.c \
                   umac_mesh_ctrl.c umac_mesh_rmc.c umac_mesh_pathtbl.c umac_mesh_hwmp.c \
                   umac_mesh_hwmp_relay.c umac_mesh_ies.c umac_mesh_plink_tbl.c \
@@ -74,7 +77,8 @@ SIMNODE_REAL = $(addprefix $(SDKMESH)/,umac_mesh.c umac_mesh_fwd_glue.c umac_mes
                   umac_mesh_bip.c umac_mesh_frag.c) \
                 $(addprefix $(HAP)/crypto/,aes-internal.c aes-internal-enc.c) \
                 $(addprefix $(FW)/morselib/src/umac/datapath/,umac_datapath.c umac_datapath_mesh.c datapath_defrag.c) \
-                $(addprefix $(FW)/morselib/src/common/,mmpkt.c mmpkt_list.c mac_address.c) \
+                $(addprefix $(FW)/morselib/src/common/,mmpkt.c mmpkt_list.c mac_address.c consbuf.c common.c) \
+                $(FW)/src/mmutils/mmutils_wlan.c \
                 $(FW)/morselib/src/umac/data/umac_data.c \
                 $(addprefix $(FW)/morselib/src/umac/keys/,umac_keys.c connection_keys.c) \
                 $(addprefix $(FW)/morselib/src/umac/frames/,frame_constructor.c action.c probe_request.c \
@@ -91,14 +95,17 @@ SIMNODE_FAKE = $(addprefix $(SIMNODE)/,fake_rtos.c fake_chip.c fake_config.c fak
                   fake_radio_stack.c warthog_globals.c simnode.c sta_data_seam.c interface_seam.c)
 SIMNODE_SRCS = $(SIMNODE_REAL) $(SIMNODE_FAKE)
 # umac_sta_data.c is compiled inside sta_data_seam.c, which adds a hook at its peer-address
-# read, and umac_ba.c with it; umac_interface.c inside interface_seam.c. Each is a
-# prerequisite, so an edit rebuilds, and SIMNODE_C keeps it off the command line.
+# read, and umac_ba.c and umac_health_check.c (its timeout handler named) with it; umac_interface.c
+# inside interface_seam.c. Each is a prerequisite, so an edit rebuilds, and SIMNODE_C keeps it off
+# the command line.
 SIMNODE_SEAMED = $(FW)/morselib/src/umac/data/umac_sta_data.c $(FW)/morselib/src/umac/ba/umac_ba.c \
-                 $(FW)/morselib/src/umac/interface/umac_interface.c
+                 $(FW)/morselib/src/umac/interface/umac_interface.c \
+                 $(FW)/morselib/src/umac/health_check/umac_health_check.c
 SIMNODE_HDRS = $(wildcard $(SIMNODE)/*.h) $(MESHHDRS) $(SIMNODE_SEAMED) \
                $(addprefix $(FW)/morselib/src/umac/interface/,umac_interface.h umac_interface_data.h) \
                $(wildcard $(FW)/morselib/src/umac/datapath/*.h) $(wildcard $(FW)/morselib/src/umac/keys/*.h) \
-               $(FW)/morselib/src/internal/mmdrv.h
+               $(FW)/morselib/src/internal/mmdrv.h $(FW)/morselib/src/common/consbuf.h \
+               $(wildcard $(FW)/morselib/src/umac/health_check/*.h)
 SIMNODE_C = $(filter-out $(SIMNODE_SEAMED),$(filter %.c,$^))
 
 # The shipping mesh byte-layout code, compiled straight out of the vendored SDK.
@@ -120,22 +127,22 @@ all: $(TESTS) linkcheck freestanding region-bcf glueguard flasher bat-freestandi
 	@fail=0; for t in $(TESTS); do echo "--- $$t ---"; ./$$t || fail=1; done; \
 	  if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
 
-# region_bcf.h is the BCF sdkconfig.defaults links, byte for byte: compared once a build fetched it.
-# REGION_BCF_REQUIRED=1 (CI, after its builds) fails instead of skipping when it is not fetched.
+# region_bcf.h is the BCF sdkconfig.defaults links, byte for byte, from the SDK's own morsefirmware/mm6108/bcfs.
+# REGION_BCF_REQUIRED=1 (CI) fails instead of skipping when that file is missing.
 CFG_DEFAULTS := ../../../sdkconfig.defaults
 cfg_val = $(shell sed -n 's/^$(1)=\(.*\)$$/\1/p' $(CFG_DEFAULTS))
 REGION_BCF_FILE := $(patsubst "%",%,$(call cfg_val,CONFIG_MM_BCF_FILE))
-REGION_BCF_SRC := ../../../managed_components/morsemicro__firmware/mm6108/$(REGION_BCF_FILE)
+REGION_BCF_SRC := ../../halow/components/mm-iot-sdk/framework/morsefirmware/mm6108/bcfs/$(REGION_BCF_FILE)
 region_bcf_gen = { printf '/* SPDX-License-Identifier: LicenseRef-MorseMicroBDL */\n'; \
-  printf '/* %s from morsemicro/firmware (managed_components), byte for byte: make region-bcf checks it. */\n' "$(REGION_BCF_FILE)"; \
+  printf '/* %s from morsemicro/firmware 2.10.4-esp32-1, unmodified (SDK morsefirmware/mm6108/bcfs), byte for byte: make region-bcf checks it. */\n' "$(REGION_BCF_FILE)"; \
   printf 'static const unsigned char k_region_bcf[%s] = {' "$$(wc -c < $(1) | tr -d ' ')"; \
   od -An -v -tx1 $(1) | awk '{for (i = 1; i <= NF; i++) {printf "%s0x%s,", (n % 12 == 0 ? "\n    " : " "), $$i; n++}} END {printf "\n"}'; \
   printf '};\n'; }
 region-bcf:
 	@echo "=== region_bcf.h is the linked BCF ==="
 	@if [ ! -f $(REGION_BCF_SRC) ]; then \
-	  if [ "$(REGION_BCF_REQUIRED)" = 1 ]; then echo "FAIL $(REGION_BCF_SRC) not fetched (a pio build fetches it)"; exit 1; fi; \
-	  echo "skip $(REGION_BCF_SRC) not fetched (a pio build fetches it)"; \
+	  if [ "$(REGION_BCF_REQUIRED)" = 1 ]; then echo "FAIL $(REGION_BCF_SRC) is missing (the halow component ships it)"; exit 1; fi; \
+	  echo "skip $(REGION_BCF_SRC) is missing (the halow component ships it)"; \
 	elif $(call region_bcf_gen,$(REGION_BCF_SRC)) | cmp -s - region_bcf.h; then echo "ok   region_bcf.h is $(REGION_BCF_FILE) byte for byte"; \
 	else echo "FAIL region_bcf.h is not $(REGION_BCF_SRC): make region-bcf-regen"; exit 1; fi
 region-bcf-regen:
@@ -192,7 +199,7 @@ test_region_au2020: $(REGION_SRCS)
 # A scan programs its channel list's strictest duty cycle and MPSW before HW_SCAN (morselib hw_scan.c,
 # umac_regdb.c as shipped), over the lists main/region.c hands the chip.
 HWSCAN_SRCS = test_hw_scan.c region_bcf.h $(FW)/morselib/src/umac/scan/hw_scan.c $(FW)/morselib/src/umac/regdb/umac_regdb.c \
-              $(MAINDIR)/region.c $(MAINDIR)/region.h $(FW)/src/mmregdb/mmregdb.c $(wildcard $(FW)/morselib/src/umac/scan/*.h) \
+              $(FW)/morselib/src/common/consbuf.c $(FW)/src/mmutils/mmutils_wlan.c $(MAINDIR)/region.c $(MAINDIR)/region.h $(FW)/src/mmregdb/mmregdb.c $(wildcard $(FW)/morselib/src/umac/scan/*.h) \
               $(FW)/morselib/src/umac/regdb/umac_regdb.h
 test_hw_scan: $(HWSCAN_SRCS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) -I$(FW)/morselib/src/umac/scan -I$(FW)/src/mmregdb \
@@ -221,20 +228,20 @@ test_beacon_yield: test_beacon_yield.c $(BCNDIR)/beacon.h
 
 # The chip VIF pieces no simnode links: driver.c's reads of the chip's own status (extracted
 # by name into test_chipvif_glue.fns) against a fake morse_cmd_tx, beacon.c's IRQ count, host-tick
-# yield and teardown, umac_ps.c's CONFIG_PS gate, driver_health.c's forced failure
+# yield and teardown, umac_ps.c's CONFIG_PS gate, umac_health_check.c's forced failure
 # (AT+CHIPRESTART) and the hang guard's health read and block; with the MESH-VIF flag and without.
 DRVSRC := $(FW)/morselib/src/driver/driver.c
 CHIPVIF_FNS := mmdrv_add_if mmdrv_add_if_status mmdrv_set_bssid mmdrv_cfg_bss_beacon \
-               mmdrv_mesh_config mmdrv_get_capabilities_status mmdrv_update_sta_state \
-               mmdrv_update_sta_state_status mmdrv_install_key mmdrv_install_key_status \
-               mmdrv_force_health_check_fail mmdrv_hang_health
+               mmdrv_mesh_config mmdrv_get_capabilities mmdrv_get_capabilities_status \
+               mmdrv_update_sta_state mmdrv_update_sta_state_status mmdrv_install_key \
+               mmdrv_install_key_status
 CHIPVIF_DEPS := test_chipvif_glue.c test_chipvif_glue.fns $(BCNDIR)/beacon.c $(BCNDIR)/beacon.h \
-                $(FW)/morselib/src/umac/ps/umac_ps.c $(FW)/morselib/src/driver/health/driver_health.c \
-                $(FW)/morselib/src/driver/health/driver_health.h $(SIMNODE_HDRS)
+                $(FW)/morselib/src/umac/ps/umac_ps.c $(FW)/morselib/src/umac/health_check/umac_health_check.c \
+                $(FW)/morselib/src/umac/health_check/umac_health_check.h $(SIMNODE_HDRS)
 test_chipvif_glue.fns: $(DRVSRC) Makefile
 	@for f in $(CHIPVIF_FNS); do \
-	  awk -v f="$$f" '$$0 ~ ("^int " f "\\(") {on=1} on {print} on && /^}/ {exit}' $(DRVSRC) | grep . || \
-	    { echo "$(DRVSRC) has no int $$f(" >&2; exit 1; }; \
+	  awk -v f="$$f" '$$0 ~ ("^(int|enum mmwlan_status) " f "\\(") {on=1} on {print} on && /^}/ {exit}' $(DRVSRC) | grep . || \
+	    { echo "$(DRVSRC) has no int or enum mmwlan_status $$f(" >&2; exit 1; }; \
 	done > $@.tmp && mv $@.tmp $@
 
 test_chipvif_glue: $(CHIPVIF_DEPS)
@@ -242,6 +249,40 @@ test_chipvif_glue: $(CHIPVIF_DEPS)
 
 test_chipvif_glue_off: $(CHIPVIF_DEPS)
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $< -o $@
+
+# The real morse_cmd_tx (command.c) under driver.c's status helpers, SET_TXPOWER, set_param and the
+# dynamic power-save timeout, extracted by name into test_cmd_status.fns with ps.c's setter.
+PSSRC := $(FW)/morselib/src/driver/morse_driver/ps.c
+CMDSTATUS_FNS := $(CHIPVIF_FNS) mmdrv_set_txpower mmdrv_set_param mmdrv_set_dynamic_ps_timeout
+test_cmd_status.fns: $(DRVSRC) $(PSSRC) Makefile
+	@{ for f in $(CMDSTATUS_FNS); do \
+	    awk -v f="$$f" '$$0 ~ ("^(int|enum mmwlan_status) " f "\\(") {on=1} on {print} on && /^}/ {exit}' $(DRVSRC) | grep . || \
+	      { echo "$(DRVSRC) has no int or enum mmwlan_status $$f(" >&2; exit 1; }; \
+	  done; \
+	  awk '$$0 ~ "^int morse_ps_set_dynamic_ps_timeout\\(" {on=1} on {print} on && /^}/ {exit}' $(PSSRC) | grep . || \
+	    { echo "$(PSSRC) has no int morse_ps_set_dynamic_ps_timeout(" >&2; exit 1; }; } > $@.tmp && mv $@.tmp $@
+
+test_cmd_status: test_cmd_status.c test_cmd_status.fns $(FW)/morselib/src/driver/morse_driver/command.c \
+                 $(FW)/morselib/src/common/mmpkt.c $(FW)/morselib/src/common/common.c $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -DWARTHOG_MESH_CHIP_VIF_MESH=1 -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) $< \
+	  $(FW)/morselib/src/common/mmpkt.c $(FW)/morselib/src/common/common.c -o $@
+
+# The SPI transport's start and its unwind (sdio.c's spi_irq globals and three functions, extracted by
+# name into test_sdio_start.fns): a start over a lock a stuck spi_irq task kept fails at once.
+SDIOSRC := $(FW)/morselib/src/driver/transport/sdio.c
+SDIO_FNS := morse_spi_irq_main morse_trns_start_unwind morse_trns_start
+test_sdio_start.fns: $(SDIOSRC) Makefile
+	@{ awk '/^static struct mmosal_mutex \*bus_lock = NULL;$$/,/^static volatile bool spi_irq_task_has_finished = false;$$/' \
+	    $(SDIOSRC) | grep . || { echo "$(SDIOSRC) has no spi_irq globals from bus_lock to spi_irq_task_has_finished" >&2; exit 1; }; \
+	  for f in $(SDIO_FNS); do \
+	    awk -v f="$$f" '$$0 ~ ("^(static void|morse_error_t) " f "\\(") {on=1} on {print} on && /^}/ {exit}' $(SDIOSRC) | grep . || \
+	      { echo "$(SDIOSRC) has no static void or morse_error_t $$f(" >&2; exit 1; }; \
+	  done; } > $@.tmp && mv $@.tmp $@
+
+test_sdio_start: test_sdio_start.c test_sdio_start.fns $(FW)/morselib/src/driver/transport/morse_transport.h \
+                 $(FW)/morselib/include/mmosal.h $(FW)/morselib/include/mmhal_wlan.h \
+                 $(FW)/morselib/src/driver/driver.h $(FW)/morselib/src/driver/morse_driver/hw.h $(SIMNODE_HDRS)
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-unused-variable -Wno-void-pointer-to-int-cast $(SIMNODE_INCS) -I$(FW)/morselib/src/driver/transport $< -o $@
 
 # AT output into the 512 B CDC TX FIFO: a long reply and its OK arrive whole.
 test_cdc_out: test_cdc_out.c $(MAINDIR)/cdc_out.c $(MAINDIR)/cdc_out.h
@@ -361,7 +402,7 @@ SUPP_INCS := -include hostcompat/hostap_prelude.h -I$(FW)/src -I$(FW)/src/hostap
              -I$(HAP)/utils -I$(HAP)/common -I$(FW)/src/hostap/wpa_supplicant \
              -I$(FW)/morselib/include -I$(FW)/morselib/src -I$(FW)/src/mmutils \
              -I$(FW)/morselib/src/internal -I$(FW)/morselib/mmrc/src/core \
-             -I$(FW)/morselib/src/umac/rc/mmrc_osal -I../../halow/components/shims/include/esp32s3 \
+             -I$(FW)/morselib/src/umac/rc/mmrc_osal -I../../halow/components/shims/include/unknown \
              -I$(SIMNODE)/hostshim -idirafter hostcompat
 SUPP_HDRS := hostcompat/hostap_prelude.h $(HOSTAP_CMAKE) $(wildcard $(HAP)/ap/*.h) \
              $(wildcard $(FW)/src/hostap/wpa_supplicant/mesh*.h) \
@@ -374,6 +415,16 @@ test_supp_mesh_conf: test_supp_mesh_conf.c $(FW)/morselib/src/umac/supplicant_sh
 	$(if $(SUPP_DEFS_BAD),$(error $(HOSTAP_CMAKE): BUILD_DEFINES line(s) the SUPP_DEFS scrape does not parse: $(SUPP_DEFS_BAD)))
 	$(if $(SUPP_DEFS),,$(error $(HOSTAP_CMAKE): the SUPP_DEFS scrape found no BUILD_DEFINES))
 	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-void-pointer-to-int-cast $(SUPP_DEFS) $(SUPP_INCS) $(filter %.c,$^) -o $@
+
+# hostap's ELOOP_ALL_CTX through the eloop shim and umac's timeout queue, and a mesh station freed
+# with plink_timer or mesh_auth_timer armed (real sta_info.c and mesh_mpm.c): nothing outlives it.
+ELOOP_SRCS := $(SIMNODE)/test_eloop_all_ctx.c $(FW)/morselib/src/umac/supplicant_shim/eloop.c \
+              $(FW)/morselib/src/umac/core/umac_timeout.c $(HAP)/ap/sta_info.c $(HAP)/utils/wpabuf.c \
+              $(FW)/src/hostap/wpa_supplicant/mesh_mpm.c $(SIMNODE)/warthog_globals.c
+test_eloop_all_ctx: $(ELOOP_SRCS) $(SUPP_HDRS) $(HAP)/utils/eloop.h $(wildcard $(FW)/morselib/src/umac/core/*.h)
+	$(if $(SUPP_DEFS_BAD),$(error $(HOSTAP_CMAKE): BUILD_DEFINES line(s) the SUPP_DEFS scrape does not parse: $(SUPP_DEFS_BAD)))
+	$(if $(SUPP_DEFS),,$(error $(HOSTAP_CMAKE): the SUPP_DEFS scrape found no BUILD_DEFINES))
+	$(CC) $(CFLAGS) $(SANFLAGS) -Wno-void-pointer-to-int-cast -DUNIT_TESTS_64 $(SUPP_DEFS) $(SUPP_INCS) $(filter %.c,$^) -o $@
 
 # Path selection against a peer running MFP: CCMP on unicast HWMP, our MGTK on group
 # (group-addressed privacy), and what an SAE node accepts. Once as the chip-key builds
@@ -623,5 +674,5 @@ linkcheck: linkcheck_main.c $(DOT11AH) $(COMPAT)
 	@echo "link OK: dot11ah layer is self-contained"
 
 clean:
-	rm -f $(TESTS) $(LWIP_NAPT_TESTS) $(USBNET_TESTS) linkcheck_all libsimnode*.dylib libsimnode*.so test_chipvif_glue.fns test_chipvif_glue.fns.tmp
+	rm -f $(TESTS) $(LWIP_NAPT_TESTS) $(USBNET_TESTS) linkcheck_all libsimnode*.dylib libsimnode*.so test_chipvif_glue.fns test_chipvif_glue.fns.tmp test_sdio_start.fns test_sdio_start.fns.tmp test_cmd_status.fns test_cmd_status.fns.tmp
 	rm -rf *.dSYM

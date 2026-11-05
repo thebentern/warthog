@@ -30,16 +30,19 @@ int eloop_register_timeout(unsigned int secs,
 
     delta_ms = secs * 1000 + usecs / 1000;
 
-    return umac_core_register_timeout(umac_data_get_umacd(),
-                                      delta_ms,
-                                      handler,
-                                      eloop_data,
-                                      user_data);
+    bool ok =
+        umac_core_register_timeout(umac_data_get_umacd(), delta_ms, handler, eloop_data, user_data);
+
+    return ok ? 0 : -1;
 }
 
 int eloop_cancel_timeout(eloop_timeout_handler handler, void *eloop_data, void *user_data)
 {
-    return umac_core_cancel_timeout(umac_data_get_umacd(), handler, eloop_data, user_data);
+    /* warthog: ELOOP_ALL_CTX matches any context, as in hostap's own eloop.c. */
+    void *arg1 = eloop_data == ELOOP_ALL_CTX ? UMAC_CORE_TIMEOUT_ARG_ANY : eloop_data;
+    void *arg2 = user_data == ELOOP_ALL_CTX ? UMAC_CORE_TIMEOUT_ARG_ANY : user_data;
+
+    return umac_core_cancel_timeout(umac_data_get_umacd(), handler, arg1, arg2);
 }
 
 int eloop_cancel_timeout_one(eloop_timeout_handler handler,
@@ -58,7 +61,8 @@ int eloop_cancel_timeout_one(eloop_timeout_handler handler,
     if (ret > 0 && remaining != NULL)
     {
         remaining->sec = remaining_ms / 1000;
-        remaining->usec = remaining_ms * 1000;
+
+        remaining->usec = (remaining_ms % 1000) * 1000;
     }
 
     return ret;

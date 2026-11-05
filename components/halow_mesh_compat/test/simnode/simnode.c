@@ -21,6 +21,7 @@
 #include "umac/mesh/umac_mesh_fwd_glue.h"
 #include "umac/mesh/umac_mesh_ies.h"
 #include "umac/interface/umac_interface.h"
+#include "umac/health_check/umac_health_check.h"
 #include "umac/rc/umac_rc.h"
 
 void simnode_set_identity(const uint8_t mac[6], uint16_t vif_id);
@@ -136,6 +137,7 @@ static void simnode_ext_rx_(struct mmpkt *pkt, const struct mmwlan_rx_metadata *
         uint32_t n = mmpkt_get_data_length(v);
         memcpy(e->frame, mmpkt_get_data_start(v), n < sizeof(e->frame) ? n : sizeof(e->frame));
         e->len = (uint16_t)n;
+        e->vif = md != NULL ? (unsigned)md->vif : 0u;
         if (md != NULL && md->ta != NULL)
         {
             memcpy(e->ta, md->ta, 6);
@@ -380,6 +382,10 @@ static bool simnode_start_(const uint8_t mac[6], bool sae, uint16_t vif_id)
     umac_data_init();
     s_umacd = umac_data_get_umacd();
     if (s_umacd == NULL) { return false; }
+    /* As mmwlan_init: no VIF in either slot, the health check at its default interval. */
+    umac_interface_init(s_umacd);
+    umac_health_check_init(s_umacd);
+    simnode_core_set_running(true);
 
     struct mmwlan_mesh_args args;
     memset(&args, 0, sizeof(args));
@@ -402,8 +408,9 @@ static bool simnode_start_(const uint8_t mac[6], bool sae, uint16_t vif_id)
     }
     if (s_boot_scan)
     {
-        uint16_t scan_vif = UMAC_INTERFACE_VIF_ID_INVALID;
-        if (umac_interface_add(s_umacd, UMAC_INTERFACE_SCAN, NULL, &scan_vif) != MMWLAN_SUCCESS)
+        /* hw_scan.c passes the STA ops, which simnode does not link: NULL keeps the slot's. */
+        if (umac_interface_add(s_umacd, UMAC_INTERFACE_SCAN, NULL, NULL) != MMWLAN_SUCCESS ||
+            umac_interface_get_vif_id(s_umacd, UMAC_INTERFACE_SCAN) == MMDRV_VIF_ID_INVALID)
         {
             return false;
         }
@@ -438,6 +445,7 @@ void simnode_stop(void)
     }
     s_up = false;
     s_umacd = NULL;
+    simnode_core_set_running(false);
     simnode_outbox_clear();
 }
 
@@ -477,6 +485,31 @@ void simnode_del_peer(const uint8_t mac[6])
     simnode_loop_leave();
 }
 
+bool simnode_stub_known(const char *name); /* fake_radio_stack.c */
+
+/* The STA connection's entry points that are stubs here, but for the two every TX status and every
+ * transmit takes (populate_tx_metadata, handle_ack_status): a mesh path reaches none of them. */
+unsigned simnode_sta_mode_hits(void)
+{
+    static const char *const sta[] = {
+        "umac_connection_addr_matches_bssid", "umac_connection_handle_beacon_loss",
+        "umac_connection_handle_hw_restarted", "umac_connection_process_beacon_ies",
+        "umac_connection_process_disassoc_req",
+    };
+    unsigned n = 0;
+    for (unsigned i = 0; i < sizeof(sta) / sizeof(sta[0]); i++)
+    {
+        if (!simnode_stub_known(sta[i])) { return UINT32_MAX; } /* gone: the count proves nothing */
+        n += simnode_stub_hits(sta[i]);
+    }
+    return n;
+}
+
+unsigned simnode_kept_allocs(void)
+{
+    return datapath_ops_mesh.lookup_stad_by_peer_addr(umac_data_get_umacd(), NULL) != NULL ? 1u : 0u;
+}
+
 void simnode_recycle_arm(const void *block, size_t size); /* fake_rtos.c */
 
 bool simnode_recycle_peer_record(const uint8_t *mac)
@@ -500,6 +533,13 @@ static bool simnode_host_tx_on_(const uint8_t da[6], const uint8_t sa[6],
                                 const uint8_t *payload, uint16_t payload_len, bool pump,
                                 uint8_t tid);
 
+/* The VIF mmwlan_tx_pkt stamps on a host frame with no VIF named and no AP VIF: the STA slot's,
+ * where the mesh lives; the datapath picks its ops by it. */
+static uint16_t host_tx_vif_id_(void)
+{
+    return umac_interface_get_vif_id(s_umacd, UMAC_INTERFACE_STA);
+}
+
 int simnode_host_tx_eth(const uint8_t *ra, const uint8_t da[6], const uint8_t sa[6],
                         uint16_t ethertype, const uint8_t *payload, uint16_t payload_len)
 {
@@ -507,6 +547,7 @@ int simnode_host_tx_eth(const uint8_t *ra, const uint8_t da[6], const uint8_t sa
     struct mmpkt *pkt = umac_datapath_alloc_mmpkt_for_qos_data_tx(
         (uint32_t)payload_len + sizeof(struct umac_8023_hdr), MMDRV_PKT_CLASS_DATA_TID0);
     if (pkt == NULL) { return (int)MMWLAN_NO_MEM; }
+    mmdrv_get_tx_metadata(pkt)->vif_id = host_tx_vif_id_();
     struct umac_8023_hdr h;
     memcpy(h.dest_addr, da, 6);
     memcpy(h.src_addr, sa, 6);
@@ -553,7 +594,8 @@ static bool simnode_host_tx_on_(const uint8_t da[6], const uint8_t sa[6],
     struct mmpkt *pkt = umac_datapath_alloc_mmpkt_for_qos_data_tx(
         (uint32_t)payload_len + sizeof(struct umac_8023_hdr), MMDRV_PKT_CLASS_DATA_TID0 + tid);
     if (pkt == NULL) { return false; }
-    mmdrv_get_tx_metadata(pkt)->tid = tid; /* as mmwlan_tx_pkt sets it */
+    mmdrv_get_tx_metadata(pkt)->tid = tid; /* as mmwlan_tx_pkt sets it, and the VIF */
+    mmdrv_get_tx_metadata(pkt)->vif_id = host_tx_vif_id_();
     struct umac_8023_hdr h;
     memcpy(h.dest_addr, da, 6);
     memcpy(h.src_addr, sa, 6);
@@ -666,10 +708,9 @@ int simnode_render_paths(char *buf, uint32_t len)
     return umac_mesh_fwd_glue_render(buf, len);
 }
 
-/* driver_health.c's failure path (morse_reset_chip), on the health task. */
+/* umac_health_check.c's failure path: mmdrv_host_hw_restart_required pauses TX itself. */
 void simnode_chip_restart_queued(void)
 {
-    mmdrv_host_set_tx_paused(MMDRV_PAUSE_SOURCE_MASK_HW_RESTART, true);
     mmdrv_host_hw_restart_required();
 }
 

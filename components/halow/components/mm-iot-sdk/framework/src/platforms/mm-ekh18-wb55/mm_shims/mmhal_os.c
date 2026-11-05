@@ -31,7 +31,16 @@
 #define MS_TO_LPTIM_TICKS(x) (((x) * LPTIM_TICKS_PER_SECOND) / 1000)
 
 /** Macro to transform LPTIM ticks into milliseconds.  */
-#define LPTIM_TICKS_TO_MS(x) (((x) * 1000) / LPTIM_TICKS_PER_SECOND)
+#define LPTIM_TICKS_TO_MS_ROUNDED(x) \
+    (((x) * 1000 + (LPTIM_TICKS_PER_SECOND / 2)) / LPTIM_TICKS_PER_SECOND)
+
+/**
+ * Number of LPTIM ticks that elapse between wake from deep sleep and systick restart.
+ *
+ * This value represents the duration required to reconfigure the system clock, and is used to
+ * reduce the sleep duration to account for this.
+ */
+#define WAKE_RECONFIG_TICKS (2)
 
 const uint32_t mmhal_system_clock = 64000000;
 
@@ -283,7 +292,7 @@ static uint32_t mmhal_sleep_configure_timer(uint32_t sleep_time_ms)
         sleep_time_ticks = MAX_POSSIBLE_SUPPRESSED_TICKS;
     }
 
-    uint32_t wakeup_time_ticks = start_time_ticks + sleep_time_ticks;
+    uint32_t wakeup_time_ticks = start_time_ticks + sleep_time_ticks - WAKE_RECONFIG_TICKS;
 
     /* Limit to 16 bit */
     wakeup_time_ticks &= 0xFFFF;
@@ -419,6 +428,7 @@ uint32_t mmhal_sleep(enum mmhal_sleep_state sleep_state, uint32_t expected_idle_
     uint32_t elapsed_ms = 0;
     uint32_t elapsed_ticks = 0;
     uint32_t start_time_ticks;
+    uint32_t end_time_ticks;
 
     /* Disable Random Number Generator */
     LL_RNG_Disable(RNG);
@@ -427,7 +437,7 @@ uint32_t mmhal_sleep(enum mmhal_sleep_state sleep_state, uint32_t expected_idle_
     {
         mmhal_sleep_deinit_peripherals();
 
-        start_time_ticks = mmhal_sleep_configure_timer(expected_idle_time_ms - elapsed_ms);
+        start_time_ticks = mmhal_sleep_configure_timer(expected_idle_time_ms);
         /* Clear wake-up flags */
         PWR->SR1 |= PWR_SR1_WUF;
         /* Enable Deep Sleep Mode */
@@ -439,29 +449,25 @@ uint32_t mmhal_sleep(enum mmhal_sleep_state sleep_state, uint32_t expected_idle_
         /* Wait for any interrupts */
         __WFI();
 
-        /* Calculate the time that elapsed whilst we were asleep. */
-        if (LL_LPTIM_GetCounter(LPTIM1) < start_time_ticks)
-        {
-            elapsed_ticks += 0x10000 + LL_LPTIM_GetCounter(LPTIM1) - start_time_ticks;
-            elapsed_ms = LPTIM_TICKS_TO_MS(elapsed_ticks);
-        }
-        else
-        {
-            elapsed_ticks += LL_LPTIM_GetCounter(LPTIM1) - start_time_ticks;
-            elapsed_ms = LPTIM_TICKS_TO_MS(elapsed_ticks);
-        }
-
         /* Configure the system clock after waking up from stop mode. */
         SystemClock_Config();
         PeriphCommonClock_Config();
 
-        if (elapsed_ms > expected_idle_time_ms)
-        {
-            elapsed_ms = expected_idle_time_ms;
-        }
+        /* Record tick count immediately before SysTick restart. */
+        end_time_ticks = LL_LPTIM_GetCounter(LPTIM1);
 
         /* Restart the SysTick */
         SysTick->CTRL |= (SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_TICKINT_Msk);
+
+        /* Calculate the time that elapsed whilst we were asleep. */
+        elapsed_ticks = (uint16_t)(end_time_ticks - start_time_ticks);
+        elapsed_ms = LPTIM_TICKS_TO_MS_ROUNDED(elapsed_ticks);
+        if (elapsed_ms > expected_idle_time_ms)
+        {
+            /* Clamp elapsed time. */
+            MMOSAL_DEV_ASSERT(elapsed_ms - expected_idle_time_ms == 1);
+            elapsed_ms = expected_idle_time_ms;
+        }
 
         mmhal_sleep_init_peripherals();
     }

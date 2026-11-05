@@ -70,10 +70,16 @@ CONFIG_MM_SPI_CS=4
 CONFIG_MM_SPI_IRQ=3
 
 # --- Morse firmware / chip selection ------------------------------------------
-CONFIG_MMHAL_CHIP_TYPE_MM6108=y
-# Quectel FGH100M-H specific BCF for rated TX power.
+# The chip fixes the firmware: the SDK's framework/morsefirmware/mm6108.mbin.
+CONFIG_MM_CHIP_MM6108=y
+# Quectel FGH100M-H specific BCF for rated TX power, from the SDK's morsefirmware/mm6108/bcfs.
 CONFIG_MM_BCF_FILE="bcf_fgh100mhaamd.mbin"
-CONFIG_MM_FW_FILE="mm6108.mbin"
+# The 802.11s mesh needs the AP code (hostapd, driver_ap.c); the component refuses to configure without it.
+CONFIG_HALOW_AP_MODE=y
+# Chip power save stays off: upstream's "default true" is an undefined symbol, so n; pinned in case it becomes y.
+# CONFIG_HALOW_PS_MODE is not set
+# RESET_N release to the first SPI clocking: upstream's default, a knob until a bench sweep says otherwise.
+CONFIG_MM_RESET_SETTLE_MS=20
 # FGH100M-H: rated 902-928 MHz; its BCF has sections (AU, US populated) for these in-band countries.
 CONFIG_WARTHOG_HW_REGIONS="AU,JP,KR,NZ,US"
 CONFIG_WARTHOG_HW_BAND_LO_KHZ=902000
@@ -124,7 +130,7 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=32
-# The dump runs on its own stack: with 0 it runs on the asserting one (the 'health' task has 4096 B).
+# The dump runs on its own stack: with 0 it runs on the asserting one (the 'drv' task has 3072 B).
 CONFIG_ESP_COREDUMP_STACK_SIZE=1792
 # No core-dump log lines on the panic path; they print to the USB-Serial-JTAG console.
 # CONFIG_ESP_COREDUMP_LOGS is not set
