@@ -345,8 +345,9 @@ stack.
 - SAE/AMPE with chip crypto (`warthog-mesh-sae`) peers cross-vendor, but its
   data plane has not carried traffic with an OpenMANET peer. On the STA chip
   interface Warthog's chip firmware (`mm6108.mbin` 1.17.6, as morselib drives
-  it) was measured keeping one pairwise key, the last install winning, and
-  failing group RX from more than one peer (`docs/mesh-attachment-model.md`), so
+  it; not re-measured on 1.17.9, which the build now ships) was measured keeping
+  one pairwise key, the last install winning, and failing group RX from more
+  than one peer (`docs/mesh-attachment-model.md`), so
   on that interface more than one keyed peer, and any peer's group frames, need
   host CCMP (`warthog-mesh-sae-swccmp`), which carried traffic with OpenMANET
   1.8.0 on air on 2026-09-29/30 in batman mode. On a MESH chip interface
@@ -357,8 +358,8 @@ stack.
   OpenMANET's Linux driver runs different chip firmware (mm6108-2.0.1),
   installs each peer's keys at that peer's AID, and falls back to software
   crypto per key. `warthog-mesh-sae-meshvif` installs each peer's MGTK at its
-  AID the same way, on a MESH chip interface; 1.17.6 opens group frames that
-  way (measured on air on 2026-10-01)
+  AID the same way, on a MESH chip interface; 1.17.6 opened group frames that
+  way (measured on air on 2026-10-01; not re-measured on 1.17.9)
   (`wiki/OpenMANET-Interop.md`, *Group frames in the chip*).
 - A beaconing SAE node (the wizard default) starts SAE with Warthog only after
   a beacon or probe response from it that carries an RSN element, which

@@ -268,12 +268,13 @@ goes into the chip with the first peer, so standard group frames
 (`AT+MESHGRP=1`) go out under Warthog's own key id. On a MESH chip interface
 `warthog-mesh-sae-meshvif` installs each peer's MGTK at that peer's AID beside
 its own at AID 0, as Linux (`morse_driver`) does, and chip firmware 1.17.6
-opened every peer's group frames (on air 2026-10-01, two OpenMANET 1.8.0 Pis
-and another Warthog: `AT+GTKSTAT?` `inst=3 fail=0`, no undecryptable group
-frame). Elsewhere peers' MGTKs stay in the host keychain only: on the STA chip
-interface (MM-IoT-SDK 2.10.4, `mm6108.mbin` 1.17.6) group RX from more than one
-peer failed both with the key installed at each peer's AID and with it once at
-AID 0; the Linux order is untested there. That limit is why the host software
+opened every peer's group frames (on air 2026-10-01, not re-measured on
+1.17.9; two OpenMANET 1.8.0 Pis and another Warthog: `AT+GTKSTAT?`
+`inst=3 fail=0`, no undecryptable group frame). Elsewhere peers' MGTKs stay in
+the host keychain only: on the STA chip interface (MM-IoT-SDK 2.10.4,
+`mm6108.mbin` 1.17.6; not re-measured on 2.12.3 and 1.17.9) group RX from more
+than one peer failed both with the key installed at each peer's AID and with it
+once at AID 0; the Linux order is untested there. That limit is why the host software
 CCMP path exists, and that path (RX *and* TX, compiled only into the
 `warthog-mesh-sae-swccmp` builds) is implemented and keeps a per-transmitter
 key for every peer. Host CCMP refuses a unicast frame keyed with a group key

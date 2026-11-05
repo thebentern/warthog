@@ -29,6 +29,8 @@ cmake_install.cmake
 *.a
 *.elf
 *.bin
+# The vendored morse-firmware tree is committed whole (its BCF sources included).
+!components/halow/components/firmware/morse-firmware/**/*.bin
 *.map
 
 # IDE / tooling
@@ -94,6 +96,7 @@ components/halow_mesh_compat/test/batman_vm/batvm_node_san
 # editor / tooling backups -- never belong in the tree
 *.bak
 *.orig
+*.orig_*
 *.rej
 components/halow_mesh_compat/test/sim_mesh
 __pycache__/

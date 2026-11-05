@@ -1,0 +1,15 @@
+TARGET_DIR := /lib/firmware/morse
+
+BCF_BINS := $(shell find bcf -name "*.bin")
+FW_BINS := $(shell find firmware -name "*.bin")
+
+SRC_FILES := \
+        $(BCF_BINS) \
+        $(FW_BINS)
+
+.PHONY: all install
+
+all: install
+
+install:
+	install -D -t $(TARGET_DIR) $(SRC_FILES)

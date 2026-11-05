@@ -39,17 +39,19 @@ static int failures;
 static char log_[512];
 static const struct mmwlan_s1g_channel_list *s_list;
 static struct umac_scan_data s_scan;
-static int s_duty_ret, s_mpsw_ret, s_completed = -1;
+static enum mmwlan_status s_duty_ret, s_mpsw_ret;
+static int s_completed = -1;
 static void log_add_(const char *s) { strncat(log_, s, sizeof(log_) - strlen(log_) - 1); }
 
-int mmdrv_set_duty_cycle(uint32_t duty_cycle, bool omit, enum mmwlan_duty_cycle_mode mode)
+enum mmwlan_status mmdrv_set_duty_cycle(uint32_t duty_cycle, bool omit, enum mmwlan_duty_cycle_mode mode)
 {
     char b[64];
     snprintf(b, sizeof(b), "duty %u omit %d mode %d; ", (unsigned)duty_cycle, (int)omit, (int)mode);
     log_add_(b);
     return s_duty_ret;
 }
-int mmdrv_cfg_mpsw(uint32_t airtime_min_us, uint32_t airtime_max_us, uint32_t packet_space_window_length_us)
+enum mmwlan_status mmdrv_cfg_mpsw(uint32_t airtime_min_us, uint32_t airtime_max_us,
+                                  uint32_t packet_space_window_length_us)
 {
     char b[64];
     snprintf(b, sizeof(b), "mpsw %u/%u/%u; ", (unsigned)airtime_min_us, (unsigned)airtime_max_us,
@@ -57,14 +59,14 @@ int mmdrv_cfg_mpsw(uint32_t airtime_min_us, uint32_t airtime_max_us, uint32_t pa
     log_add_(b);
     return s_mpsw_ret;
 }
-int mmdrv_execute_command(uint8_t *command, uint8_t *response, uint32_t *response_len)
+/* driver.c builds HW_SCAN from these parameters; logged as that command. */
+enum mmwlan_status mmdrv_hw_scan(uint16_t vif_id, struct mmdrv_hw_scan_params *p)
 {
-    (void)response; (void)response_len;
-    const struct morse_cmd_req_hw_scan *r = (const struct morse_cmd_req_hw_scan *)command;
+    (void)vif_id;
     char b[48];
-    snprintf(b, sizeof(b), "cmd %u flags %u; ", (unsigned)r->hdr.message_id, (unsigned)r->flags);
+    snprintf(b, sizeof(b), "cmd %u flags %u; ", (unsigned)MORSE_CMD_ID_HW_SCAN, (unsigned)p->flags);
     log_add_(b);
-    return 0;
+    return MMWLAN_SUCCESS;
 }
 const struct mmwlan_s1g_channel_list *umac_config_get_channel_list(struct umac_data *umacd) { (void)umacd; return s_list; }
 bool umac_config_is_opclass_check_enabled(struct umac_data *umacd) { (void)umacd; return true; }
@@ -79,12 +81,14 @@ enum mmwlan_status umac_interface_get_vif_mac_addr(struct umac_data *umacd, enum
     memcpy(mac, m, 6);
     return MMWLAN_SUCCESS;
 }
-enum mmwlan_status umac_interface_add(struct umac_data *umacd, enum umac_interface_type type, const uint8_t *mac, uint16_t *vif_id)
+enum mmwlan_status umac_interface_add(struct umac_data *umacd, enum umac_interface_type type,
+                                      const struct umac_datapath_ops *ops, const uint8_t *mac)
 {
-    (void)umacd; (void)type; (void)mac;
-    *vif_id = 1;
+    (void)umacd; (void)type; (void)ops; (void)mac;
     return MMWLAN_SUCCESS;
 }
+uint16_t umac_interface_get_vif_id(struct umac_data *umacd, uint16_t type_mask) { (void)umacd; (void)type_mask; return 1; }
+const struct umac_datapath_ops *const umac_datapath_ops_sta = NULL;
 void umac_interface_remove(struct umac_data *umacd, enum umac_interface_type type) { (void)umacd; (void)type; }
 void umac_datapath_pause(struct umac_data *umacd, uint16_t source_mask) { (void)umacd; (void)source_mask; }
 void umac_datapath_unpause(struct umac_data *umacd, uint16_t source_mask) { (void)umacd; (void)source_mask; }
@@ -187,15 +191,15 @@ int main(void)
     /* The chip refusing either: no HW_SCAN at all, the scan reported terminated. */
     struct warthog_region_plan jp;
     plan_("JP", false, &jp);
-    s_mpsw_ret = -1;
+    s_mpsw_ret = MMWLAN_ERROR;
     const char *got = scan_(jp.list);
     CHECK(strcmp(got, "duty 1000 omit 1 mode 0; mpsw 2000/100000/2000; ") == 0 && s_completed == MMWLAN_SCAN_TERMINATED,
           "MPSW refused: no HW_SCAN, scan terminated [%s]", got);
-    s_mpsw_ret = 0; s_duty_ret = -1;
+    s_mpsw_ret = MMWLAN_SUCCESS; s_duty_ret = MMWLAN_ERROR;
     got = scan_(jp.list);
     CHECK(strcmp(got, "duty 1000 omit 1 mode 0; ") == 0 && s_completed == MMWLAN_SCAN_TERMINATED,
           "duty cycle refused: no MPSW, no HW_SCAN, scan terminated [%s]", got);
-    s_duty_ret = 0;
+    s_duty_ret = MMWLAN_SUCCESS;
 
     if (failures) {
         printf("%d FAILURE(S)\n", failures);

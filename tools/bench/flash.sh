@@ -1,5 +1,8 @@
 # flash7: hub-safe serial flasher that also handles boards enumerating >1 CDC port.
-PY="${PIO_PYTHON:-$HOME/.platformio/penv/bin/python}"
+# PlatformIO's core dir as pio reads it: a leading ~ expanded, a relative one made absolute.
+core=${PLATFORMIO_CORE_DIR:-$HOME/.platformio}
+case $core in "~"/*) core=$HOME/${core#"~/"} ;; /*) ;; *) core=$PWD/$core ;; esac
+PY="${PIO_PYTHON:-$core/penv/bin/python}"
 # Derive the repo root from this script rather than hardcoding one checkout.
 cd "$(cd "$(dirname "$0")/../.." && pwd)"
 # Which build to flash. Defaults to the mesh bench image.

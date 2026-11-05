@@ -99,7 +99,7 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
                                        struct umac_sta_data *stad,
                                        struct mmpktview *rxbufview)
 {
-    (void)stad;  /* the established peer the frame came from, or NULL */
+    (void)stad;  /* the peer the frame came from, or the common stad (no peer) */
     const struct dot11_hdr *header = (struct dot11_hdr *)mmpkt_get_data_start(rxbufview);
     uint16_t frame_control_le = header->frame_control;
     /* Under SAE every path that can start a peering applies the candidate RSSI floor. */
@@ -263,7 +263,7 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
                 }
             }
             /* Forward to supplicant — bss.c uses these for IE caching. */
-            umac_supp_process_mgmt_frame(umacd, rxbufview);
+            umac_supp_process_mgmt_frame(umacd, rxbufview, MMWLAN_VIF_STA);
             break;
         }
 
@@ -285,7 +285,7 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
             }
             MMLOG_ERR("mesh: rx mgmt subtype=%u (fc=0x%04x) -> supplicant fan-out\n",
                       subtype, frame_control_le);
-            umac_supp_process_mgmt_frame(umacd, rxbufview);
+            umac_supp_process_mgmt_frame(umacd, rxbufview, MMWLAN_VIF_STA);
             break;
         }
     }
@@ -319,6 +319,9 @@ static bool s_peer_mfp[MESH_MAX_PEERS];
  * counted on the side new readers no longer join. */
 static struct umac_sta_data *s_dying[MESH_MAX_PEERS];
 static bool s_dying_old[MESH_MAX_PEERS];
+/* As the AP's sta_common: what a frame from a node with no slot runs against (lookup by NULL).
+ * No peer address, so never associated; never in s_peers. Kept: nothing tears the mesh down. */
+static struct umac_sta_data *s_common;
 static uint8_t s_own_addr[6];
 static uint16_t s_num_pkts_queued;
 
@@ -617,7 +620,7 @@ static void mesh_own_pn_store_(uint64_t base)
 static bool mesh_chip_install_key_(uint16_t vif_id, uint16_t aid, struct mmdrv_key_conf *kc)
 {
     int32_t st = 0;
-    if (mmdrv_install_key_status(vif_id, aid, kc, &st) != 0)
+    if (mmdrv_install_key_status(vif_id, aid, kc, &st) != MMWLAN_SUCCESS)
     {
         return false;
     }
@@ -742,7 +745,7 @@ static struct mesh_peer_gtk mesh_peer_gtk_take_(int slot)
 static void mesh_peer_gtk_disable_idx_(int slot, struct umac_sta_data *stad, uint8_t hw_idx)
 {
     const bool ok = mmdrv_disable_key(umac_sta_data_get_vif_id(stad), umac_sta_data_get_aid(stad),
-                                      hw_idx, false) == 0;
+                                      hw_idx, false) == MMWLAN_SUCCESS;
     MMOSAL_TASK_ENTER_CRITICAL();
     if (!ok)
     {
@@ -1176,16 +1179,17 @@ static bool mesh_p1_group_key_to_chip_(uint16_t vif_id)
  */
 /* One SET_STA_STATE, a refusal (a status morse_cmd_tx does not return) counted by state: the
  * transport result, and in @p refused (may be NULL) whether the chip refused it. */
-static int mesh_chip_sta_state_(uint16_t vif_id, uint16_t aid, const uint8_t *peer_addr,
-                                enum morse_sta_state state, bool *refused)
+static enum mmwlan_status mesh_chip_sta_state_(uint16_t vif_id, uint16_t aid,
+                                               const uint8_t *peer_addr,
+                                               enum morse_sta_state state, bool *refused)
 {
     int32_t st = 0;
-    int r = mmdrv_update_sta_state_status(vif_id, aid, peer_addr, state, &st);
+    const enum mmwlan_status r = mmdrv_update_sta_state_status(vif_id, aid, peer_addr, state, &st);
     if (refused != NULL)
     {
-        *refused = r == 0 && st != 0;
+        *refused = r == MMWLAN_SUCCESS && st != 0;
     }
-    if (r == 0 && st != 0)
+    if (r == MMWLAN_SUCCESS && st != 0)
     {
         if ((unsigned)state < sizeof(g_warthog_chipcmd_sta_refused) / sizeof(g_warthog_chipcmd_sta_refused[0]))
         {
@@ -1209,14 +1213,14 @@ static bool mesh_chip_register_sta_(uint16_t vif_id, uint16_t aid, const uint8_t
     for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
     {
         bool refused = false;
-        int r = mesh_chip_sta_state_(vif_id, aid, peer_addr, seq[i], &refused);
-        if (r != 0)
+        const enum mmwlan_status r = mesh_chip_sta_state_(vif_id, aid, peer_addr, seq[i], &refused);
+        if (r != MMWLAN_SUCCESS)
         {
             MMLOG_WRN("mesh: chip sta_state %d for " MM_MAC_ADDR_FMT " -> %d\n",
-                      (int)seq[i], MM_MAC_ADDR_VAL(peer_addr), r);
+                      (int)seq[i], MM_MAC_ADDR_VAL(peer_addr), (int)r);
             g_warthog_mesh_chip_sta_fail++;
         }
-        all = all && r == 0 && !refused;
+        all = all && r == MMWLAN_SUCCESS && !refused;
     }
     return all;
 }
@@ -1301,7 +1305,7 @@ static enum mmwlan_status umac_datapath_mesh_install_peer_keys(struct umac_sta_d
      * rxdrop reason=4 with the ciphertext intact) or discards them silently. If
      * it delivers, that gate is where software decryption hooks -- and no
      * firmware parameter is needed, which matters because
-     * MORSE_CMD_PARAM_ID_CRYPTO_IN_HOST is accepted and ignored by this build.
+     * MORSE_CMD_PARAM_ID_CRYPTO_IN_HOST changed nothing on air on 1.17.6 (driver.c).
      *
      * TX is expected to break on a board built this way: with no chip key the
      * frame goes out unprotected and the peer drops it as plaintext
@@ -1594,8 +1598,8 @@ enum mmwlan_status umac_datapath_mesh_set_peer_key(const uint8_t *peer_addr, con
          * and withhold it from the chip, so the chip cannot decrypt this peer
          * and we learn whether it hands the frame up undecrypted -- which is
          * where software CCMP would hook -- or eats it in firmware, which
-         * would end the idea. Unlike CRYPTO_IN_HOST, which this build accepts
-         * and ignores, withholding the key needs nothing from the firmware.
+         * would end the idea. Unlike CRYPTO_IN_HOST, which changed nothing on
+         * air on 1.17.6, withholding the key needs nothing from the firmware.
          *
          * Expect TX to this peer to stop working on such a build. That is the
          * cost of asking the RX question on its own. */
@@ -1995,13 +1999,13 @@ void umac_datapath_mesh_frag_overlap_note(struct umac_sta_data *stad, bool mgmt,
     }
 }
 
-int umac_datapath_mesh_tx_chip_mgmt(struct mmpkt *pkt)
+enum mmwlan_status umac_datapath_mesh_tx_chip_mgmt(struct mmpkt *pkt)
 {
     const uint8_t side = umac_datapath_mesh_read_begin(); /* any task: the peers are read */
     struct mmpktview *v = mmpkt_open(pkt);
     const int slot = mmpkt_get_data_length(v) >= 10u ? mesh_slot_of_(mmpkt_get_data_start(v) + 4) : -1;
     mmpkt_close(&v);
-    int ret = 0;
+    enum mmwlan_status ret = MMWLAN_SUCCESS;
     mesh_frag_lock_();
     if (mesh_frag_blocks_(slot, true, 0) && mmpkt_list_length(&s_frag_held) < MESH_FRAG_HOLD_MAX)
     {
@@ -2012,7 +2016,7 @@ int umac_datapath_mesh_tx_chip_mgmt(struct mmpkt *pkt)
     {
         mmpkt_release(pkt);
         g_warthog_tx_nokey++;
-        ret = -1;
+        ret = MMWLAN_UNAVAILABLE;
     }
     else
     {
@@ -2766,12 +2770,17 @@ bool umac_datapath_mesh_chip_restored(uint16_t vif_id)
 {
     bool all = true;
     s_restore_vif = vif_id;
+    if (s_common != NULL)
+    {
+        umac_sta_data_set_vif_id(s_common, vif_id); /* the reinstalled VIF may have a new id */
+    }
     for (int i = 0; i < MESH_MAX_PEERS; i++)
     {
         if (s_peers[i] == NULL)
         {
             continue;
         }
+        umac_sta_data_set_vif_id(s_peers[i], vif_id);
         if (mesh_chip_register_sta_(vif_id, umac_sta_data_get_aid(s_peers[i]),
                                     umac_sta_data_peek_peer_addr(s_peers[i])))
         {
@@ -2884,7 +2893,7 @@ static struct umac_sta_data *mesh_lookup_stad_by_peer_addr(struct umac_data *uma
                                                            const uint8_t *peer_addr)
 {
     (void)umacd;
-    return mesh_find_peer_(peer_addr);
+    return peer_addr != NULL ? mesh_find_peer_(peer_addr) : s_common;
 }
 
 /* TX destination -> next hop.
@@ -2963,11 +2972,30 @@ static struct umac_sta_data *mesh_lookup_stad_by_aid(struct umac_data *umacd, ui
     return s_peers[aid - 1];
 }
 
-/* Mesh peers do not power-save through us; treat every peer as awake. */
-static bool mesh_set_stad_sleep_state(struct umac_sta_data *stad, bool asleep)
+/* Mesh peers do not power-save through us; treat every peer as awake, whatever its PM bit. */
+static bool mesh_update_stad_state_rx(struct umac_sta_data *stad,
+                                      const struct mmdrv_rx_metadata *metadata,
+                                      uint16_t frame_control_le)
 {
-    (void)stad; (void)asleep;
+    (void)stad; (void)metadata; (void)frame_control_le;
     return true;
+}
+
+extern volatile uint32_t g_warthog_mesh_eapol_drop, g_warthog_mesh_unknown_ta;
+
+/* A mesh runs no EAPOL (SAE and AMPE travel in management frames): dropped, counted. */
+static void mesh_supp_l2_sock_receive(struct umac_data *umacd, const uint8_t *payload,
+                                      size_t payload_len, const uint8_t *src_addr)
+{
+    (void)umacd; (void)payload; (void)payload_len; (void)src_addr;
+    g_warthog_mesh_eapol_drop++;
+}
+
+/* Data from a node that holds no slot is routine on a mesh: counted, nothing else. */
+static void mesh_handle_frame_unknown_sta(struct umac_data *umacd, const uint8_t *ta)
+{
+    (void)umacd; (void)ta;
+    g_warthog_mesh_unknown_ta++;
 }
 
 static bool mesh_is_stad_tx_paused(struct umac_sta_data *stad)
@@ -2999,6 +3027,8 @@ static void mesh_queue_one_(struct umac_data *umacd, struct umac_sta_data *stad,
     }
     if (live)
     {
+        /* Group replicas and relayed copies too: each goes out on the peer's (the mesh) VIF. */
+        mmdrv_get_tx_metadata(txbuf)->vif_id = umac_sta_data_get_vif_id(stad);
         umac_sta_data_queue_pkt(stad, txbuf);
         umac_stats_update_datapath_txq_high_water_mark(umacd, ++s_num_pkts_queued);
     }
@@ -3287,25 +3317,48 @@ const struct umac_datapath_ops datapath_ops_mesh = {
     .lookup_stad_by_peer_addr    = mesh_lookup_stad_by_peer_addr,
     .lookup_stad_by_tx_dest_addr = mesh_lookup_stad_by_tx_dest_addr,
     .lookup_stad_by_aid          = mesh_lookup_stad_by_aid,
-    .set_stad_sleep_state        = mesh_set_stad_sleep_state,
+    .update_stad_state_rx        = mesh_update_stad_state_rx,
     .is_stad_tx_paused           = mesh_is_stad_tx_paused,
     .enqueue_tx_frame            = mesh_enqueue_tx_frame,
     .dequeue_tx_frame            = mesh_dequeue_tx_frame,
     .construct_80211_data_header = mesh_construct_80211_data_header,
     .get_sta_state               = mesh_get_sta_state,
+    .supp_l2_sock_receive        = mesh_supp_l2_sock_receive,
+    .handle_frame_unknown_sta    = mesh_handle_frame_unknown_sta,
     .frames_allowed_pre_association = frames_allowed_pre_association_mesh_mode,
+    .type                        = "MESH",
 };
 
 void umac_datapath_configure_mesh_mode(struct umac_data *umacd)
 {
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
+    (void)umacd;
     if (s_frag_lock == NULL)
     {
         s_frag_lock = mmosal_mutex_create("mesh_frag");
     }
-    data->ops = &datapath_ops_mesh;
     umac_mesh_ies_capacity_fn = mesh_capacity_;
-    MMLOG_INF("Datapath configured for mesh mode\n");
+    MMLOG_INF("Datapath prepared for mesh mode\n");
+}
+
+enum mmwlan_status umac_datapath_mesh_common_start(struct umac_data *umacd, uint16_t vif_id,
+                                                   const uint8_t *own_addr, bool sae)
+{
+    if (s_common == NULL)
+    {
+        s_common = umac_sta_data_alloc(umacd);
+        if (s_common == NULL)
+        {
+            MMLOG_ERR("mesh: common stad alloc failed\n");
+            return MMWLAN_NO_MEM;
+        }
+    }
+    /* As umac_ap_start does for sta_common; the peer address stays zero. */
+    umac_sta_data_set_vif_id(s_common, vif_id);
+    umac_sta_data_set_bssid(s_common, own_addr);
+    umac_sta_data_set_security(s_common, (sae || g_warthog_mesh_secure) ? MMWLAN_SAE : MMWLAN_OPEN,
+                               MMWLAN_PMF_DISABLED);
+    umac_keys_init(s_common);
+    return MMWLAN_SUCCESS;
 }
 
 /* AT+REKEY=<n>: re-push peer slot n's own pairwise key (mesh_restore_peer_key_)

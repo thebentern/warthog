@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: LicenseRef-MorseMicroBDL */
-/* bcf_fgh100mhaamd.mbin from morsemicro/firmware (managed_components), byte for byte: make region-bcf checks it. */
+/* bcf_fgh100mhaamd.mbin from morsemicro/firmware 2.10.4-esp32-1, unmodified (SDK morsefirmware/mm6108/bcfs), byte for byte: make region-bcf checks it. */
 static const unsigned char k_region_bcf[540] = {
     0x00, 0x80, 0x04, 0x00, 0x4d, 0x4d, 0x42, 0x43, 0x00, 0x81, 0x70, 0x00,
     0xef, 0xbe, 0xad, 0xde, 0xb3, 0xa4, 0x69, 0x71, 0x08, 0x00, 0x00, 0x00,

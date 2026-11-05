@@ -16,6 +16,7 @@
 #include "umac/mesh/umac_mesh_fwd.h"
 #include "umac/mesh/umac_mesh_hwmp_relay.h"
 #include "umac/core/umac_core.h"
+#include "umac/interface/umac_interface.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -73,7 +74,9 @@ extern volatile uint32_t g_warthog_hwmp_unprotected, g_warthog_hwmp_mmie, g_wart
 #endif
 
 extern struct umac_sta_data *umac_datapath_mesh_find_peer(const uint8_t *addr);
-extern int umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len);
+extern enum mmwlan_status umac_mesh_tx_action(const uint8_t *da, const uint8_t *body, uint16_t body_len);
+extern enum mmwlan_status umac_mesh_tx_action_queued(const uint8_t *da, const uint8_t *body,
+                                                     uint16_t body_len, bool *queued);
 extern const uint8_t *umac_mesh_own_addr(void);
 extern uint32_t *umac_mesh_hwmp_own_sn_ptr(void);
 extern bool umac_mesh_sae_active(void);
@@ -225,6 +228,7 @@ void umac_mesh_fwd_glue_forward(struct umac_data *umacd, struct mmpktview *body,
     memset(&md->mesh, 0, sizeof(md->mesh));
     md->enc = ENCRYPTION_ENABLED;
     md->tid = 0;
+    md->vif_id = umac_interface_get_vif_id(umacd, UMAC_INTERFACE_MESH);
     struct umac_mesh_ctrl mc = r->fwd_mc;
     extern volatile uint32_t g_warthog_mesh_grp;
     if (group && g_warthog_mesh_grp)
@@ -279,7 +283,7 @@ void umac_mesh_fwd_glue_forward(struct umac_data *umacd, struct mmpktview *body,
         return;
     }
     if (group) { g_warthog_fwd_grp++; } else { g_warthog_fwd_uni++; }
-    data->ops->enqueue_tx_frame(umacd, stad, copy);
+    datapath_ops_mesh.enqueue_tx_frame(umacd, stad, copy);
 }
 
 static void maybe_preq_(const uint8_t *target, uint32_t lifetime_tu)
@@ -300,8 +304,9 @@ static void maybe_preq_(const uint8_t *target, uint32_t lifetime_tu)
                                          lifetime_tu, ra);
     }
     unlock_();
-    /* Only 0 is on the radio: one queued for the event loop is counted when it gets there. */
-    if (n != 0 && umac_mesh_tx_action(ra, body, n) == 0)
+    /* Only one on the radio counts here: one queued for the loop is counted when it goes. */
+    bool queued = false;
+    if (n != 0 && umac_mesh_tx_action_queued(ra, body, n, &queued) == MMWLAN_SUCCESS && !queued)
     {
         g_warthog_fwd_preq_tx++;
         lock_();
@@ -361,8 +366,7 @@ static bool send_now_(struct umac_data *umacd, struct mmpkt *pkt, const uint8_t 
     md->enc = ENCRYPTION_ENABLED;
     memset(&md->mesh, 0, sizeof(md->mesh));
     umac_mesh_fwd_glue_tx_classify(pkt, da, sa);
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-    data->ops->enqueue_tx_frame(umacd, stad, pkt);
+    datapath_ops_mesh.enqueue_tx_frame(umacd, stad, pkt);
     umac_core_evt_wake(umacd);
     return true;
 }
@@ -376,8 +380,7 @@ static bool send_relayed_(struct umac_data *umacd, struct mmpkt *pkt, const uint
     {
         return false;
     }
-    struct umac_datapath_data *data = umac_data_get_datapath(umacd);
-    data->ops->enqueue_tx_frame(umacd, stad, pkt);
+    datapath_ops_mesh.enqueue_tx_frame(umacd, stad, pkt);
     umac_core_evt_wake(umacd);
     return true;
 }
@@ -733,7 +736,7 @@ void umac_mesh_fwd_glue_peer_lost(const uint8_t *peer)
     unlock_();
     for (uint32_t i = 0; i < n; i++)
     {
-        if (umac_mesh_tx_action(acts[i].to, acts[i].body, acts[i].body_len) >= 0)
+        if (umac_mesh_tx_action(acts[i].to, acts[i].body, acts[i].body_len) == MMWLAN_SUCCESS)
         {
             g_warthog_fwd_perr_tx++;
         }

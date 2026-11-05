@@ -64,7 +64,7 @@ int main(void)
 
     /* Nothing on a mesh data path should have fallen through into the radio
      * stack the simulator does not model. */
-    CHECK(simnode_stub_hits("umac_connection_get_state") == 0,
+    CHECK(simnode_sta_mode_hits() == 0,
           "the mesh TX path never entered STA-mode connection code");
 
     /* The tick is what the 2 s probe task runs. */

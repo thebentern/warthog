@@ -3,10 +3,11 @@
  * umac_interface.c, umac_mesh.c and the datapath, against a fake chip that loses everything it
  * holds when it boots again (fake_chip.c, simnode_chipstate).
  *
- * morselib restarts the chip when a health check fails (driver_health.c: every 90 s, and on
- * demand after bus failures): the health task pauses TX and posts HW_RESTARTED at the head of
- * the event queue, and the handler reloads the firmware (mmdrv_deinit, mmdrv_init).
- * simnode_chip_restart runs that path from the health task's two calls on. Upstream puts a STA
+ * morselib restarts the chip when a health check fails (umac_health_check.c: a timeout on the
+ * umac event loop, every 90 s after the last activity, and on demand after bus failures):
+ * mmdrv_host_hw_restart_required pauses TX and posts HW_RESTARTED at the head of the event queue,
+ * and the handler reloads the firmware (mmdrv_deinit, mmdrv_init). simnode_chip_restart runs that
+ * path from mmdrv_host_hw_restart_required on. Upstream puts a STA
  * interface back (umac_connection_handle_hw_restarted) and asserts on an AP one; it asserted on
  * a mesh too, so the board reset and the mesh came back only after a full boot and re-peering.
  * Linux (mac80211's reconfig, morse_driver's morse_mesh_reconfig) re-adds the interface, its
@@ -30,7 +31,7 @@
  *  (2) (red) the chip interface comes back as the mesh had it: its type (MESH 5 on -meshvif,
  *      else STA 1) and VIF id, a MESH one's capabilities read again; the TX status flush
  *      watermark, the dynamic power-save timeout and the power-save mode are set again
- *      (umac_interface_init_vif); the health check interval too (pin: the shim also sets it);
+ *      (umac_interface_init_vif); the health check runs again (pin: the shim also starts it);
  *  (3) (red) the channel goes back: the interface forgets the channel the chip lost, so
  *      set_channel_from_regdb sends it again;
  *  (4) (red) the four QoS queues, BSS_CONFIG, the host beacon timer, MESH_CONFIG(START) with
@@ -75,13 +76,13 @@
  *      refused MTK is retried the same way, frames to that peer held from the chip meanwhile; a
  *      refused station record is counted stafail and walked to AUTHORIZED at the next tick; a
  *      refused peer MGTK goes back at the next tick; pending counts what still waits;
- *  (18) (red) a restart posted while another runs (the health check right after the reload fails
- *      too): both run and the mesh comes back after the second; a probe posted as the first ends
- *      goes out only after the second;
- *  (19) (red) AT+CHIPRESTART: the request is posted to the event loop, which fails the next health
- *      check through the driver; nothing reaches the driver from the calling task; the chip then
- *      restarts as after a real failure, counted forced; one posted while a restart is pending
- *      runs after it, on the reloaded driver (pin);
+ *  (18) (red) a restart posted while another runs (the driver asks for one again as the first ends):
+ *      both run and the mesh comes back after the second; a probe posted as the first ends goes out
+ *      only after the second;
+ *  (19) (red) AT+CHIPRESTART: the request is posted to the event loop, which arms a forced failure
+ *      and demands a check; the check's timeout fails it without asking the chip; nothing reaches
+ *      the driver from the calling task; the chip then restarts as after a real failure, counted
+ *      forced; one posted while a restart is pending runs after it, on the reloaded driver (pin);
  *  (20) (red) a restore command the chip answers otherwise than it did at the start on the same
  *      interface type (MESH_CONFIG, BSS_BEACON_CONFIG) is counted cmdfail and the restart not as a
  *      full restore; the start's own refusals repeated (the STA VIF's -17s) count nothing (pin);
@@ -103,7 +104,8 @@
  *  (25) the hang guard's ping: one waits at most; the loop's answer counts g_warthog_loop_pongs and lets the
  *      next post; NO_MEM leaves none waiting; a loop down or stopping is UNAVAILABLE and forgets the waiting
  *      one, which, kept in the queue, still runs after; the handler waits only on AT+HANGTEST=loop's block.
- *  (19) also: (red) a request posted while the driver is stopped is dropped by the loop, counted.
+ *  (19) also: (red) a request posted while the health check is stopped (umac_interface_remove stops
+ *      it before mmdrv_deinit) is dropped by the loop, counted.
  *  (26) (red) a FIRST start whose channel the chip refuses fails: mmwlan_mesh_enable is not SUCCESS,
  *      g_warthog_mesh_chan_st (AT+MESHCFG?) holds the refusal, and neither BSS_BEACON_CONFIG nor
  *      MESH_CONFIG(START) reaches the chip, nor does the host beacon timer start: the mesh never beacons
@@ -112,6 +114,10 @@
  *  (27) (red) a FIRST start with no row in the channel list fails the same way: not SUCCESS,
  *      g_warthog_mesh_chan_st is MMWLAN_ERROR, and no channel push, BSS_BEACON_CONFIG, MESH_CONFIG(START)
  *      or beacon timer; the next start with the list back clears the status and starts.
+ *  (28) (pin) upstream's health check under the mesh: its timeout probes the chip
+ *      (mmdrv_health_check) a full interval after the last activity, not before; a hung chip fails
+ *      the probe and its retry, and the check restarts it as (1) does, the mesh back; the restart
+ *      starts the check again.
  */
 #include <stdio.h>
 #include <string.h>
@@ -126,6 +132,7 @@
 #include "umac/data/umac_data.h"
 #include "umac/datapath/umac_datapath.h"
 #include "umac/datapath/umac_datapath_private.h"
+#include "umac/health_check/umac_health_check.h"
 #include "umac/interface/umac_interface.h"
 #include "umac/interface/umac_interface_data.h"
 #include "umac/mesh/umac_mesh_ccm.h"
@@ -487,9 +494,8 @@ static void t_recovers(void)
           "(2) (red) the TX status flush watermark (%lu), the dynamic power-save timeout (%u) and the "
           "power-save mode (%u) are set again", (unsigned long)s->flush_wm, s->dyn_ps_sets,
           simnode_stub_hits("umac_ps_update_mode") - ps0);
-    CHECK(s->health_ms == MMWLAN_DEFAULT_MIN_HEALTH_CHECK_INTERVAL_MS,
-          "(2) (pin) the health check interval is set again (%lu; the shim sets it too)",
-          (unsigned long)s->health_ms);
+    CHECK(simnode_health_check_armed(),
+          "(2) (pin) the health check runs again: its timeout is armed (the shim starts it too)");
     CHECK(simnode_stub_hits("umac_interface_set_channel_from_regdb") == ch0 + 1u &&
               ifd->current_s1g_operation.operating_channel_index == 0u,
           "(3) (red) the channel is sent again (%u), its cached setting forgotten first",
@@ -801,16 +807,22 @@ static void probe_mid_(void)
     simnode_chip_on_restart_done(probes_at_done_); /* the second restart's end */
 }
 
+/* As the first restart ends the driver asks for another (a bus failure), then the probe burst runs. */
+static void restart_mid_(void)
+{
+    simnode_chip_restart_queued();
+    probe_mid_();
+}
+
 static void t_double(void)
 {
     printf("--- (18) a restart posted while another runs ---\n");
     CHECK(sae_mesh_(), "the mesh starts");
     const unsigned b0 = simnode_chipstate()->boots;
-    simnode_chip_fail_next_health_check();
-    simnode_chip_on_restart_done(probe_mid_);
+    simnode_chip_on_restart_done(restart_mid_);
     simnode_outbox_clear();
     s_probes_at_done = 99;
-    CHECK(restart_ok_(), "(18) (red) the check right after the reload fails too: no reset");
+    CHECK(restart_ok_(), "(18) (red) the driver asks for a restart again as the first ends: no reset");
     CHECK(s_probe_mid == 0 && s_outbox_mid == 0u,
           "(18) (red) as the first ends, the second still pending: the probe burst only posts its probe (%d)",
           s_probe_mid);
@@ -1030,36 +1042,86 @@ static void t_failures(void)
     }
 }
 
+/* The event loop until nothing more is due now: a timeout a handler arms at 0 fires too. */
+static void run_timeouts_(void) { simnode_advance_run(0u); }
+
 static void t_forced(void)
 {
     printf("--- (19) AT+CHIPRESTART goes through the event loop ---\n");
     CHECK(sae_mesh_(), "the mesh starts");
+    struct umac_data *umacd = umac_data_get_umacd();
     const unsigned off0 = simnode_chip_calls_off_loop(), b0 = simnode_chipstate()->boots;
-    const enum mmwlan_status st = umac_chip_restart_request(umac_data_get_umacd());
+    const unsigned h0 = simnode_chip_health_checks();
+    const enum mmwlan_status st = umac_chip_restart_request(umacd);
     CHECK(st == MMWLAN_SUCCESS && g_warthog_chiprestart_forced == 0u && simnode_chipstate()->boots == b0 &&
               simnode_chip_calls_off_loop() == off0,
           "(19) (red) from the AT task the request is only posted: nothing reaches the driver there (%d)", (int)st);
     simnode_pump();
+    CHECK(g_warthog_chiprestart_forced == 0u && simnode_chipstate()->boots == b0,
+          "(19) (red) the loop arms the failure and demands a check: nothing fails yet");
+    run_timeouts_();
     CHECK(g_warthog_chiprestart_forced == 1u && g_warthog_chiprestart_n == 1u && g_warthog_chiprestart_mesh == 1u &&
-              simnode_chipstate()->boots == b0 + 1u && simnode_chip_calls_off_loop() == off0,
-          "(19) (red) the loop fails the health check through the driver and the chip restarts as after a "
-          "real failure, the mesh back (forced %lu, restarts %lu)", (unsigned long)g_warthog_chiprestart_forced,
-          (unsigned long)g_warthog_chiprestart_n);
+              simnode_chipstate()->boots == b0 + 1u && simnode_chip_calls_off_loop() == off0 &&
+              simnode_chip_health_checks() == h0,
+          "(19) (red) the check's timeout fails it without asking the chip, and the chip restarts as after a "
+          "real failure, the mesh back (forced %lu, restarts %lu, probes %u)",
+          (unsigned long)g_warthog_chiprestart_forced, (unsigned long)g_warthog_chiprestart_n,
+          simnode_chip_health_checks() - h0);
     simnode_chip_restart_queued();
-    (void)umac_chip_restart_request(umac_data_get_umacd());
-    CHECK(!simnode_expect_assert(simnode_pump) && g_warthog_chiprestart_n == 3u && g_warthog_chiprestart_forced == 2u &&
-              simnode_chipstate()->boots == b0 + 3u,
+    (void)umac_chip_restart_request(umacd);
+    CHECK(!simnode_expect_assert(run_timeouts_) && g_warthog_chiprestart_n == 3u &&
+              g_warthog_chiprestart_forced == 2u && simnode_chipstate()->boots == b0 + 3u,
           "(19) (pin) one posted while a restart is pending runs after it, on the reloaded driver (restarts %lu)",
           (unsigned long)g_warthog_chiprestart_n);
     const uint32_t dr0 = g_warthog_chiprestart_dropped;
-    mmdrv_deinit();
-    const enum mmwlan_status st2 = umac_chip_restart_request(umac_data_get_umacd());
-    simnode_pump();
+    umac_health_check_stop(umacd);
+    const enum mmwlan_status st2 = umac_chip_restart_request(umacd);
+    run_timeouts_();
     CHECK(st2 == MMWLAN_SUCCESS && g_warthog_chiprestart_dropped == dr0 + 1u && g_warthog_chiprestart_n == 3u &&
               g_warthog_chiprestart_forced == 2u && simnode_chipstate()->boots == b0 + 3u,
-          "(19) (red) the driver stopped: the request is posted (%d) but the loop drops it, counted dropped (%lu)",
-          (int)st2, (unsigned long)(g_warthog_chiprestart_dropped - dr0));
-    (void)mmdrv_init(NULL, "US");
+          "(19) (red) the health check stopped: the request is posted (%d) but the loop drops it, counted "
+          "dropped (%lu)", (int)st2, (unsigned long)(g_warthog_chiprestart_dropped - dr0));
+    umac_health_check_start(umacd);
+}
+
+/* umac_health_check.c's interval for MMWLAN's default minimum and maximum (90 s). */
+#define HEALTH_MS \
+    (MMWLAN_DEFAULT_MIN_HEALTH_CHECK_INTERVAL_MS + \
+     (MMWLAN_DEFAULT_MAX_HEALTH_CHECK_INTERVAL_MS - MMWLAN_DEFAULT_MIN_HEALTH_CHECK_INTERVAL_MS) / 2u)
+
+static void advance_1_(void) { simnode_advance_run(1u); }
+
+static void t_health_check(void)
+{
+    printf("--- (28) upstream's health check under the mesh ---\n");
+    CHECK(sae_mesh_(), "the mesh starts");
+    (void)simnode_run_timeouts(); /* the start's check: it re-arms for the interval */
+    const unsigned h0 = simnode_chip_health_checks(), b0 = simnode_chipstate()->boots;
+    simnode_advance_run(HEALTH_MS - 1u);
+    CHECK(simnode_chip_health_checks() == h0 && simnode_health_check_armed(),
+          "(28) (pin) no probe 1 ms before the interval, the check armed (%u)",
+          simnode_chip_health_checks() - h0);
+    simnode_advance_run(1u);
+    CHECK(simnode_chip_health_checks() == h0 + 1u && simnode_chipstate()->boots == b0,
+          "(28) (pin) one probe at %u ms, answered: no restart (%u)", (unsigned)HEALTH_MS,
+          simnode_chip_health_checks() - h0);
+    simnode_chip_fail_next_health_check();
+    simnode_advance_run(HEALTH_MS - 1u);
+    CHECK(simnode_chip_health_checks() == h0 + 1u && g_warthog_chiprestart_n == 0u,
+          "(28) (pin) the chip hangs: nothing yet, 1 ms before an interval after the last probe");
+    CHECK(!simnode_expect_assert(advance_1_) && simnode_chip_health_checks() == h0 + 3u &&
+              g_warthog_chiprestart_n == 1u && g_warthog_chiprestart_mesh == 1u &&
+              simnode_chipstate()->boots == b0 + 1u,
+          "(28) (pin) its probe and the retry fail, and the check restarts the chip, the mesh back "
+          "(probes %u, restarts %lu)", simnode_chip_health_checks() - h0,
+          (unsigned long)g_warthog_chiprestart_n);
+    CHECK(simnode_health_check_armed() && held_(0, false, 1, K_OWN) &&
+              simnode_chip_sta_state(aid_(A), NULL) == MORSE_STA_AUTHORIZED,
+          "(28) (pin) the restart starts the check again; our MGTK and A's station are back");
+    simnode_advance_run(HEALTH_MS);
+    CHECK(simnode_chip_health_checks() == h0 + 4u && g_warthog_chiprestart_n == 1u,
+          "(28) (pin) the reloaded chip answers the next probe, an interval later (%u)",
+          simnode_chip_health_checks() - h0);
 }
 
 /* The STA VIF's refusals, measured on air at every start: BSS_BEACON_CONFIG and MESH_CONFIG, -17. */
@@ -1488,6 +1550,7 @@ int main(void)
     t_loop_ping();
     t_first_start_channel_refused();
     t_first_start_no_channel();
+    t_health_check();
     stop_();
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("test_simnode_restart: all passed\n");

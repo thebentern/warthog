@@ -54,7 +54,9 @@
  *      but are not duplicates (pin); a retransmitted fragment is (FILTSTAT dup, pin) and the
  *      MSDU is still delivered once, intact (red); under a Block Ack session the expected
  *      sequence control steps through the fragments, a fragment received early waits in
- *      the reorder window and the MSDU is delivered intact, the next one is not outdated.
+ *      the reorder window and the MSDU is delivered intact, the next one is not outdated;
+ *      behind a lost MSDU the fragments wait until the reorder timeout releases them into
+ *      reassembly, and the MSDU is delivered intact (pin).
  * Bounds (reassembly holds chip-RX-sized buffers, and its timeouts share the core's pool with
  * hostap's MPM and SAE timers):
  * (11) (red) a chain the core had no timeout for still goes 1 s after its first fragment,
@@ -1123,6 +1125,22 @@ static void t_dup_ba(void)
           "(red) a second fragment received before its first waits in the reorder window and "
           "the MSDU is delivered intact (buffered %u, nofirst %u)",
           (unsigned)(g_warthog_reord_buffered - s.buffered), D(s, nofirst));
+    /* Behind a lost sequence number every fragment waits in the window, and only the reorder
+     * timeout (100 ms, checked every 25 ms) lets them into reassembly. */
+    s = snap_();
+    simnode_ext_rx_clear();
+    s_seq++; /* the lost MSDU */
+    send_(tmpl_(W), &m, cut3, 2, NULL);
+    const unsigned waiting = simnode_ext_rx_count();
+    simnode_advance_run(100u + 25u);
+    const struct simnode_extrx *x = simnode_ext_rx_get(0);
+    CHECK(waiting == 0u && g_warthog_reord_buffered - s.buffered == 3u && simnode_ext_rx_count() == 1u &&
+              last_ext_(&got) && got.len == whole.len && memcmp(got.b, whole.b, whole.len) == 0 &&
+              D(s, ok) == 1u && x != NULL && x->vif == MMWLAN_VIF_STA,
+          "(pin) behind a lost MSDU its three fragments wait in the window; the reorder timeout lets "
+          "them into reassembly and the MSDU is delivered intact, as the STA VIF's (%u waiting, "
+          "buffered %u, %u delivered)", waiting, (unsigned)(g_warthog_reord_buffered - s.buffered),
+          simnode_ext_rx_count());
     simnode_set_ampdu(false);
     s_seq = 100;
 }

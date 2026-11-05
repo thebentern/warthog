@@ -208,7 +208,6 @@ struct simnode_chipstate {
     uint32_t frag_threshold;   /* its own TX fragmentation threshold (AT+FRAG); 0 off */
     bool     crypto_in_host_set;
     bool     crypto_in_host;
-    uint32_t health_ms;        /* the health check's minimum interval; 0 none set */
     uint32_t flush_wm;         /* MORSE_PARAM_ID_TX_STATUS_FLUSH_WATERMARK; 0 none set */
     unsigned dyn_ps_sets;      /* dynamic power-save timeouts set since it booted */
     uint32_t dyn_ps_ms;        /* the last one */
@@ -217,15 +216,21 @@ struct simnode_chipstate {
 const struct simnode_chipstate *simnode_chipstate(void);
 /** The SET_STA_STATE state the chip holds for @p aid (its address to @p addr), or -1. */
 int simnode_chip_sta_state(uint16_t aid, uint8_t addr[6]);
-/** A health check failed: what driver_health.c does then (the TX path paused, the restart event
- *  posted at the head of the event queue), and the event loop run, which restarts the chip
- *  (mmdrv_deinit, mmdrv_init: it loses everything above) through umac_mmdrv_shim.c. */
+/** A health check failed: what umac_health_check.c does then (mmdrv_host_hw_restart_required: the
+ *  TX path paused, the restart event posted at the head of the event queue), and the event loop
+ *  run, which restarts the chip (mmdrv_deinit, mmdrv_init: it loses everything above) through
+ *  umac_mmdrv_shim.c. */
 void simnode_chip_restart(void);
 /** As simnode_chip_restart, returning once the event is posted: the loop has not run. */
 void simnode_chip_restart_queued(void);
-/** The health check the driver runs when its interval is next set (at a restart, right after the
- *  chip boots) fails, so the health task posts another restart. */
+/** The chip hangs: every health probe (mmdrv_health_check, which umac_health_check.c's timeout runs
+ *  on the event loop) fails until the chip next boots, so the next check asks for a restart. */
 void simnode_chip_fail_next_health_check(void);
+/** mmdrv_health_check calls since the simulator was loaded. */
+unsigned simnode_chip_health_checks(void);
+/** The umac event loop's task exists (umac_core_is_running): simnode_start sets it, simnode_stop
+ *  clears it. */
+void simnode_core_set_running(bool on);
 /** Run @p cb once, as the next restart completes (mmdrv_hw_restart_completed), standing for
  *  another task at that moment. */
 void simnode_chip_on_restart_done(void (*cb)(void));
@@ -235,7 +240,7 @@ unsigned simnode_chip_keys(struct simnode_keyinst *out, unsigned max);
 /** Run @p fn; true if a firmware assertion fired in it (the board would reset there). */
 bool simnode_expect_assert(void (*fn)(void));
 /** Calls that reached the chip off the umac event loop (which runs a restart): AT+CRYPTOHOST's
- *  set and read, and AT+CHIPRESTART's forced health check failure. */
+ *  set and read, and the health probe. */
 unsigned simnode_chip_calls_off_loop(void);
 /** umac_interface_set_channel_from_regdb (a stub) returns @p status from now on; 0 by default. */
 void simnode_set_channel_status(int status);
@@ -438,6 +443,13 @@ size_t simnode_last_new_peer(uint8_t addr[6], const uint8_t **ies);
 
 /** Live allocations, for leak assertions. */
 unsigned simnode_live_allocs(void);
+/** Calls into the STA connection's stubs a mesh path must never reach (populate_tx_metadata and
+ *  handle_ack_status, which every frame takes, aside); UINT32_MAX when one of them is no longer a stub. */
+unsigned simnode_sta_mode_hits(void);
+/** Allocations the firmware keeps for its life: the mesh's common station record (the datapath's
+ *  lookup with no address), made at the first mesh start and never freed. A run that leaked
+ *  nothing ends with simnode_live_allocs() equal to this. */
+unsigned simnode_kept_allocs(void);
 unsigned simnode_in_critical(void);
 /** Blocks freed inside a critical section so far (packets included). */
 unsigned simnode_frees_in_critical(void);
@@ -464,11 +476,16 @@ void simnode_set_rx_filter_hook(void (*cb)(void));
 bool simnode_recycle_peer_record(const uint8_t *mac);
 unsigned simnode_rssi_calls(void);
 bool simnode_rssi_for(const uint8_t *ta, int16_t *rssi);
+/** umac_core timeout registrations; this and simnode_timeouts_pending leave out the health
+ *  check's own timeout (umac_health_check.c), which stays armed while the check runs. */
 unsigned simnode_timeouts_registered(void);
-/** Make the next umac_core timeout registration fail, as an empty pool does. */
+/** Make the next umac_core timeout registration fail (not the health check's), as an empty
+ *  pool does. */
 void simnode_fail_next_timeout(void);
 /** umac_core timeouts registered and not yet fired or dequeued. */
 unsigned simnode_timeouts_pending(void);
+/** The health check's own timeout is pending (umac_health_check.c re-arms it after each run). */
+bool simnode_health_check_armed(void);
 /** Pending timeouts with an argument inside station record @p rec (addresses only: it may be
  *  freed). A record del_peer freed must have none left. */
 unsigned simnode_timeouts_holding(const void *rec);
@@ -499,6 +516,7 @@ struct simnode_extrx {
     uint16_t len;       /* whole 802.3 frame, header included (frame holds the first 1600) */
     uint8_t  ta[6];
     bool     have_ta;
+    unsigned vif;       /* the metadata's VIF (an mmwlan_vif): the mesh delivers as MMWLAN_VIF_STA */
 };
 /** On: register the extended RX callback, which silences the raw one, as on the firmware.
  *  Off: the raw callback again. Survives simnode_start. */

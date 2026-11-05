@@ -176,15 +176,19 @@ int warthog_hang_test_probe(uint32_t test)
 int warthog_hang_test_reply(char *buf, size_t len, uint32_t test)
 {
     switch (test) {
-    case WARTHOG_HANG_TEST_LOOP:
     case WARTHOG_HANG_TEST_TCPIP:
     case WARTHOG_HANG_TEST_USB:
     case WARTHOG_HANG_TEST_TIMER:
         return snprintf(buf, len, "+HANGTEST: %s blocks at its next probe; reset=PANIC in about %u s\r\n",
                         warthog_hang_test_names[test], (unsigned)WARTHOG_HANG_LIMIT_S);
+    case WARTHOG_HANG_TEST_LOOP:
+        return snprintf(buf, len,
+                        "+HANGTEST: loop blocks at its next probe, with the health check; reset=PANIC in %u to %u s\r\n",
+                        (unsigned)WARTHOG_HANG_LIMIT_S - 90u, (unsigned)WARTHOG_HANG_LIMIT_S);
     case WARTHOG_HANG_TEST_HEALTH:
-        return snprintf(buf, len, "+HANGTEST: health blocks at its next wake; reset=PANIC in up to %u s\r\n",
-                        (unsigned)WARTHOG_HANG_LIMIT_S);
+        return snprintf(buf, len,
+                        "+HANGTEST: health blocks at its next run, with the event loop; reset=PANIC in %u to %u s\r\n",
+                        (unsigned)WARTHOG_HANG_LIMIT_S - 90u, (unsigned)WARTHOG_HANG_LIMIT_S);
     case WARTHOG_HANG_TEST_DRV:
         return snprintf(buf, len, "+HANGTEST: drv blocks; the chip restart then blocks loop; reset=PANIC in up to %u s\r\n",
                         (unsigned)WARTHOG_HANG_LIMIT_S + 100u);

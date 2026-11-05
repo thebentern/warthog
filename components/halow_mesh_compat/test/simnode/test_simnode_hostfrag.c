@@ -416,7 +416,8 @@ static unsigned budget_(const struct cap *e)
 static uint64_t host_pn_(const uint8_t *peer)
 {
     struct umac_sta_data *stad = umac_datapath_mesh_find_peer(peer);
-    return stad != NULL ? umac_keys_get_tx_seq(stad, UMAC_KEY_TYPE_PAIRWISE) : 0u;
+    const int kid = stad != NULL ? umac_keys_get_active_key_id(stad, UMAC_KEY_TYPE_PAIRWISE) : -1;
+    return kid >= 0 ? umac_keys_get_tx_seq(stad, (uint8_t)kid) : 0u;
 }
 static uint64_t chip_pn_(const uint8_t *peer)
 {

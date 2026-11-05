@@ -16,7 +16,7 @@ SDK and a host-side test suite for the parts that can be tested without a radio.
 
 ## Building every environment
 
-Nine device environments plus `native`. Build them all before sending a change —
+Nine device environments; CI builds every env platformio.ini defines. Build them all before sending a change —
 it is easy to break an env you are not using, because build flags differ between
 them:
 

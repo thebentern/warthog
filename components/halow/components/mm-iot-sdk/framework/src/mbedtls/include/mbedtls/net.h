@@ -21,7 +21,7 @@
  */
 /*
  *  Copyright The Mbed TLS Contributors
- *  Copyright 2023 Morse Micro
+ *  Copyright 2023-2026 Morse Micro
  *  SPDX-License-Identifier: Apache-2.0
  *
  *  Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -44,9 +44,9 @@
 
 #include "mbedtls/ssl.h"
 
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 /** Failed to open a socket. */
 #define MBEDTLS_ERR_NET_SOCKET_FAILED -0x0042
@@ -101,7 +101,7 @@ typedef void (*mbedtls_net_rx_callback_t)(struct mbedtls_net_context *ctx, void 
 /**
  * Data structure for mbedtls session network layer context.
  *
- * This supports both FreeRTOS+ TCP and LWIP as the TCP/IP stack.
+ * This supports LWIP as the TCP/IP stack.
  */
 typedef struct mbedtls_net_context
 {
@@ -119,17 +119,11 @@ typedef struct mbedtls_net_context
         void *socket;
     };
 
-    /** Subset of this data structure used only by FreeRTOS+ TCP. */
-    struct
-    {
-        /** The socket type, in case the IP stack does not provide a means of reading this back
-         *  from the socket. */
-        int type;
-        /** Set to @c FREERTOS_MSG_DONTWAIT if non-blocking, else 0. */
-        int non_blocking_flag;
-        /** The socket set used for polling */
-        void *socket_set;
-    } freertos;
+    /** Registered callback to be invoked when RX data becomes available. */
+    mbedtls_net_rx_callback_t rx_callback;
+
+    /** Opaque argument for @c rx_callback. */
+    void *rx_callback_arg;
 
     /**
      * Indicates whether RX data has become ready since the last read or the last time this
@@ -137,12 +131,7 @@ typedef struct mbedtls_net_context
      *
      * Note that it only gets set if rx_callack is registered.
      */
-    atomic_size_t rx_data_ready;
-
-    /** Registered callback to be invoked when RX data becomes available. */
-    mbedtls_net_rx_callback_t rx_callback;
-    /** Opaque argument for @c rx_callback. */
-    void *rx_callback_arg;
+    bool rx_data_ready;
 } mbedtls_net_context;
 
 /**
@@ -191,14 +180,13 @@ int mbedtls_net_connect(mbedtls_net_context *ctx, const char *host, const char *
 int mbedtls_net_bind(mbedtls_net_context *ctx, const char *bind_ip, const char *port, int proto);
 
 /**
- * \brief           Accept a connection from a remote client
+ * \brief           Accept a connection from a remote client and return client IP address and port
  *
  * \param bind_ctx  Relevant socket
  * \param client_ctx Will contain the connected client socket
- * \param client_ip Will contain the client IP address, can be NULL
- * \param buf_size  Size of the client_ip buffer
- * \param ip_len    Will receive the size of the client IP written,
- *                  can be NULL if client_ip is null
+ * \param client_ip Will contain the client IP address as a string, can be NULL
+ * \param client_ip_len  Size of the client_ip buffer
+ * \param client_port Client port number in host byte order, can be NULL
  *
  * \return          0 if successful, or
  *                  MBEDTLS_ERR_NET_SOCKET_FAILED,
@@ -210,9 +198,9 @@ int mbedtls_net_bind(mbedtls_net_context *ctx, const char *bind_ip, const char *
  */
 int mbedtls_net_accept(mbedtls_net_context *bind_ctx,
                        mbedtls_net_context *client_ctx,
-                       void *client_ip,
-                       size_t buf_size,
-                       size_t *ip_len);
+                       char *client_ip,
+                       size_t client_ip_len,
+                       uint16_t *client_port);
 
 /**
  * \brief          Check and wait for the context to be ready for read/write
@@ -284,6 +272,54 @@ void mbedtls_net_usleep(unsigned long usec);
 int mbedtls_net_recv(void *ctx, unsigned char *buf, size_t len);
 
 /**
+ * \brief          Read at most 'len' characters. If no error occurs,
+ *                 the actual amount read is returned.
+ *
+ * \param ctx      Socket
+ * \param buf      The buffer to write to
+ * \param len      Maximum length of the buffer
+ * \param client_ip Will contain the source IP address as a string, can be NULL
+ * \param client_ip_len  Size of the source_ip buffer
+ * \param client_port Source port number in host byte order
+ *
+ * \return         the number of bytes received,
+ *                 or a non-zero error code; with a non-blocking socket,
+ *                 MBEDTLS_ERR_SSL_WANT_READ indicates read() would block.
+ */
+int mbedtls_net_recvfrom(void *ctx,
+                         unsigned char *buf,
+                         size_t buf_len,
+                         char *source_ip,
+                         size_t source_ip_len,
+                         uint16_t *source_port);
+
+/**
+ * \brief          Read at most 'len' characters, blocking for at most
+ *                 'timeout' milliseconds. If no error occurs, the actual amount
+ *                 read is returned.
+ *
+ * \param ctx      Socket
+ * \param buf      The buffer to write to
+ * \param len      Maximum length of the buffer
+ * \param timeout  Maximum number of milliseconds to wait for data
+ *                 0 means no timeout (wait forever)
+ * \param client_ip Will contain the source IP address as a string, can be NULL
+ * \param client_ip_len  Size of the source_ip buffer
+ * \param client_port Source port number in host byte order
+ *
+ * \return         the number of bytes received,
+ *                 or a non-zero error code; with a non-blocking socket,
+ *                 MBEDTLS_ERR_SSL_WANT_READ indicates read() would block.
+ */
+int mbedtls_net_recvfrom_timeout(void *ctx,
+                                 unsigned char *buf,
+                                 size_t buf_len,
+                                 uint32_t timeout,
+                                 char *source_ip,
+                                 size_t source_ip_len,
+                                 uint16_t *source_port);
+
+/**
  * \brief          Write at most 'len' characters. If no error occurs,
  *                 the actual amount read is returned.
  *
@@ -298,8 +334,29 @@ int mbedtls_net_recv(void *ctx, unsigned char *buf, size_t len);
 int mbedtls_net_send(void *ctx, const unsigned char *buf, size_t len);
 
 /**
+ * \brief          Write at most 'len' characters to the given destination
+ *
+ * \note           TLS is not supported (destination_ip/destination_port are ignored).
+ *
+ * \param ctx      Socket
+ * \param buf      The buffer to read from
+ * \param len      The length of the buffer
+ * \param destination_ip Buffer from which to take the destination IP address, can be NULL
+ * \param destination_port Variable from which to take the destination IP port, can be NULL
+ *
+ * \return         the number of bytes sent,
+ *                 or a non-zero error code; with a non-blocking socket,
+ *                 MBEDTLS_ERR_SSL_WANT_WRITE indicates write() would block.
+ */
+int mbedtls_net_sendto(void *ctx,
+                       const unsigned char *buf,
+                       size_t len,
+                       const char *destination_ip,
+                       const uint16_t *destination_port);
+
+/**
  * \brief          Read at most 'len' characters, blocking for at most
- *                 'timeout' seconds. If no error occurs, the actual amount
+ *                 'timeout' milliseconds. If no error occurs, the actual amount
  *                 read is returned.
  *
  * \note           The current implementation of this function uses

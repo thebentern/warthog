@@ -1,0 +1,44 @@
+# Copyright 2024-2026 Morse Micro
+# SPDX-License-Identifier: Apache-2.0
+menu "Morse Micro Firmware Configuration"
+    config MM_BCF_FILE
+        string "Morse Micro Board Configuration File"
+        help
+            Set the name of or relative path to the BCF (Board Configuration File).
+
+            Only the filename is required; the bcf directory of the morse-firmware
+            submodule is searched recursively, so vendor subdirectories do not need
+            to be specified.
+
+            .bin files are converted to .mbin (based on file extension). A .mbin may
+            be requested even when only the .bin source is shipped: the .bin is then
+            located and run through the conversion automatically.
+
+            Example valid filenames include:
+              - bcf_mf08651_us.bin
+              - bcf_mf15457.bin
+              - bcf_fgh100mhaamd.mbin
+              - bcf_aw_hm593.mbin
+
+            This file provides board-specific configuration data for the Morse Micro chip/module.
+
+            The build system will search for the specified file in the following locations:
+              1. the relative path from the project root
+              2. recursively within the morse-firmware submodule's bcf directory
+
+            If a file is not found, an error will be thrown when building.
+
+    choice MM_CHIP
+        bool "Morse Micro Chip Variant"
+        optional
+        help
+            This is used for selecting HAL calls and selecting firmware.
+
+        config MM_CHIP_MM6108
+            bool "Morse Micro mm6108"
+        config MM_CHIP_MM8108
+            bool "Morse Micro mm8108"
+    endchoice
+
+endmenu
+

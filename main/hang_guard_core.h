@@ -27,7 +27,7 @@ enum warthog_hang_test { WARTHOG_HANG_TEST_NONE, WARTHOG_HANG_TEST_LOOP, WARTHOG
 
 struct warthog_hang_state {
     bool on;
-    uint32_t seen;      /* answer count (health: the task's wakes) at the last tick */
+    uint32_t seen;      /* answer count (health: the health check's timeout runs) at the last tick */
     uint32_t since_ms;  /* start of the wait now running */
     uint32_t age_ms;    /* at the last tick; 0 when off */
     uint32_t max_ms;    /* longest since the guard started */

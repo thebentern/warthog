@@ -10,7 +10,6 @@
 
 #include "mmhal_wlan.h"
 #include "mmhal_os.h"
-#include "mmosal.h"
 #include "mmpkt.h"
 #include "mmwlan.h"
 #include "mmwlan_stats.h"

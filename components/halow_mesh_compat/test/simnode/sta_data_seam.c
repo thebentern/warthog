@@ -10,7 +10,7 @@
  * hook armed every call goes straight to the real function.
  *
  * umac_ba.c, the shipping Block Ack code, is compiled here too, unchanged: the
- * Makefile's simnode source list does not name it yet.
+ * Makefile's simnode source list does not name it yet. So is umac_health_check.c, below.
  */
 #define umac_sta_data_matches_peer_addr simnode_sta_data_matches_peer_addr_real
 #include "umac/data/umac_sta_data.c"
@@ -39,3 +39,12 @@ bool umac_sta_data_matches_peer_addr(struct umac_sta_data *stad, const uint8_t *
 }
 
 #include "umac/ba/umac_ba.c"
+
+/* umac_health_check.c, unchanged too. Its timeout stays armed for as long as the check runs, so the
+ * harness names its handler: fake_app.c's timeout counts leave that one out. */
+#include "umac/health_check/umac_health_check.c"
+
+umac_core_timeout_handler_t simnode_health_timeout_handler(void)
+{
+    return umac_health_check_timeout_handler;
+}

@@ -3,6 +3,7 @@
 
 set(MM_IOT_SDK ${CMAKE_CURRENT_SOURCE_DIR}/mm-iot-sdk)
 
+add_subdirectory(firmware)
 add_subdirectory(shims)
 add_subdirectory(mmpktmem)
 add_subdirectory(mmutils)

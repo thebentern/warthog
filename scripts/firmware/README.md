@@ -62,9 +62,17 @@ mesh receive problem at the time.
 ## How to use
 
 ### Swap to Linux firmware for testing
+
+The build links the SDK copy below (`rel_1_17_9`), so replacing it changes the
+image. The bundled CMake (`components/halow/components/firmware/CMakeLists.txt`)
+looks for `mm6108.mbin`, then `mm6108.bin`, relative to the project root first
+and only then under the SDK's `framework/morsefirmware/`: a `mm6108.mbin` at the
+project root silently overrides the SDK one, and a `.bin` is converted at build
+time, which needs pyelftools in PlatformIO's IDF environment.
+
 ```sh
 SDK_FW=components/halow/components/mm-iot-sdk/framework/morsefirmware/mm6108.mbin
-cp "$SDK_FW" "$SDK_FW.orig_sdk_1_17_6"
+cp "$SDK_FW" "$SDK_FW.orig_sdk_1_17_9"
 cp your-locally-built-mm6108_softmac.mbin "$SDK_FW"
 pio run -e warthog-mesh-smoke -t upload
 ```
@@ -72,21 +80,35 @@ pio run -e warthog-mesh-smoke -t upload
 ### Restore original SDK firmware
 ```sh
 SDK_FW=components/halow/components/mm-iot-sdk/framework/morsefirmware/mm6108.mbin
-cp "$SDK_FW.orig_sdk_1_17_6" "$SDK_FW"
+cp "$SDK_FW.orig_sdk_1_17_9" "$SDK_FW"
 pio run -e warthog-mesh-smoke -t upload
 ```
 
 ### Regenerate the MMFW from a newer Linux ELF
+
+The tree carries morse-firmware `ea18605f`, whose
+`components/halow/components/firmware/morse-firmware/firmware/mm6108.bin` is
+such an ELF (`rel_1_17_9`); for a newer one:
+
 ```sh
 # Download new firmware
 curl -O https://raw.githubusercontent.com/MorseMicro/morse-firmware/main/firmware/mm6108.bin
-# Convert
-~/.platformio/penv/bin/python scripts/firmware/elf_to_mmfw.py mm6108.bin mm6108.mbin
+# Convert (stdlib only; needs a RISC-V objcopy, below)
+python3 scripts/firmware/elf_to_mmfw.py mm6108.bin mm6108.mbin
 ```
+
+objcopy is `--objcopy PATH`, else `$OBJCOPY`, else the newest `toolchain-riscv32-esp*` under
+`${PLATFORMIO_CORE_DIR:-$HOME/.platformio}/packages`. Warthog builds never install a RISC-V toolchain
+(pioarduino adds one only for a project with a `ulp/` directory). Install one there at the version the
+pinned platform's `platform.json` lists, or `scripts/ci/check-platform-pin.sh --installed` fails on it
+(55.03.312-1: `pio pkg install -g -t platformio/toolchain-riscv32-esp@14.2.0+20260121`), or take Espressif's
+`riscv32-esp-elf` release (github.com/espressif/crosstool-NG) and pass its `bin/riscv32-esp-elf-objcopy` as
+`--objcopy`. The script fails, writing nothing, when objcopy fails on a section (an Xtensa objcopy does) or
+no segment is extracted.
 
 ### Decompose an MMFW for analysis
 ```sh
-~/.platformio/penv/bin/python scripts/firmware/mmfw_extract.py mm6108.mbin /tmp/mm6108_segments
+python3 scripts/firmware/mmfw_extract.py mm6108.mbin /tmp/mm6108_segments
 ls /tmp/mm6108_segments
 ```
 
@@ -95,6 +117,8 @@ ls /tmp/mm6108_segments
 MMFW TLV container (from `morselib/include/mbin.h`):
 - `0x8000` MAGIC, len=4, data = `MMFW` (`0x57464d4d`)
 - `0x0001` BCF_ADDR, len=4, data = BCF load address (e.g. `0x8011fa80`)
+- `0x0002` COREDUMP_MEM_REGION (the SDK's `rel_1_17_9` `mm6108.mbin` carries 4;
+  `mmfw_extract.py` skips TLVs it does not know)
 - `0x8001` FW_SEGMENT, len=4+N, data = `load_addr(u32 LE) + raw bytes`
   (capped at 32KB per TLV; split larger sections into multiple TLVs)
 - `0x8002` FW_SEGMENT_DEFLATED, same as 0x8001 but data is `load_addr +

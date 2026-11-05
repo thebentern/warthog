@@ -1,0 +1,2 @@
+# UV_CONSTRAINT for pioarduino's penv: the platform installs pioarduino>=6.2.0, which PyPI resolves past PIO_VERSION.
+pioarduino==6.2.0

@@ -7,6 +7,7 @@
 
 #include "mmlog.h"
 #include "mmosal.h"
+#include "mmdrv.h"
 #include "umac/core/umac_core.h"
 #include "umac/datapath/datapath_defrag.h"
 #include "dot11/dot11_utils.h"
@@ -22,9 +23,11 @@
 /* warthog: QoS TIDs 0-7, and 8 (non-QoS data, which TID 8 shares); a higher TID has no chain. */
 #define DEFRAG_TID_IDX_MAX (MMWLAN_MAX_QOS_TID + 1)
 
-/* A chain's buffer: the first fragment's MAC header, then up to the largest MSDU body. */
+/* A chain's buffer: the first fragment's MAC header, then up to the largest MSDU body; and the
+ * first fragment's RX metadata. */
 #define FRAG_CHAIN_HDR_SPACE  (sizeof(struct dot11_data_hdr))
 #define FRAG_CHAIN_BODY_SPACE (DOT11_MAX_PAYLOAD_LEN)
+#define FRAG_CHAIN_MD_SPACE   (sizeof(struct mmdrv_rx_metadata))
 
 /* warthog: QoS Control's A-MSDU Present, and the bits every fragment of one MSDU shares: the TID,
  * and on the mesh Mesh Control Present (in a BSS bit 8 is TXOP or queue size, which may change). */
@@ -184,16 +187,21 @@ static struct datapath_defrag_chain *datapath_defrag_slot(const struct datapath_
     return victim;
 }
 
-/* A buffer for a new chain holding @p first's MAC header: from the heap, outside the chip's RX
- * pool, so reassembly never takes a block chip RX needs. */
+/* A buffer for a new chain holding @p first's MAC header and @p rxbuf's RX metadata: from the heap,
+ * outside the chip's RX pool, so reassembly never takes a block chip RX needs. */
 static bool datapath_defrag_begin(struct datapath_defrag_chain *frag_chain,
-                                  const struct dot11_data_hdr *first)
+                                  const struct dot11_data_hdr *first, struct mmpkt *rxbuf)
 {
-    frag_chain->buf = mmpkt_alloc_on_heap(FRAG_CHAIN_HDR_SPACE, FRAG_CHAIN_BODY_SPACE, 0);
+    frag_chain->buf = mmpkt_alloc_on_heap(FRAG_CHAIN_HDR_SPACE, FRAG_CHAIN_BODY_SPACE, FRAG_CHAIN_MD_SPACE);
     if (frag_chain->buf == NULL)
     {
         MMLOG_WRN("Failed to allocate a frag chain buffer\n");
         return false;
+    }
+    const struct mmdrv_rx_metadata *md = mmpkt_get_metadata(rxbuf).rx;
+    if (md != NULL)
+    {
+        *mmpkt_get_metadata(frag_chain->buf).rx = *md;
     }
     struct mmpktview *view = mmpkt_open(frag_chain->buf);
     mmpkt_prepend_data(view, (const uint8_t *)first, dot11_data_hdr_get_len(first));
@@ -271,7 +279,7 @@ struct mmpkt *datapath_defrag(struct umac_data *umacd,
         {
             frag_chain = datapath_defrag_slot(data);
         }
-        if (!datapath_defrag_begin(frag_chain, *data_hdr))
+        if (!datapath_defrag_begin(frag_chain, *data_hdr, rxbuf))
         {
             drop = &g_warthog_defrag_nomem;
             goto exit;

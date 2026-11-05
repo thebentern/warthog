@@ -48,7 +48,7 @@ void app_init(void)
         {
             /* We got a file not found error, so simply create the file */
             printf("File test.txt not found, creating...");
-            fd = open("test.txt", O_RDWR | O_CREAT);
+            fd = open("test.txt", O_RDWR | O_CREAT, 0644);
             if (fd >= 0)
             {
                 char message[] = "G'day World!\n";

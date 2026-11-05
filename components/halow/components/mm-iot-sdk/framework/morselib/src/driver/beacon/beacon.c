@@ -32,8 +32,8 @@ void morse_beacon_irq_handle(struct driver_data *driverd, uint32_t status1_reg)
          * each TBTT — meaning it's either internally re-using the one
          * template we gave it, or it's not running its beacon timer at
          * all for mesh. Without this diagnostic we couldn't tell which.
-         * NOTE: this is the ISR — keep the log short. */
-        driver_task_notify_event_from_isr(driverd, DRV_EVT_BEACON_REQ_PEND);
+         * NOTE: this runs on the spi_irq task, not in an ISR. */
+        driver_task_notify_event(driverd, DRV_EVT_BEACON_REQ_PEND);
     }
 }
 

@@ -153,7 +153,8 @@ against SAE nodes was measured on both `-meshvif` builds from 2026-09-30 to
 On the chip-crypto build (`warthog-mesh-sae`), in the 2026-09-20 run, ICMP was
 0/30 and every undecryptable frame was group-addressed
 (`AT+RXCHAN?` showed `nodec grp` climbing 1:1 with pings while `uni` stayed
-0). Measured on Warthog's chip firmware (`mm6108.mbin` 1.17.6) on the mesh
+0). Measured on Warthog's chip firmware (`mm6108.mbin` 1.17.6; not re-measured
+on 1.17.9, which the build now ships) on the mesh
 interface (the STA chip interface every build but the `-meshvif` ones runs
 the mesh on): one pairwise key, where the last install wins, and a second
 group-key install breaks group decryption, while every 802.11s peer generates
@@ -449,6 +450,7 @@ sends it whole.
 
 #### What chip firmware 1.17.6 does with fragments
 
+Measured on 1.17.6; not re-measured on 1.17.9, which the build now ships.
 Measured on air on 2026-10-03 with `AT+TXCAP` on the sending Warthog and
 `AT+RXCAP` on the receiving one (the two captures agree byte for byte except
 Duration), chip firmware 1.17.6 on both, 1 MHz MCS0 (`AT+TXRATE=0,1`),
@@ -561,7 +563,8 @@ whole at 1 MHz MCS3, 2 MHz MCS1 and faster.
 #### Sealed and group frames at rates the chip delivers
 
 `AT+SEALFIT=1`, the default, sends a frame the host does not cut only at rates
-where chip firmware 1.17.6 delivers it:
+where chip firmware 1.17.6 delivers it (measured on 1.17.6; not re-measured on
+1.17.9):
 
 - host CCMP: a sealed unicast frame whole;
 - chip keys: a sealed unicast frame in at most 2 fragments under `AT+FRAG` too,
@@ -652,13 +655,14 @@ OpenMANET nodes):
 | `AT+FRAG=0` | 16/16: the chip did not fragment them |
 
 `AT+MACSTATS?` tag 4152 (on the Warthog's chip, firmware 1.17.6, the fragments
-the chip transmitted, host-made ones included; measured 2026-10-01 and 02) rose
+the chip transmitted, host-made ones included; measured 2026-10-01 and 02 on
+1.17.6, not re-measured on 1.17.9) rose
 with them. On the host-CCMP build the Pi's `RX MPDUs with MIC fail` rose by 3 a
 reply; on the chip-key build the chip sent about one fragment of each frame it
 cut (tag 4152 +10 for 8 frames).
 
 Measured on 2026-10-03 against OpenMANET 1.8.0 Pis (chip firmware 2.0.1), the
-Warthog's chip on 1.17.6, `AT+HOSTFRAG=auto` with no fragment cap (host CCMP
+Warthog's chip on 1.17.6 (not re-measured on 1.17.9), `AT+HOSTFRAG=auto` with no fragment cap (host CCMP
 cutting too, up to 3 fragments a frame), host fragments cut after the session
 ends as above:
 
@@ -860,8 +864,9 @@ same:
 - The MIC octets the chip leaves on a fresh frame are checked in the host under
   the sender's MGTK. Until one verifies, the check only counts (`mic_ok`,
   `mic_bad`); chip firmware 1.17.6 does not leave them intact (measured
-  2026-10-01, [below](#measured-on-air-2026-10-01)). The first `mic_ok` proves
-  the chip keeps them (a chance match is 2^-64) and arms the check for that
+  2026-10-01 on 1.17.6, not re-measured on 1.17.9,
+  [below](#measured-on-air-2026-10-01)). The first `mic_ok` proves the chip
+  keeps them (a chance match is 2^-64) and arms the check for that
   frame class (`mic_arm=1` data, `2` group path selection, `3` both). From then
   on a frame whose MIC fails is dropped before any replay counter moves (95 or
   `gp micdrop`; `micdrop=<data>/<path selection>` in `AT+GTKSTAT?`).
@@ -897,8 +902,8 @@ same:
 
 One Warthog on this build, both 1.8.0 Pis and a `-swccmp-meshvif` Warthog:
 
-- The chip (`mm6108.mbin` 1.17.6) opens a peer's group frames under the key at
-  that peer's AID: `inst=3 fail=0`, `nodec grp` flat (before: about 32 a
+- The chip (`mm6108.mbin` 1.17.6; not re-measured on 1.17.9) opens a peer's
+  group frames under the key at that peer's AID: `inst=3 fail=0`, `nodec grp` flat (before: about 32 a
   minute), group PREQs answered with PREPs, and each Pi holds an `ACTIVE` path
   to the Warthog.
 - Pi to Warthog, 20/20 pings and 10/10 at 1000 bytes; Warthog to each Pi and to
@@ -937,7 +942,8 @@ hw=]` per keyed peer; `inst` one per keyed peer after a fresh start (it grows by
 one for each survivor when a peer leaves, on `AT+REKEY` and on an MGTK
 re-delivery); `rx_grp` and `mgmt_gp` climbing with the node's broadcasts and
 PREQs; `mic_bad` keeping pace with them, `mic_ok` and `mic_arm` at 0 (chip
-firmware 1.17.6 does not leave the MIC octets intact; measured 2026-10-01);
+firmware 1.17.6 does not leave the MIC octets intact; measured 2026-10-01 on
+1.17.6, not re-measured on 1.17.9);
 `fail`, `delfail`, `tainted`, `taint`, `micdrop` at 0 and `forged` flat in
 steady state (`fence` may move by a frame or two when a peer re-keys).
 `AT+RXCHAN?` `nodec grp` should stay flat, and on the node `iw dev wlh0 mpath
@@ -1002,7 +1008,7 @@ reading first:
 | `applied chan=NONE` | Mesh is off (the station holds the whole country list), or the radio is held | `AT+MESHEN=1` and `AT+RESET`; check `AT+REGION?` for `radio held:`. |
 | `set_channel_list` non-zero | morselib refused the channel list; the radio is **not** on the channel printed above | A firmware fault, not configuration: read the boot log. `AT+MESHCHAN=default` does not help here. |
 | `src=default+stored-refused` | The stored `AT+MESHCHAN` is not in this region's table, so the region default runs | Store a row of the running region's table to match the peer, or `AT+MESHCHAN=default`. |
-| `mesh not started: the chip refused the channel` | The chip refused the mesh channel at the first start, so the mesh sends nothing | A chip or firmware fault, not configuration: read the boot log, then `AT+RESET`. |
+| `mesh not started: channel setup failed` | The mesh channel's setup failed at the first start, so the mesh sends nothing; `st=` says why ([AT reference](AT-Command-Reference#mesh)) | `st=1`: the channel list has no row (`AT+REGION?`, `AT+MESHCHAN?`), or the chip's reply was malformed. `st=8`: the chip refused the channel (`EPERM`) or morselib refused the row, such as a bandwidth the chip lacks; try another `AT+MESHCHAN` row. `st=14` or `6`: the chip refused or did not answer the channel, TX power, duty cycle or MPSW: read the boot log, then `AT+RESET`. |
 | `beacons_heard=0` | Nothing is audible | Channel, bandwidth, or range. Compare `applied chan`/`bw` against `uci get wireless.radio1.channel` on the peer — `radio1` is the HaLow device and `channel` lives on the device, not the iface; `radio0` is the 5 GHz radio and `default_radio0.channel` is unset. Fix this before looking at anything else. A peer in beaconless mode sends no beacons at all; when its probe requests name our mesh, the diagnosis line says so. |
 | `beacons_heard>0`, `peers=0` | The mesh is audible and Warthog will not join it | Mesh ID (exact match, case included), operating class, or security mode. An open Warthog will not peer with an SAE mesh, and vice versa. Signal: an OpenMANET node takes no candidate it hears at or below its `mesh_rssi_threshold` (-80 dBm), and Warthog starts no peering at or below its own floor (`AT+MESHRSSI`, also -80), which the diagnosis line reports. Management frame protection is **not** on this list — peering is measured working with it off; it governs path selection (see the PMF note below). |
 | `peers>0` but no traffic | Peered; this is a data-plane question | `AT+RXCHAN?` and `AT+MPING=<peer>,8`. |

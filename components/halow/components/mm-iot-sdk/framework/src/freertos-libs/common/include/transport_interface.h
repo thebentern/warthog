@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2022 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
- * Copyright 2023 Morse Micro.
+ * Copyright 2023-2026 Morse Micro.
  *
  * SPDX-License-Identifier: MIT
  *
@@ -45,6 +45,9 @@
 #include "mbedtls/threading.h"
 #include "mbedtls/x509.h"
 #include "mbedtls/net.h"
+#if defined(MBEDTLS_SSL_PROTO_DTLS)
+#include "mbedtls/timing.h"
+#endif
 
 #ifndef TRANSPORT_EXTERNAL_CTR_DRBG_ENABLED
 #define TRANSPORT_EXTERNAL_CTR_DRBG_ENABLED (0)
@@ -267,11 +270,21 @@ typedef struct SSLContext
     mbedtls_x509_crt rootCa;                 /**< Root CA certificate context. */
     mbedtls_x509_crt clientCert;             /**< Client certificate context. */
     mbedtls_pk_context privKey;              /**< Client private key context. */
+#if defined(MBEDTLS_SSL_PROTO_DTLS)
+    mbedtls_timing_delay_context timer;      /**< Timer used for DTLS handshake retries */
+#endif
 #if !TRANSPORT_EXTERNAL_CTR_DRBG_ENABLED
     mbedtls_entropy_context entropyContext;  /**< Entropy context for random number generation. */
     mbedtls_ctr_drbg_context ctrDrgbContext; /**< CTR DRBG context for random number generation. */
 #endif
 } SSLContext_t;
+
+typedef void (*TransportRecvCallback_t)(NetworkContext_t *ctx, void *arg);
+typedef enum TransportProtocol
+{
+    TRANSPORT_TCP = 0,
+    TRANSPORT_UDP
+} TransportProtocol_t;
 
 /**
  * Definition of the network context for the transport interface
@@ -279,10 +292,13 @@ typedef struct SSLContext
  */
 struct NetworkContext
 {
-    mbedtls_net_context tcpSocket;
+    mbedtls_net_context socket;
     SSLContext_t sslContext;
+    TransportProtocol_t proto;
     uint32_t receiveTimeoutMs;
     uint32_t sendTimeoutMs;
+    TransportRecvCallback_t recv_callback;
+    void *recv_callback_arg;
 };
 
 /**
@@ -325,7 +341,8 @@ typedef enum TransportStatus
     TRANSPORT_HANDSHAKE_FAILED,      /**< Performing TLS handshake with server failed. */
     TRANSPORT_AUTHENTICATION_FAILED, /**< Handshake failed as server credentials could not be validated. */
     TRANSPORT_INTERNAL_ERROR,        /**< A call to a system API resulted in an internal error. */
-    TRANSPORT_CONNECT_FAILURE        /**< Initial connection to the server failed. */
+    TRANSPORT_CONNECT_FAILURE,       /**< Initial connection to the server failed. */
+    TRANSPORT_NOT_SUPPORTED,         /**< Features that are not yet implmented/supported. */
 } TransportStatus_t;
 
 /**
@@ -334,16 +351,16 @@ typedef enum TransportStatus
  * @param[out] pNetworkContext Pointer to a network context to contain the
  * initialized socket handle.
  * @param[in] pHostName The hostname of the remote endpoint.
+ * @param[in] proto The desired protocol, TCP or UDP.
  * @param[in] port The destination port.
  * @param[in] pNetworkCredentials Credentials for the TLS connection.
- * @param[in] receiveTimeoutMs Receive socket timeout.
- * @param[in] sendTimeoutMs Send socket timeout.
  *
  * @return #TLS_TRANSPORT_SUCCESS, #TLS_TRANSPORT_INSUFFICIENT_MEMORY, #TLS_TRANSPORT_INVALID_CREDENTIALS,
  * #TLS_TRANSPORT_HANDSHAKE_FAILED, #TLS_TRANSPORT_INTERNAL_ERROR, or #TLS_TRANSPORT_CONNECT_FAILURE.
  */
 TransportStatus_t transport_connect( NetworkContext_t * pNetworkContext,
                                            const char * pHostName,
+                                           TransportProtocol_t proto,
                                            uint16_t port,
                                            const NetworkCredentials_t * pNetworkCredentials);
 
@@ -355,7 +372,7 @@ TransportStatus_t transport_connect( NetworkContext_t * pNetworkContext,
 void transport_disconnect( NetworkContext_t * pNetworkContext );
 
 /**
- * Receives data from an established TLS connection.
+ * Receives data from an established TCP/TLS connection.
  *
  * This is the TLS version of the transport interface's
  * #TransportRecv_t function.
@@ -371,6 +388,46 @@ void transport_disconnect( NetworkContext_t * pNetworkContext );
 int32_t transport_recv( NetworkContext_t * pNetworkContext,
                            void * pBuffer,
                            size_t bytesToRecv );
+
+/**
+ * Receives data from an established TCP/TLS connection.
+ * Same as transport_recv but takes a timeout parameter
+ * and returns a timeout error on timeout
+ *
+ * @param[in]  pNetworkContext The Network context.
+ * @param[out] pBuffer         Buffer to receive bytes into.
+ * @param[in]  bytesToRecv     Number of bytes to receive from the network.
+ * @param[in]  timeoutMs       Max blocking time in milliseconds.
+ *
+ * @return number of bytes received if successful or a negative value on error.
+ */
+int32_t transport_recv_with_timeout(NetworkContext_t * pNetworkContext,
+                                    void * pBuffer,
+                                    size_t bytesToRecv,
+                                    uint32_t timeoutMs);
+
+/**
+ * Reads data from a socket and provides source IP address and port
+ *
+ * @note TLS is not supported (source_ip/source_port are ignored).
+ *
+ * @param[in]  pNetworkContext The Network context.
+ * @param[out] pBuffer         Buffer to receive bytes into.
+ * @param[in]  bytesToRecv     Number of bytes to receive from the network.
+ * @param[in]  timeoutMs       Max blocking time in milliseconds.
+ * @param[out] source_ip       Buffer into which to receive source IP address
+ * @param[out] source_ip_len   Length of source_ip buffer
+ * @param[out] source_port     Variable into which to receive source IP port
+ *
+ * @return number of bytes received if successful or a negative value on error.
+ */
+int32_t transport_recv_from_with_timeout(NetworkContext_t *pNetworkContext,
+                                         void *pBuffer,
+                                         size_t bytesToRecv,
+                                         uint32_t timeoutMs,
+                                         char *source_ip,
+                                         size_t source_ip_len,
+                                         uint16_t *source_port);
 
 /**
  * Sends data over an established TLS connection.
@@ -390,6 +447,39 @@ int32_t transport_send( NetworkContext_t * pNetworkContext,
                            const void * pBuffer,
                            size_t bytesToSend );
 
+/**
+ * Writes data to a socket using given destination IP address and port.
+ *
+ * @note TLS is not supported (destination_ip/destination_port are ignored).
+ *
+ * @param[in] pNetworkContext The network context.
+ * @param[in] pBuffer Buffer containing the bytes to send.
+ * @param[in] bytesToSend Number of bytes to send from the buffer.
+ * @param[in] source_ip Buffer from which to take the destination IP address
+ * @param[in] source_port     Variable from which to take the destination IP port
+ *
+ * @return Number of bytes (> 0) sent on success;
+ * 0 if the socket times out without sending any bytes;
+ * else a negative value to represent error.
+ */
+int32_t transport_send_to(NetworkContext_t *pNetworkContext,
+                          const void *pBuffer,
+                          size_t bytesToSend,
+                          const char *destination_ip,
+                          const uint16_t *destination_port);
+
+/**
+ * Register a callback that is invoked when data is received on the socket.
+ *
+ * @param[in] pNetworkContext The network context this callback applies to.
+ * @param[in] recvCallback The callback to register.
+ * @param[in] arg Opaque argument to be passed to the callback.
+ *
+ * @return 0 on success, else an appropriate negative error code.
+ */
+int32_t transport_register_recv_callback( NetworkContext_t * pNetworkContext,
+                                          TransportRecvCallback_t recvCallback,
+                                          void *arg );
 
 /* *INDENT-OFF* */
 #ifdef __cplusplus

@@ -8,7 +8,10 @@
 #   sh scripts/regen-screenshots.sh [board-serial-suffix]
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PY="${PIO_PYTHON:-$HOME/.platformio/penv/bin/python}"
+# PlatformIO's core dir as pio reads it: a leading ~ expanded, a relative one made absolute.
+core=${PLATFORMIO_CORE_DIR:-$HOME/.platformio}
+case $core in "~"/*) core=$HOME/${core#"~/"} ;; /*) ;; *) core=$PWD/$core ;; esac
+PY="${PIO_PYTHON:-$core/penv/bin/python}"
 SUFFIX="${1:-}"
 CAP=$(mktemp -d)
 cd "$ROOT"

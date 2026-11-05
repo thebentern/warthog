@@ -172,14 +172,6 @@ const struct mmwlan_qos_queue_params *umac_config_get_default_qos_queue_params(s
     return p;
 }
 
-/* umac_config.c's defaults, which the interface and a chip restart hand the health check. */
-void umac_config_get_health_check_interval(struct umac_data *umacd, uint32_t *min_ms, uint32_t *max_ms)
-{
-    (void)umacd;
-    *min_ms = MMWLAN_DEFAULT_MIN_HEALTH_CHECK_INTERVAL_MS;
-    *max_ms = MMWLAN_DEFAULT_MAX_HEALTH_CHECK_INTERVAL_MS;
-}
-
 uint32_t umac_config_get_datapath_rx_reorder_list_maxlen(struct umac_data *umacd)
 {
     (void)umacd;

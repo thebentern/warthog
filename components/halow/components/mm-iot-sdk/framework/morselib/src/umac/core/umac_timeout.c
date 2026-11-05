@@ -178,11 +178,7 @@ static void umac_timeoutq_enqueue(struct umac_core_timeoutq *toq, struct umac_co
     umac_timeoutq_enqueue_protected(toq, to);
     MMOSAL_TASK_EXIT_CRITICAL();
 
-    MMLOG_VRB("TO + %08lx: h=%08lx arg1=%08lx arg2=%08lx\n",
-              (uint32_t)to,
-              (uint32_t)to->handler,
-              (uint32_t)to->arg1,
-              (uint32_t)to->arg2);
+    MMLOG_VRB("TO + %p: h=%p arg1=%p arg2=%p\n", to, to->handler, to->arg1, to->arg2);
 }
 
 static struct umac_core_timeout *umac_timeoutq_remove_one_protected(
@@ -278,12 +274,8 @@ uint32_t umac_timeoutq_dispatch(struct umac_core_data *core)
             break;
         }
 
-        MMLOG_VRB("TO X %08lx: h=%08lx arg1=%08lx arg2=%08lx\n",
-                  (uint32_t)to,
-                  (uint32_t)to->handler,
-                  (uint32_t)to->arg1,
-                  (uint32_t)to->arg2);
-        MMLOG_VRB("HEAD: %08lx\n", (uint32_t)core->toq.head);
+        MMLOG_VRB("TO X %p: h=%p arg1=%p arg2=%p\n", to, to->handler, to->arg1, to->arg2);
+        MMLOG_VRB("HEAD: %p\n", core->toq.head);
         umac_timeoutq_dispatch_timeout(core, to);
         num_timeouts_fired++;
     }
@@ -318,6 +310,15 @@ uint32_t umac_timeoutq_time_to_next_timeout(struct umac_core_data *core)
     }
 }
 
+static bool umac_timeoutq_cancel_matches(const struct umac_core_timeout *to,
+                                         umac_core_timeout_handler_t handler,
+                                         void *arg1,
+                                         void *arg2)
+{
+    return to->handler == handler && (arg1 == UMAC_CORE_TIMEOUT_ARG_ANY || to->arg1 == arg1) &&
+           (arg2 == UMAC_CORE_TIMEOUT_ARG_ANY || to->arg2 == arg2);
+}
+
 static int umac_timeoutq_cancel_protected(struct umac_core_timeoutq *toq,
                                           umac_core_timeout_handler_t handler,
                                           void *arg1,
@@ -328,7 +329,7 @@ static int umac_timeoutq_cancel_protected(struct umac_core_timeoutq *toq,
     int count = 0;
 
 
-    while (walk != NULL && walk->handler == handler && walk->arg1 == arg1 && walk->arg2 == arg2)
+    while (walk != NULL && umac_timeoutq_cancel_matches(walk, handler, arg1, arg2))
     {
         toq->head = walk->next;
         umac_timeoutq_free_protected(toq, walk);
@@ -348,7 +349,7 @@ static int umac_timeoutq_cancel_protected(struct umac_core_timeoutq *toq,
 
     while (walk != NULL)
     {
-        if (walk->handler == handler && walk->arg1 == arg1 && walk->arg2 == arg2)
+        if (umac_timeoutq_cancel_matches(walk, handler, arg1, arg2))
         {
             prev->next = walk->next;
 
@@ -389,11 +390,11 @@ void umac_timeoutq_dump(struct umac_core_timeoutq *toq)
     MMLOG_INF("UMAC Timeout Queue:\n");
     for (walk = toq->head; walk != NULL; walk = walk->next)
     {
-        MMLOG_INF("TO %08lx: h=%08lx arg1=%08lx arg2=%08lx @=%lu\n",
-                  (uint32_t)walk,
-                  (uint32_t)walk->handler,
-                  (uint32_t)walk->arg1,
-                  (uint32_t)walk->arg2,
+        MMLOG_INF("TO %p: h=%p arg1=%p arg2=%p @=%lu\n",
+                  walk,
+                  walk->handler,
+                  walk->arg1,
+                  walk->arg2,
                   walk->timeout_abs_ms);
     }
 }
@@ -558,12 +559,7 @@ int umac_core_deplete_timeout(struct umac_data *umacd,
         umac_core_evt_wake(umacd);
     }
 
-    MMLOG_VRB("DEPLETE: %4lu %08lx %08lx %08lx; ret=%d\n",
-              delta_ms,
-              (uint32_t)handler,
-              (uint32_t)arg1,
-              (uint32_t)arg2,
-              ret);
+    MMLOG_VRB("DEPLETE: %4lu %p %p %p; ret=%d\n", delta_ms, handler, arg1, arg2, ret);
 
     return ret;
 }

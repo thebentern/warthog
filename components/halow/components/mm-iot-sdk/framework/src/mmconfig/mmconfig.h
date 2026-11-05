@@ -161,13 +161,15 @@
  * ------------
  *
  * To read data we simply scan the primary partition Key-Value by Key-Value till we find the
- * requested key or run into the @c 0xFF marker signifying end of the list.
+ * requested key or run into the @c 0xFF marker signifying end of the list. If an optional valid
+ * factory partition is configured, and the key is not found in the writable partition, the factory
+ * partition is scanned as a fallback.
  *
  * Programming the config store from a host PC {#MMCONFIG_PROGRAMMING}
  * ===========================================
  *
  * This section provides instructions for programming the config store from a host PC via the
- * command line. Alternatively the config store may be programmed through the Platform IO UI.
+ * command line.
  *
  * - Connect the target on USB and start OpenOCD in a terminal by running the following command from
  *   the `framework` directory. If OpenOCD starts successfully it will print some information
@@ -243,7 +245,7 @@ struct mmconfig_update_node
      * unless it is to be used for multiple deletions and so ends in an
      * asterisk '*'
      */
-    char *key;
+    const char *key;
 
     /** Pointer to the data. May be NULL to indicate deletion.
      */
@@ -251,6 +253,9 @@ struct mmconfig_update_node
 
     /** Size of the data. May be zero to indicate deletion. */
     size_t size;
+
+    /** Boolean flag to indicate if data is dynamically allocated */
+    bool data_malloced;
 
     /** Pointer to the next node in the list */
     struct mmconfig_update_node *next;
@@ -260,9 +265,25 @@ struct mmconfig_update_node
  * Erases all flash blocks allocated to persistent storage and write the signature
  * at the 2 copies in flash.
  *
+ * If a factory MMCONFIG partition is configured, it is not erased. After this call, reads for keys
+ * that are not present in the writable partition will fall back to the factory partition.
+ *
  * @return It returns 0 on success or an error code on failure.
  */
 int mmconfig_eraseall(void);
+
+/**
+ * Check the status of the optional factory MMCONFIG partition.
+ *
+ * The factory partition uses the same on-flash format as a single MMCONFIG image and is treated as
+ * read-only. If valid, it supplies fallback values for keys not present in the writable partition.
+ * Note that calling this will also initialize any other config partition.
+ *
+ * @return     Returns @c MMCONFIG_OK if the factory partition is configured and valid,
+ *             @c MMCONFIG_ERR_NOT_SUPPORTED if no usable factory partition is configured,
+ *             or @c MMCONFIG_ERR_INVALID_PARTITION if the configured partition is invalid.
+ */
+enum mmconfig_result mmconfig_check_factory_partition_status(void);
 
 /**
  * Writes the raw data to persistent store location identified by key.
@@ -286,6 +307,10 @@ int mmconfig_write_data(const char *key, const void *data, size_t size);
 
 /**
  * Deletes the specified key(s) from persistent store.
+ *
+ * If a factory MMCONFIG partition is configured, this only deletes matching key(s) from the
+ * writable partition. Reads for deleted keys will fall back to the factory partition if matching
+ * factory values exist.
  *
  * @param  key Identifies the data element in persistent storage and is a
  *                      case insensitive alphanumeric (plus underscore) string starting
@@ -543,14 +568,6 @@ int mmconfig_validate_key_character(char character);
 int mmconfig_check_usage(const struct mmconfig_update_node *node_list,
                          uint32_t *bytes_used,
                          int32_t *bytes_remaining);
-
-/**
- * Loads and applies any other @c mmwlan settings specified in config store.
- *
- * Specifically looks for @c wlan.subbands_enabled, @c wlan.sgi_enabled,
- * @c wlan.ampdu_enabled, @c wlan.fragment_threshold and @c wlan.rts_threshold.
- */
-void load_mmwlan_settings(void);
 
 #ifdef __cplusplus
 }

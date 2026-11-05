@@ -11,7 +11,10 @@ TAG="${1:?usage: $0 TAG OUTDIR [SDKCONFIG]}"
 OUT="${2:?usage: $0 TAG OUTDIR [SDKCONFIG]}"
 CFG="${3:-sdkconfig.warthog-station}"
 PY="${PYTHON:-python3}"
-NVS_TOOL="${NVS_TOOL:-$HOME/.platformio/packages/framework-espidf/components/nvs_flash/nvs_partition_tool/nvs_tool.py}"
+# PlatformIO's core dir as pio reads it: a leading ~ expanded, a relative one made absolute.
+core=${PLATFORMIO_CORE_DIR:-$HOME/.platformio}
+case $core in "~"/*) core=$HOME/${core#"~/"} ;; /*) ;; *) core=$PWD/$core ;; esac
+NVS_TOOL="${NVS_TOOL:-$core/packages/framework-espidf/components/nvs_flash/nvs_partition_tool/nvs_tool.py}"
 # regnvs's size in partitions.csv (12K).
 SIZE=0x3000
 

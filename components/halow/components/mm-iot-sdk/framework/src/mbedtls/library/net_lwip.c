@@ -2,7 +2,7 @@
  *  TCP/IP or UDP/IP networking functions
  *
  *  Copyright The Mbed TLS Contributors
- *  Copyright 2023 Morse Micro
+ *  Copyright 2023-2026 Morse Micro
  *  SPDX-License-Identifier: Apache-2.0
  *
  *  Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -33,7 +33,30 @@
 #include "lwip/sys.h"
 #include "lwip/netdb.h"
 
+#include "mmosal.h"
 #define IS_EINTR(ret) ((ret) == EINTR)
+
+union sockaddr_union
+{
+    struct sockaddr sa;
+#if defined(LWIP_IPV4) && LWIP_IPV4
+    struct sockaddr_in sockaddr_in4;
+#endif
+#if defined(LWIP_IPV6) && LWIP_IPV6
+    struct sockaddr_in6 sockaddr_in6;
+#endif
+};
+
+static int mbedtls_net_accept_info_sockaddr(mbedtls_net_context *bind_ctx,
+                                            mbedtls_net_context *client_ctx,
+                                            union sockaddr_union *client_sockaddr,
+                                            size_t client_sockaddr_buf_size);
+
+static int mbedtls_net_recvfrom_info_sockaddr(void *ctx,
+                                              unsigned char *buf,
+                                              size_t len,
+                                              union sockaddr_union *source_sockaddr,
+                                              size_t source_sockaddr_buf_size);
 
 /*
  * Return 0 if the file descriptor is valid, an error otherwise.
@@ -232,19 +255,119 @@ static int net_would_block(const mbedtls_net_context *ctx)
     return 0;
 }
 
+static int sockaddr_to_string(union sockaddr_union *source_sockaddr,
+                              char *ip,
+                              size_t ip_len,
+                              uint16_t *port)
+{
+#if defined(LWIP_IPV4) && LWIP_IPV4
+    if (source_sockaddr->sa.sa_family == AF_INET)
+    {
+        if (port != NULL)
+        {
+            *port = ntohs(source_sockaddr->sockaddr_in4.sin_port);
+        }
+
+        if ((ip != NULL) && (ip_len > 0))
+        {
+            if (inet_ntop(source_sockaddr->sa.sa_family,
+                          &source_sockaddr->sockaddr_in4.sin_addr.s_addr,
+                          ip,
+                          ip_len) == NULL)
+            {
+                return MBEDTLS_ERR_NET_BUFFER_TOO_SMALL;
+            }
+        }
+    }
+#endif
+#if defined(LWIP_IPV6) && LWIP_IPV6
+    if (source_sockaddr->sa.sa_family == AF_INET6)
+    {
+        if (port != NULL)
+        {
+            *port = ntohs(source_sockaddr->sockaddr_in6.sin6_port);
+        }
+
+        if ((ip != NULL) && (ip_len > 0))
+        {
+            if (inet_ntop(source_sockaddr->sa.sa_family,
+                          &source_sockaddr->sockaddr_in6.sin6_addr.s6_addr,
+                          ip,
+                          ip_len) == NULL)
+            {
+                return MBEDTLS_ERR_NET_BUFFER_TOO_SMALL;
+            }
+        }
+    }
+#endif
+
+    return 0;
+}
+
+static bool string_to_sockaddr(const char *ip,
+                               const uint16_t *port,
+                               union sockaddr_union *dest_sockaddr)
+{
+    int result = 0;
+#if defined(LWIP_IPV4) && LWIP_IPV4
+    result = inet_pton(AF_INET, ip, &dest_sockaddr->sockaddr_in4.sin_addr.s_addr);
+    if (result == 1)
+    {
+        dest_sockaddr->sa.sa_family = AF_INET;
+        dest_sockaddr->sockaddr_in4.sin_port = htons(*port);
+        return true;
+    }
+#endif
+#if defined(LWIP_IPV6) && LWIP_IPV6
+    result = inet_pton(AF_INET6, ip, &dest_sockaddr->sockaddr_in6.sin6_addr.s6_addr);
+    if (result == 1)
+    {
+        dest_sockaddr->sa.sa_family = AF_INET6;
+        dest_sockaddr->sockaddr_in6.sin6_port = htons(*port);
+        return true;
+    }
+#endif
+
+    return false;
+}
+
 /*
- * Accept a connection from a remote client
+ * Accept a connection from a remote client with client IP address returned as string and
+ * port in host byte order
  */
 int mbedtls_net_accept(mbedtls_net_context *bind_ctx,
                        mbedtls_net_context *client_ctx,
-                       void *client_ip,
-                       size_t buf_size,
-                       size_t *ip_len)
+                       char *client_ip,
+                       size_t client_ip_len,
+                       uint16_t *client_port)
+{
+    union sockaddr_union client_info;
+    memset(&client_info, 0, sizeof(client_info));
+
+    int ret =
+        mbedtls_net_accept_info_sockaddr(bind_ctx, client_ctx, &client_info, sizeof(client_info));
+    if (ret != 0)
+    {
+        return ret;
+    }
+
+    ret = sockaddr_to_string(&client_info, client_ip, client_ip_len, client_port);
+
+    return ret;
+}
+
+/*
+ * Accept a connection from a remote client with client information returned in sockaddr
+ */
+static int mbedtls_net_accept_info_sockaddr(mbedtls_net_context *bind_ctx,
+                                            mbedtls_net_context *client_ctx,
+                                            union sockaddr_union *client_sockaddr,
+                                            size_t client_sockaddr_buf_size)
 {
     int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
     int type;
 
-    struct sockaddr_storage client_addr;
+    union sockaddr_union client_addr;
 
     int n = (int)sizeof(client_addr);
     int type_len = (int)sizeof(type);
@@ -260,8 +383,7 @@ int mbedtls_net_accept(mbedtls_net_context *bind_ctx,
     if (type == SOCK_STREAM)
     {
         /* TCP: actual accept() */
-        ret = client_ctx->fd =
-            (int)lwip_accept(bind_ctx->fd, (struct sockaddr *)&client_addr, (socklen_t *)&n);
+        ret = client_ctx->fd = (int)lwip_accept(bind_ctx->fd, &client_addr.sa, (socklen_t *)&n);
     }
     else
     {
@@ -272,7 +394,7 @@ int mbedtls_net_accept(mbedtls_net_context *bind_ctx,
                                  buf,
                                  sizeof(buf),
                                  MSG_PEEK,
-                                 (struct sockaddr *)&client_addr,
+                                 &client_addr.sa,
                                  (socklen_t *)&n);
     }
 
@@ -293,7 +415,7 @@ int mbedtls_net_accept(mbedtls_net_context *bind_ctx,
         struct sockaddr_storage local_addr;
         int one = 1;
 
-        if (lwip_connect(bind_ctx->fd, (struct sockaddr *)&client_addr, n) != 0)
+        if (lwip_connect(bind_ctx->fd, &client_addr.sa, n) != 0)
         {
             return MBEDTLS_ERR_NET_ACCEPT_FAILED;
         }
@@ -320,34 +442,28 @@ int mbedtls_net_accept(mbedtls_net_context *bind_ctx,
         }
     }
 
-    if (client_ip != NULL)
+    if (client_sockaddr != NULL)
     {
 #if defined(LWIP_IPV4) && LWIP_IPV4
-        if (client_addr.ss_family == AF_INET)
+        if (client_addr.sa.sa_family == AF_INET)
         {
-            struct sockaddr_in *addr4 = (struct sockaddr_in *)&client_addr;
-            *ip_len = sizeof(addr4->sin_addr.s_addr);
-
-            if (buf_size < *ip_len)
+            if (client_sockaddr_buf_size < sizeof(struct sockaddr_in))
             {
                 return MBEDTLS_ERR_NET_BUFFER_TOO_SMALL;
             }
 
-            memcpy(client_ip, &addr4->sin_addr.s_addr, *ip_len);
+            memcpy(client_sockaddr, &client_addr.sockaddr_in4, sizeof(struct sockaddr_in));
         }
 #endif
-#if defined(LWIP_IPV4) && LWIP_IPV6
-        if (client_addr.ss_family == AF_INET6)
+#if defined(LWIP_IPV6) && LWIP_IPV6
+        if (client_addr.sa.sa_family == AF_INET6)
         {
-            struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&client_addr;
-            *ip_len = sizeof(addr6->sin6_addr.s6_addr);
-
-            if (buf_size < *ip_len)
+            if (client_sockaddr_buf_size < sizeof(struct sockaddr_in6))
             {
                 return MBEDTLS_ERR_NET_BUFFER_TOO_SMALL;
             }
 
-            memcpy(client_ip, &addr6->sin6_addr.s6_addr, *ip_len);
+            memcpy(client_sockaddr, &client_addr.sockaddr_in6, sizeof(struct sockaddr_in6));
         }
 #endif
     }
@@ -441,52 +557,7 @@ void mbedtls_net_usleep(unsigned long usec)
     mmosal_task_sleep((usec + 500) / 1000);
 }
 
-/*
- * Read at most 'len' characters
- */
-int mbedtls_net_recv(void *ctx, unsigned char *buf, size_t len)
-{
-    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
-    int fd = ((mbedtls_net_context *)ctx)->fd;
-
-    ret = check_fd(fd, 0);
-    if (ret != 0)
-    {
-        return ret;
-    }
-
-    /* Clear RX ready prior to reading from the socket. */
-    atomic_store(&((mbedtls_net_context *)ctx)->rx_data_ready, 0);
-
-    ret = (int)lwip_read(fd, buf, len);
-
-    if (ret < 0)
-    {
-        if (net_would_block(ctx) != 0)
-        {
-            return MBEDTLS_ERR_SSL_WANT_READ;
-        }
-
-        if (errno == EPIPE || errno == ECONNRESET)
-        {
-            return MBEDTLS_ERR_NET_CONN_RESET;
-        }
-
-        if (errno == EINTR)
-        {
-            return MBEDTLS_ERR_SSL_WANT_READ;
-        }
-
-        return MBEDTLS_ERR_NET_RECV_FAILED;
-    }
-
-    return ret;
-}
-
-/*
- * Read at most 'len' characters, blocking for at most 'timeout' ms
- */
-int mbedtls_net_recv_timeout(void *ctx, unsigned char *buf, size_t len, uint32_t timeout)
+static int mbedtls_net_rx_timeout(void *ctx, uint32_t timeout)
 {
     int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
     struct timeval tv;
@@ -523,14 +594,60 @@ int mbedtls_net_recv_timeout(void *ctx, unsigned char *buf, size_t len, uint32_t
         return MBEDTLS_ERR_NET_RECV_FAILED;
     }
 
-    /* This call will not block */
-    return mbedtls_net_recv(ctx, buf, len);
+    return 0;
 }
 
 /*
- * Write at most 'len' characters
+ * Read at most 'len' characters
  */
-int mbedtls_net_send(void *ctx, const unsigned char *buf, size_t len)
+int mbedtls_net_recv(void *ctx, unsigned char *buf, size_t len)
+{
+    return mbedtls_net_recvfrom_info_sockaddr(ctx, buf, len, NULL, 0);
+}
+
+int mbedtls_net_recvfrom_timeout(void *ctx,
+                                 unsigned char *buf,
+                                 size_t len,
+                                 uint32_t timeout,
+                                 char *source_ip,
+                                 size_t source_ip_len,
+                                 uint16_t *source_port)
+{
+    int ret = mbedtls_net_rx_timeout(ctx, timeout);
+    if (ret != 0)
+    {
+        return ret;
+    }
+
+    return mbedtls_net_recvfrom(ctx, buf, len, source_ip, source_ip_len, source_port);
+}
+
+int mbedtls_net_recvfrom(void *ctx,
+                         unsigned char *buf,
+                         size_t len,
+                         char *source_ip,
+                         size_t source_ip_len,
+                         uint16_t *source_port)
+{
+    union sockaddr_union source_addr;
+
+    int ret = mbedtls_net_recvfrom_info_sockaddr(ctx, buf, len, &source_addr, sizeof(source_addr));
+
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    (void)sockaddr_to_string(&source_addr, source_ip, source_ip_len, source_port);
+
+    return ret;
+}
+
+static int mbedtls_net_recvfrom_info_sockaddr(void *ctx,
+                                              unsigned char *buf,
+                                              size_t len,
+                                              union sockaddr_union *source_sockaddr,
+                                              size_t source_sockaddr_buf_size)
 {
     int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
     int fd = ((mbedtls_net_context *)ctx)->fd;
@@ -541,7 +658,107 @@ int mbedtls_net_send(void *ctx, const unsigned char *buf, size_t len)
         return ret;
     }
 
-    ret = (int)write(fd, buf, len);
+    /* Clear RX ready prior to reading from the socket. */
+    ((mbedtls_net_context *)ctx)->rx_data_ready = false;
+    MMPORT_MEM_SYNC();
+
+    if (source_sockaddr != NULL)
+    {
+        socklen_t sockaddr_buf_size = (socklen_t)source_sockaddr_buf_size;
+        ret = (int)lwip_recvfrom(fd, buf, len, 0, &source_sockaddr->sa, &sockaddr_buf_size);
+    }
+    else
+    {
+        ret = (int)lwip_recvfrom(fd, buf, len, 0, NULL, NULL);
+    }
+
+    if (ret < 0)
+    {
+        if (net_would_block(ctx) != 0)
+        {
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
+
+        if (errno == EPIPE || errno == ECONNRESET)
+        {
+            return MBEDTLS_ERR_NET_CONN_RESET;
+        }
+
+        if (errno == EINTR)
+        {
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
+
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+
+    return ret;
+}
+
+/*
+ * Read at most 'len' characters, blocking for at most 'timeout' ms
+ */
+int mbedtls_net_recv_timeout(void *ctx, unsigned char *buf, size_t len, uint32_t timeout)
+{
+    int ret = mbedtls_net_rx_timeout(ctx, timeout);
+    if (ret != 0)
+    {
+        return ret;
+    }
+
+    /* This call will not block */
+    return mbedtls_net_recv(ctx, buf, len);
+}
+
+/*
+ * Write at most 'len' characters
+ */
+int mbedtls_net_send(void *ctx, const unsigned char *buf, size_t len)
+{
+    return mbedtls_net_sendto(ctx, buf, len, NULL, NULL);
+}
+
+int mbedtls_net_sendto(void *ctx,
+                       const unsigned char *buf,
+                       size_t len,
+                       const char *destination_ip,
+                       const uint16_t *destination_port)
+{
+    union sockaddr_union dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
+    int fd = ((mbedtls_net_context *)ctx)->fd;
+    int flags = 0;
+
+    ret = check_fd(fd, 0);
+    if (ret != 0)
+    {
+        return ret;
+    }
+
+    if ((destination_ip != NULL) &&
+        (destination_port != NULL) &&
+        string_to_sockaddr(destination_ip, destination_port, &dest_addr))
+    {
+        socklen_t dest_addr_len = 0;
+#if defined(LWIP_IPV4) && LWIP_IPV4
+        if (dest_addr.sa.sa_family == AF_INET)
+        {
+            dest_addr_len = sizeof(struct sockaddr_in);
+        }
+#endif
+#if defined(LWIP_IPV6) && LWIP_IPV6
+        if (dest_addr.sa.sa_family == AF_INET6)
+        {
+            dest_addr_len = sizeof(struct sockaddr_in6);
+        }
+#endif
+        ret = (int)lwip_sendto(fd, buf, len, flags, &dest_addr.sa, dest_addr_len);
+    }
+    else
+    {
+        ret = (int)write(fd, buf, len);
+    }
 
     if (ret < 0)
     {
@@ -601,7 +818,9 @@ void mbedtls_net_free(mbedtls_net_context *ctx)
 static void mbedtls_net_rx_cb(void *arg)
 {
     struct mbedtls_net_context *ctx = (struct mbedtls_net_context *)arg;
-    atomic_store(&ctx->rx_data_ready, 1);
+
+    ctx->rx_data_ready = true;
+
     if (ctx->rx_callback != NULL)
     {
         ctx->rx_callback(ctx, ctx->rx_callback_arg);
@@ -626,7 +845,10 @@ int mbedtls_net_register_rx_callback(struct mbedtls_net_context *ctx,
 
 int mbedtls_net_check_and_clear_rx_ready(mbedtls_net_context *ctx)
 {
-    bool ready = atomic_exchange(&(ctx->rx_data_ready), 0);
+    MMOSAL_TASK_ENTER_CRITICAL();
+    bool ready = ctx->rx_data_ready;
+    ctx->rx_data_ready = false;
+    MMOSAL_TASK_EXIT_CRITICAL();
     return ready;
 }
 
