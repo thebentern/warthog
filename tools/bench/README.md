@@ -45,9 +45,10 @@ on first use. The numbers below were measured with the originals.
 
    Pushes 1.5 Mbit/s of UDP and ten 1400-byte pings a second through each
    board's USB network interface to `<dest-ip>`, and opens and closes each
-   console port once a second, sending nothing. Pass: `RESULT pass`. Without
-   the slave mode define the whole USB function stops within two minutes and
-   needs a power cycle.
+   console port once a second, sending nothing. `RESULT pass` requires both
+   traffic sources to send packets on every board's interface. Echo replies
+   are optional. Without the slave mode define the whole USB function stops
+   within two minutes and needs a power cycle.
 2. Command sessions under the same load:
 
        python3 h6/usb_console_load.py commands 70 <dest-ip> <usb-serial>...
@@ -65,9 +66,14 @@ on first use. The numbers below were measured with the originals.
    `main/usbdiag.c` (compiled to nothing without the flag) writes a 90-byte
    line to the console every tick from core 1, and the script holds the port
    open while `h6/usbctl` sends about 2,000 control requests a second that the
-   board refuses. Pass: output keeps arriving for 200 s. Without the cap it
-   stops within 150 s, usually within 20 s. The modes `getcoding` and `none`
-   are controls and pass either way.
+   board refuses. A pass requires complete diagnostic `spam` lines throughout
+   the run. A four-second gap fails even if warnings keep arriving. Without
+   the cap the stream stops within 150 s, usually within 20 s. The modes
+   `getcoding` and `none` are controls and pass either way.
+
+Run the hardware-free script regression tests from the repository root.
+
+    python3 -m unittest discover -s tools/bench/h6
 
 A console that has gone silent comes back with `h6/usbprobe reset <usb-serial>`
 (a port reset; the board does not reboot). The bench image also streams the
