@@ -852,6 +852,38 @@ esp_err_t warthog_cfg_set_dns(const char *dns)
     return err;
 }
 
+uint8_t warthog_cfg_get_ext_ram(void)
+{
+    nvs_handle_t h;
+    uint8_t on = 1; /* the PSRAM is used unless a board was told otherwise */
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v;
+        if (nvs_get_u8(h, "ext_ram", &v) == ESP_OK && v <= 1) {
+            on = v;
+        }
+        nvs_close(h);
+    }
+    return on;
+}
+
+esp_err_t warthog_cfg_set_ext_ram(uint8_t on)
+{
+    if (on > 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, "ext_ram", on);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
 esp_err_t warthog_cfg_erase(void)
 {
     nvs_handle_t h;

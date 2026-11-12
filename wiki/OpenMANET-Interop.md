@@ -1010,6 +1010,7 @@ reading first:
 | `src=default+stored-refused` | The stored `AT+MESHCHAN` is not in this region's table, so the region default runs | Store a row of the running region's table to match the peer, or `AT+MESHCHAN=default`. |
 | `mesh not started: channel setup failed` | The mesh channel's setup failed at the first start, so the mesh sends nothing; `st=` says why ([AT reference](AT-Command-Reference#mesh)) | `st=1`: the channel list has no row (`AT+REGION?`, `AT+MESHCHAN?`), or the chip's reply was malformed. `st=8`: the chip refused the channel (`EPERM`) or morselib refused the row, such as a bandwidth the chip lacks; try another `AT+MESHCHAN` row. `st=14` or `6`: the chip refused or did not answer the channel, TX power, duty cycle or MPSW: read the boot log, then `AT+RESET`. |
 | `beacons_heard=0` | Nothing is audible | Channel, bandwidth, or range. Compare `applied chan`/`bw` against `uci get wireless.radio1.channel` on the peer — `radio1` is the HaLow device and `channel` lives on the device, not the iface; `radio0` is the 5 GHz radio and `default_radio0.channel` is unset. Fix this before looking at anything else. A peer in beaconless mode sends no beacons at all; when its probe requests name our mesh, the diagnosis line says so. |
+| `beacons_heard=0`, `prq_other` climbing in `AT+PRSPSTAT?` | A mesh node is audible on this channel under another mesh ID; the diagnosis line does not read that counter | Compare `AT+MESHID?` with the peer's `mesh_id`. |
 | `beacons_heard>0`, `peers=0` | The mesh is audible and Warthog will not join it | Mesh ID (exact match, case included), operating class, or security mode. An open Warthog will not peer with an SAE mesh, and vice versa. Signal: an OpenMANET node takes no candidate it hears at or below its `mesh_rssi_threshold` (-80 dBm), and Warthog starts no peering at or below its own floor (`AT+MESHRSSI`, also -80), which the diagnosis line reports. Management frame protection is **not** on this list — peering is measured working with it off; it governs path selection (see the PMF note below). |
 | `peers>0` but no traffic | Peered; this is a data-plane question | `AT+RXCHAN?` and `AT+MPING=<peer>,8`. |
 
@@ -1228,7 +1229,10 @@ bridge (`l2=bridge multicast=all(bridged)`); both are compiled and host-tested.
 Unicast relay with `AT+MESHFWD=1` was measured on air under SAE on 2026-10-02,
 with two OpenMANET nodes' paths pinned through the Warthog
 ([below](#turning-on-the-relay-the-on-air-experiment-in-order)); path selection
-through a Warthog and bridge mode were not.
+through a Warthog was not. Bridge mode was measured on air on 2026-11-10 and 2026-11-11
+beside two OpenMANET 1.8.0 nodes without `bat0`: the bridge's and a USB
+host's DHCP leases, unicast up to 3000 bytes and a host's multicast and
+broadcast ([Mesh Mode](Mesh-Mode#bridge-mode)).
 
 `multicast=meshtastic(239.0.0.69)` is deliberate. In NAT mode the repeater in
 `main/mudp.c` carries Meshtastic's UDP group, `239.0.0.69:4403`, between the
@@ -1281,8 +1285,10 @@ OpenMANET 1.8.0 Pis whose paths were pinned through it (`iw dev wlh0 mpath new
 <other-pi> next_hop <warthog>`), 300-, 1000- and 1400-byte pings 10/10 each,
 `fwd uni` 106. Those frames named the other Pi in addr3, so the chip hands up
 third-party frames (step 1). Path selection through a Warthog, relayed group
-frames, hosts across the relay and bridge mode are host-tested and simulated
-only. The order, each step a counter read rather than an argument:
+frames and hosts across the relay are host-tested and simulated only; bridge
+mode (step 5) was measured on 2026-11-10 and 2026-11-11
+([Mesh Mode](Mesh-Mode#bridge-mode)). The order, each step a counter read
+rather than an argument:
 
 1. **Does the chip hand up third-party frames at all?** One Linux node peered
    with the warthog, forwarding still off. On the Linux node, install a static
@@ -1314,17 +1320,23 @@ only. The order, each step a counter read rather than an argument:
    should catch the echo.
 4. **Hosts across the relay.** A laptop behind each node; ping laptop to
    laptop. `AT+MESHPATH?` should show both laptops as `host=... behind=...`.
-5. **Bridge mode.** `AT+MESHBRIDGE=1`, `AT+RESET`. The warthog's USB host
+5. **Bridge mode.** `AT+MESHBRIDGE=1`, `AT+RESET`, then read `AT+MESHBRIDGE?`
+   first (`running=1 reason=ok`, then `mesh_link=1`). The warthog's USB host
    should get a lease from the OpenMANET node's dnsmasq (or nothing, on a
    warthog-only mesh — that is the documented cost), and mDNS/CoT discovery
    between the laptop and a node's host is the thing this mode exists for.
+   Measured on 2026-11-10 and 2026-11-11: the host's lease 24 to 57 s after boot, pings
+   to the gateway up to 3000 bytes, and a host's multicast and broadcast
+   crossing between two bridged Warthogs, the broadcast also reaching the Pis'
+   wired LAN; mDNS and
+   CoT applications themselves were not run.
    This needs a node without `bat0`; OpenMANET's own services are not
    reachable this way (see
    [Reaching OpenMANET applications](#reaching-openmanet-applications)).
 
 `tools/bench/openmanet_interop.py --fwd` sets step 2 up and reads steps 2–4;
-`--bridge` adds step 5. Both report; neither asserts, because only unicast
-relay over pinned paths has a measured baseline.
+`--bridge` adds step 5. Both report; neither asserts: when they were written
+only unicast relay over pinned paths had a measured baseline.
 
 ## Vanilla OpenWrt
 

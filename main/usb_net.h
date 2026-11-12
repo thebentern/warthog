@@ -9,6 +9,10 @@
 /* Bring up TinyUSB CDC-NCM (CDC-ECM on warthog-station-ecm) + a DHCP-serving esp_netif. NULL on failure. */
 esp_netif_t *warthog_usb_net_start(void);
 
+/* app_main, once it has started the bridge or decided for none: raises the network link of a host that
+ * attached while warthog_mesh_bridge_pending() (the link is held until then). Nothing before TinyUSB starts. */
+void warthog_usb_net_link_release(void);
+
 /* The USB network counters AT+STATUS? prints; zeros before warthog_usb_net_start. */
 void warthog_usb_net_stats(struct usbnet_stats *out);
 

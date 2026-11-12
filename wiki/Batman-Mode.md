@@ -376,18 +376,37 @@ Details in the [AT Command Reference](AT-Command-Reference#batman-mode).
   `tt=256/256`. A node set up as the wizard does announced three entries of its
   own on air (its bat0 MAC untagged and on VLAN 1, and its bridge's MAC), so 32
   such nodes take 96 rows before any client. Shown in host simulation only.
-- Heap: about 58 KB while batman runs (engine 32.5 KB, frame slots 15.7 KB,
-  render buffer 4 KB, task stack 6 KB), allocated at mesh start; nothing when off.
-  Computed from the Xtensa object sizes. On a board (`warthog-mesh-sae-swccmp`,
-  2026-09-29/30) `heap_free` was about 53 KB right after boot; with 3–4 SAE
-  peers and host CCMP it settled at 22–31 KB, with `heap_min` 10.9–20 KB and
-  `heap_largest` 8.7–15 KB, little headroom. The engine task's `stack_free` was
-  about 4.1 KB of its 6 KB. Received frames
-  reach lwIP as heap copies, at most 16 at once (about 24 KB at the 1460-byte
-  MTU, about 33 KB for 2 KB reassembled frames), each freed when lwIP has read it;
+- Memory: about 58 KB while batman runs, allocated at mesh start; nothing when
+  off. 52 KB of it (engine 32.5 KB, frame slots 15.7 KB, render buffer 4 KB;
+  computed from the Xtensa object sizes, 52.7 KB measured in `AT+HEAP?`) is in
+  the board's PSRAM heap; the 6 KB task stack is internal RAM. Batman mode
+  needs that heap: when it is not in use on a mesh boot (`AT+HEAP?` `psram
+  state=` `off`, `none` or `bad`: `AT+EXTRAM=0`, a PSRAM that did not answer or
+  failed its boot test) batman is not started, `AT+MESHBATMAN?` reads
+  `stored=1 running=0 reason=no-psram`, `AT+MESHCFG?` `batman=refused(no-psram)`,
+  `AT+BATSTAT?` answers `+ERR: batman not running (no-psram)`, and the node
+  runs as an ordinary leaf (measured: a lease, and pings through NAT). Safe mode
+  starts no mesh at all and reads `reason=mesh-off`. It is refused because, with `AT+EXTRAM=0` and the tables in internal
+  RAM, batman under load ran internal RAM down to 1.6 KB with 85 failed
+  allocations in six seconds and one board asserted and rebooted.
+  Before 2026-11 all of it was internal RAM: on a board
+  (`warthog-mesh-sae-swccmp`, 2026-09-29/30) `heap_free` was about 53 KB right
+  after boot; with 3–4 SAE peers and host CCMP it settled at 22–31 KB, with
+  `heap_min` 10.9–20 KB and `heap_largest` 8.7–15 KB, and on 2026-11-10
+  (`warthog-mesh-sae-swccmp-meshvif`, 3 peers) 3.5 to 12.8 KB with a low-water
+  mark of 56 bytes, a panic in about one boot of nine and 23 chip restarts in
+  ten minutes (`docs/test-sweep-2026-11-10.md`, H2). With the tables in PSRAM,
+  on the same image and peers (2026-11-10 and 2026-11-11): 88 to 92 KB of
+  internal RAM free before bat0 has its address and 82 KB with it, `min` 72 to
+  84 KB across 20 boots ([Measured on air](#measured-on-air)). The engine
+  task's `stack_free` was about 4.1 KB of its 6 KB (2026-09-29/30). Received
+  frames reach lwIP as copies in the PSRAM heap, at most 16 at once (about
+  24 KB at the 1460-byte MTU, about 33 KB for 2 KB reassembled frames), each
+  freed when lwIP has read it;
   a frame past 16 is dropped and counted in `deliver_cap` (`AT+BATSTAT?`). They
   take the place of the radio's receive buffers, up to 23, that lwIP holds with
-  batman off, so they are not in the 58 KB, but they do show in `heap_min`. An
+  batman off, so they are not in the 58 KB, and in PSRAM they do not show in
+  `heap_min` either. An
   IP fragment is copied again and its delivery freed at once (`main/nat_frag.c`):
   reassembly holds none of the 16.
   Flash: 31.7 KB of code (`.text` and `.literal`; 3.8 KB of constants besides)
@@ -442,12 +461,24 @@ SAE; the 09-30 image, which no longer has that counter, is the fix. On an open
 mesh the Warthog's own PREQ every 2 s gives the node the path, and a 1.8.1-dev
 node (`mesh_nolearn` 1) sends to a one-hop peer directly.
 
+2026-11-10 and 2026-11-11, `warthog-mesh-sae-swccmp-meshvif` built from this
+tree, batman's tables in the PSRAM heap, two Warthogs with three peers each
+and a Mac on each board's USB network:
+
+| | Result |
+|---|---|
+| Boots | 20 (10 a board): no panic, no core dump; internal RAM `min` 72 to 84 KB |
+| Soak, 15 min, one ping a second each way through NAT onto bat0 | 890/900 and 881/900 answered; 0 chip restarts; host CCMP `micfail` 0; `AT+HEAP?` `alloc_fail=0` |
+| Overload, 2 min, both hosts sending 1.5 Mbit/s of UDP and ten 1400-byte pings a second through NAT (about twice what the link carries) | no reset; `alloc_fail=0`; internal RAM `min` 23.4 to 23.6 KB (a sum of per-region low-water marks; sampled `free` was 48 to 56 KB); `AT+BATSTAT?` `deliver_nomem=0`; `+USBNET` `drop_nomem=0 rx_nomem=0` |
+| Panic path | `AT+ASSERTTEST=at`: `reset=PANIC`, a core dump, and `psram state=ok` again after the restart |
+| `AT+EXTRAM=0` | batman refused (`reason=no-psram`), the node a leaf; `AT+EXTRAM=1` again: batman as before |
+
 ## Not yet measured
 
 | | How to settle it |
 |---|---|
 | Unicast between two other stations, which the MM6108 also hands up (data seen on 2026-09-30 as host CCMP `micfail`). Data is dropped before any decryption (host-tested). Management frames between them are only counted: whether the chip hands those up is not measured, and a Protected one from a peer still reaches host CCMP (`micfail`) | while two neighbours exchange unicast, `AT+FILTSTAT?` `not_ours` rises. Its second line's `mgmt_nours` says whether their unicast management (PREPs as their path refreshes, Block Ack) reaches the Warthog; `AT+SWCCMP?` `micfail` stays flat only while `mgmt_nours` does, since between neighbours running MFP (the Pis' `ieee80211w=2`) those frames are Protected. If it rises, they need dropping before host CCMP and Block Ack as data is |
-| A host tethered to the Warthog reaching the batman mesh: the AT console on USB CDC-ACM ran in batman mode, but no host on USB NCM or the Wi-Fi AP has sent traffic through NAT onto bat0, and the AP's start in batman mode is not checked | with `AT+MESHBATMAN=1` and a lease (`AT+MESHBATMAN?` `addr=leased`), a host on USB NCM (a `192.168.4.x` lease) and one on the AP (`192.168.5.x`) each ping the lease's `router=` address and a Pi's `br-lan` or `br-ahwlan` address, and resolve a name with `AT+DNS=` set to that router |
+| A host tethered to the Warthog reaching the batman mesh: the AT console on USB CDC-ACM ran in batman mode, but until 2026-11 no host on USB NCM or the Wi-Fi AP had sent traffic through NAT onto bat0. On 2026-11-10 and 2026-11-11 a host on each of two Warthogs' USB network pinged through NAT onto bat0 once a second for 15 min, 890/900 and 881/900 answered ([Measured on air](#measured-on-air)). Still open: a host on the Wi-Fi AP, the AP's start in batman mode, a wizard node's addresses and DNS | with `AT+MESHBATMAN=1` and a lease (`AT+MESHBATMAN?` `addr=leased`), a host on USB NCM (a `192.168.4.x` lease) and one on the AP (`192.168.5.x`) each ping the lease's `router=` address and a Pi's `br-lan` or `br-ahwlan` address, and resolve a name with `AT+DNS=` set to that router |
 | Frames near the 1500-byte batman MTU cross the chip with AE-2 and CCMP overhead. From every Linux node only on `-swccmp-meshvif` or with the node set to CTS-to-self or RTS off, on other builds only from the peer the chip registered last (Limits); 1400-byte pings passed either way | on `-swccmp-meshvif`, or with the node so set, `ping -s 1432 -M do` between the node's `br-ahwlan` address (bat0 has none on a wizard node) and the Warthog's bat0 address, both ways |
 | `AT+MESHGRP=1`: whether a Linux node takes the Warthog's group frames under its MGTK (on the swccmp builds only if the chip starts that key at the TX PN it was installed with; [OpenMANET Interop](OpenMANET-Interop#management-frame-protection-peering-does-not-need-it-path-selection-does)), and the airtime of AE-2 copies against group frames, 1 against 3 broadcast copies. Only `0` has run on air | `batctl n` on the node still lists the Warthog with `AT+MESHGRP=1`; Meshtastic multicast delivery and OGM loss under both settings |
 | DHCP against the two 30 s holds above: in the VM (batman-adv 2024.3, veth) the leases came inside the 45 s wait; the on-air leases of 2026-09-30 were not timed against either hold; on air it depends on how long the node's mesh and the Warthog's peering take | power a node and the Warthog up together, then power-cycle the Warthog (not `AT+RESET`, which keeps its sequence numbers) within 5 s of its first route; `AT+STATUS?` must show an address from the node's DHCP pool, not `10.41.253.x` |

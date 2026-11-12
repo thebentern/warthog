@@ -1,6 +1,6 @@
 ## Warthog — managed component dependencies.
 ##
-## Pulled from https://components.espressif.com on first build.
+## Both are vendored under components/ (override_path); nothing is fetched from the registry.
 dependencies:
   idf:
     version: ">=5.5.4,<6.0"
@@ -14,6 +14,19 @@ dependencies:
     # Directory is named `halow` (the dependency short name) so the IDF
     # component graph resolves `main`'s `REQUIRES halow` to the fork.
     override_path: "../components/halow"
-  # Bundles TinyUSB 0.21.0~2: iOS NCM needs >=0.21.0 (hathach/tinyusb#3630); Windows since
-  # KB5124008 refuses 0.21.0~1's NTB divisor of 1.
-  espressif/esp_tinyusb: "==3.0.0"
+  espressif/esp_tinyusb:
+    # override_path builds the vendored copy; version is provenance only.
+    # Bundles TinyUSB 0.21.0~2: iOS NCM needs >=0.21.0 (hathach/tinyusb#3630); Windows since
+    # KB5124008 refuses 0.21.0~1's NTB divisor of 1.
+    version: "==3.0.0"
+    # Vendored 2026-11-11: the registry's 3.0.0 (component_hash 0ff29f6113c4..., files as its
+    # CHECKSUMS.json lists them) minus test_apps and TinyUSB's repository tooling, with two
+    # changes: include/tusb_config.h sets CFG_TUD_DWC2_DMA_ENABLE to 0, and tusb.c's
+    # tu_edpt_stream_write_xfer() sends one packet per transfer (lines marked "Warthog H6"). The
+    # Buffer DMA driver stops the USB function when the console port is opened and closed under
+    # network load, and the slave mode driver stalls the console on replies longer than one packet
+    # (docs/test-sweep-2026-11-10.md, H6); a managed component cannot carry the edits, since the
+    # component manager restores the files at the next configure.
+    # Directory is named `esp_tinyusb` (the dependency short name) so `main`'s
+    # `REQUIRES esp_tinyusb` resolves to it.
+    override_path: "../components/esp_tinyusb"

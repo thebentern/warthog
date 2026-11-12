@@ -13,13 +13,13 @@ struct bat_config;
 
 enum bat_mode_reason { BAT_MODE_OK, BAT_MODE_OFF, BAT_MODE_MESH_OFF, BAT_MODE_FWD,
                        BAT_MODE_BRIDGE, BAT_MODE_NO_GROUP_RX, BAT_MODE_NOMEM,
-                       BAT_MODE_INIT_FAIL, BAT_MODE_MESH_FAILED };
+                       BAT_MODE_INIT_FAIL, BAT_MODE_MESH_FAILED, BAT_MODE_NO_PSRAM };
 
 /* Whether batman may run: batman 0 -> OFF, mesh off -> MESH_OFF, SAE without host CCMP
  * -> NO_GROUP_RX, 802.11s forwarding -> FWD, bridge -> BRIDGE, else OK. */
 enum bat_mode_reason bat_mode_check(uint8_t batman, uint8_t mesh_en, uint8_t fwd, uint8_t bridge,
                                     bool sae_build, bool host_ccmp_build);
-/* ok off mesh-off fwd bridge sae-no-host-ccmp nomem init-failed mesh-failed; "?" out of range. */
+/* ok off mesh-off fwd bridge sae-no-host-ccmp nomem init-failed mesh-failed no-psram; "?" out of range. */
 const char *bat_mode_reason_text(enum bat_mode_reason r);
 
 enum bat_mode_rx { BAT_MODE_RX_BATMAN, BAT_MODE_RX_NONBAT, BAT_MODE_RX_SHORT,

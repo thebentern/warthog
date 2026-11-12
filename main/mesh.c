@@ -79,6 +79,13 @@ static const char *TAG = "warthog.mesh";
 
 static char s_mesh_id_active[WARTHOG_CFG_MESH_ID_MAXLEN + 1];
 static uint16_t s_mesh_beacon_tu;
+/* The mesh is enabled and its addressing is polled: what AT+MESHBRIDGE=1 needs before it starts. */
+static bool s_mesh_running;
+
+bool warthog_mesh_running(void)
+{
+    return s_mesh_running;
+}
 
 /* Rolled or reset by the watchdog (probe task), read by AT+MESHCFG? (AT task). */
 static struct warthog_mesh_diag_window s_diag_win;
@@ -459,6 +466,9 @@ static void mesh_addr_netif_poll_(void)
         .peers = mmwlan_mesh_get_peer_count(), .dhcp = warthog_cfg_get_mesh_dhcp() != 0,
         .dhcp_running = io.running, .leased = io.leased, .have_ip = io.now.ip.addr != 0, .binding = io.binding,
     };
+    if (in.estab) {
+        warthog_mesh_bridge_port_up(); /* bridge mode: its mesh port carries nothing before the first peer */
+    }
     esp_netif_ip_info_t st;
     mesh_addr_static_(&st);
     switch (mesh_addr_step(&s_addr, &in)) {
@@ -901,6 +911,7 @@ void warthog_mesh_smoke_test(void)
                                        MESH_PROBE_BURST_TASK_PRIO,
                                        NULL);
         if (tret == pdPASS) {
+            s_mesh_running = true;
             ESP_LOGW(TAG, "[step30] mesh-probe task started (interval=%u ms)",
                      MESH_PROBE_BURST_PERIOD_MS);
         } else {

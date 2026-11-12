@@ -82,6 +82,11 @@ for a in sorted(P):
         if a==b: continue
         q(a,('AT+MPING=%s,1'%IP[b]).encode(),w=4)   # warm ARP
         o=q(a,('AT+MPING=%s,5'%IP[b]).encode(),w=9)
+        e=re.search(r'\+ERR: (.*)',o)
+        if e:
+            # The sender refused the ping (no route, no socket, a bad address): its own state, not a board off USB.
+            check("icmp/%s->%s"%(a,b), False, "%s refused: %s"%(a,e.group(1).strip()))
+            continue
         m=re.search(r'(\d+) sent, (\d+) received',o)
         if not m:
             # No answer from the SENDER's console is a bench failure, not a

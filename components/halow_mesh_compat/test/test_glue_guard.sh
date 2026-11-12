@@ -13,7 +13,8 @@ fail=0
 ok()   { echo "ok   $1"; }
 bad()  { echo "FAIL $1"; fail=1; }
 # GLUEGUARD_UPSTREAM_REQUIRED=1 (CI, after its builds): guards 70, 71, 73, 75 and 76 fail without the IDF and
-# TinyUSB packages and the generated sdkconfigs they compare, instead of passing on what is present.
+# TinyUSB packages and the generated sdkconfigs they compare, instead of passing on what is present, and guard 87
+# fails on a build directory still configured with the managed esp_tinyusb.
 GG_STRICT=${GLUEGUARD_UPSTREAM_REQUIRED:-0}
 # PlatformIO's core dir as pio reads it: a leading ~ expanded, a relative one from the repo root.
 PIO_CORE=${PLATFORMIO_CORE_DIR:-$HOME/.platformio}
@@ -441,14 +442,15 @@ rm -f .glueguard.tmp
 
 # 14. Every AT reply, and the OK/ERROR after it, waits for room in the 512 B CDC
 #     FIFO (cdc_out_write, tested in test_cdc_out). Only the echo and lines from
-#     other tasks (esp_ping callbacks, mcast_rx_task) may use the no-wait writer,
-#     and those tasks must: a wait there delays pings or overflows the socket.
+#     another task (mcast_rx_task) may use the no-wait writer, and that task must:
+#     a wait there overflows its socket. AT+MPING's lines are replies, written by
+#     the AT task (the AT+MPING guard at the end of this file runs the command).
 stray=$(awk '
   /^[a-zA-Z_].*\(/ && !/;$/ { fn=$0; sub(/\(.*/, "", fn); sub(/.*[ *]/, "", fn) }
-  /cdc_write_nowait\(/ && fn !~ /^(cdc_write_nowait|mping_on_success|mping_on_timeout|mcast_rx_task|at_task)$/ { print NR }
+  /cdc_write_nowait\(/ && fn !~ /^(cdc_write_nowait|mcast_rx_task|at_task)$/ { print NR }
   /tinyusb_cdcacm_write_queue\(|tud_cdc_n_write\(|cdc_write_long\(/ { print NR }
   /cdc_out_(write|write_nowait|vprintf_nowait)\(/ && fn !~ /^(cdc_write|cdc_write_nowait)$/ { print NR }
-  /(^|[^_a-z])(cdc_write|reply_ok|reply_error)\(/ && fn ~ /^(mping_on_success|mping_on_timeout|mcast_rx_task)$/ { print NR }
+  /(^|[^_a-z])(cdc_write|reply_ok|reply_error)\(/ && fn ~ /^(mcast_rx_task)$/ { print NR }
 ' "$A")
 if [ -n "$stray" ]; then
   bad "AT output bypasses the waiting writer at main/at.c line $(echo "$stray" | tr '\n' ' ')"
@@ -502,7 +504,7 @@ elif awk '/^static int cdc_vprintf\(/,/^}/' "$U" | grep -q 'cdc_out_vprintf_nowa
      awk '/^esp_netif_t \*warthog_usb_net_start\(void\)/,/^}/' "$U" | \
        awk '/s_cdc_mtx = xSemaphoreCreateMutexStatic\(/ {m=NR} /esp_log_set_vprintf\(&cdc_vprintf\)/ {v=NR}
             END {exit (m && v && m < v) ? 0 : 1}'; then
-  ok "log lines, +MPING/+MCAST and the echo share the reply lock, never wait for it, and the lock exists first"
+  ok "log lines, +MCAST and the echo share the reply lock, never wait for it, and the lock exists first"
 else
   bad "main/usb_net.c: the log mirror, the port's lock wiring, or the lock's creation order changed"
 fi
@@ -941,7 +943,7 @@ int main(int argc, char **argv)
 {
     unsigned size = (unsigned)atoi(argv[1]);
     const char *reasons[] = { "ok", "off", "mesh-off", "fwd", "bridge", "sae-no-host-ccmp", "nomem", "init-failed",
-                              "mesh-failed" };
+                              "mesh-failed", "no-psram" };
     char buf[2048];
     struct meshcfg_mode y;
     memset(&y, 0, sizeof(y));
@@ -1040,15 +1042,19 @@ fi
 
 # 32. With batman off nothing is allocated: warthog_bat_port_start returns on any
 #     refusal before its first allocation, and mesh.c starts it before mmwlan_mesh_enable.
+#     Without the PSRAM heap it is refused there too (reason no-psram; measured 2026-11-11 with
+#     AT+EXTRAM=0: internal RAM down to 1.6 KB under load, 85 failed allocations, one assert reset).
 if awk '/^esp_err_t warthog_bat_port_start\(/,/^}/' "$BP" | \
      awk '/if \(s_reason != BAT_MODE_OK\)/ {g=NR} /return ESP_OK;/ && g && !r {r=NR}
+          /if \(warthog_ext_ram_state\(\) != WARTHOG_EXT_RAM_OK\) \{/ && !p {p=NR}
+          p && !q && /s_reason = BAT_MODE_NO_PSRAM;/ {q=NR} q && !x && /return ESP_OK;/ {x=NR}
           /(calloc|malloc|xQueueCreate|xSemaphoreCreate|xTaskCreate)\(/ && !a {a=NR}
-          END {exit (g && r && a && r < a) ? 0 : 1}' && \
+          END {exit (g && r && a && r < a && p && q && x && r < p && x < a) ? 0 : 1}' && \
    awk '/^void warthog_mesh_smoke_test\(/,/^}/' ../../../main/mesh.c | \
      awk '/warthog_bat_port_start\(\);/ {s=NR} /= mmwlan_mesh_enable\(/ {if (s) e=1} END {exit e ? 0 : 1}'; then
-  ok "batman allocates nothing unless bat_mode_check says ok, and starts before mmwlan_mesh_enable"
+  ok "batman allocates nothing unless bat_mode_check says ok and the PSRAM heap is in use, and starts before mmwlan_mesh_enable"
 else
-  bad "warthog_bat_port_start allocates before its refusal return, or runs after mmwlan_mesh_enable"
+  bad "warthog_bat_port_start allocates before its refusal returns (bat_mode_check, no PSRAM heap), or runs after mmwlan_mesh_enable"
 fi
 
 # 33. The batman AT setters, parsers and their NVS storage, compiled out of main/at.c and
@@ -1363,6 +1369,7 @@ cat > "$T/fakes.c" <<'EOF'
 
 #include "bat_mode.h"
 #include "bat_port.h"
+#include "ext_ram.h"
 #include "fake.h"
 
 static int fails;
@@ -1488,7 +1495,13 @@ static volatile int f_delivered, f_freed, f_regs;
 static size_t f_rx_copy_len;
 static void *f_held[64]; /* frames lwIP holds (tcpip mailbox, socket mailboxes) while f_hold */
 static int f_hold, f_nheld, f_malloc_fail;
-void *f_malloc(size_t n) { if (f_malloc_fail > 0) { f_malloc_fail--; return NULL; } return (malloc)(n); }
+static int f_mallocs;
+void *f_malloc(size_t n) { f_mallocs++; if (f_malloc_fail > 0) { f_malloc_fail--; return NULL; } return (malloc)(n); }
+/* main/ext_ram.c: the port's tables, slots and deliveries; a board whose PSRAM heap is in use unless a
+ * run mode says otherwise. */
+static enum warthog_ext_ram f_ext_state = WARTHOG_EXT_RAM_OK;
+void *warthog_ext_malloc(size_t n) { return f_malloc(n); }
+enum warthog_ext_ram warthog_ext_ram_state(void) { return f_ext_state; }
 void *esp_netif_get_io_driver(esp_netif_t *n) { (void)n; return (void *)&f_lw; }
 esp_err_t esp_netif_set_driver_config(esp_netif_t *n, const esp_netif_driver_ifconfig_t *c) { (void)n; f_drv = *c; return ESP_OK; }
 void *esp_netif_get_netif_impl(esp_netif_t *n) { (void)n; return &f_lw; }
@@ -1726,7 +1739,7 @@ static int refused(const char *mode, int want_reason)
 {
     esp_err_t e = warthog_bat_port_start();
     CHECK(!warthog_bat_port_running() && warthog_bat_port_reason() == want_reason && f_queues == 0 &&
-          f_regs == 0 && f_inits == 0 && g_warthog_mesh_batman == 0,
+          f_mallocs == 0 && f_regs == 0 && f_inits == 0 && g_warthog_mesh_batman == 0 && g_warthog_host_ccmp_on == 0,
           "%s: not running (reason %s, start %d), nothing allocated, no hook, gate closed", mode,
           bat_mode_reason_text((enum bat_mode_reason)warthog_bat_port_reason()), e);
     return fails ? 1 : 0;
@@ -1739,6 +1752,12 @@ int main(int argc, char **argv)
     if (!strcmp(mode, "off")) { f_stored = 0; return refused("batman off", BAT_MODE_OFF); }
     if (!strcmp(mode, "fwd")) { f_fwd = 1; return refused("AT+MESHFWD=1 stored too", BAT_MODE_FWD); }
     if (!strcmp(mode, "nomac")) { f_mac_fail = 1; return refused("no mesh MAC", BAT_MODE_INIT_FAIL); }
+    /* C1: batman's tables and frame copies never come out of internal RAM. */
+    if (!strcmp(mode, "nopsram-off")) { f_ext_state = WARTHOG_EXT_RAM_OFF; return refused("PSRAM heap off (AT+EXTRAM=0, safe mode)", BAT_MODE_NO_PSRAM); }
+    if (!strcmp(mode, "nopsram-none")) { f_ext_state = WARTHOG_EXT_RAM_NONE; return refused("no PSRAM heap", BAT_MODE_NO_PSRAM); }
+    if (!strcmp(mode, "nopsram-bad")) { f_ext_state = WARTHOG_EXT_RAM_BAD; return refused("PSRAM failed its test", BAT_MODE_NO_PSRAM); }
+    /* The stored refusals come first: their reason is the one to fix. */
+    if (!strcmp(mode, "nopsram-fwd")) { f_ext_state = WARTHOG_EXT_RAM_OFF; f_fwd = 1; return refused("no PSRAM heap and AT+MESHFWD=1", BAT_MODE_FWD); }
 
     uint8_t soft_mac[6];
     bat_mode_soft_mac(FAC, MESH, soft_mac);
@@ -2029,7 +2048,7 @@ EOF
 why=""
 if ${CC:-cc} -std=gnu11 -w -pthread ${SANFLAGS:-} -DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_HOST_CCMP=1 -I"$T" -I"$T/inc" \
      -I../../../main -I../../../main/bat -o "$T/t" "$T/t.c" "$BP" ../../../main/bat_mode.c 2>"$T/cc.log"; then
-  for m in run off fwd nomac; do
+  for m in run off fwd nomac nopsram-off nopsram-none nopsram-bad nopsram-fwd; do
     "$T/t" "$m" > "$T/$m.log" 2>&1 || why="$why $m: $(grep -m2 -E '^FAIL|ERROR|Sanitizer' "$T/$m.log" | tr '\n' ' ')"
   done
 else
@@ -2454,6 +2473,14 @@ static int mmwlan_get_mac_addr(uint8_t m[6]) { static const uint8_t h[6] = { 0x3
 static bool warthog_mesh_bridge_pending(void) { return br_pending; }
 static bool warthog_mesh_bridge_active(void) { return br_active != 0; }
 static esp_netif_t *warthog_mesh_bridge_netif(void) { return br_active ? &BR : NULL; }
+/* The bridge's mesh port: raised from the poll, never before a peer is ESTAB, and before the bridge comes up. */
+static int br_port_ups, br_port_early, br_port_late;
+static void warthog_mesh_bridge_port_up(void)
+{
+    br_port_ups++;
+    br_port_early += !(g_warthog_mpm_estab || g_warthog_hostap_estab);
+    br_port_late += br_port_ups == 1 && (dhcp_starts != 0 || LW.up);
+}
 #include "fn.c"
 
 static void bind_first(esp_err_t (*fn)(void *), void *ctx)
@@ -2498,6 +2525,7 @@ static void reset(int dhcp)
     mac_lo[1] = 0xa5;
     s_addr_poll_us = 0;
     plain = br_pending = br_active = 0;
+    br_port_ups = br_port_early = br_port_late = 0;
     g_warthog_mpm_estab = 0;
     g_warthog_hostap_estab = 1;
     peer_count = 1;
@@ -2874,18 +2902,19 @@ int main(int argc, char **argv)
     plain = 1;
     g_warthog_hostap_estab = 0;
     for (int i = 0; i < 5; i++) step();
-    CHECK(LW.up == 0 && dhcp_starts == 0, "plain: a candidate's slot is not ESTAB: nothing comes up");
+    CHECK(LW.up == 0 && dhcp_starts == 0 && br_port_ups == 0, "plain: a candidate's slot is not ESTAB: nothing comes up");
     g_warthog_mpm_estab = 1; /* open mesh: warthog's own MPM */
     br_pending = 1;
     for (int i = 0; i < 5; i++) step();
-    CHECK(LW.up == 0 && dhcp_starts == 0, "plain: nothing while the bridge is still to come");
+    CHECK(LW.up == 0 && dhcp_starts == 0 && br_port_ups == 0, "plain: nothing while the bridge is still to come");
 
     reset(1); /* AT+MESHBRIDGE=1 and up: the bridge is the L3 interface, the mesh netif a port */
     plain = br_active = 1;
     t = 0;
     while (t < 10 && LW.ip.addr != ST) { step(); t++; }
     CHECK(t == 4 && BR.cache.ip.addr == ST && BR.st == ESP_NETIF_DHCP_STOPPED && dhcp_starts == 1 &&
-          N.cache.ip.addr == 0 && N.st == ESP_NETIF_DHCP_INIT && bad_set == 0,
+          N.cache.ip.addr == 0 && N.st == ESP_NETIF_DHCP_INIT && bad_set == 0 &&
+          br_port_ups >= 1 && br_port_early == 0 && br_port_late == 0,
           "plain, bridge up: DHCP and the static address go on the BRIDGE, never on the mesh port "
           "(tick %d bridge %08x/%d port %08x/%d)", t, BR.cache.ip.addr, BR.st, N.cache.ip.addr, N.st);
 
@@ -2950,6 +2979,11 @@ if ! awk '/^void warthog_mesh_smoke_test\(/,/^}/' "$MC" | \
             s && NR == s + 1 && /^ *warthog_bat_port_mesh_up\(\);/ {u=NR} u && NR == u + 1 && /} else \{/ {x=NR}
             x && NR == x + 1 && /^ *warthog_bat_port_mesh_failed\(\);/ {f=1} END {exit f ? 0 : 1}'; then
   why="$why mmwlan_mesh_enable's result does not reach warthog_bat_port_mesh_up / _mesh_failed;"
+fi
+if ! awk '/^static void mesh_addr_netif_poll_\(void\)/,/^}/' "$MC" | \
+       awk '/if \(in\.estab\) \{/ {e=NR} e && NR == e + 1 && /warthog_mesh_bridge_port_up\(\);/ {u=NR}
+            /switch \(mesh_addr_step\(/ {s=NR} END {exit (u && s && u < s) ? 0 : 1}'; then
+  why="$why mesh_addr_netif_poll_ does not raise the bridge's mesh port on ESTAB before it acts;"
 fi
 # Statically too: the lwIP calls sit only in functions esp_netif_tcpip_exec runs.
 why="$why$(lwip_only_in_tcpip "$MC" mesh_bat_io_ \
@@ -3054,18 +3088,24 @@ fi
 
 # 38. NAPT (main/nat.c, which batman mode also uses for the tether) is enabled on the tcpip
 #     thread: the first ip_napt_enable_netif arms lwIP's NAPT timer with sys_timeout, which
-#     inserts into tcpip's unlocked timer list (no core locking in any sdkconfig). enforce_state
-#     is compiled out of nat.c and ticked with the HaLow side's address appearing on the third
-#     tick: NAPT goes on for both inside netifs then, or for USB alone without an AP, with every
-#     NAPT call inside esp_netif_tcpip_exec; and statically no function outside one it runs
-#     calls the NAPT API.
+#     inserts into tcpip's unlocked timer list (no core locking in any sdkconfig), and callocs
+#     lwIP's NAPT tables, asserting when they do not fit (both boards reset there on 2026-11-10).
+#     enforce_state is compiled out of nat.c with lwip/lwip_napt.h's table sizes (IP_NAPT_MAX
+#     512, IP_PORTMAP_MAX 32: nothing in the build gives lwIP or nat.c another, guard 83) and
+#     ticked: with no free block of NAT_NAPT_ROOM it makes no NAPT call and counts the pass;
+#     with one, NAPT goes on for both inside netifs at that pass, before the HaLow side has an
+#     address, and the default route only once it has one (the third tick); once the tables
+#     are taken the heap is not asked again, also after netif_add cleared a netif's flag or
+#     both; USB alone without an AP; every NAPT call and heap walk inside esp_netif_tcpip_exec;
+#     and statically no function outside one it runs calls the NAPT API.
 NC=../../../main/nat.c
 T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
 awk '/^static bool s_napt_logged/ {p=1} /^static void nat_task/ {exit} p' "$NC" > "$T/fn.c"
 cat > "$T/t.c" <<'EOF'
-/* enforce_state, compiled out of main/nat.c, against a model of esp_netif and lwIP's NAPT API.
- * An ip_napt_enable_netif outside esp_netif_tcpip_exec is counted. */
+/* enforce_state, compiled out of main/nat.c, against a model of esp_netif, the heap and lwIP's
+ * NAPT API. An ip_napt_enable_netif or a heap walk outside esp_netif_tcpip_exec is counted. */
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -3079,18 +3119,31 @@ struct netif { uint8_t napt; };
 #define IP2STR(p) (unsigned)((p)->addr & 0xff), (unsigned)((p)->addr >> 8 & 0xff), (unsigned)((p)->addr >> 16 & 0xff), (unsigned)((p)->addr >> 24)
 #define ESP_LOGI(tag, ...) ((void)(tag))
 #define ESP_LOGW(tag, ...) ((void)(tag))
+#define ESP_LOGE(tag, ...) ((void)(tag))
+#define MALLOC_CAP_INTERNAL (1u << 11)
+#define MALLOC_CAP_DEFAULT (1u << 12)
+#define IP_NAPT_MAX 512 /* lwip/lwip_napt.h's own, as is IP_PORTMAP_MAX */
+#define IP_PORTMAP_MAX 32
 static const char *TAG = "t";
-static int in_tcpip, outside, timer_arms, napt_table;
+static int in_tcpip, outside, timer_arms, napt_table, napt_calls, heap_asks, wrong_caps, default_sets;
+static size_t f_largest;
 struct esp_netif_obj { const char *key; int present; struct netif lw; esp_netif_ip_info_t ip; };
 static struct esp_netif_obj STA = { "WIFI_STA_DEF", 1 }, USB = { "USB", 1 }, AP = { "WIFI_AP_DEF", 1 };
 static bool warthog_mesh_bridge_active(void) { return false; }
+static size_t heap_caps_get_largest_free_block(uint32_t caps)
+{
+    heap_asks++;
+    wrong_caps += caps != (MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL); /* what lwIP's calloc draws on */
+    outside += !in_tcpip;
+    return f_largest;
+}
 static esp_netif_t *esp_netif_get_handle_from_ifkey(const char *k)
 {
     esp_netif_t *n = !strcmp(k, STA.key) ? &STA : !strcmp(k, USB.key) ? &USB : !strcmp(k, AP.key) ? &AP : NULL;
     return n && n->present ? n : NULL;
 }
 static esp_err_t esp_netif_get_ip_info(esp_netif_t *n, esp_netif_ip_info_t *i) { *i = n->ip; return ESP_OK; }
-static esp_err_t esp_netif_set_default_netif(esp_netif_t *n) { (void)n; return ESP_OK; } /* IDF: IPC into tcpip */
+static esp_err_t esp_netif_set_default_netif(esp_netif_t *n) { (void)n; default_sets++; return ESP_OK; } /* IDF: IPC into tcpip */
 static void *esp_netif_get_netif_impl(esp_netif_t *n) { return &n->lw; }
 static esp_err_t esp_netif_tcpip_exec(esp_err_t (*fn)(void *), void *ctx)
 {
@@ -3099,9 +3152,10 @@ static esp_err_t esp_netif_tcpip_exec(esp_err_t (*fn)(void *), void *ctx)
     in_tcpip--;
     return e;
 }
-/* The first enable of any netif is ip_napt_init: mem_calloc, then sys_timeout(ip_napt_tmr). */
+/* The first enable of any netif is ip_napt_init: two callocs and an assert, then sys_timeout(ip_napt_tmr). */
 static int ip_napt_enable_netif(struct netif *n, int en)
 {
+    napt_calls++;
     outside += !in_tcpip;
     timer_arms += en && !napt_table;
     napt_table |= en;
@@ -3113,15 +3167,35 @@ static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf(__VA_ARGS__); printf(" | "); } } while (0)
 int main(void)
 {
+    f_largest = NAT_NAPT_ROOM - 1;
+    enforce_state();
+    CHECK(napt_calls == 0 && !USB.lw.napt && !AP.lw.napt && s_napt_nomem == 1 && !s_napt_on,
+          "no free block for the tables: NAPT was still enabled (%d calls), which is lwIP's assert", napt_calls);
+    enforce_state();
+    CHECK(napt_calls == 0 && s_napt_nomem == 2, "still no room: the second pass enabled NAPT or was not counted");
+    f_largest = NAT_NAPT_ROOM;
     for (int tick = 0; tick < 5; tick++) {
         if (tick == 2) STA.ip.ip.addr = 0x6600290au; /* 10.41.0.102 on bat0, or the HaLow STA's lease */
         enforce_state();
-        if (tick == 1) CHECK(!USB.lw.napt && !AP.lw.napt, "NAPT on before the HaLow side had an address");
+        if (tick == 0) CHECK(USB.lw.napt && AP.lw.napt && timer_arms == 1 && s_napt_on == 1,
+                             "NAPT not on at the first pass with room, before the HaLow side has an address");
+        if (tick == 1) CHECK(default_sets == 0, "the default route set before the HaLow side had an address");
     }
-    CHECK(USB.lw.napt && AP.lw.napt && timer_arms == 1, "NAPT not on for both inside netifs (usb %d ap %d, "
-          "timer armed %d times)", USB.lw.napt, AP.lw.napt, timer_arms);
-    CHECK(outside == 0, "%d NAPT calls outside tcpip context (the first arms lwIP's timer list from the nat task)",
-          outside);
+    CHECK(USB.lw.napt && AP.lw.napt && timer_arms == 1 && default_sets == 3 && s_napt_nomem == 2,
+          "after the address: usb %d ap %d, timer armed %d times, default route set %d times", USB.lw.napt,
+          AP.lw.napt, timer_arms, default_sets);
+    CHECK(outside == 0 && wrong_caps == 0, "%d NAPT or heap calls outside tcpip context, %d with other caps than "
+          "calloc's", outside, wrong_caps);
+    const int asks = heap_asks;
+    f_largest = 0;
+    AP.lw.napt = 0; /* the AP netif came up after USB's enable */
+    enforce_state();
+    CHECK(AP.lw.napt && heap_asks == asks && s_napt_nomem == 2,
+          "tables held: a later netif needs no room, and the heap is not walked again (%d asks)", heap_asks - asks);
+    USB.lw.napt = AP.lw.napt = 0; /* netif_add again: both flags cleared, lwIP's tables kept */
+    enforce_state();
+    CHECK(USB.lw.napt && AP.lw.napt && heap_asks == asks && s_napt_nomem == 2 && timer_arms == 1,
+          "both flags cleared with the tables held: not re-enabled, or the heap was asked (%d asks)", heap_asks - asks);
     memset(&USB.lw, 0, sizeof(USB.lw));
     memset(&AP.lw, 0, sizeof(AP.lw));
     AP.present = 0;
@@ -3145,7 +3219,7 @@ fi
 rm -rf "$T"
 why="$why$(lwip_only_in_tcpip "$NC" nat_napt_on_ 'ip_napt_[a-z_]+[(]')"
 if [ -z "$why" ]; then
-  ok "NAPT: enabled on both inside netifs once the HaLow side has an address, only in tcpip context"
+  ok "NAPT: enabled on both inside netifs at the first pass with room for lwIP's tables, never without it, only in tcpip context"
 else
   bad "nat.c NAPT enable: $why"
 fi
@@ -4905,7 +4979,8 @@ fi
 #     (warthog_halow_start_safe) and the AT+ASSERTTEST=hang stop before their own work, so a chip a
 #     panic left out of reset is held there (a chip held in reset holds SPI_IRQ low: a level
 #     interrupt storm, then INT_WDT; measured on air 2026-10-03). Across main/ and components/
-#     (tests and managed components aside) gpio_install_isr_service and gpio_isr_register appear
+#     (tests, managed components and the vendored esp_tinyusb aside: its tinyusb_vbus_monitor.c is built
+#     only for esp32p4 and esp32s31) gpio_install_isr_service and gpio_isr_register appear
 #     only after warthog_chip_hold_reset() in the same function, and a file outside the shims that
 #     attaches a GPIO ISR sets no level interrupt type. SPI_IRQ and BUSY are disabled in
 #     mmhal_wlan_deinit before RESET_N goes low. Task stacks with a printf in their failure path:
@@ -4937,7 +5012,7 @@ awk '/^void app_main\(void\)/,/^}/' ../../../main/main.c | awk '/if \(warthog_bo
     a && /warthog_chip_hold_reset\(\);/ && !h {h=NR} a && /for \(;;\) \{/ && !l {l=NR} END {exit (a && h > a && l > h) ? 0 : 1}' || \
   why66="${why66:-the AT+ASSERTTEST=hang stop does not hold the chip in reset before it spins}"
 for f66 in $(grep -rlE 'gpio_install_isr_service\(|gpio_isr_register\(|gpio_isr_handler_add\(' ../../../main ../.. --include='*.c' 2>/dev/null | \
-             grep -v -e '/test/' -e '/managed_components/' -e '/platforms/'); do
+             grep -v -e '/test/' -e '/managed_components/' -e '/esp_tinyusb/' -e '/platforms/'); do
   awk '/^[A-Za-z_][A-Za-z0-9_ *]*\(/ {h=0} /warthog_chip_hold_reset\(\);/ {h=1}
        /^[^\/]*(gpio_install_isr_service|gpio_isr_register)\(/ && !h {bad=1} END {exit bad ? 1 : 0}' "$f66" || \
     why66="${why66:-${f66#../../../} installs a GPIO ISR without holding the chip in reset first}"
@@ -5372,7 +5447,9 @@ fi
 #     (l2_transmit) only queues (usbnet_tx); tud_network_can_xmit, _xmit and _recv_renew are called
 #     only from usb_net.c's port one-liners, which only usbnet_core.c's pump and receive path call
 #     (test_usbnet.c runs those against TinyUSB's own NCM and ECM drivers); tud_network_link_state
-#     only from the TinyUSB event callback. What the host test cannot see: main/CMakeLists.txt
+#     only from the TinyUSB event callback and, in bridge mode, the deferred release of a link held at attach
+#     (un_link_release_, posted once by app_main after the bridge decision: a host gets no 192.168.4.x lease
+#     from the DHCP server the bridge is about to stop). What the host test cannot see: main/CMakeLists.txt
 #     builds usbnet_core.c and links with -Wl,--wrap=netd_xfer_cb; __wrap_netd_xfer_cb runs the
 #     driver's callback, then usbnet_xfer_done with whether the driver armed that endpoint again
 #     (tx_busy_ms); the kick is usbd_defer_func(un_kicked_, NULL, false) and the hang guard's ping
@@ -5402,16 +5479,166 @@ for f72 in tud_network_can_xmit tud_network_xmit tud_network_recv_renew; do
   [ "$n72" = 1 ] && grep -Eq "^static [a-z]+ un_[a-z_]+\(.*\) \{ (return )?$f72\(" "$U72" || \
     why72="${why72:-$f72 is called outside its usb_net.c port one-liner ($n72 calls)}"
 done
-awk '/tud_network_link_state\(0, (true|false)\)/ && fn != "on_tinyusb_event" {print NR}
+awk '/tud_network_link_state\(/ && !(fn == "on_tinyusb_event" && /tud_network_link_state\(0, (true|false)\);/) &&
+    !(fn == "un_link_release_" && /tud_network_link_state\(0, true\);/) {print NR}
   /^[a-z].*\(/ && !/;$/ { if (match($0, /[a-z_0-9]+\(/)) fn = substr($0, RSTART, RLENGTH - 1) }' "$U72" | grep -q . && \
-  why72="${why72:-tud_network_link_state is called outside the TinyUSB event callback}"
+  why72="${why72:-tud_network_link_state is called outside the TinyUSB event callback and the deferred bridge-mode release}"
+[ "$(grep -c 'tud_network_link_state(' "$U72")" = 3 ] || \
+  why72="${why72:-usb_net.c does not call tud_network_link_state exactly three times (attach, detach, the release of a held link)}"
 for o72 in ../../../main/*.c ../../../main/bat/*.c; do
   [ "$o72" = "$U72" ] && continue
   grep -Eq 'tud_network_(can_xmit|xmit|recv_renew|link_state)\(|usbd_defer_func\(|netd_xfer_cb' "$o72" && \
     why72="${why72:-${o72##*/} calls the USB network class or the TinyUSB defer queue}"
 done
-[ "$(grep -c 'usbd_defer_func(' "$U72")" = 2 ] && grep -q '^static void un_kick_(void) { usbd_defer_func(un_kicked_, NULL, false); }$' "$U72" || \
-  why72="${why72:-the usbd_defer_func in usb_net.c are not the kick, usbd_defer_func(un_kicked_, NULL, false), and the hang guard ping}"
+[ "$(grep -c 'usbd_defer_func(' "$U72")" = 3 ] && grep -q '^static void un_kick_(void) { usbd_defer_func(un_kicked_, NULL, false); }$' "$U72" && \
+  [ "$(awk '/^void warthog_usb_net_link_release\(void\)/,/^}/' "$U72" | grep -c 'usbd_defer_func(un_link_release_, NULL, false);')" = 1 ] || \
+  why72="${why72:-the usbd_defer_func in usb_net.c are not the kick, usbd_defer_func(un_kicked_, NULL, false), the hang guard ping and the release of a held link}"
+# The bridge-mode link hold, compiled out of usb_net.c and run on a model of the TinyUSB task's queue: while
+# warthog_mesh_bridge_pending() the attach raises no link (a host would lease from the DHCP server the bridge
+# stops); the release app_main posts raises it once, in the TinyUSB task; no ordering loses the link-up.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{
+  cat <<'EOF'
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef enum { TINYUSB_EVENT_ATTACHED, TINYUSB_EVENT_DETACHED, TINYUSB_EVENT_SUSPENDED, TINYUSB_EVENT_RESUMED } tinyusb_event_id_t;
+typedef struct { tinyusb_event_id_t id; } tinyusb_event_t;
+static const char *TAG = "usb_net";
+static char logs[512];
+#define ESP_LOGI(tag, ...) do { (void)(tag); snprintf(logs + strlen(logs), sizeof(logs) - strlen(logs), __VA_ARGS__); \
+                                snprintf(logs + strlen(logs), sizeof(logs) - strlen(logs), "|"); } while (0)
+static bool pending, inited, mounted, in_usb_task, led;
+static int ups, downs, link = -1, outside, flushes, queued;
+static void (*q_fn[4])(void *);
+static struct { int x; } s_usbnet;
+static bool warthog_mesh_bridge_pending(void) { return pending; }
+static void warthog_led_set_usb(bool on) { led = on; }
+static void usbnet_flush(void *u) { (void)u; flushes++; }
+static bool tud_inited(void) { return inited; }
+static bool tud_mounted(void) { return mounted; }
+static void tud_network_link_state(uint8_t rhport, bool up)
+{
+    (void)rhport;
+    if (!in_usb_task) { outside++; }
+    if (up) { ups++; } else { downs++; }
+    link = up;
+}
+static void usbd_defer_func(void (*fn)(void *), void *arg, bool in_isr)
+{
+    (void)arg; (void)in_isr;
+    if (!inited || queued >= 4) { outside++; return; }
+    q_fn[queued++] = fn;
+}
+EOF
+  awk '/^static bool s_link_held, s_link_decided;$/' "$U72"
+  awk '/^static void un_link_release_\(void \*arg\)$/,/^}/' "$U72"
+  awk '/^void warthog_usb_net_link_release\(void\)$/,/^}/' "$U72"
+  awk '/^static void on_tinyusb_event\(tinyusb_event_t \*event, void \*arg\)$/,/^}/' "$U72"
+  cat <<'EOF'
+static int fails;
+#define CHECK(c, ...) do { if (!(c)) { fails++; printf(__VA_ARGS__); printf(" | "); } } while (0)
+static void world(bool bridge_pending)
+{
+    s_link_held = s_link_decided = false;
+    pending = bridge_pending; inited = true; mounted = in_usb_task = led = false;
+    ups = downs = outside = flushes = queued = 0; link = -1; logs[0] = 0;
+}
+static void ev(tinyusb_event_id_t id) /* the TinyUSB task runs esp_tinyusb's mount and unmount callbacks */
+{
+    tinyusb_event_t e = { .id = id };
+    if (id == TINYUSB_EVENT_ATTACHED) { mounted = true; }
+    if (id == TINYUSB_EVENT_DETACHED) { mounted = false; }
+    in_usb_task = true; on_tinyusb_event(&e, NULL); in_usb_task = false;
+}
+static void drain(void) /* the TinyUSB task runs what was deferred to it */
+{
+    in_usb_task = true;
+    for (int i = 0; i < queued; i++) { q_fn[i](NULL); }
+    queued = 0; in_usb_task = false;
+}
+int main(void)
+{
+    world(false); /* NAT mode, station images, safe mode: as before the hold existed */
+    ev(TINYUSB_EVENT_ATTACHED);
+    CHECK(ups == 1 && link == 1 && led && strcmp(logs, "host attached; raising the network link|") == 0,
+          "not pending: attach did not raise the link (%s)", logs);
+    warthog_usb_net_link_release(); drain();
+    CHECK(ups == 1 && link == 1, "not pending: the release raised the link again");
+    ev(TINYUSB_EVENT_DETACHED);
+    CHECK(downs == 1 && link == 0 && !led && flushes == 1, "detach did not drop the link and flush");
+
+    world(true); /* attach before the decision: held, then raised by the release, in the TinyUSB task */
+    ev(TINYUSB_EVENT_ATTACHED);
+    CHECK(ups == 0 && link == -1 && led && strcmp(logs, "host attached; network link held until the bridge is decided|") == 0,
+          "LINK RAISED WHILE THE BRIDGE IS PENDING, or no LED and log (ups %d, %s)", ups, logs);
+    pending = false; logs[0] = 0;
+    warthog_usb_net_link_release();
+    CHECK(ups == 0 && queued == 1, "the release raised the link on app_main's task, or deferred nothing");
+    drain();
+    CHECK(ups == 1 && link == 1 && strcmp(logs, "bridge decided; raising the network link|") == 0,
+          "the release did not raise the held link (%s)", logs);
+    ev(TINYUSB_EVENT_DETACHED); ev(TINYUSB_EVENT_ATTACHED);
+    CHECK(ups == 2 && link == 1, "a re-attach after the decision did not get the link at once");
+
+    world(true); /* the decision lands while the handler runs: the release is queued behind it */
+    ev(TINYUSB_EVENT_ATTACHED); pending = false; warthog_usb_net_link_release(); drain();
+    CHECK(ups == 1 && link == 1, "attach racing the decision lost the link");
+
+    world(true); /* attach between the decision and the release call */
+    pending = false; ev(TINYUSB_EVENT_ATTACHED);
+    CHECK(ups == 1 && link == 1, "attach after the decision, before the release, was held");
+    warthog_usb_net_link_release(); drain();
+    CHECK(ups == 1 && link == 1, "the release raised an already raised link");
+
+    world(true); /* attach only after the release */
+    pending = false; warthog_usb_net_link_release(); drain();
+    CHECK(ups == 0, "the release raised the link of a board with no host");
+    ev(TINYUSB_EVENT_ATTACHED);
+    CHECK(ups == 1 && link == 1, "attach after the release was held");
+
+    world(true); /* held, detached, the decision made with no host */
+    ev(TINYUSB_EVENT_ATTACHED); ev(TINYUSB_EVENT_DETACHED);
+    CHECK(ups == 0 && downs == 1 && !s_link_held, "detach did not clear the held state");
+    pending = false; warthog_usb_net_link_release(); drain();
+    CHECK(ups == 0, "the release raised the link of a host that left");
+
+    world(true); /* held, detached, re-attached, all before the decision */
+    ev(TINYUSB_EVENT_ATTACHED); ev(TINYUSB_EVENT_DETACHED); ev(TINYUSB_EVENT_ATTACHED);
+    CHECK(ups == 0, "re-attach while pending raised the link");
+    pending = false; warthog_usb_net_link_release(); drain();
+    CHECK(ups == 1 && link == 1, "re-attach while pending never got the link");
+
+    world(true); /* held, and the host left as the release was queued */
+    ev(TINYUSB_EVENT_ATTACHED); warthog_usb_net_link_release(); mounted = false; drain();
+    CHECK(ups == 0, "the release raised the link of an unmounted device");
+
+    world(false); /* the gate set again after this boot's decision: no hold when no release will come */
+    warthog_usb_net_link_release(); drain(); pending = true;
+    ev(TINYUSB_EVENT_ATTACHED);
+    CHECK(ups == 1 && link == 1, "an attach after the release was held by a gate set later");
+
+    world(true); /* USB did not start */
+    inited = false; warthog_usb_net_link_release();
+    CHECK(queued == 0 && outside == 0 && ups == 0, "the release touched a TinyUSB that did not start");
+
+    CHECK(outside == 0, "%d link or queue calls outside the TinyUSB task", outside);
+    if (fails == 0) { printf("ok\n"); }
+    return 0;
+}
+EOF
+} > "$T/t.c"
+if ! ${CC:-cc} -std=gnu11 -Wall -Werror ${SANFLAGS:-} -o "$T/t" "$T/t.c" 2>"$T/err"; then
+  why72="${why72:-the bridge-mode link hold does not compile out of usb_net.c: $(head -3 "$T/err" | tr '\n' ' ')}"
+else
+  run72=$("$T/t" 2>&1)
+  [ "$run72" = ok ] || why72="${why72:-bridge-mode link hold: ${run72:-did not run}}"
+fi
+rm -rf "$T"
+[ "$(awk '/^void app_main\(void\)/,/^}/' ../../../main/main.c | grep -c 'warthog_usb_net_link_release();')" = 1 ] && \
+  [ "$(cat ../../../main/*.c ../../../main/bat/*.c | grep -c 'warthog_usb_net_link_release();')" = 1 ] || \
+  why72="${why72:-the held USB link is not released exactly once, by app_main}"
 awk '/^enum warthog_hang_post warthog_usb_net_ping\(void\)/,/^}/' "$U72" | awk '/if \(!tud_inited\(\)\)/ {a=NR}
   /if \(s_ping_pending\)/ {b=NR} /if \(tud_task_event_ready\(\)\)/ {c=NR} /s_ping_pending = true;/ {d=NR}
   /usbd_defer_func\(un_pong_, NULL, false\);/ {e=NR} END {exit (a && a < b && b < c && c < d && d < e) ? 0 : 1}' || \
@@ -5462,7 +5689,7 @@ for w72 in tx_stall_ms tx_busy_ms rx_idle_ms; do
 done
 grep -q 'wrap=netd_xfer_cb' ../../../docs/fork-inventory.md || why72="${why72:-the fork inventory does not list the netd_xfer_cb wrap}"
 if [ -z "$why72" ]; then
-  ok "USB network class: one owner (the TinyUSB task), lwIP only queues, the --wrap completion pump with the endpoint's busy state, one kick and one hang-guard ping at most, NCM renews per datagram; host test config matches sdkconfig.defaults' pinned NTBs and every NCM sdkconfig; usbnet in make all and CI, glue guard re-run after the builds; +USBNET documented"
+  ok "USB network class: one owner (the TinyUSB task), lwIP only queues, the --wrap completion pump with the endpoint's busy state, one kick and one hang-guard ping at most, in bridge mode the link held at attach until app_main releases it (run in every ordering), NCM renews per datagram; host test config matches sdkconfig.defaults' pinned NTBs and every NCM sdkconfig; usbnet in make all and CI, glue guard re-run after the builds; +USBNET documented"
 else
   bad "USB network class: $why72"
 fi
@@ -5672,7 +5899,7 @@ if [ -f "$IDFS73/../lwip/port/freertos/sys_arch.c" ]; then
     why73="${why73:-the IDF tiT no longer runs due lwIP timeouts before each mailbox fetch, or takes them from a pool: the tcpip beat can stop while tiT runs}"
   up73="$up73 sys_arch.c tcpip.c"
 fi
-TU73=${TUSB_DIR:-../../../managed_components/espressif__esp_tinyusb/tinyusb}
+TU73=${TUSB_DIR:-../../../components/esp_tinyusb/tinyusb}
 if [ -d "$TU73/src/device" ]; then
   awk '/^void usbd_defer_func\(/,/^}/' "$TU73/src/device/usbd.c" | grep -q 'queue_event(&event, in_isr);' && \
     awk '/osal_queue_send\(osal_queue_t qhdl/,/^}/' "$TU73/src/osal/osal_freertos.h" | tr -d ' \n' | grep -q 'if(!in_isr){returnxQueueSendToBack(' && \
@@ -6805,7 +7032,7 @@ fi
 #     default one names the NCM interface and its MAC by esp_tinyusb's own STRID enum, and usb_net.c's
 #     s_string_desc must hold those strings at the same positions. That enum counts only the classes
 #     Kconfig enables (3.0.0 added MTP between MSC and NET), so MSC and MTP must stay off in every NCM build.
-ET79=../../../managed_components/espressif__esp_tinyusb
+ET79=../../esp_tinyusb
 why79=""
 if [ -f "$ET79/usb_descriptors.c" ]; then
   e79=$(awk '/^enum \{$/ {e = 1; ids = ""; skip = 0; next}
@@ -6826,10 +7053,10 @@ if [ -f "$ET79/usb_descriptors.c" ]; then
     done
   done
 elif [ "$GG_STRICT" = 1 ]; then
-  why79="GLUEGUARD_UPSTREAM_REQUIRED=1 and no managed esp_tinyusb at $ET79"
+  why79="GLUEGUARD_UPSTREAM_REQUIRED=1 and no vendored esp_tinyusb at $ET79"
 fi
 if [ -z "$why79" ] && [ -z "${e79:-}" ]; then
-  ok "USB string indices: no managed esp_tinyusb, nothing compared"
+  ok "USB string indices: no vendored esp_tinyusb, nothing compared"
 elif [ -z "$why79" ]; then
   ok "USB string indices: usb_net.c's string table matches esp_tinyusb's default NCM descriptor ($e79), MSC and MTP off"
 else
@@ -7036,6 +7263,1574 @@ if [ -z "$why82" ]; then
   ok "a chip that does not boot: 3 attempts with the chip held in reset between them, none after a channel-list or argument failure, ESP_FAIL before the netif (run); the board stays up radio-down, the fatal handler only once the radio is up; a failed transport start unwinds, and none starts over a lock it leaked"
 else
   bad "boot retry: $why82"
+fi
+
+# 83. RAM headroom (measured on boards 2026-11-10: batman mode left 3.5-12.8 KB of heap with heap_min 56 B, and
+#     lwIP's NAPT table, a 16 KB calloc lwIP asserts on, failed on both boards). AT+HEAP? (heap_lines_ and
+#     ext_ram_text_ in main/at.c, compiled out and run): the four lines with every field in its slot, each
+#     PSRAM state named in enum warthog_ext_ram's order, inside buf[] at its longest; it reads internal RAM as
+#     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT and the PSRAM heap as MALLOC_CAP_SPIRAM, and the failed-allocation
+#     hook is in IRAM and registered before the AT task. main/ext_ram.c compiled and run on fake IDF headers
+#     over host memory: off until asked; none, with not one byte written, when IDF did not initialise the
+#     PSRAM, its size is 0, PSRAM address 0 or any page of the megabyte is not mapped, is flash, or is another
+#     PSRAM page; ok after the test, registered once with MALLOC_CAP_SPIRAM as its only capability over exactly
+#     the megabyte (all of a smaller chip), and then asked first with internal RAM second; none when the
+#     registration is refused; bad, and never a heap, when half the megabyte is the other half again (a stuck
+#     address line); built without CONFIG_SPIRAM it is none and links without esp_psram or esp_mm. app_main
+#     asks only outside safe mode and with AT+EXTRAM on (cfg.c: default 1, 0 or 1 only), after the config is
+#     up and before the HaLow and USB starts. Nothing else names MALLOC_CAP_SPIRAM; only bat_port.c and
+#     usb_net.c call warthog_ext_malloc; the HaLow stack's allocator is still pvPortMalloc (its buffers go to
+#     SPI DMA). sdkconfig.defaults maps the PSRAM without giving it to IDF's allocator, letting FreeRTOS take
+#     a task stack in it (IDF's default with a PSRAM) or running IDF's aborting boot test, and takes the Wi-Fi
+#     library out of IRAM; main/CMakeLists.txt builds ext_ram.c.
+#     Nothing in the build gives IP_NAPT_MAX or IP_PORTMAP_MAX a value (only main/nat.c and nat.h name them,
+#     and neither defines one), so lwIP's two tables and the room main/nat.c asks the heap for before the
+#     first enable, those two times 32 and 16 bytes plus 4 KB, come from one lwip/lwip_napt.h
+#     (test_lwip_napt_frag pins the 32 and 16 against IDF's lwIP). The AT reference names every key.
+why83=""
+ER83=../../../main/ext_ram.c
+EH83=../../../main/ext_ram.h
+NC83=../../../main/nat.c
+NH83=../../../main/nat.h
+MN83=../../../main/main.c
+CF83=../../../main/cfg.c
+MC83=../../../main/CMakeLists.txt
+SD83=../../../sdkconfig.defaults
+AR83=../../../wiki/AT-Command-Reference.md
+for f83 in "$ER83" "$EH83"; do
+  [ -f "$f83" ] || why83="${why83:-${f83#../../../} is missing}"
+done
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{ awk '/^struct heapstat \{/,/^};/' "$A"
+  awk '/^static const char \*ext_ram_text_\(/,/^}/' "$A"
+  awk '/^static int heap_lines_\(/,/^}/' "$A"; } > "$T/fn.c"
+size83=$(awk '/^static void cmd_heap\(void\)/ {on=1} on && /static char buf\[[0-9]+\];/ {match($0, /\[[0-9]+\]/); print substr($0, RSTART + 1, RLENGTH - 2); exit}' "$A")
+cat > "$T/t.c" <<'EOF2'
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fn.c"
+int main(int argc, char **argv)
+{
+    static const char *const want[] = { "off", "none", "ok", "bad", "?" };
+    unsigned size = (unsigned)atoi(argv[1]);
+    char buf[1024];
+    struct heapstat s = { 101, 102, 103, 104, 2, 201, 202, 203, 301, 302, 0x804, 512, 16896, 1, 7 };
+    heap_lines_(buf, sizeof(buf), &s);
+    if (strcmp(buf, "+HEAP: internal free=101 min=102 largest=103 total=104\r\n"
+                    "+HEAP: psram state=ok free=201 largest=202 total=203\r\n"
+                    "+HEAP: alloc_fail=301 last_size=302 last_caps=0x804\r\n"
+                    "+HEAP: napt entries=512 bytes=16896 on=1 refused=7\r\n") != 0) {
+        printf("fields: %s", buf);
+        return 0;
+    }
+    for (uint32_t i = 0; i < 5; i++) {
+        if (strcmp(ext_ram_text_(i), want[i]) != 0) {
+            printf("state %u reads %s, want %s\n", (unsigned)i, ext_ram_text_(i), want[i]);
+            return 0;
+        }
+    }
+    memset(&s, 0xff, sizeof(s));
+    s.ext_state = 1; /* "none", the longest name */
+    int n = heap_lines_(buf, sizeof(buf), &s);
+    (void)argc;
+    printf("%s %d/%u\n", n + 1 <= (int)size ? "ok" : "short", n + 1, size);
+    return 0;
+}
+EOF2
+fit83=""
+if [ -n "$size83" ] && ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -I"$T" -o "$T/t" "$T/t.c" 2>/dev/null; then
+  fit83=$("$T/t" "$size83")
+fi
+case "$fit83" in ok*) ;; *) why83="${why83:-AT+HEAP?: ${fit83:-heap_lines_ did not build or run}}" ;; esac
+tr -d ' \n' 2>/dev/null < "$EH83" | sed 's:/\*[^*]*\*/::g' | \
+  grep -qF 'enumwarthog_ext_ram{WARTHOG_EXT_RAM_OFF,WARTHOG_EXT_RAM_NONE,WARTHOG_EXT_RAM_OK,WARTHOG_EXT_RAM_BAD,};' || \
+  why83="${why83:-enum warthog_ext_ram is not off, none, ok, bad, the order ext_ram_text_ names}"
+C83=$(awk '/^static void cmd_heap\(void\)/,/^}/' "$A" | tr -d ' \n')
+case "$C83" in *'constuint32_tin=MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT;'*'heap_caps_get_minimum_free_size(in)'*'.ext_state=(uint32_t)warthog_ext_ram_state(),'*'heap_caps_get_free_size(MALLOC_CAP_SPIRAM)'*'heap_lines_(buf,sizeof(buf),&s);cdc_write(buf);reply_ok();'*) ;;
+  *) why83="${why83:-cmd_heap does not read internal RAM as INTERNAL|8BIT and the PSRAM heap as MALLOC_CAP_SPIRAM, or does not print its lines}" ;; esac
+awk '/strcasecmp\(verb, "HEAP"\) == 0 && terminator == .\?./ {getline; print}' "$A" | grep -q 'cmd_heap();' || \
+  why83="${why83:-AT+HEAP? is not dispatched}"
+awk '/strcasecmp\(verb, "EXTRAM"\) == 0 && terminator == .\?./ {getline; print}' "$A" | grep -q 'cmd_extram_query();' || \
+  why83="${why83:-AT+EXTRAM? is not dispatched}"
+D83=$(awk '/strcasecmp\(verb, "EXTRAM"\) == 0 && terminator == .=./,/strcasecmp\(verb, "EXTRAM"\) == 0 && terminator == .\?./' "$A" | tr -d ' \n')
+case "$D83" in *'if(strcmp(a,"0")!=0&&strcmp(a,"1")!=0){reply_error('*'}elseif(warthog_cfg_set_ext_ram((uint8_t)(a[0]-'"'"'0'"'"'))!=ESP_OK){'*) ;;
+  *) why83="${why83:-AT+EXTRAM= takes more than 0 or 1, or does not store it}" ;; esac
+grep -q '^static void IRAM_ATTR heap_fail_cb_(size_t size, uint32_t caps, const char \*fn)$' "$A" || \
+  why83="${why83:-the failed-allocation hook is not in IRAM (heap_caps_alloc_failed is)}"
+awk '/^esp_err_t warthog_at_start\(void\)/,/^}/' "$A" | \
+  awk '/heap_caps_register_failed_alloc_callback\(heap_fail_cb_\);/ {r=NR} /xTaskCreatePinnedToCore\(at_task,/ {t=NR} END {exit (r && t && r < t) ? 0 : 1}' || \
+  why83="${why83:-the failed-allocation hook is not registered before the AT task starts}"
+awk '/^uint8_t warthog_cfg_get_ext_ram\(void\)/,/^}/' "$CF83" | tr -d ' \n' | grep -q 'uint8_ton=1;.*nvs_get_u8(h,"ext_ram",&v)==ESP_OK&&v<=1' || \
+  why83="${why83:-the stored AT+EXTRAM value reads back something other than 0 or 1, or its default is not 1}"
+awk '/^esp_err_t warthog_cfg_set_ext_ram\(/,/^}/' "$CF83" | tr -d ' \n' | grep -q 'if(on>1){returnESP_ERR_INVALID_ARG;}' || \
+  why83="${why83:-warthog_cfg_set_ext_ram stores a value above 1}"
+AM83=$(awk '/^void app_main\(void\)/,/^}/' "$MN83")
+printf '%s\n' "$AM83" | awk '/ESP_ERROR_CHECK\(warthog_cfg_init\(\)\);/ {c=NR} /^    if \(!safe && warthog_cfg_get_ext_ram\(\) != 0\) \{$/ {g=NR}
+    /^        \(void\)warthog_ext_ram_init\(\);$/ {i=NR} /if \(safe\) \{/ {s=NR} /warthog_usb_net_start\(\)/ {u=NR}
+    END {exit (c && g > c && i == g + 1 && i < s && s < u) ? 0 : 1}' || \
+  why83="${why83:-app_main does not ask for the PSRAM heap only outside safe mode and with AT+EXTRAM on, after the config is up and before the HaLow and USB starts}"
+[ "$(grep -l 'warthog_ext_ram_init(' ../../../main/*.c | tr '\n' ' ')" = "$ER83 $MN83 " ] || \
+  why83="${why83:-warthog_ext_ram_init is called outside app_main}"
+[ "$(grep -rl 'MALLOC_CAP_SPIRAM' ../../../main ../../halow --include='*.c' --include='*.h' 2>/dev/null | sort | tr '\n' ' ')" = "$A $ER83 " ] || \
+  why83="${why83:-MALLOC_CAP_SPIRAM is named outside main/ext_ram.c and main/at.c}"
+[ "$(grep -l 'warthog_ext_malloc(' ../../../main/*.c | tr '\n' ' ')" = "$BP $ER83 $U " ] || \
+  why83="${why83:-warthog_ext_malloc is called outside main/bat_port.c and main/usb_net.c}"
+awk '/^void \*mmosal_malloc_\(size_t size\)/,/^}/' ../../halow/components/shims/mmosal_shim_freertos_esp32.c | grep -q 'return pvPortMalloc(size);' || \
+  why83="${why83:-mmosal_malloc_ is no longer pvPortMalloc: the buffers of the HaLow stack go to SPI DMA}"
+grep -q '^        "ext_ram.c"$' "$MC83" || why83="${why83:-main/CMakeLists.txt does not build ext_ram.c}"
+for r83 in esp_psram esp_mm; do
+  awk '/^    REQUIRES$/ {on=1; next} on && /^\)/ {exit} on {print $1}' "$MC83" | grep -qx "$r83" || why83="${why83:-main does not require $r83}"
+done
+nm83=$({ grep -rlE 'IP_(NAPT|PORTMAP)_MAX' ../../../main ../../../CMakeLists.txt ../../../platformio.ini ../../../scripts 2>/dev/null
+         grep -rlE 'IP_(NAPT|PORTMAP)_MAX' ../.. --include=CMakeLists.txt --include='*.cmake' 2>/dev/null; } | sort | tr '\n' ' ')
+[ "$nm83" = "$NC83 $NH83 " ] || \
+  why83="${why83:-IP_NAPT_MAX or IP_PORTMAP_MAX is named outside main/nat.c and nat.h ($nm83): lwIP and nat.c must both read the two in lwip_napt.h}"
+grep -Eq '^[[:space:]]*#[[:space:]]*(define|undef)[[:space:]]+IP_(NAPT|PORTMAP)_MAX' "$NC83" "$NH83" && \
+  why83="${why83:-main/nat.c or nat.h gives IP_NAPT_MAX or IP_PORTMAP_MAX a value of its own}"
+awk '/^#define NAT_NAPT_BYTES /,/^#define NAT_NAPT_ROOM /' "$NC83" | tr -d ' \n' | \
+  grep -qF '#defineNAT_NAPT_BYTES((size_t)IP_NAPT_MAX*32u+(size_t)IP_PORTMAP_MAX*16u)#defineNAT_NAPT_ROOM(NAT_NAPT_BYTES+4096u)' || \
+  why83="${why83:-main/nat.c does not size its heap check from IP_NAPT_MAX x 32 + IP_PORTMAP_MAX x 16 bytes with 4 KB to spare}"
+for k83 in 'CONFIG_SPIRAM=y' 'CONFIG_SPIRAM_MODE_OCT=y' 'CONFIG_SPIRAM_SPEED_40M=y' 'CONFIG_SPIRAM_IGNORE_NOTFOUND=y' \
+           'CONFIG_SPIRAM_USE_MEMMAP=y' 'CONFIG_SPIRAM_MEMTEST=n' 'CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=n' \
+           'CONFIG_ESP_WIFI_IRAM_OPT=n' 'CONFIG_ESP_WIFI_RX_IRAM_OPT=n'; do
+  grep -qx "$k83" "$SD83" || why83="${why83:-sdkconfig.defaults lacks $k83}"
+done
+grep -Eq '^CONFIG_SPIRAM_(USE_MALLOC|USE_CAPS_ALLOC|TRY_ALLOCATE_WIFI_LWIP|ALLOW_BSS_SEG_EXTERNAL_MEMORY|MEMTEST)=y$' "$SD83" && \
+  why83="${why83:-sdkconfig.defaults gives the PSRAM to the IDF allocator, or runs the aborting IDF boot test}"
+row83=$(grep '^| `AT+HEAP?`' "$AR83")
+[ -n "$row83" ] || why83="${why83:-no AT+HEAP? row in the AT reference}"
+for k83 in free min largest total state off none ok bad alloc_fail last_size last_caps entries bytes on refused; do
+  case "$row83" in *"\`$k83\`"*) ;; *) why83="${why83:-the AT+HEAP? row does not name \`$k83\`}" ;; esac
+done
+row83=$(grep '^| `AT+EXTRAM=<0\\|1>`, `AT+EXTRAM?`' "$AR83")
+[ -n "$row83" ] || why83="${why83:-no AT+EXTRAM row in the AT reference}"
+for k83 in state test_ms; do
+  case "$row83" in *"$k83="*) ;; *) why83="${why83:-the AT+EXTRAM row does not name $k83=}" ;; esac
+done
+awk '/^static void cmd_extram_query\(void\)/,/^}/' "$A" | grep -qF '"+EXTRAM: %u state=%s test_ms=%lu\r\n"' || \
+  why83="${why83:-AT+EXTRAM? does not print the stored value, the state and test_ms}"
+# main/ext_ram.c itself, on fake IDF headers over host memory.
+mkdir -p "$T/inc"
+for h83 in sdkconfig.h esp_err.h esp_log.h esp_heap_caps.h esp_heap_caps_init.h esp_mmu_map.h esp_psram.h; do
+  echo '#include "fake.h"' > "$T/inc/$h83"
+done
+cat > "$T/inc/fake.h" <<'EOF2'
+/* Every ESP-IDF name main/ext_ram.c uses. */
+#pragma once
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#ifndef CONFIG_SPIRAM
+#define CONFIG_SPIRAM 1
+#endif
+#define CONFIG_MMU_PAGE_SIZE 0x10000
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_FAIL (-1)
+#define ESP_ERR_NOT_FOUND 0x105
+const char *esp_err_to_name(esp_err_t e);
+void f_log(const char *fmt, ...);
+#define ESP_LOGE(tag, ...) f_log(__VA_ARGS__)
+#define ESP_LOGW(tag, ...) f_log(__VA_ARGS__)
+#define ESP_LOGI(tag, ...) f_log(__VA_ARGS__)
+uint32_t esp_log_timestamp(void);
+#define MALLOC_CAP_8BIT (1u << 2)
+#define MALLOC_CAP_SPIRAM (1u << 10)
+#define MALLOC_CAP_INTERNAL (1u << 11)
+void *heap_caps_malloc_prefer(size_t size, size_t num, ...);
+esp_err_t heap_caps_add_region_with_caps(const uint32_t caps[], intptr_t start, intptr_t end);
+typedef uint32_t esp_paddr_t;
+typedef enum { MMU_VADDR_DATA = 1, MMU_VADDR_INSTRUCTION = 2 } mmu_vaddr_t;
+typedef enum { MMU_TARGET_FLASH0 = 1, MMU_TARGET_PSRAM0 = 2 } mmu_target_t;
+esp_err_t esp_mmu_paddr_to_vaddr(esp_paddr_t paddr, mmu_target_t target, mmu_vaddr_t type, void **out_vaddr);
+esp_err_t esp_mmu_vaddr_to_paddr(void *vaddr, esp_paddr_t *out_paddr, mmu_target_t *out_target);
+bool esp_psram_is_initialized(void);
+size_t esp_psram_get_size(void);
+EOF2
+cat > "$T/t.c" <<'EOF2'
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include "ext_ram.c"
+#define PAGE 0x10000u
+#define MB (1024u * 1024u)
+static uint8_t *f_base; /* where the fake IDF mapped PSRAM address 0 */
+static int f_inited, f_p2v_fail, f_hole = -1, f_flash = -1, f_shift = -1, f_adds, f_v2p, f_prefer;
+static size_t f_size, f_pref_n;
+static esp_err_t f_add_ret = ESP_OK;
+static uint32_t f_caps[3], f_pref_caps[2];
+static intptr_t f_start, f_end;
+bool esp_psram_is_initialized(void) { return f_inited != 0; }
+size_t esp_psram_get_size(void) { return f_size; }
+esp_err_t esp_mmu_paddr_to_vaddr(esp_paddr_t paddr, mmu_target_t target, mmu_vaddr_t type, void **out_vaddr)
+{
+    if (f_p2v_fail || paddr != 0 || target != MMU_TARGET_PSRAM0 || type != MMU_VADDR_DATA) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    *out_vaddr = f_base;
+    return ESP_OK;
+}
+esp_err_t esp_mmu_vaddr_to_paddr(void *vaddr, esp_paddr_t *out_paddr, mmu_target_t *out_target)
+{
+    const size_t off = (size_t)((uint8_t *)vaddr - f_base);
+    const int page = (int)(off / PAGE);
+    f_v2p++;
+    if (page == f_hole) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    *out_target = page == f_flash ? MMU_TARGET_FLASH0 : MMU_TARGET_PSRAM0;
+    *out_paddr = (esp_paddr_t)(off + (page == f_shift ? PAGE : 0u));
+    return ESP_OK;
+}
+esp_err_t heap_caps_add_region_with_caps(const uint32_t caps[], intptr_t start, intptr_t end)
+{
+    f_adds++;
+    memcpy(f_caps, caps, sizeof(f_caps));
+    f_start = start;
+    f_end = end;
+    return f_add_ret;
+}
+void *heap_caps_malloc_prefer(size_t size, size_t num, ...)
+{
+    va_list ap;
+    va_start(ap, num);
+    f_prefer++;
+    f_pref_n = num;
+    f_pref_caps[0] = va_arg(ap, uint32_t);
+    f_pref_caps[1] = va_arg(ap, uint32_t);
+    va_end(ap);
+    return malloc(size);
+}
+const char *esp_err_to_name(esp_err_t e) { (void)e; return "refused"; }
+void f_log(const char *fmt, ...) { (void)fmt; }
+uint32_t esp_log_timestamp(void) { return 0; }
+/* A megabyte of address space whose second half is its first half again: an address line stuck. */
+static uint8_t *alias_mb(const char *path)
+{
+    const int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || ftruncate(fd, (off_t)(MB / 2)) != 0) {
+        return NULL;
+    }
+    uint8_t *b = mmap(NULL, MB, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (b == MAP_FAILED ||
+        mmap(b, MB / 2, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED ||
+        mmap(b + MB / 2, MB / 2, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) {
+        return NULL;
+    }
+    close(fd);
+    return b;
+}
+#define CHECK(c, ...) do { if (!(c)) { printf(__VA_ARGS__); printf("\n"); return 0; } } while (0)
+int main(int argc, char **argv)
+{
+    static const char *const why[] = { "IDF did not initialise the PSRAM", "its size is 0", "PSRAM address 0 is not mapped",
+                                       "page 5 is not mapped", "page 3 is flash", "page 7 is another PSRAM page" };
+    uint8_t *mem = malloc(MB + PAGE);
+    void *q = warthog_ext_malloc(64);
+    CHECK(argc == 2 && mem != NULL, "setup");
+    CHECK(warthog_ext_ram_state() == WARTHOG_EXT_RAM_OFF && q != NULL && f_prefer == 0, "before it is asked for: not off, or not malloc");
+    free(q);
+    f_base = mem;
+    for (int k = 0; k < 6; k++) {
+        f_inited = k != 0;
+        f_size = k == 1 ? 0 : 8u * MB;
+        f_p2v_fail = k == 2;
+        f_hole = k == 3 ? 5 : -1;
+        f_flash = k == 4 ? 3 : -1;
+        f_shift = k == 5 ? 7 : -1;
+        memset(mem, 0xEE, MB + PAGE);
+        s_state = WARTHOG_EXT_RAM_OFF;
+        CHECK(warthog_ext_ram_init() == WARTHOG_EXT_RAM_NONE && f_adds == 0, "%s: not none, or a heap was registered", why[k]);
+        for (size_t i = 0; i < MB + PAGE; i++) {
+            CHECK(mem[i] == 0xEE, "%s: byte %u of it was written", why[k], (unsigned)i);
+        }
+        q = warthog_ext_malloc(64);
+        CHECK(q != NULL && f_prefer == 0, "%s: warthog_ext_malloc is not malloc", why[k]);
+        free(q);
+    }
+    f_inited = 1;
+    f_size = 8u * MB;
+    f_p2v_fail = 0;
+    f_hole = f_flash = f_shift = -1;
+    s_state = WARTHOG_EXT_RAM_OFF;
+    f_v2p = 0;
+    CHECK(warthog_ext_ram_init() == WARTHOG_EXT_RAM_OK && f_adds == 1, "a good megabyte: not ok, or not registered once");
+    CHECK(f_caps[0] == MALLOC_CAP_SPIRAM && f_caps[1] == 0 && f_caps[2] == 0, "heap capabilities 0x%x 0x%x 0x%x, want MALLOC_CAP_SPIRAM alone",
+          (unsigned)f_caps[0], (unsigned)f_caps[1], (unsigned)f_caps[2]);
+    CHECK(f_start == (intptr_t)mem && f_end - f_start == (intptr_t)MB && f_v2p == (int)(MB / PAGE),
+          "the heap is not the megabyte (%ld bytes), or not each of its pages was checked (%d)", (long)(f_end - f_start), f_v2p);
+    for (size_t i = MB; i < MB + PAGE; i++) {
+        CHECK(mem[i] == 0xEE, "the test wrote past the megabyte");
+    }
+    q = warthog_ext_malloc(64);
+    CHECK(q != NULL && f_prefer == 1 && f_pref_n == 2 && f_pref_caps[0] == MALLOC_CAP_SPIRAM &&
+          f_pref_caps[1] == (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), "ok: not PSRAM first, then internal RAM");
+    free(q);
+    CHECK(warthog_ext_ram_init() == WARTHOG_EXT_RAM_OK && f_adds == 1, "a second init registered again");
+    s_state = WARTHOG_EXT_RAM_OFF;
+    f_size = MB / 2;
+    CHECK(warthog_ext_ram_init() == WARTHOG_EXT_RAM_OK && f_end - f_start == (intptr_t)(MB / 2), "a 512 KB chip: not all of it, or more");
+    f_size = 8u * MB;
+    s_state = WARTHOG_EXT_RAM_OFF;
+    f_add_ret = ESP_FAIL;
+    f_prefer = 0;
+    CHECK(warthog_ext_ram_init() == WARTHOG_EXT_RAM_NONE, "a refused registration: not none");
+    q = warthog_ext_malloc(64);
+    CHECK(q != NULL && f_prefer == 0, "a refused registration: warthog_ext_malloc is not malloc");
+    free(q);
+    f_add_ret = ESP_OK;
+    f_base = alias_mb(argv[1]);
+    CHECK(f_base != NULL, "no aliased mapping at %s", argv[1]);
+    s_state = WARTHOG_EXT_RAM_OFF;
+    const int adds = f_adds;
+    CHECK(warthog_ext_ram_init() == WARTHOG_EXT_RAM_BAD && f_adds == adds, "half the megabyte aliasing the other: not bad, or registered");
+    q = warthog_ext_malloc(64);
+    CHECK(q != NULL && f_prefer == 0, "bad: warthog_ext_malloc is not malloc");
+    free(q);
+    printf("ok\n");
+    return 0;
+}
+EOF2
+cat > "$T/t0.c" <<'EOF2'
+#include <stdio.h>
+#include <stdlib.h>
+#include "ext_ram.c"
+void f_log(const char *fmt, ...) { (void)fmt; }
+void *heap_caps_malloc_prefer(size_t size, size_t num, ...) { (void)size; (void)num; return NULL; }
+int main(void)
+{
+    void *q = NULL;
+    if (warthog_ext_ram_init() != WARTHOG_EXT_RAM_NONE || warthog_ext_ram_state() != WARTHOG_EXT_RAM_NONE ||
+        (q = warthog_ext_malloc(64)) == NULL) {
+        printf("built without CONFIG_SPIRAM: not none, or warthog_ext_malloc is not malloc\n");
+        return 0;
+    }
+    free(q);
+    printf("ok\n");
+    return 0;
+}
+EOF2
+run83=""
+if [ -f "$ER83" ]; then
+  if ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -I"$T/inc" -I../../../main -o "$T/t" "$T/t.c" 2>"$T/err" && \
+     ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -DCONFIG_SPIRAM=0 -I"$T/inc" -I../../../main -o "$T/t0" "$T/t0.c" 2>>"$T/err"; then
+    run83=$("$T/t" "$T/alias")
+    [ "$run83" = ok ] && run83=$("$T/t0")
+  else
+    run83="build: $(head -3 "$T/err" | tr '\n' ' ')"
+  fi
+fi
+rm -rf "$T"
+[ "$run83" = ok ] || why83="${why83:-ext_ram.c on the host: ${run83:-did not run}}"
+if [ -z "$why83" ]; then
+  ok "RAM headroom: AT+HEAP? prints internal RAM, the PSRAM heap, refused allocations and NAT's table in buf[$size83] (${fit83#ok }); ext_ram.c tests and registers the PSRAM's megabyte as a heap only MALLOC_CAP_SPIRAM reaches, falls back to malloc when it is off, missing, refused or bad, and is asked only outside safe mode with AT+EXTRAM on; only batman's tables and USB and batman frame copies use it; lwIP and main/nat.c both read lwip_napt.h's IP_NAPT_MAX and IP_PORTMAP_MAX, which nothing in the build redefines"
+else
+  bad "RAM headroom: $why83"
+fi
+
+# 84. Bridge mode (AT+MESHBRIDGE=1, main/mesh_bridge.c) is built whole or not at all (measured on air
+#     2026-11-10: IDF's bridge glue never started the bridge, yet the USB and AP DHCP servers were stopped,
+#     NAT stood down, the mesh netif waited at 0.0.0.0 and the first AT+MPING called a NULL output on lwIP's
+#     thread). mesh_bridge.c compiled against a model of esp_netif and lwIP and run: no bridge without a
+#     running mesh that was armed for one; the bridge enters lwIP, every port joins, the ports' DHCP servers
+#     and addresses go and the bridge becomes the default route in ONE tcpip run, in that order, and only
+#     then is it published; every refusal leaves both DHCP servers, both addresses, every port's input and
+#     the mesh port's DHCP client as they were, clears the datapath gate and ends the mesh netif's wait; a
+#     bridge lwIP holds is never destroyed; warthog_mesh_bridge_none() ends the wait when no start is
+#     called; the mesh port comes up once, in tcpip context, only after the bridge is published; grp_rx
+#     follows the image (open; host CCMP armed; a chip-key build on a MESH chip VIF with AT+GTKPERSTA on);
+#     AT+MESHBRIDGE? fits its buffer at its longest, and its heap figures and the 4 KB asked before lwIP
+#     allocates are internal RAM as AT+HEAP? reads it. app_main hands the AP netif to the start, calls
+#     warthog_mesh_bridge_none() otherwise, both before NAT and the repeater; AT+STATUS?, AT+MCAST and
+#     AT+MESHCFG? read the bridge. lwIP's own bridge runs on the host (lwip_bridge.mk, test_lwip_bridge.c:
+#     ports, flooding, learning, DHCP on the bridge, the ping-reply trap behind mesh_bridge.c's #error):
+#     make all runs lwip-bridge, and CI runs it (plain and SAN=1) after the PlatformIO build with
+#     LWIP_BRIDGE_REQUIRED=1, also against esp-lwip c6f2f878 (IDF 5.5.6).
+MB=../../../main/mesh_bridge.c
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+mkdir -p "$T/freertos" "$T/lwip"
+cat > "$T/esp_err.h" <<'EOF'
+#pragma once
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_FAIL (-1)
+#define ESP_ERR_NO_MEM 0x101
+#define ESP_ERR_INVALID_STATE 0x103
+#define ESP_ERR_NOT_FOUND 0x105
+#define ESP_ERR_NOT_SUPPORTED 0x106
+#define ESP_ERR_TIMEOUT 0x107
+EOF
+cat > "$T/sdkconfig.h" <<'EOF'
+#pragma once
+#ifndef T_NO_BRIDGE
+#define CONFIG_ESP_NETIF_BRIDGE_EN 1
+#endif
+#define CONFIG_LWIP_LOCAL_HOSTNAME "espressif"
+EOF
+cat > "$T/esp_netif.h" <<'EOF'
+#pragma once
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include "esp_err.h"
+#include "sdkconfig.h"
+typedef struct esp_netif_obj esp_netif_t;
+typedef struct { uint32_t addr; } esp_ip4_addr_t;
+typedef struct { esp_ip4_addr_t ip, netmask, gw; } esp_netif_ip_info_t;
+typedef struct { uint16_t max_fdb_dyn_entries, max_fdb_sta_entries; uint8_t max_ports; } bridgeif_config_t;
+typedef struct {
+    uint32_t flags, get_ip_event, lost_ip_event;
+    const char *if_key, *if_desc;
+    int route_prio;
+    bridgeif_config_t *bridge_info;
+} esp_netif_inherent_config_t;
+typedef struct { const esp_netif_inherent_config_t *base; const void *driver, *stack; } esp_netif_config_t;
+#define ESP_NETIF_INHERENT_DEFAULT_BR() { .flags = 0x40, .get_ip_event = 4, .lost_ip_event = 5, .if_key = "BR0", .if_desc = "br0", .route_prio = 70 }
+#define ESP_NETIF_NETSTACK_DEFAULT_BR ((const void *)1)
+enum { IP_EVENT_STA_GOT_IP = 0, IP_EVENT_STA_LOST_IP = 1 };
+#define ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED 0x5005
+typedef esp_err_t (*esp_netif_callback_fn)(void *ctx);
+esp_netif_t *esp_netif_new(const esp_netif_config_t *cfg);
+void esp_netif_destroy(esp_netif_t *n);
+esp_err_t esp_netif_set_mac(esp_netif_t *n, uint8_t mac[]);
+esp_netif_t *esp_netif_get_handle_from_ifkey(const char *key);
+bool esp_netif_is_netif_up(esp_netif_t *n);
+esp_err_t esp_netif_tcpip_exec(esp_netif_callback_fn fn, void *ctx);
+void esp_netif_action_start(void *n, const char *base, int32_t id, void *data);
+esp_err_t esp_netif_set_hostname(esp_netif_t *n, const char *name);
+esp_err_t esp_netif_bridge_add_port(esp_netif_t *br, esp_netif_t *port);
+esp_err_t esp_netif_dhcps_stop(esp_netif_t *n);
+esp_err_t esp_netif_dhcpc_stop(esp_netif_t *n);
+esp_err_t esp_netif_set_ip_info(esp_netif_t *n, const esp_netif_ip_info_t *ip);
+esp_err_t esp_netif_set_default_netif(esp_netif_t *n);
+EOF
+printf '#pragma once\n#include "esp_netif.h"\nvoid *esp_netif_get_netif_impl(esp_netif_t *n);\n' > "$T/esp_netif_net_stack.h"
+cat > "$T/esp_heap_caps.h" <<'EOF'
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+#define MALLOC_CAP_8BIT (1 << 2)
+#define MALLOC_CAP_INTERNAL (1 << 11)
+#define MALLOC_CAP_DEFAULT (1 << 12)
+size_t heap_caps_get_free_size(uint32_t caps);
+size_t heap_caps_get_minimum_free_size(uint32_t caps);
+size_t heap_caps_get_largest_free_block(uint32_t caps);
+EOF
+cat > "$T/esp_log.h" <<'EOF'
+#pragma once
+void t_log(const char *tag, const char *fmt, ...);
+#define ESP_LOGE(tag, ...) t_log(tag, __VA_ARGS__)
+#define ESP_LOGW(tag, ...) t_log(tag, __VA_ARGS__)
+EOF
+printf '#pragma once\n#define pdMS_TO_TICKS(ms) (ms)\n' > "$T/freertos/FreeRTOS.h"
+printf '#pragma once\nvoid vTaskDelay(unsigned ticks);\n' > "$T/freertos/task.h"
+cat > "$T/lwip/netif.h" <<'EOF'
+#pragma once
+#include <stddef.h>
+struct pbuf;
+struct netif;
+typedef int err_t;
+typedef err_t (*netif_input_fn)(struct pbuf *p, struct netif *inp);
+typedef err_t (*netif_linkoutput_fn)(struct netif *netif, struct pbuf *p);
+struct netif { struct netif *next; netif_input_fn input; netif_linkoutput_fn linkoutput; unsigned char flags; };
+extern struct netif *netif_list;
+#define NETIF_FOREACH(netif) for ((netif) = netif_list; (netif) != NULL; (netif) = (netif)->next)
+#define NETIF_FLAG_UP 0x01U
+#define NETIF_FLAG_LINK_UP 0x04U
+#define NETIF_FLAG_ETHARP 0x08U
+#define NETIF_FLAG_ETHERNET 0x10U
+#define netif_set_flags(netif, set_flags) do { LWIP_CTX(); (netif)->flags = (unsigned char)((netif)->flags | (set_flags)); } while (0)
+void netif_set_up(struct netif *netif);
+void netif_set_link_up(struct netif *netif);
+EOF
+printf '#pragma once\n#include "lwip/netif.h"\nerr_t tcpip_input(struct pbuf *p, struct netif *inp);\n' > "$T/lwip/tcpip.h"
+cat > "$T/t.c" <<'EOF'
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+static int in_tcpip, outside; /* lwIP, or a port's layer 3, touched outside esp_netif_tcpip_exec */
+#define LWIP_CTX() (outside += !in_tcpip)
+#include "mesh_bridge.c"
+
+struct esp_netif_obj { struct netif lw; bool listed, dhcps_on, dhcpc_stopped; uint32_t ip; };
+static struct esp_netif_obj MESH, USB, AP, BRN;
+struct netif *netif_list;
+volatile uint32_t g_warthog_mesh_bridge, g_warthog_host_ccmp_on, g_warthog_chipvif_type, g_warthog_peer_gtk_mode;
+
+/* knobs */
+static bool mesh_running, usb_exists, new_fails, start_adds_nothing, set_ip_fails;
+static int ap_up_at_ms, clock_ms, refuse_add;
+static size_t heap_largest;
+/* what happened */
+static int n_new, n_destroy, n_start, n_add, tick, t_start, t_add[3], t_stop, t_default, runs;
+static bool add_unlisted, destroyed_listed;
+static esp_netif_t *def;
+static const char *hostname;
+static uint32_t ev_got;
+static uint8_t br_mac[6];
+static char logs[512];
+
+void t_log(const char *tag, const char *fmt, ...)
+{
+    (void)tag;
+    va_list ap;
+    va_start(ap, fmt);
+    size_t n = strlen(logs);
+    vsnprintf(logs + n, sizeof(logs) - n, fmt, ap);
+    va_end(ap);
+}
+static void list_(struct esp_netif_obj *o) { if (!o->listed) { o->listed = true; o->lw.next = netif_list; netif_list = &o->lw; } }
+static err_t out_(struct netif *n, struct pbuf *p) { (void)n; (void)p; return 0; }
+static err_t br_in_(struct pbuf *p, struct netif *inp) { (void)p; (void)inp; return 0; } /* lwIP's bridge input */
+err_t tcpip_input(struct pbuf *p, struct netif *inp) { (void)p; (void)inp; return 0; }
+void netif_set_up(struct netif *n) { LWIP_CTX(); n->flags |= NETIF_FLAG_UP; }
+void netif_set_link_up(struct netif *n) { LWIP_CTX(); n->flags |= NETIF_FLAG_LINK_UP; }
+bool warthog_mesh_running(void) { return mesh_running; }
+static int wrong_caps; /* a heap call that asks for anything but internal RAM as AT+HEAP? reads it */
+#define T_INTERNAL (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+size_t heap_caps_get_free_size(uint32_t caps) { wrong_caps += caps != T_INTERNAL; return 4294967295u; }
+size_t heap_caps_get_minimum_free_size(uint32_t caps) { wrong_caps += caps != T_INTERNAL; return 4294967295u; }
+size_t heap_caps_get_largest_free_block(uint32_t caps) { wrong_caps += caps != T_INTERNAL; return heap_largest; }
+void vTaskDelay(unsigned ticks)
+{
+    clock_ms += (int)ticks;
+    if (ap_up_at_ms >= 0 && clock_ms >= ap_up_at_ms) { list_(&AP); AP.lw.flags |= NETIF_FLAG_UP | NETIF_FLAG_LINK_UP; }
+}
+void *esp_netif_get_netif_impl(esp_netif_t *n) { return n != NULL ? &n->lw : NULL; }
+esp_netif_t *esp_netif_get_handle_from_ifkey(const char *key) { return usb_exists && strcmp(key, "USB") == 0 ? &USB : NULL; }
+bool esp_netif_is_netif_up(esp_netif_t *n) { return (n->lw.flags & NETIF_FLAG_UP) != 0; }
+esp_netif_t *esp_netif_new(const esp_netif_config_t *cfg)
+{
+    n_new++;
+    if (new_fails) { return NULL; }
+    memset(&BRN, 0, sizeof(BRN));
+    ev_got = cfg->base->get_ip_event;
+    return &BRN;
+}
+void esp_netif_destroy(esp_netif_t *n) { n_destroy++; destroyed_listed |= n->listed; }
+esp_err_t esp_netif_set_mac(esp_netif_t *n, uint8_t mac[]) { (void)n; memcpy(br_mac, mac, 6); return ESP_OK; }
+esp_err_t esp_netif_tcpip_exec(esp_netif_callback_fn fn, void *ctx)
+{
+    runs++;
+    in_tcpip++;
+    esp_err_t e = fn(ctx);
+    in_tcpip--;
+    return e;
+}
+void esp_netif_action_start(void *n_, const char *base, int32_t id, void *data)
+{
+    (void)base; (void)id; (void)data;
+    esp_netif_t *n = n_;
+    LWIP_CTX();
+    n_start++;
+    t_start = ++tick;
+    if (!start_adds_nothing) {
+        n->lw.input = tcpip_input;
+        n->lw.linkoutput = out_;
+        n->lw.flags = NETIF_FLAG_ETHARP | NETIF_FLAG_ETHERNET | NETIF_FLAG_LINK_UP;
+        list_(n);
+    }
+}
+esp_err_t esp_netif_set_hostname(esp_netif_t *n, const char *name) { (void)n; hostname = name; return ESP_OK; }
+esp_err_t esp_netif_bridge_add_port(esp_netif_t *br, esp_netif_t *port)
+{
+    LWIP_CTX();
+    add_unlisted |= !br->listed;
+    if (n_add == refuse_add || !(port->lw.flags & NETIF_FLAG_ETHARP) || !(port->lw.flags & NETIF_FLAG_ETHERNET)) {
+        return ESP_FAIL;
+    }
+    t_add[n_add++] = ++tick;
+    port->lw.input = br_in_;
+    port->lw.flags &= (unsigned char)~NETIF_FLAG_ETHARP;
+    return ESP_OK;
+}
+esp_err_t esp_netif_dhcps_stop(esp_netif_t *n)
+{
+    LWIP_CTX();
+    if (t_stop == 0) { t_stop = ++tick; }
+    if (!n->dhcps_on) { return ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED; }
+    n->dhcps_on = false;
+    return ESP_OK;
+}
+esp_err_t esp_netif_set_ip_info(esp_netif_t *n, const esp_netif_ip_info_t *ip)
+{
+    LWIP_CTX();
+    if (n->dhcps_on || set_ip_fails) { return ESP_FAIL; }
+    n->ip = ip->ip.addr;
+    return ESP_OK;
+}
+esp_err_t esp_netif_dhcpc_stop(esp_netif_t *n) { LWIP_CTX(); n->dhcpc_stopped = true; return ESP_OK; }
+esp_err_t esp_netif_set_default_netif(esp_netif_t *n) { LWIP_CTX(); def = n; t_default = ++tick; return ESP_OK; }
+
+static void port_(struct esp_netif_obj *o, unsigned flags, bool dhcps, uint32_t ip)
+{
+    memset(o, 0, sizeof(*o));
+    o->lw.input = tcpip_input;
+    o->lw.linkoutput = out_;
+    o->lw.flags = (unsigned char)(NETIF_FLAG_ETHARP | NETIF_FLAG_ETHERNET | flags);
+    o->dhcps_on = dhcps;
+    o->ip = ip;
+    list_(o);
+}
+/* A booted node on a running mesh armed for a bridge: mesh netif down, USB and AP up and serving DHCP. */
+static void world(void)
+{
+    netif_list = NULL;
+    memset(&BRN, 0, sizeof(BRN));
+    port_(&MESH, 0, false, 0);
+    port_(&USB, NETIF_FLAG_UP | NETIF_FLAG_LINK_UP, true, 0x0104a8c0u);
+    port_(&AP, NETIF_FLAG_UP | NETIF_FLAG_LINK_UP, true, 0x0105a8c0u);
+    s_br = NULL; s_failed = false; s_mesh_up = false; s_reason = "off"; s_ports = "none";
+#if CONFIG_ESP_NETIF_BRIDGE_EN
+    s_mesh = NULL;
+#endif
+    mesh_running = usb_exists = true;
+    new_fails = start_adds_nothing = set_ip_fails = add_unlisted = destroyed_listed = false;
+    ap_up_at_ms = refuse_add = -1;
+    clock_ms = n_new = n_destroy = n_start = n_add = tick = t_start = t_stop = t_default = runs = 0;
+    memset(t_add, 0, sizeof(t_add));
+    heap_largest = 20000;
+    def = NULL; hostname = NULL; ev_got = 99; logs[0] = 0;
+    g_warthog_mesh_bridge = 1;
+    g_warthog_host_ccmp_on = 0; g_warthog_chipvif_type = 1; g_warthog_peer_gtk_mode = 1;
+}
+static bool nat_intact(void) /* as with the setting at 0 */
+{
+    return USB.dhcps_on && AP.dhcps_on && USB.ip != 0 && AP.ip != 0 && !MESH.dhcpc_stopped && def == NULL &&
+           MESH.lw.input == tcpip_input && USB.lw.input == tcpip_input && AP.lw.input == tcpip_input &&
+           (MESH.lw.flags & USB.lw.flags & AP.lw.flags & NETIF_FLAG_ETHARP) != 0 &&
+           !(MESH.lw.flags & (NETIF_FLAG_UP | NETIF_FLAG_LINK_UP));
+}
+static bool fell_back(void) /* the wrapper's part of every refusal */
+{
+    return !warthog_mesh_bridge_active() && !warthog_mesh_bridge_pending() && warthog_mesh_bridge_failed() &&
+           warthog_mesh_bridge_netif() == NULL && g_warthog_mesh_bridge == 0;
+}
+static bool says(const char *want)
+{
+    char b[160];
+    const int w = warthog_mesh_bridge_status(b, sizeof(b));
+    return w == (int)strlen(b) && strncmp(b, want, strlen(want)) == 0;
+}
+static int fails;
+#define CHECK(c, ...) do { if (!(c)) { fails++; printf(__VA_ARGS__); printf(" | "); } } while (0)
+static const uint8_t MAC[6] = { 0x3c, 0x1a, 0xcc, 0x4c, 0x73, 0x8d }, ZERO[6] = { 0 };
+
+int main(void)
+{
+    char b[160];
+#ifdef T_NO_BRIDGE
+    world();
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_ERR_NOT_SUPPORTED && nat_intact() && fell_back() &&
+          n_new == 0 && says("running=0 reason=not-built ports=none mesh_link=0 "), "not built: %s", s_reason);
+    warthog_mesh_bridge_port_up();
+    CHECK(outside == 0 && runs == 0, "not built: the port-up call does something");
+#else
+    world(); /* the setting at 0: nothing waits, nothing to end */
+    g_warthog_mesh_bridge = 0;
+    warthog_mesh_bridge_none();
+    CHECK(!warthog_mesh_bridge_pending() && !warthog_mesh_bridge_failed() && nat_intact() && logs[0] == 0 &&
+          says("running=0 reason=off ports=none mesh_link=0 "), "setting 0: none() did something (%s)", s_reason);
+
+    world(); /* armed at mesh enable, and app_main calls no start: the wait ends */
+    CHECK(warthog_mesh_bridge_pending(), "armed: not pending before app_main decides");
+    warthog_mesh_bridge_none();
+    CHECK(fell_back() && nat_intact() && n_new == 0 && says("running=0 reason=not-started "), "none(): %s", s_reason);
+
+    world(); /* station boot, or a mesh that did not start */
+    mesh_running = false;
+    g_warthog_mesh_bridge = 0;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_ERR_INVALID_STATE && nat_intact() && fell_back() &&
+          n_new == 0 && runs == 0 && says("running=0 reason=mesh-off ports=none mesh_link=0 "), "mesh off: %s", s_reason);
+
+    world(); /* a mesh MAC that was not read */
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, ZERO) == ESP_ERR_INVALID_STATE && nat_intact() && fell_back() &&
+          n_new == 0 && says("running=0 reason=mesh-off "), "zero MAC: %s", s_reason);
+
+    world(); /* the mesh came up as a leaf: no bridge over it */
+    g_warthog_mesh_bridge = 0;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_ERR_INVALID_STATE && nat_intact() && fell_back() &&
+          n_new == 0 && runs == 0 && says("running=0 reason=not-armed "), "not armed: %s", s_reason);
+
+    world(); /* three ports */
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_OK, "three ports: refused (%s)", s_reason);
+    CHECK(runs == 1 && n_new == 1 && n_start == 1 && n_add == 3 && n_destroy == 0 && !add_unlisted && outside == 0,
+          "three ports: not one tcpip run (runs %d new %d start %d add %d)", runs, n_new, n_start, n_add);
+    CHECK(t_start < t_add[0] && t_add[0] < t_add[1] && t_add[1] < t_add[2] && t_add[2] < t_stop && t_stop < t_default,
+          "three ports: order start %d adds %d %d %d stop %d default %d", t_start, t_add[0], t_add[1], t_add[2], t_stop, t_default);
+    CHECK(MESH.lw.input == br_in_ && USB.lw.input == br_in_ && AP.lw.input == br_in_ && !USB.dhcps_on && !AP.dhcps_on &&
+          USB.ip == 0 && AP.ip == 0 && MESH.dhcpc_stopped && def == &BRN && memcmp(br_mac, MAC, 6) == 0 &&
+          hostname != NULL && strcmp(hostname, "espressif") == 0 && ev_got == IP_EVENT_STA_GOT_IP,
+          "three ports: a port keeps its layer 3, or the bridge is not the default route with the mesh netif's MAC, name and events");
+    CHECK(warthog_mesh_bridge_active() && warthog_mesh_bridge_netif() == &BRN && !warthog_mesh_bridge_pending() &&
+          !warthog_mesh_bridge_failed() && g_warthog_mesh_bridge == 1 &&
+          !(MESH.lw.flags & (NETIF_FLAG_UP | NETIF_FLAG_LINK_UP)) &&
+          says("running=1 reason=ok ports=usb,ap,mesh mesh_link=0 "), "three ports: published wrongly (%s %s)", s_reason, s_ports);
+    warthog_mesh_bridge_port_up();
+    CHECK((MESH.lw.flags & NETIF_FLAG_UP) && (MESH.lw.flags & NETIF_FLAG_LINK_UP) && MESH.dhcpc_stopped &&
+          runs == 2 && outside == 0 && says("running=1 reason=ok ports=usb,ap,mesh mesh_link=1 "), "port up: mesh port not raised in tcpip context");
+    for (int i = 0; i < 5; i++) { warthog_mesh_bridge_port_up(); }
+    CHECK(runs == 2, "port up: raised more than once (%d runs)", runs);
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_OK && n_new == 1 && runs == 2, "a second start did something");
+
+    world(); /* the port-up call before any bridge */
+    warthog_mesh_bridge_port_up();
+    CHECK(runs == 0 && nat_intact(), "port up with no bridge touched the mesh netif");
+
+    world(); /* the AP's netif appears 300 ms after esp_wifi_start() */
+    AP.listed = false; netif_list = &USB.lw; USB.lw.next = &MESH.lw; MESH.lw.next = NULL; AP.lw.flags &= (unsigned char)~NETIF_FLAG_UP;
+    ap_up_at_ms = 300;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_OK && n_add == 3 && clock_ms >= 300 && clock_ms < 2000 &&
+          says("running=1 reason=ok ports=usb,ap,mesh "), "late AP: %s after %d ms", s_reason, clock_ms);
+
+    world(); /* it never appears */
+    AP.listed = false; netif_list = &USB.lw; USB.lw.next = &MESH.lw; MESH.lw.next = NULL; AP.lw.flags &= (unsigned char)~NETIF_FLAG_UP;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_ERR_TIMEOUT && clock_ms >= 2000 && clock_ms <= 2100 &&
+          n_new == 0 && USB.dhcps_on && USB.ip != 0 && USB.lw.input == tcpip_input && fell_back() &&
+          says("running=0 reason=ap-not-up ports=none "), "AP never up: %s after %d ms", s_reason, clock_ms);
+
+    world(); /* the AP did not start (a bad passphrase): USB and mesh */
+    CHECK(warthog_mesh_bridge_start(&MESH, NULL, MAC) == ESP_OK && n_add == 2 && AP.dhcps_on && AP.ip != 0 &&
+          AP.lw.input == tcpip_input && says("running=1 reason=ok ports=usb,mesh "), "no AP: %s %s", s_reason, s_ports);
+
+    world(); /* no USB netif: AP and mesh */
+    usb_exists = false;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_OK && n_add == 2 && USB.dhcps_on &&
+          says("running=1 reason=ok ports=ap,mesh "), "no USB: %s %s", s_reason, s_ports);
+
+    world(); /* neither */
+    usb_exists = false;
+    CHECK(warthog_mesh_bridge_start(&MESH, NULL, MAC) == ESP_ERR_NOT_FOUND && n_new == 0 && nat_intact() && fell_back() &&
+          says("running=0 reason=no-port "), "no port: %s", s_reason);
+
+    world(); /* a port lwIP would refuse: nothing is started */
+    USB.lw.flags &= (unsigned char)~NETIF_FLAG_ETHARP;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_ERR_INVALID_STATE && n_start == 0 && n_add == 0 && n_destroy == 1 &&
+          !destroyed_listed && AP.dhcps_on && AP.ip != 0 && fell_back() && says("running=0 reason=port-refused "), "port without ETHARP: %s", s_reason);
+    world(); /* a port another bridge already took */
+    AP.lw.input = br_in_;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_ERR_INVALID_STATE && n_start == 0 && n_destroy == 1 &&
+          USB.dhcps_on && fell_back() && says("running=0 reason=port-refused "), "port with a foreign input: %s", s_reason);
+
+    world(); /* no room for lwIP's part: IDF would abort inside the start */
+    heap_largest = 4095;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_ERR_NO_MEM && n_start == 0 && n_destroy == 1 && !destroyed_listed &&
+          nat_intact() && fell_back() && says("running=0 reason=nomem "), "4095 B: %s", s_reason);
+    world();
+    new_fails = true;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_ERR_NO_MEM && runs == 0 && n_destroy == 0 && nat_intact() &&
+          fell_back() && says("running=0 reason=nomem "), "esp_netif_new failed: %s", s_reason);
+
+    world(); /* lwIP refuses the third port after two joined: undone, and the bridge lwIP holds stays */
+    refuse_add = 2;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_FAIL && n_add == 2 && n_destroy == 0 && nat_intact() &&
+          fell_back() && BRN.listed && says("running=0 reason=port-refused ports=none "), "third port refused: %s", s_reason);
+    warthog_mesh_bridge_port_up();
+    CHECK(!(MESH.lw.flags & NETIF_FLAG_UP), "third port refused: the mesh port was raised for a bridge that is not there");
+
+    world(); /* the start returned and lwIP has no bridge: nothing joins, nothing is destroyed */
+    start_adds_nothing = true;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_FAIL && n_add == 0 && n_destroy == 0 && nat_intact() &&
+          fell_back(), "bridge not listed: %s", s_reason);
+
+    world(); /* a port's address cannot be cleared: the bridge runs and says so */
+    set_ip_fails = true;
+    CHECK(warthog_mesh_bridge_start(&MESH, &AP, MAC) == ESP_OK && says("running=1 reason=ok(port-addr) ports=usb,ap,mesh ") &&
+          strstr(logs, "kept its address") != NULL, "address kept: %s", s_reason);
+
+    world(); /* the longest line fits AT+MESHBRIDGE?'s buffer, and a short buffer is not overrun */
+    set_ip_fails = true;
+    (void)warthog_mesh_bridge_start(&MESH, &AP, MAC);
+    warthog_mesh_bridge_port_up();
+    const int w = warthog_mesh_bridge_status(b, sizeof(b));
+    CHECK(15 + w + 3 <= T_LINE && w == (int)strlen(b), "AT+MESHBRIDGE? is %d + 15 + 3 in line[%d]", w, T_LINE);
+    memset(b, 'x', sizeof(b));
+    CHECK(warthog_mesh_bridge_status(b, 20) == 19 && b[19] == 0 && b[20] == 'x' && warthog_mesh_bridge_status(b, 0) == 0,
+          "the status overruns a short buffer or misreports what it wrote");
+
+    world(); /* grp_rx by image: T_GRP is a mask of the cases in which this build must say 1 */
+    for (int m = 0; m < 8; m++) {
+        g_warthog_host_ccmp_on = m & 1; g_warthog_chipvif_type = (m & 2) ? 5 : 1; g_warthog_peer_gtk_mode = (m >> 2) & 1;
+        (void)warthog_mesh_bridge_status(b, sizeof(b));
+        CHECK((strstr(b, " grp_rx=1 ") != NULL) == ((T_GRP >> m) & 1) && (strstr(b, " grp_rx=0 ") != NULL) == !((T_GRP >> m) & 1),
+              "grp_rx with ccmp=%d mesh_vif=%d gtk=%d: %s", m & 1, (m >> 1) & 1, (m >> 2) & 1, b);
+    }
+    world();
+    g_warthog_chipvif_type = 5;
+    (void)warthog_mesh_bridge_start(&MESH, &AP, MAC);
+    CHECK((strstr(logs, "hear no broadcast") != NULL) == !((T_GRP >> 6) & 1), "the boot line about group frames: %s", logs);
+#endif
+    CHECK(outside == 0, "%d lwIP or port calls outside tcpip context", outside);
+    CHECK(wrong_caps == 0, "%d heap calls not for MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT", wrong_caps);
+    if (fails == 0) { printf("ok\n"); }
+    return 0;
+}
+EOF
+size84=$(awk '/strcasecmp\(verb, "MESHBRIDGE"\) == 0 && terminator == .\?./ {on=1} on && /static char line\[[0-9]+\];/ {match($0, /\[[0-9]+\]/); print substr($0, RSTART + 1, RLENGTH - 2); exit}' "$A")
+why84=""
+w84() { [ -n "$why84" ] || why84="$1"; } # the first reason is the one reported
+[ -n "$size84" ] || w84 "AT+MESHBRIDGE? has no static line[] to size"
+# name | image flags | cases (ccmp + 2*mesh_vif + 4*gtk) in which grp_rx must read 1
+for v84 in 'open||255' 'sae|-DWARTHOG_MESH_SAE=1|0' 'nochipkey|-DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1|0' \
+           'swccmp|-DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1|170' \
+           'swccmp-meshvif|-DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_AMPE_NO_CHIP_KEY=1 -DWARTHOG_MESH_HOST_CCMP=1 -DWARTHOG_MESH_CHIP_VIF_MESH=1|170' \
+           'meshvif|-DWARTHOG_MESH_SAE=1 -DWARTHOG_MESH_CHIP_VIF_MESH=1|192' 'not-built|-DT_NO_BRIDGE=1|255'; do
+  n84=${v84%%|*}; r84=${v84#*|}; f84=${r84%%|*}; g84=${r84##*|}
+  if ! ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} $f84 -DT_GRP="$g84" -DT_LINE="${size84:-0}" -I"$T" -I../../../main -o "$T/t" "$T/t.c" 2>"$T/err"; then
+    w84 "$n84 build: $(head -3 "$T/err" | tr '\n' ' ')"
+  else
+    run84=$("$T/t" 2>&1)
+    [ "$run84" = ok ] || w84 "$n84: ${run84:-did not run}"
+  fi
+done
+rm -rf "$T"
+scan84=$(lwip_only_in_tcpip "$MB" br_attach_ '(netif_set_up|netif_set_link_up|netif_set_flags|esp_netif_bridge_add_port|bridgeif_[a-z_]+)[(]')
+[ -z "$scan84" ] || w84 "mesh_bridge.c:$scan84"
+grep -q 'esp_netif_br_glue' "$MB" && w84 "mesh_bridge.c uses IDF's bridge glue again"
+awk '/^static esp_err_t br_attach_\(/,/^}/' "$MB" | grep -q 'ESP_LOG' && w84 "br_attach_ logs on lwIP's own stack"
+AM84=$(awk '/^void app_main\(void\)/,/^}/' ../../../main/main.c | sed 's:/\*[^*]*\*/::g' | tr -d ' \n')
+case "$AM84" in *'esp_netif_t*ap=warthog_wifi_ap_start();'*'warthog_mesh_bridge_start(mmhalow_get_netif(),ap,mesh_mac);'*'}else{warthog_mesh_bridge_none();}ESP_ERROR_CHECK(warthog_nat_start());warthog_usb_net_link_release();'*'warthog_mudp_start()'*) ;;
+  *) w84 "app_main does not hand the AP netif to the bridge start, or does not end the wait for a bridge when it calls no start, before NAT, the held USB link's release and the repeater start" ;; esac
+awk '/^static void cmd_meshcfg\(void\)/,/^}/' "$A" | grep -q '\.bridge_stored = warthog_mesh_bridge_failed(),' || \
+  w84 "AT+MESHCFG? does not report a failed bridge start"
+awk '/^static void cmd_status\(void\)/,/^}/' "$A" | grep -q 'esp_netif_t \*halow = halow_l3_netif_();' || \
+  w84 "AT+STATUS? does not read the bridge's address"
+awk '/^static void cmd_mcast_set\(/,/^}/' "$A" | grep -q 'esp_netif_t \*halow = halow_l3_netif_();' || \
+  w84 "AT+MCAST does not join on the bridge's address"
+awk '/^static esp_netif_t \*halow_l3_netif_\(void\)/,/^}/' "$A" | tr -d ' \n' | \
+  grep -q 'returnwarthog_mesh_bridge_active()?warthog_mesh_bridge_netif():esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");' || \
+  w84 "halow_l3_netif_ is not the bridge while it runs, else the mesh netif"
+awk '/^void warthog_mesh_smoke_test\(/,/^}/' ../../../main/mesh.c | \
+  awk '/if \(tret == pdPASS\) \{/ {p=NR} p && NR == p + 1 && /s_mesh_running = true;/ {ok=1} END {exit ok ? 0 : 1}' || \
+  w84 "mesh.c does not say the mesh is running once its probe task exists"
+grep -q '^all:.* lwip-bridge' Makefile && grep -q '^include lwip_bridge.mk$' Makefile || w84 "make all does not run lwip-bridge"
+ci_after_station 'make -C components/halow_mesh_compat/test lwip-bridge LWIP_BRIDGE_REQUIRED=1' \
+  'make -C components/halow_mesh_compat/test clean lwip-bridge SAN=1 LWIP_BRIDGE_REQUIRED=1' || \
+  w84 "CI does not run lwip-bridge after its PlatformIO build"
+ci_after_station 'make -C components/halow_mesh_compat/test clean lwip-bridge IDF_LWIP="$d" LWIP_BRIDGE_REQUIRED=1' \
+  'make -C components/halow_mesh_compat/test clean lwip-bridge IDF_LWIP="$d" LWIP_BRIDGE_REQUIRED=1 SAN=1' || \
+  w84 "CI does not run lwip-bridge against esp-lwip c6f2f878 (IDF 5.5.6) after its PlatformIO build"
+grep '^| `AT+MESHBRIDGE?`' ../../../wiki/AT-Command-Reference.md | grep -q 'grp_rx' || \
+  w84 "the AT reference does not describe the fields of AT+MESHBRIDGE?"
+if [ -z "$why84" ]; then
+  ok "bridge mode: built in one tcpip run on a running, armed mesh or not at all; every refusal leaves NAT mode as with the setting at 0 and ends the mesh netif's wait; the mesh port rises once after the bridge is published; grp_rx by image; AT+MESHBRIDGE? fits line[$size84]; app_main, AT+STATUS?, AT+MCAST and AT+MESHCFG? wired; make all and CI run lwip-bridge"
+else
+  bad "bridge mode: $why84"
+fi
+
+# 85. AT+MPING runs whole on the AT task (measured on a board 2026-11-10: with a host pinging it,
+#     esp_ping's receive loop never timed out, its session outlived the command and its end callback gave
+#     a semaphore the command had deleted). cmd_mping and its helpers are compiled out of main/at.c and
+#     run on a scripted socket, clock and route: other ICMP neither moves a probe's deadline nor sits in
+#     the socket between probes, counts are exact, the socket is closed before the summary; nothing in
+#     main/ starts an esp_ping session.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+{
+  grep -E '^#define MPING_[A-Z_]+ ' "$A"
+  awk '/^static char \*trim\(char \*s\)/,/^}/' "$A"
+  awk '/^static void reply_ok\(void\)/,/^}/' "$A"
+  awk '/^static void reply_error\(const char \*why\)/,/^}/' "$A"
+  awk '/^static void mping_build_\(/,/^}/' "$A"
+  awk '/^static bool mping_is_reply_\(/,/^}/' "$A"
+  awk '/^struct mping_route \{/,/^};/' "$A"
+  awk '/^static esp_err_t mping_route_\(/,/^}/' "$A"
+  awk '/^static void cmd_mping\(char \*args\)/,/^}/' "$A"
+} > "$T/fn.c"
+cat > "$T/t.c" <<'EOF85'
+/* cmd_mping and its helpers, compiled out of main/at.c, on a scripted socket, clock and route.
+ * Time moves only in a wait (recvfrom, vTaskDelay), in sendto, and 1 us a clock read; every packet
+ * due by then is queued as lwIP queues it on a raw socket, six at most. */
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+
+typedef int esp_err_t;
+#define ESP_OK 0
+typedef struct { uint32_t addr; } ip4_addr_t;
+#define IP4ADDR_STRLEN_MAX 16
+struct netif { const char *output; uint8_t num; };
+#define netif_get_index(n) ((uint8_t)((n)->num + 1))
+#define pdMS_TO_TICKS(ms) (ms)
+#define QCAP 6 /* DEFAULT_RAW_RECVMBOX_SIZE */
+
+struct pk { int64_t at; int len; uint8_t b[64]; };
+static struct pk q[QCAP], rep[64];
+static int n_q, max_q, opens, closes, sends, forever, send_errno[32];
+static int64_t now_us, bg_period, bg_next, bg_stop, answer_rtt_us, send_cost_us;
+static long rcvtimeo_ms;
+static unsigned last_id, clock_reads, rnd_i;
+static bool sock_open, fail_socket, fail_sockopt, fail_recv, echo_self, open_at_summary, open_at_end;
+static struct netif good = { "out", 0 }, ghost = { NULL, 0 }, stray = { "out", 3 }, *route_netif;
+static char out[8192];
+static int failures;
+#define CHECK(c, ...) do { if (!(c)) { printf(__VA_ARGS__); printf("; "); failures++; } } while (0)
+
+static void deliver(const uint8_t *b, int len)
+{
+    if (sock_open && n_q < QCAP) { /* lwIP drops what the mailbox cannot take */
+        memcpy(q[n_q].b, b, (size_t)len);
+        q[n_q++].len = len;
+        if (n_q > max_q) {
+            max_q = n_q;
+        }
+    }
+}
+
+/* A 20-octet IPv4 header, protocol ICMP, from src; then the ICMP message. */
+static int wrap(uint8_t *o, uint32_t src, const uint8_t *icmp, int n)
+{
+    memset(o, 0, 20);
+    o[0] = 0x45;
+    o[9] = 1;
+    memcpy(o + 12, &src, 4);
+    memcpy(o + 20, icmp, (size_t)n);
+    return 20 + n;
+}
+
+static int64_t next_arrival(void)
+{
+    int64_t t = (bg_period && bg_next < bg_stop) ? bg_next : INT64_MAX;
+    for (int i = 0; i < 64; i++) {
+        if (rep[i].len && rep[i].at < t) {
+            t = rep[i].at;
+        }
+    }
+    return t;
+}
+
+static void advance(int64_t to)
+{
+    for (int64_t t = next_arrival(); t <= to; t = next_arrival()) {
+        now_us = t;
+        if (bg_period && bg_next == t && bg_next < bg_stop) { /* a host pinging the board: an echo request to us */
+            static const uint8_t req[8] = { 8, 0, 0, 0, 0x42, 0x42, 0, 7 };
+            uint8_t p[28];
+            const int n = wrap(p, inet_addr("192.168.4.2"), req, 8);
+            deliver(p, n);
+            bg_next += bg_period;
+            continue;
+        }
+        for (int i = 0; i < 64; i++) {
+            if (rep[i].len && rep[i].at == t) {
+                deliver(rep[i].b, rep[i].len);
+                rep[i].len = 0;
+                break;
+            }
+        }
+    }
+    now_us = to;
+}
+
+static void schedule(int64_t at, const uint8_t *b, int len)
+{
+    for (int i = 0; i < 64; i++) {
+        if (!rep[i].len) {
+            rep[i].at = at;
+            rep[i].len = len;
+            memcpy(rep[i].b, b, (size_t)len);
+            return;
+        }
+    }
+}
+
+static int t_socket(int d, int t, int p)
+{
+    (void)d; (void)t; (void)p;
+    if (fail_socket) {
+        errno = ENFILE;
+        return -1;
+    }
+    opens++;
+    sock_open = true;
+    n_q = 0;
+    rcvtimeo_ms = 0;
+    return 54;
+}
+
+static int t_setsockopt(int s, int level, int name, const void *v, socklen_t l)
+{
+    (void)s; (void)l;
+    if (fail_sockopt) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (level == SOL_SOCKET && name == SO_RCVTIMEO) {
+        const struct timeval *tv = v;
+        rcvtimeo_ms = (long)tv->tv_sec * 1000 + (long)tv->tv_usec / 1000;
+    }
+    return 0;
+}
+
+static int t_close(int s)
+{
+    (void)s;
+    closes++;
+    sock_open = false;
+    n_q = 0;
+    return 0;
+}
+
+static ssize_t t_sendto(int s, const void *d, size_t n, int f, const struct sockaddr *to, socklen_t tl)
+{
+    const uint8_t *b = d;
+    const uint32_t dst = ((const struct sockaddr_in *)to)->sin_addr.s_addr;
+    const int k = sends++;
+    uint8_t p[64], r[40];
+    int len;
+    (void)s; (void)f; (void)tl;
+    advance(now_us + send_cost_us); /* lwIP's thread sends, or waits for the radio, meanwhile */
+    if (k < 32 && send_errno[k]) {
+        errno = send_errno[k];
+        return -1;
+    }
+    last_id = ((unsigned)b[4] << 8) | b[5];
+    if (echo_self) { /* our own request, looped back to the socket */
+        len = wrap(p, dst, b, (int)n);
+        schedule(now_us, p, len);
+    }
+    if (answer_rtt_us >= 0) {
+        memcpy(r, b, n);
+        r[0] = 0; /* the target's echo reply; nothing reads its checksum */
+        len = wrap(p, dst, r, (int)n);
+        schedule(now_us + answer_rtt_us, p, len);
+    }
+    errno = 0;
+    return (ssize_t)n;
+}
+
+static ssize_t t_recvfrom(int s, void *m, size_t n, int f, struct sockaddr *a, socklen_t *al)
+{
+    (void)s; (void)a; (void)al;
+    if (!sock_open || fail_recv) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    if (n_q == 0 && !(f & MSG_DONTWAIT)) {
+        if (rcvtimeo_ms <= 0) { /* on the board this waits for ever */
+            forever++;
+            advance(now_us + 3600 * (int64_t)1000000);
+        }
+        const int64_t limit = now_us + rcvtimeo_ms * 1000;
+        while (n_q == 0 && now_us < limit) {
+            const int64_t t = next_arrival();
+            advance(t < limit ? t : limit);
+        }
+    }
+    if (n_q == 0) {
+        errno = EWOULDBLOCK;
+        return -1;
+    }
+    const size_t len = (size_t)q[0].len < n ? (size_t)q[0].len : n;
+    memcpy(m, q[0].b, len);
+    n_q--;
+    memmove(&q[0], &q[1], sizeof(q[0]) * (size_t)n_q);
+    errno = 0;
+    return (ssize_t)len;
+}
+
+static void vTaskDelay(uint32_t ticks) { advance(now_us + (int64_t)ticks * 1000); }
+static int64_t esp_timer_get_time(void) { clock_reads++; advance(now_us + 1); return now_us; }
+static uint32_t esp_random(void) { return (rnd_i++ & 1u) ? 0x61234u : 0x51234u; } /* the same 16 bits each time */
+static esp_err_t esp_netif_tcpip_exec(esp_err_t (*fn)(void *), void *ctx) { return fn(ctx); }
+static struct netif *ip4_route(const ip4_addr_t *d) { (void)d; return route_netif; }
+static struct netif *netif_get_by_index(uint8_t i) { return i == netif_get_index(&good) ? &good : NULL; }
+
+static int ip4addr_aton(const char *c, ip4_addr_t *a)
+{
+    struct in_addr in;
+    if (inet_pton(AF_INET, c, &in) != 1) {
+        return 0;
+    }
+    a->addr = in.s_addr;
+    return 1;
+}
+
+static char *ip4addr_ntoa_r(const ip4_addr_t *a, char *buf, int len)
+{
+    struct in_addr in;
+    in.s_addr = a->addr;
+    return (char *)inet_ntop(AF_INET, &in, buf, (socklen_t)len);
+}
+
+static void cdc_write(const char *s)
+{
+    if (strstr(s, " sent, ") != NULL) {
+        open_at_summary = sock_open;
+    }
+    if (!strcmp(s, "OK\r\n") || !strcmp(s, "ERROR\r\n")) {
+        open_at_end = sock_open;
+    }
+    snprintf(out + strlen(out), sizeof(out) - strlen(out), "%s", s);
+}
+
+#define socket t_socket
+#define setsockopt t_setsockopt
+#define close t_close
+#define sendto t_sendto
+#define recvfrom t_recvfrom
+#include "fn.c"
+
+static void world(void)
+{
+    now_us = 5000000;
+    bg_period = bg_next = 0;
+    bg_stop = now_us + 30 * (int64_t)1000000; /* a host stops in the end: a wait its pings hold open fails on time, not never */
+    n_q = max_q = 0;
+    memset(rep, 0, sizeof(rep));
+    sock_open = fail_socket = fail_sockopt = fail_recv = echo_self = open_at_summary = open_at_end = false;
+    opens = closes = sends = forever = 0;
+    memset(send_errno, 0, sizeof(send_errno));
+    rcvtimeo_ms = 0;
+    answer_rtt_us = -1;
+    send_cost_us = 200;
+    clock_reads = 0;
+    route_netif = &good;
+}
+
+static long run(const char *args)
+{
+    char a[64];
+    const int64_t t0 = now_us;
+    snprintf(a, sizeof(a), "%s", args);
+    out[0] = '\0';
+    cmd_mping(a);
+    return (long)((now_us - t0) / 1000);
+}
+
+#define USAGE "+ERR: usage: AT+MPING=<ipv4>[,<count 1-20>]\r\nERROR\r\n"
+#define DEAD1 "+MPING: seq=1 timeout\r\n+MPING: 1 sent, 0 received, 100% loss\r\nOK\r\n"
+
+int main(void)
+{
+    static struct netif *const bad[3] = { NULL, &ghost, &stray };
+    static const char *const junk[] = { "", "abc", "999.1.1.1", "fe80::1", ",3" };
+    static const struct { const char *a; int n; } cnt[] = { { "10.0.0.9", 4 }, { "10.0.0.9,0", 4 },
+        { "10.0.0.9,21", 4 }, { "10.0.0.9,abc", 4 }, { "10.0.0.9,1", 1 }, { " 10.0.0.9 , 20 ", 20 } };
+    uint8_t p[MPING_PKT_LEN], ip[80];
+    unsigned id1;
+    long ms;
+    int n;
+
+    /* 1. The sequence measured on air: a host pings the board every 200 ms, the target is dead. */
+    world(); bg_period = 200000; bg_next = now_us + 1000;
+    ms = run("192.168.4.250,2");
+    CHECK(!strcmp(out, "+MPING: seq=1 timeout\r\n+MPING: seq=2 timeout\r\n"
+                       "+MPING: 2 sent, 0 received, 100% loss\r\nOK\r\n"),
+          "a dead target under a host's pings printed [%s]", out);
+    CHECK(ms >= 2000 && ms <= 2 * (MPING_TIMEOUT_MS + MPING_POLL_MS) + 5,
+          "a dead target under a host's pings took %ld ms", ms);
+    CHECK(opens == 1 && closes == 1 && !sock_open && !open_at_summary && !open_at_end && forever == 0,
+          "the socket: %d opened, %d closed, open at the summary %d, at the OK %d, waits without a timeout %d",
+          opens, closes, (int)open_at_summary, (int)open_at_end, forever);
+
+    /* 2. A live target under the same pings, and none of them left in the socket between probes. */
+    world(); bg_period = 200000; bg_next = now_us + 1000; answer_rtt_us = 15000;
+    ms = run("10.41.254.1,4");
+    CHECK(!strcmp(out, "+MPING: reply from 10.41.254.1 seq=1 time=15ms\r\n"
+                       "+MPING: reply from 10.41.254.1 seq=2 time=15ms\r\n"
+                       "+MPING: reply from 10.41.254.1 seq=3 time=15ms\r\n"
+                       "+MPING: reply from 10.41.254.1 seq=4 time=15ms\r\n"
+                       "+MPING: 4 sent, 4 received, 0% loss\r\nOK\r\n") && ms >= 3010 && ms <= 3030,
+          "a live target under a host's pings: %ld ms, [%s]", ms, out);
+    CHECK(max_q <= 2, "a host's pings sat in the socket between probes: %d held at once", max_q);
+
+    /* 3. ICMP every millisecond: the deadlines hold, and a reply back before the task reads again has a slot. */
+    world(); bg_period = 1000; bg_next = now_us + 500;
+    ms = run("10.0.0.9,3");
+    CHECK(strstr(out, "+MPING: 3 sent, 0 received, 100% loss\r\nOK\r\n") != NULL &&
+          ms <= 3 * (MPING_TIMEOUT_MS + MPING_POLL_MS) + 5, "a dead target under a flood: %ld ms, [%s]", ms, out);
+    world(); bg_period = 1000; bg_next = now_us + 500; answer_rtt_us = 0;
+    (void)run("10.0.0.9,3");
+    CHECK(strstr(out, "+MPING: 3 sent, 3 received, 0% loss\r\nOK\r\n") != NULL,
+          "a reply lost to a full socket queue: [%s]", out);
+
+    /* 4. A reply 1.5 s late arrives during the next command, which has another id. */
+    world(); answer_rtt_us = 1500000;
+    (void)run("10.0.0.9,1");
+    id1 = last_id;
+    CHECK(!strcmp(out, DEAD1), "a reply after the deadline: [%s]", out);
+    answer_rtt_us = -1;
+    (void)run("10.0.0.9,1");
+    CHECK(last_id != id1 && !strcmp(out, DEAD1), "the last command's late reply: ids %04x %04x, [%s]", id1, last_id, out);
+
+    /* 5. Our own request looped back (a ping to one of the board's addresses) is not the reply; the reply behind it is. */
+    world(); echo_self = true;
+    (void)run("192.168.4.1,2");
+    CHECK(strstr(out, "+MPING: 2 sent, 0 received, 100% loss\r\n") != NULL,
+          "an echo request with our id and seq counted as a reply: [%s]", out);
+    world(); echo_self = true; answer_rtt_us = 300;
+    (void)run("192.168.4.1,2");
+    CHECK(!strcmp(out, "+MPING: reply from 192.168.4.1 seq=1 time=0ms\r\n"
+                       "+MPING: reply from 192.168.4.1 seq=2 time=0ms\r\n"
+                       "+MPING: 2 sent, 2 received, 0% loss\r\nOK\r\n"),
+          "the board's own address, the looped request and then the reply: [%s]", out);
+
+    /* 6. A send lwIP refuses is not counted, and the pace holds; sends that wait a second for the radio
+     *    and then fail take that second each, not two. */
+    world(); answer_rtt_us = 2000; send_errno[1] = ENOMEM;
+    ms = run("10.0.0.9,3");
+    CHECK(!strcmp(out, "+MPING: reply from 10.0.0.9 seq=1 time=2ms\r\n+MPING: seq=2 timeout\r\n"
+                       "+MPING: reply from 10.0.0.9 seq=3 time=2ms\r\n"
+                       "+MPING: 2 sent, 2 received, 0% loss\r\nOK\r\n") && ms >= 2000 && ms <= 2015,
+          "a refused send: %ld ms, [%s]", ms, out);
+    world(); send_cost_us = 1000000; send_errno[0] = send_errno[1] = send_errno[2] = EIO;
+    ms = run("10.0.0.9,3");
+    CHECK(!strcmp(out, "+MPING: seq=1 timeout\r\n+MPING: seq=2 timeout\r\n+MPING: seq=3 timeout\r\n"
+                       "+MPING: 0 sent, 0 received, 100% loss\r\nOK\r\n") && ms >= 3000 && ms <= 3010,
+          "sends that wait a second and fail: %ld ms, [%s]", ms, out);
+
+    /* 7. A socket that fails: lost probes at the same pace, no spin. */
+    world(); fail_recv = true;
+    ms = run("10.0.0.9,3");
+    CHECK(strstr(out, "+MPING: 3 sent, 0 received, 100% loss\r\nOK\r\n") != NULL && ms >= 2000 && ms <= 2010 &&
+          clock_reads < 50 && closes == 1, "a failing socket: %ld ms, %u clock reads, [%s]", ms, clock_reads, out);
+
+    /* 8. No route, or a route through a netif lwIP does not hold: refused before any socket. */
+    for (int i = 0; i < 3; i++) {
+        world(); route_netif = bad[i];
+        (void)run("10.9.9.9,2");
+        CHECK(!strcmp(out, "+ERR: no route to 10.9.9.9\r\nERROR\r\n") && opens == 0 && sends == 0,
+              "route case %d: [%s], %d sockets", i, out, opens);
+    }
+
+    /* 9. No socket, or no receive timeout on it: refused, nothing sent, nothing left open. */
+    world(); fail_socket = true;
+    (void)run("10.0.0.9");
+    CHECK(!strcmp(out, "+ERR: ping session\r\nERROR\r\n") && closes == 0 && sends == 0, "no socket: [%s]", out);
+    world(); fail_sockopt = true;
+    (void)run("10.0.0.9");
+    CHECK(!strcmp(out, "+ERR: ping session\r\nERROR\r\n") && opens == 1 && closes == 1 && !sock_open && sends == 0,
+          "no receive timeout: [%s], %d opened, %d closed", out, opens, closes);
+
+    /* 10. Arguments: IPv4 only; a count outside 1-20 or not a number is 4, as documented. */
+    for (unsigned i = 0; i < sizeof(junk) / sizeof(junk[0]); i++) {
+        world();
+        (void)run(junk[i]);
+        CHECK(!strcmp(out, USAGE) && opens == 0, "'%s': [%s]", junk[i], out);
+    }
+    for (unsigned i = 0; i < sizeof(cnt) / sizeof(cnt[0]); i++) {
+        world();
+        ms = run(cnt[i].a);
+        CHECK(sends == cnt[i].n && closes == 1 && ms <= (long)cnt[i].n * (MPING_TIMEOUT_MS + MPING_POLL_MS) + 5,
+              "'%s': %d probes in %ld ms", cnt[i].a, sends, ms);
+    }
+
+    /* 11. The packet and the matcher. */
+    mping_build_(p, 0x1234, 1);
+    CHECK(p[0] == 8 && p[1] == 0 && p[2] == 0xe0 && p[3] == 0xb5 && p[4] == 0x12 && p[5] == 0x34 && p[6] == 0 &&
+          p[7] == 1 && p[8] == 'A' && p[39] == 0x60, "echo request 1234/1: %02x%02x%02x%02x %02x%02x%02x%02x",
+          p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    mping_build_(p, 0xffff, 20);
+    CHECK(p[2] == 0xf2 && p[3] == 0xd6, "echo request ffff/20: checksum %02x%02x", p[2], p[3]);
+    p[0] = 0; /* as the target answers it */
+    n = wrap(ip, 0, p, (int)sizeof(p));
+    CHECK(mping_is_reply_(ip, (size_t)n, 0xffff, 20), "the reply is not matched");
+    CHECK(!mping_is_reply_(ip, (size_t)n, 0xfffe, 20) && !mping_is_reply_(ip, (size_t)n, 0xffff, 19) &&
+          !mping_is_reply_(ip, 27, 0xffff, 20) && !mping_is_reply_(ip, 19, 0xffff, 20),
+          "another id, another seq or a short packet is matched");
+    ip[9] = 17; CHECK(!mping_is_reply_(ip, (size_t)n, 0xffff, 20), "UDP is matched"); ip[9] = 1;
+    ip[0] = 0x65; CHECK(!mping_is_reply_(ip, (size_t)n, 0xffff, 20), "IP version 6 is matched");
+    ip[0] = 0x44; CHECK(!mping_is_reply_(ip, (size_t)n, 0xffff, 20), "a 16-octet IP header is matched"); ip[0] = 0x45;
+    ip[21] = 1; CHECK(!mping_is_reply_(ip, (size_t)n, 0xffff, 20), "code 1 is matched"); ip[21] = 0;
+    ip[20] = 8; CHECK(!mping_is_reply_(ip, (size_t)n, 0xffff, 20), "an echo request is matched");
+    ip[20] = 3; CHECK(!mping_is_reply_(ip, (size_t)n, 0xffff, 20), "an ICMP error is matched"); ip[20] = 0;
+    memmove(ip + 24, ip + 20, sizeof(p)); /* four octets of IP options */
+    memset(ip + 20, 0, 4);
+    ip[0] = 0x46;
+    CHECK(mping_is_reply_(ip, (size_t)n + 4, 0xffff, 20) && !mping_is_reply_(ip, 31, 0xffff, 20),
+          "a 24-octet IP header is not followed");
+    return failures != 0;
+}
+EOF85
+why85=""
+if ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -I"$T" -o "$T/t" "$T/t.c" 2>"$T/err"; then
+  why85=$("$T/t") || why85="${why85:-the harness stopped without a message}"
+else
+  why85="did not build: $(head -3 "$T/err" | tr '\n' ' ')"
+fi
+# The firmware build has -Wall off (this IDF package), so nothing there checks a conversion against its argument:
+# the host compiler does it here, on the same text (every argument is cast, so the types are the board's).
+[ -n "$why85" ] || ${CC:-cc} -std=gnu11 -fsyntax-only -Wformat -Werror=format -I"$T" "$T/t.c" 2>/dev/null || \
+  why85="a printf conversion in the AT+MPING block or in this harness does not match its argument"
+rm -rf "$T"
+grep -Eq 'esp_ping_|ping/ping_sock\.h' ../../../main/*.c ../../../main/*.h && \
+  why85="${why85:-main/ uses esp_ping again: its session can outlive the command that started it}"
+MP85=$(awk '/^static void cmd_mping\(char \*args\)/,/^}/' "$A")
+printf '%s\n' "$MP85" | grep -Eq 'xTaskCreate|cdc_write_nowait|xSemaphore|xQueue' && \
+  why85="${why85:-cmd_mping hands part of the command to another task}"
+printf '%s\n' "$MP85" | awk '/^    close\(s\);/ {c=NR} /"\+MPING: %lu sent, %lu received, %lu%% loss/ {m=NR}
+  /^    reply_ok\(\);/ {k=NR} END {exit (c && m && k && c < m && m < k) ? 0 : 1}' || \
+  why85="${why85:-cmd_mping does not close its socket before the summary and the OK}"
+if [ -z "$why85" ]; then
+  ok "AT+MPING runs whole on the AT task on one raw socket, no esp_ping in main/: under other ICMP every 200 ms and every 1 ms each probe ends at its own deadline with exact counts, and none of it is left in the socket between probes; the last command's late reply and a looped-back request are not replies; a refused send, a send that waits for the radio and a failed socket keep the pace without spinning; no route, or a netif lwIP does not hold, is refused before any socket; the socket is closed before the summary (run)"
+else
+  bad "AT+MPING: $why85"
+fi
+
+# 86. AT+MESHSEC=<0|1> (cmd_meshsec in main/at.c), compiled out and run: on an SAE build it stores
+#     the value and never asks for a re-peer (the stations are hostap's; measured on air 2026-11-10,
+#     every link dead until a reset); on a non-SAE build only a new value asks for one, and a repeat
+#     neither withdraws a pending one nor says the links are kept; a failed NVS write changes nothing.
+#     The service that takes the request (umac_datapath_mesh_service_rekey) tears links down and
+#     resets the link table only inside !umac_mesh_sae_active(), and is the one place morselib
+#     deletes every peer; the AT reference row says what an SAE build does.
+T=$(mktemp -d "${TMPDIR:-/tmp}/glueguard.XXXXXX")
+for f in reply_ok reply_error trim cmd_meshsec; do
+  awk -v f="$f" '$0 ~ ("^static [a-z ]+[*]?" f "\\(") && !/;$/ {p=1} p {print} p && /^}/ {exit}' "$A"
+done > "$T/at_fn.c"
+cat > "$T/t.c" <<'EOF'
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_FAIL (-1)
+static char out_[512];
+static void cdc_write(const char *s) { strncat(out_, s, sizeof(out_) - strlen(out_) - 1); }
+static bool b_sae, nvs_fail;
+static int stored = -1, writes;
+static bool warthog_bat_port_sae_build(void) { return b_sae; }
+static esp_err_t warthog_cfg_set_mesh_secure(uint8_t v)
+{
+    if (nvs_fail) { return ESP_FAIL; }
+    stored = v; writes++;
+    return ESP_OK;
+}
+volatile uint32_t g_warthog_mesh_secure = 1, g_warthog_mesh_repeer_req = 0;
+#include "at_fn.c"
+static int fails;
+#define CHECK(c, ...) do { if (!(c)) { fails++; printf(__VA_ARGS__); printf(" [%s] | ", out_); } } while (0)
+static void run(const char *arg) { char a[32]; snprintf(a, sizeof(a), "%s", arg); out_[0] = 0; cmd_meshsec(a); }
+static void reset(uint32_t live) { g_warthog_mesh_secure = live; g_warthog_mesh_repeer_req = 0; stored = -1; writes = 0; }
+int main(void)
+{
+    char want[160];
+    /* SAE build: stored and shown, never a re-peer, whatever the live value was. */
+    b_sae = true;
+    for (int m = 0; m < 4; m++) {
+        const int v = m & 1, live = (m >> 1) & 1;
+        reset((uint32_t)live);
+        snprintf(want, sizeof(want),
+                 "+MESHSEC: %s, stored; no effect on this SAE build (keys come from AMPE)\r\nOK\r\n",
+                 v ? "keyed" : "open");
+        run(v ? "1" : "0");
+        CHECK(!strcmp(out_, want) && g_warthog_mesh_repeer_req == 0 && stored == v &&
+              g_warthog_mesh_secure == (uint32_t)v, "SAE build: AT+MESHSEC=%d with %d set", v, live);
+    }
+    /* Non-SAE build: only a new value asks for the re-peer. */
+    b_sae = false;
+    for (int m = 0; m < 4; m++) {
+        const int v = m & 1, live = (m >> 1) & 1;
+        reset((uint32_t)live);
+        snprintf(want, sizeof(want), "+MESHSEC: %s, stored%s\r\nOK\r\n", v ? "keyed" : "open",
+                 v == live ? "; already set, no re-peer requested" : ", re-peering (~2s)");
+        run(v ? " 1 " : "0");
+        CHECK(!strcmp(out_, want) && g_warthog_mesh_repeer_req == (v == live ? 0u : 1u) && stored == v &&
+              g_warthog_mesh_secure == (uint32_t)v, "non-SAE build: AT+MESHSEC=%d with %d set", v, live);
+    }
+    /* A request still waiting for the tick: a repeat neither withdraws it nor says the links stay. */
+    reset(1); run("0"); run("0");
+    CHECK(g_warthog_mesh_repeer_req == 1 &&
+          !strcmp(out_, "+MESHSEC: open, stored; already set, no re-peer requested\r\nOK\r\n"),
+          "non-SAE build: a repeat while a re-peer is pending");
+    /* A failed write changes nothing and asks for nothing. */
+    for (int sae = 0; sae < 2; sae++) {
+        b_sae = sae != 0; reset(1); nvs_fail = true;
+        run("0");
+        CHECK(!strcmp(out_, "+ERR: nvs write\r\nERROR\r\n") && g_warthog_mesh_secure == 1 &&
+              g_warthog_mesh_repeer_req == 0, "a failed NVS write (sae build %d)", sae);
+        nvs_fail = false;
+    }
+    b_sae = false;
+    static const char *bad[] = { "", "2", "10", "1x", "0x1", "on", "-1", "1 0" };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        reset(1);
+        run(bad[i]);
+        CHECK(!strcmp(out_, "+ERR: usage: AT+MESHSEC=<0 open|1 keyed>\r\nERROR\r\n") && writes == 0 &&
+              g_warthog_mesh_repeer_req == 0 && g_warthog_mesh_secure == 1, "AT+MESHSEC=%s", bad[i]);
+    }
+    return fails != 0;
+}
+EOF
+why86=""
+if ${CC:-cc} -std=gnu11 -w ${SANFLAGS:-} -I"$T" -o "$T/t" "$T/t.c" 2>"$T/cc.log" && why86=$("$T/t"); then
+  why86=""
+else
+  why86="${why86:-did not build or run: $(head -3 "$T/cc.log" | tr '\n' ' ')}"
+fi
+rm -rf "$T"
+MS86=../../halow/components/mm-iot-sdk/framework/morselib/src
+awk '/^void umac_datapath_mesh_service_rekey\(void\)/,/^}/' "$MS86/umac/datapath/umac_datapath_mesh.c" | awk '
+  /if \(g_warthog_mesh_repeer_req\)/ && !r {r=NR}
+  r && /g_warthog_mesh_repeer_req = 0;/ && !z {z=NR}
+  z && /if \(!umac_mesh_sae_active\(\)\)/ && !g {g=NR}
+  g && /umac_datapath_mesh_del_peer\(NULL\);/ && !d {d=NR}
+  d && !l && /^[[:space:]]*}/ {x=NR}
+  d && /umac_mesh_reset_links\(\);/ && !l {l=NR}
+  END {exit (r && z && g && d && l && !x) ? 0 : 1}' || \
+  why86="${why86:-umac_datapath_mesh_service_rekey does not clear the request and then delete every peer and reset the links inside !umac_mesh_sae_active()}"
+[ "$(grep -rl 'umac_datapath_mesh_del_peer(NULL)' "$MS86" | wc -l | tr -d ' ')" = 1 ] && \
+  [ "$(grep -c 'umac_datapath_mesh_del_peer(NULL)' "$MS86/umac/datapath/umac_datapath_mesh.c")" = 1 ] || \
+  why86="${why86:-morselib deletes every mesh peer somewhere other than the SAE-gated re-peer service}"
+awk '/strcasecmp\(verb, "MESHSEC"\) == 0 && terminator == .=./ {getline; print}' "$A" | grep -q 'cmd_meshsec(args);' || \
+  why86="${why86:-AT+MESHSEC= is not dispatched to cmd_meshsec}"
+grep '^| `AT+MESHSEC=' ../../../wiki/AT-Command-Reference.md | grep -q 'SAE build' || \
+  why86="${why86:-the AT reference row for AT+MESHSEC= does not say what an SAE build does}"
+if [ -z "$why86" ]; then
+  ok "AT+MESHSEC= on an SAE build stores and never re-peers; on a non-SAE build only a new value re-peers; a failed write changes nothing; the service deletes every peer and resets the links only on a non-SAE mesh"
+else
+  bad "AT+MESHSEC / the re-peer service: $why86"
+fi
+
+# 87. The USB controller driver is TinyUSB's slave (IRQ) mode one, never Buffer DMA, and a FIFO-backed IN
+#     transfer is one packet long (measured on three boards 2026-11-11, docs/test-sweep-2026-11-10.md H6: in
+#     DMA mode the whole USB function stopped when the console port was opened and closed under network load,
+#     and only a power cycle brought it back; in slave mode about 2,400 opens under the same load did not
+#     fail). esp_tinyusb 3.0.0 hard-codes DMA, and the component manager restores an edited managed file at
+#     the next configure, so the component is vendored at components/esp_tinyusb with main/idf_component.yml's
+#     override_path, and its include/tusb_config.h sets CFG_TUD_DWC2_DMA_ENABLE to 0. Slave mode alone left
+#     one fault: a console reply longer than one packet has its later packets loaded from the CDC transmit
+#     FIFO by the interrupt handler, and with control requests arriving the console's IN endpoint was left
+#     armed with a packet the controller never sent (console silent, network up, a host port reset cleared
+#     it: seconds under a stress of refused control requests, about one 70 s run in ten in ordinary use). The
+#     cause inside the driver is not established; tusb.c's tu_edpt_stream_write_xfer caps such a transfer at
+#     one packet, which never takes that path, and survived 200 s and 500 s of the stress on two boards.
+#     Checked here: the define, once, and nothing else setting the mode; the override_path; the copy is the
+#     registry's 3.0.0 in every file but that header (the registry's but for the define and its comment) and
+#     tusb.c (the registry's but for four marked lines), by CHECKSUMS.json; nothing of it is gitignored; the
+#     host tests and the CI checks read the copy and the built ELF.
+why87=""
+E87=../../esp_tinyusb
+H87=$E87/include/tusb_config.h
+Y87=../../../main/idf_component.yml
+if [ -f "$H87" ] && [ -f "$E87/CMakeLists.txt" ] && [ -f "$E87/CHECKSUMS.json" ]; then
+  d87=$(grep -E '^[ \t]*#[ \t]*(define|undef)[ \t]+CFG_TU[DH]_DWC2_(DMA|SLAVE)_ENABLE([ \t]|$)' "$H87" | sed 's/[ \t]*\/\/.*$//' | tr -s ' \t' ' ')
+  [ "$d87" = '#define CFG_TUD_DWC2_DMA_ENABLE 0' ] || \
+    why87="tusb_config.h sets the DWC2 mode with '$(printf '%s' "$d87" | tr '\n' ';')', not one '#define CFG_TUD_DWC2_DMA_ENABLE 0'"
+  grep -q '^  #define CFG_TUD_DWC2_SLAVE_ENABLE_DEFAULT     !CFG_TUD_DWC2_DMA_ENABLE$' "$E87/tinyusb/src/common/tusb_mcu.h" && \
+    grep -q '^#if !(CFG_TUD_DWC2_SLAVE_ENABLE || CFG_TUD_DWC2_DMA_ENABLE)$' "$E87/tinyusb/src/portable/synopsys/dwc2/dcd_dwc2.c" && \
+    grep -q '^    "tinyusb/src/portable/synopsys/dwc2/dcd_dwc2.c"$' "$E87/CMakeLists.txt" || \
+    why87="${why87:-TinyUSB no longer builds dcd_dwc2.c in slave mode when CFG_TUD_DWC2_DMA_ENABLE is 0}"
+  # Nothing outside TinyUSB's own sources, that header and the manifest's comment names the mode macros (a -D
+  # flag, a second header).
+  o87=$(grep -rlE 'CFG_TU[DH]_DWC2_(DMA|SLAVE)_ENABLE' ../../../main ../../../platformio.ini ../../../CMakeLists.txt \
+          ../../../sdkconfig.defaults ../../../sdkconfig.ecm ../../../scripts/inject_version.py ../../../scripts/pre_build_morselib.py \
+          "$E87/CMakeLists.txt" "$E87/CMakeLists_v2.txt" "$E87/Kconfig" "$E87"/*.c "$E87/include" "$E87/include_private" 2>/dev/null | \
+        grep -v -x -e "$H87" -e "$Y87" | tr '\n' ' ')
+  [ -z "$o87" ] || why87="${why87:-the DWC2 mode macros are also named in ${o87% }}"
+  for g87 in ../../../sdkconfig.warthog-*; do
+    [ -f "$g87" ] || continue
+    grep -q '^CONFIG_TINYUSB_DWC2_PTI_ENABLE=y$' "$g87" && why87="${why87:-${g87##*/} enables CONFIG_TINYUSB_DWC2_PTI_ENABLE, which needs Buffer DMA}"
+  done
+
+  # main/idf_component.yml: the espressif/esp_tinyusb entry, as "version|override_path".
+  m87=$(awk '
+    function val(s) { sub(/^[^:]*:[ ]*/, "", s); sub(/[ ]+#.*$/, "", s); gsub(/"/, "", s); return s }
+    /^  [^ #]/ { on = ($0 ~ /^  espressif\/esp_tinyusb:/); if (on) inl = val($0); next }
+    on && /^    version:/ { v = val($0) }
+    on && /^    override_path:/ { o = val($0) }
+    END { print (v == "" ? inl : v) "|" o }' "$Y87")
+  [ "$m87" = '==3.0.0|../components/esp_tinyusb' ] || \
+    why87="${why87:-main/idf_component.yml has espressif/esp_tinyusb as $m87, not ==3.0.0 with override_path ../components/esp_tinyusb}"
+  grep -q '^version: 3\.0\.0$' "$E87/idf_component.yml" || why87="${why87:-components/esp_tinyusb/idf_component.yml is not version 3.0.0}"
+  grep -q '^        esp_tinyusb$' ../../../main/CMakeLists.txt || why87="${why87:-main/CMakeLists.txt does not REQUIRE esp_tinyusb}"
+
+  # The copy against the registry's own CHECKSUMS.json ("hash  path" lines): every file is listed, every
+  # listed file that is missing is one the copy drops, and only tusb_config.h and tusb.c differ.
+  if command -v sha256sum >/dev/null 2>&1; then S87="sha256sum"; else S87="shasum -a 256"; fi
+  T87=$(mktemp -d)
+  tr '{' '\n' < "$E87/CHECKSUMS.json" | sed -n 's/^"path":"\([^"]*\)","size":[0-9]*,"hash":"\([0-9a-f]\{64\}\)".*/\2  \1/p' | sort -k 2 > "$T87/want"
+  (cd "$E87" && find . -type f ! -name CHECKSUMS.json | sed 's/^\.\///' | sort | tr '\n' '\0' | xargs -0 $S87) 2>/dev/null | \
+    sed 's/^\([0-9a-f]*\) [ *]/\1  /' | sort -k 2 > "$T87/got"
+  n87=$(wc -l < "$T87/got" | tr -d ' ')
+  [ "$(wc -l < "$T87/want" | tr -d ' ')" -ge 400 ] && [ "$n87" -ge 250 ] || why87="${why87:-CHECKSUMS.json or the vendored tree did not read ($n87 files hashed)}"
+  x87=$(awk 'NR == FNR { h[$2] = $1; next }
+    !($2 in h) { print "unlisted:" $2; next }
+    { seen[$2] = 1; if (h[$2] != $1) print "differs:" $2 }
+    END { for (p in h) if (!(p in seen) && p !~ /^test_apps\// && p !~ /^tinyusb\/\./ && p != "tinyusb/AGENTS.md" && p != "tinyusb/CLAUDE.md")
+            print "missing:" p }' "$T87/want" "$T87/got" | sort | tr '\n' ' ')
+  D87=tinyusb/src/tusb.c
+  [ "$x87" = "differs:include/tusb_config.h differs:$D87 " ] || \
+    why87="${why87:-components/esp_tinyusb is not esp_tinyusb 3.0.0 with only include/tusb_config.h and tusb.c changed: ${x87:-nothing differs}}"
+  # tusb.c: every line the patch adds carries "Warthog H6". Without those lines the file is the registry's; the
+  # marked lines are three of comment and the cap; and the cap sits in tu_edpt_stream_write_xfer between the
+  # count taken for a stream with no endpoint buffer and the transfer it starts.
+  q87=$(grep -v 'Warthog H6' "$E87/$D87" | $S87 | awk '{print $1}')
+  [ -n "$q87" ] && [ "$q87" = "$(awk -v p="$D87" '$2 == p {print $1}' "$T87/want")" ] || \
+    why87="${why87:-tusb.c differs from the registry file outside its Warthog H6 lines}"
+  k87=$(grep 'Warthog H6' "$E87/$D87" | sed 's/^ *//; s/^\/\/ Warthog H6: .*/C/' | tr '\n' '|')
+  [ "$k87" = 'C|C|C|if (count > s->mps) { count = s->mps; } // Warthog H6|' ] || \
+    why87="${why87:-the Warthog H6 lines of tusb.c are not the comment and the one packet cap: $k87}"
+  l87=$(awk '/^uint32_t tu_edpt_stream_write_xfer\(/ { f = 1 } f && /^}/ { f = 0 }
+    f && /count = tu_fifo_count\(&s->ff\);/ { st = 1 } f && st == 1 && /if \(count > s->mps\) \{ count = s->mps; \} \/\/ Warthog H6$/ { st = 2 }
+    f && /^  \} else \{$/ && st == 2 { st = 3 } f && st == 3 && /stream_xfer\(s, count\)/ { st = 4 }
+    END { print st + 0 }' "$E87/$D87")
+  [ "$l87" = 4 ] || why87="${why87:-tu_edpt_stream_write_xfer does not cap a FIFO-backed transfer at one packet before starting it ($l87)}"
+  [ "$($S87 < "$E87/tinyusb/src/portable/synopsys/dwc2/dcd_dwc2.c" | awk '{print $1}')" = "$(awk '$2 == "tinyusb/src/portable/synopsys/dwc2/dcd_dwc2.c" {print $1}' "$T87/want")" ] || \
+    why87="${why87:-dcd_dwc2.c is not the registry file}"
+  # The header with the Warthog comment dropped and the define put back is the registry's file.
+  r87=$(awk '/^\/\/ Warthog, 2026-11-11: / { skip = 1 }
+    /^#define CFG_TUD_DWC2_DMA_ENABLE / { print "#define CFG_TUD_DWC2_DMA_ENABLE     1       // Enable DMA mode"; skip = 0; next }
+    !skip' "$H87" | $S87 | awk '{print $1}')
+  [ -n "$r87" ] && [ "$r87" = "$(awk '$2 == "include/tusb_config.h" {print $1}' "$T87/want")" ] || \
+    why87="${why87:-tusb_config.h differs from the registry file by more than the CFG_TUD_DWC2_DMA_ENABLE line and its comment}"
+  grep -q 'docs/test-sweep-2026-11-10.md, H6' "$H87" && grep -q '^#### H6\. ' ../../../docs/test-sweep-2026-11-10.md || \
+    why87="${why87:-tusb_config.h does not point at H6 of docs/test-sweep-2026-11-10.md, or the report has no H6}"
+  rm -rf "$T87"
+
+  # A nested .git would make the copy a submodule; an ignored file would be missing from a clone.
+  [ -z "$(find "$E87" -name .git | head -n 1)" ] || why87="${why87:-components/esp_tinyusb holds a .git}"
+  if git -C ../../.. rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    i87=$(git -C ../../.. ls-files --others --ignored --exclude-standard -- components/esp_tinyusb | head -n 3 | tr '\n' ' ')
+    [ -z "$i87" ] || why87="${why87:-.gitignore ignores vendored files: ${i87% }}"
+  fi
+
+  # The host tests and the other guards read the copy; CI checks the lock and the ELF.
+  grep -q '^TUSB_DIR ?= \.\./\.\./\.\./components/esp_tinyusb/tinyusb$' usbnet.mk || why87="${why87:-usbnet.mk does not build TinyUSB from components/esp_tinyusb}"
+  grep -q '^for n in morsemicro/halow espressif/esp_tinyusb; do$' ../../../scripts/ci/check-lock.sh && \
+    grep -q "^HASHES=''\$" ../../../scripts/ci/check-lock.sh || \
+    why87="${why87:-scripts/ci/check-lock.sh does not require espressif/esp_tinyusb local with no registry component}"
+  grep -q '^  for f in handle_rxflvl_irq handle_epin_slave; do$' ../../../scripts/ci/check-image.sh && \
+    grep -q '^  for f in dma_setup_prepare handle_epin_dma handle_epout_dma; do$' ../../../scripts/ci/check-image.sh || \
+    why87="${why87:-scripts/ci/check-image.sh does not check firmware.elf for the slave mode driver}"
+  for f87 in handle_rxflvl_irq handle_epin_slave dma_setup_prepare handle_epin_dma handle_epout_dma; do
+    grep -q "^static .*[ *]$f87(" "$E87/tinyusb/src/portable/synopsys/dwc2/dcd_dwc2.c" || \
+      why87="${why87:-dcd_dwc2.c has no static $f87, which check-image.sh looks for in the ELF}"
+  done
+  # Strict (CI, after its builds): no build dir is still configured with the managed copy an older checkout fetched.
+  for c87 in ../../../.pio/build/warthog-*/CMakeCache.txt; do
+    [ "$GG_STRICT" = 1 ] && [ -f "$c87" ] || continue
+    b87=${c87%/CMakeCache.txt}
+    grep -q 'espressif__esp_tinyusb' "$b87/build.ninja" 2>/dev/null && \
+      why87="${why87:-${b87#../../../} is configured with the managed espressif__esp_tinyusb (rebuild it)}"
+  done
+else
+  why87="no vendored esp_tinyusb at components/esp_tinyusb (include/tusb_config.h, CMakeLists.txt, CHECKSUMS.json)"
+fi
+if [ -z "$why87" ]; then
+  ok "USB controller in slave mode: the vendored esp_tinyusb 3.0.0 ($n87 files, the registry's but for tusb_config.h and four lines of tusb.c) sets CFG_TUD_DWC2_DMA_ENABLE 0 once; a FIFO-backed IN transfer is capped at one packet; main/idf_component.yml overrides to it; nothing ignored; usbnet, check-lock.sh and check-image.sh read it"
+else
+  bad "USB controller mode (H6): $why87"
 fi
 
 [ $fail -eq 0 ] && echo "GLUE INVARIANTS OK" || echo "GLUE INVARIANTS FAILED"

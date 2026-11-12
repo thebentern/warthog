@@ -321,7 +321,7 @@ AT+MPING=10.77.191.116,8
 | Established, broadcast only | `iw ... mpath dump` empty or next hop all zeros | Path discovery unanswered. Check `AT+HWMPSTAT?` `preq_tx` is climbing. |
 | ARP resolves, ping rejected | peer answers `ICMP ... unreachable` | Peer firewall. The mesh interface is not in a zone — see step 2 above. |
 | Nothing routes, mpath empty, peer `tx packets` stuck at 5 | peer `ip -s link` vs per-station counters | Mesh interface still enslaved to a bridge, with the address on `wlh0` — see step 1 above. |
-| Peering fine, zero data both ways | `AT+MESHSEC?` | Keyed Warthog against an open peer. `AT+MESHSEC=0`. |
+| Peering fine, zero data both ways | `AT+MESHSEC?` | Non-SAE build: keyed Warthog against an open peer. `AT+MESHSEC=0`. The setting has no effect on an SAE build. |
 | Frames arrive, nothing delivered | `AT+FILTSTAT?` | Names which of the RX filter's nine drop paths is firing. |
 | Small pings from the Linux node pass, ~900-byte payloads and up never arrive | nothing counted on the Warthog (`AT+SWCCMP?` `micfail`, `AT+BATSTAT?` `uc_rx` flat); `iw phy <phy> info` on the node shows `RTS threshold: 1000` | The node sends those frames behind RTS/CTS, and on a STA chip interface the Warthog's CTS reaches only the peer it registered last. Flash a `-meshvif` build, `warthog-mesh-sae-meshvif` or `warthog-mesh-sae-swccmp-meshvif` (`AT+MESHCFG?` `chip_vif=mesh(5)`), or on the node `echo Y > /sys/module/mm6108_sdio/parameters/enable_cts_to_self` (the bench Pis' MM6108 SDIO driver; elsewhere `ls /sys/module/*/parameters/enable_cts_to_self`) or `iw phy <phy> set rts off` (neither persistent). Measured 2026-09-30, and on `warthog-mesh-sae-meshvif` 2026-10-01 (`wiki/OpenMANET-Interop.md`). |
 
@@ -340,8 +340,11 @@ stack.
   two OpenMANET 1.8.0 Pis whose paths were pinned through it (300, 1000 and 1400
   bytes, 10/10 each), so on a MESH chip interface the chip hands a relay frame
   to the host. The rest of forwarding (path discovery through a relay, group
-  data, proxied endpoints) and bridge mode are host-tested only
-  (`docs/mesh-attachment-model.md`).
+  data, proxied endpoints) is host-tested only
+  (`docs/mesh-attachment-model.md`). Bridge mode was measured on air on
+  2026-11-10 and 2026-11-11 with a USB host beside two OpenMANET 1.8.0 nodes without
+  `bat0` (`wiki/Mesh-Mode.md`, Bridge mode); the Wi-Fi AP as a bridge port with
+  a client on it is not measured.
 - SAE/AMPE with chip crypto (`warthog-mesh-sae`) peers cross-vendor, but its
   data plane has not carried traffic with an OpenMANET peer. On the STA chip
   interface Warthog's chip firmware (`mm6108.mbin` 1.17.6, as morselib drives

@@ -42,6 +42,7 @@ const char *bat_mode_reason_text(enum bat_mode_reason r)
     case BAT_MODE_NOMEM:       return "nomem";
     case BAT_MODE_INIT_FAIL:   return "init-failed";
     case BAT_MODE_MESH_FAILED: return "mesh-failed";
+    case BAT_MODE_NO_PSRAM:    return "no-psram";
     default:                   return "?";
     }
 }

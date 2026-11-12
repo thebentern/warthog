@@ -15,9 +15,11 @@ idf_component_register(
         "wifi_ap.c"
         "nat.c"
         "nat_frag.c"
+        "ext_ram.c"
         "mudp.c"
         "mudp_classify.c"
         "cdc_out.c"
+        "usbdiag.c"
         "led.c"
         "cfg.c"
         "region.c"
@@ -49,6 +51,8 @@ idf_component_register(
         nvs_flash
         esp_tinyusb
         espcoredump
+        esp_psram
+        esp_mm
 )
 
 # TinyUSB's network class calls usb_net.c after each transfer, so its TX queue drains in the TinyUSB task.

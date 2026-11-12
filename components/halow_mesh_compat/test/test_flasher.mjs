@@ -3,7 +3,8 @@
 // and esptool-js: which images and region images each release offers, what doFlash hands esptool (the
 // factory image at 0x0 and the chosen region image at 0x420000 in one write; Erase & flash refused
 // before anything is erased when no country is chosen, because a full erase leaves the board on US),
-// and the Configure tab's AT+REGION? parse, its preselect (stored before running) and Save.
+// and the Configure tab's AT+REGION? parse, its preselect (stored before running) and Save,
+// and the mesh Save's check for a running SAE mesh.
 // usage: node test_flasher.mjs <index.html> <scratch .mjs path>
 import { readFileSync, writeFileSync } from "node:fs";
 const [, , html, outMod] = process.argv;
@@ -121,5 +122,35 @@ els.region.value = "KR"; await els.region.fire("change"); await els.regionSave.f
 check(JSON.stringify(sent) === '["AT+REGION=KR","AT+REGION?"]', "Save sends AT+REGION=KR, then AT+REGION?");
 check(els.cfgLog.children.some((c) => c.textContent === "Region: +INFO: stored. AT+RESET to apply."), "Save reports the +INFO line");
 check(els.region.value === "KR" && els.regionHint.textContent.includes("Running US; KR after reboot."), "after Save: KR shown, next boot noted");
+// Save mesh setting asks AT+MPMPEERS? first: a board running the SAE mesh is not sent AT+MESHSEC=
+// (the setting does nothing there, and firmware v0.1.0 dropped every link when it was sent).
+let sae = 1;
+t.setWriter({ write: async (b) => { const cmd = new TextDecoder().decode(b).trim(); sent.push(cmd);
+  setTimeout(() => t.feed(cmd === "AT+MPMPEERS?" ? `+MPMPEERS: self=4dc7f8 (none) sae=${sae} offers=0 sae_fail=0\r\nOK\r\n`
+    : "+MESHSEC: open, stored, re-peering (~2s)\r\nOK\r\n"), 5); } });
+els.meshsec.innerHTML = '<option value="0">Open</option><option value="1">Keyed</option>';
+els.meshsec.value = "0";
+sent.length = 0; els.cfgLog.children = [];
+await els.meshsecSave.fire("click");
+check(JSON.stringify(sent) === '["AT+MPMPEERS?"]' && els.cfgLog.children.some((c) => c.textContent.startsWith("Mesh: not sent")),
+  "Save mesh setting on a board running the SAE mesh: AT+MESHSEC= is not sent, and the log says so");
+sae = 0; sent.length = 0; els.cfgLog.children = [];
+await els.meshsecSave.fire("click");
+check(JSON.stringify(sent) === '["AT+MPMPEERS?","AT+MESHSEC=0"]' && els.cfgLog.children.some((c) => c.textContent === "Mesh: OK"),
+  "Save mesh setting on a non-SAE board: AT+MESHSEC=0 is sent and reported");
+// A board that never answers AT+MPMPEERS? (or answers ERROR) may be a v0.1.0 SAE mesh: nothing more is sent.
+t.setWriter({ write: async (b) => { const cmd = new TextDecoder().decode(b).trim(); sent.push(cmd);
+  if (cmd !== "AT+MPMPEERS?") setTimeout(() => t.feed("+MESHSEC: open, stored, re-peering (~2s)\r\nOK\r\n"), 5); } });
+sent.length = 0; els.cfgLog.children = [];
+await els.meshsecSave.fire("click");
+check(JSON.stringify(sent) === '["AT+MPMPEERS?"]' && sent.length === 1, "Save mesh setting, AT+MPMPEERS? never answered: exactly one command is sent, no AT+MESHSEC=");
+check(els.cfgLog.children.length === 1 && els.cfgLog.children[0].textContent === "Mesh: not sent. Could not read the mesh state." &&
+  els.cfgLog.children[0].className === "err", "Save mesh setting, AT+MPMPEERS? never answered: one error line says the mesh state could not be read");
+t.setWriter({ write: async (b) => { const cmd = new TextDecoder().decode(b).trim(); sent.push(cmd);
+  setTimeout(() => t.feed(cmd === "AT+MPMPEERS?" ? "+ERR: unknown command\r\nERROR\r\n" : "+MESHSEC: open, stored, re-peering (~2s)\r\nOK\r\n"), 5); } });
+sent.length = 0; els.cfgLog.children = [];
+await els.meshsecSave.fire("click");
+check(JSON.stringify(sent) === '["AT+MPMPEERS?"]' && els.cfgLog.children.some((c) => c.textContent === "Mesh: not sent. Could not read the mesh state."),
+  "Save mesh setting, AT+MPMPEERS? answered ERROR: AT+MESHSEC= is not sent");
 console.log(fails ? `FLASHER TESTS FAILED (${fails})` : `FLASHER TESTS PASSED (${oks})`);
 process.exit(fails ? 1 : 0);

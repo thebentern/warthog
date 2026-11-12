@@ -166,10 +166,17 @@ By default each surface is its own subnet and Warthog NAPTs between them
 - IP fragments are reassembled before NAPT and re-fragmented for the outgoing
   MTU (`main/nat_frag.c`): IPv4 only, at most 10 fragments held at once, so a
   datagram of more than 10 is never delivered.
+- At most 512 NAT sessions. lwIP's table for them (16,896 B) is taken at boot,
+  and only when a 20,992 B block of internal RAM is free: when there is none,
+  NAT is off, not the board, until there is (`AT+HEAP?` `napt`).
 
 `AT+MESHBRIDGE=1` puts USB, the Wi-Fi AP and the mesh on one L2 segment, with
 NAT and the multicast repeater off. Hosts keep their own MACs and take addresses
-from the mesh's DHCP server, which is what CoT and mDNS discovery need.
+from the mesh's DHCP server, which is what CoT and mDNS discovery need. It
+needs mesh mode: with the mesh off, or when the bridge cannot be built, the node
+stays in NAT mode and `AT+MESHBRIDGE?` gives the reason. Measured on air on
+2026-11-10 and 2026-11-11 with a USB host beside two OpenMANET 1.8.0 nodes; the Wi-Fi
+AP as a bridge port with a client on it is not measured.
 See [Mesh Mode](../wiki/Mesh-Mode.md#bridge-mode).
 
 ### Leaf (default) and relay
@@ -257,6 +264,10 @@ non-SAE Warthog left at `AT+MESHSEC=1` peers with an open node but passes no dat
 - Under SAE, batman mode needs host CCMP: `warthog-mesh-sae`, `-nochipkey` and
   `warthog-mesh-sae-meshvif` refuse `AT+MESHBATMAN=1`; open builds accept it. In
   plain mesh mode a Warthog has no IP path into `bat0`.
+- Batman mode keeps its tables in the module's PSRAM and does not start without
+  it (`AT+MESHBATMAN?` `reason=no-psram`: `AT+EXTRAM=0`, or a PSRAM that did
+  not answer or failed its test at boot); the node then runs as an ordinary leaf. `AT+HEAP?` shows
+  the state.
 - A node's unicast above its RTS threshold (1000 bytes, OpenMANET's default)
   reaches a Warthog from every node only on the `-meshvif` builds. On other builds
   it arrives only from the peer the chip registered last, unless each node is set
@@ -356,7 +367,7 @@ same line is logged every minute while the Warthog has no peers.
 | `set_channel_list` non-zero | morselib refused the list: a firmware fault, not configuration; read the boot log |
 | `beacons_heard=0` | Channel, bandwidth or range — compare with `uci get wireless.radio1.channel` |
 | `beacons_heard>0`, `peers=0` | Mesh ID (exact, case-sensitive), security mode, or signal at or below -80 dBm (`AT+MESHRSSI?`) |
-| `peers>0`, no traffic | `AT+MESHSEC` mismatch: a keyed Warthog and an open node peer but pass no data. Then `AT+RXCHAN?` |
+| `peers>0`, no traffic | On a non-SAE build, an `AT+MESHSEC` mismatch: a keyed Warthog and an open node peer but pass no data (the setting has no effect on an SAE build). Then `AT+RXCHAN?` |
 
 More in [OpenMANET Interop](../wiki/OpenMANET-Interop.md#when-a-node-will-not-join);
 plain OpenWrt is covered there too.

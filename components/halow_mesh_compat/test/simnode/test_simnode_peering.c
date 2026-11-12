@@ -48,6 +48,9 @@ extern volatile uint32_t g_warthog_mpm_parse_fail, g_warthog_mpm_estab;
 extern volatile uint32_t g_warthog_mpm_no_slot, g_warthog_mpm_expired;
 extern volatile uint32_t g_warthog_mpm_close_reason;
 extern volatile char g_warthog_mpm_links[256];
+extern volatile uint32_t g_warthog_mpm_foreign, g_warthog_prq_other;
+/* True when we hold no MPM link for @p sa (it refreshes one we do hold). */
+bool umac_mesh_note_s1g_beacon(const uint8_t *sa);
 
 static int failures;
 #define CHECK(cond, ...) do { \
@@ -250,6 +253,80 @@ static bool install_path_via(const uint8_t *via, const uint8_t *dst, uint32_t sn
     uint16_t n = umac_mesh_hwmp_build_preq(body, sizeof(body), dst, sn, sn, W, 4882u);
     if (n == 0) { return false; }
     return rx_hwmp(via, body, n);
+}
+
+/* ---- the mesh profile (sections 14 to 21) ------------------------------ */
+
+#define FC_PROBE_RSP 0x50u
+static const uint8_t OTHERID[] = { 'o', 't', 'h', 'e', 'r', 'm', 'e', 's', 'h' };
+
+/* A neighbour no earlier section used: its tail is in no stale AT+MPMPEERS? string. */
+static void xaddr_(uint8_t out[6], uint8_t id)
+{
+    static const uint8_t base[6] = { 0x02, 0x00, 0x00, 0x00, 0x02, 0x00 };
+    memcpy(out, base, 6);
+    out[5] = id;
+}
+
+/** As rx_mpm, for the mesh @p id and the security @p sae its sender claims. */
+static bool rx_mpm_as(const uint8_t *sa, uint8_t action, uint16_t llid, uint16_t plid,
+                      uint16_t aid, const uint8_t *id, uint8_t id_len, bool sae)
+{
+    uint8_t body[UMAC_MESH_MPM_BODY_MAXLEN];
+    uint16_t n = umac_mesh_ies_build_mpm_body(body, sizeof(body), action, llid, plid, 0, aid,
+                                              id, id_len, sae, NULL, 0);
+    return n != 0 && rx_mgmt(FC_ACTION, sa, body, n);
+}
+
+/** An Open from @p sa: @p ies, then a Peer Management element carrying @p llid. */
+static bool rx_open_ies(const uint8_t *sa, const uint8_t *ies, uint16_t ies_len, uint16_t llid)
+{
+    uint8_t b[160];
+    uint16_t n = 0;
+    if ((uint32_t)ies_len + 10u > sizeof(b)) { return false; }
+    b[n++] = UMAC_MESH_MPM_CATEGORY;
+    b[n++] = UMAC_MESH_MPM_ACTION_OPEN;
+    b[n++] = 0;
+    b[n++] = 0;
+    if (ies_len != 0) { memcpy(b + n, ies, ies_len); n = (uint16_t)(n + ies_len); }
+    b[n++] = UMAC_MESH_EID_PEER_MGMT;
+    b[n++] = 4;
+    b[n++] = 0;
+    b[n++] = 0;
+    b[n++] = (uint8_t)llid;
+    b[n++] = (uint8_t)(llid >> 8);
+    return rx_mgmt(FC_ACTION, sa, b, n);
+}
+
+/** Frames in the outbox with frame control octet @p fc0 addressed to @p da. */
+static unsigned count_fc_to(uint8_t fc0, const uint8_t *da)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < simnode_outbox_count(); i++)
+    {
+        const struct simnode_frame *f = simnode_outbox_get(i);
+        n += (f != NULL && f->len >= DOT11_MGMT_HDR_LEN && f->bytes[0] == fc0 &&
+              memcmp(frame_da(f), da, 6) == 0);
+    }
+    return n;
+}
+
+/** The refusal of an Open from @p sa that cited @p llid: nothing but one Close(54) to it,
+ *  llid 0, plid its llid, and no link. Clear the outbox before the Open. */
+static bool refused_54_(const uint8_t *sa, uint16_t llid)
+{
+    const struct simnode_frame *cl = mpm_nth(UMAC_MESH_MPM_ACTION_CLOSE, 0);
+    uint16_t reason = 0, l = 0xffff, p = 0;
+    if (cl == NULL || mpm_count(UMAC_MESH_MPM_ACTION_CLOSE) != 1 ||
+        mpm_count(UMAC_MESH_MPM_ACTION_OPEN) != 0 || mpm_count(UMAC_MESH_MPM_ACTION_CONFIRM) != 0 ||
+        memcmp(frame_da(cl), sa, 6) != 0)
+    {
+        return false;
+    }
+    const uint8_t *b = cl->bytes + DOT11_MGMT_HDR_LEN;
+    const uint32_t n = cl->len - DOT11_MGMT_HDR_LEN;
+    return umac_mesh_ies_get_close_reason(b, n, &reason) && reason == 54u && /* the literal */
+           mpm_ids(cl, &l, &p) && l == 0 && p == llid && umac_mesh_note_s1g_beacon(sa);
 }
 
 /* ======================================================================== */
@@ -772,6 +849,313 @@ int main(void)
                   "with reason DEST_UNREACHABLE (got %u)", pe.reason);
         }
     }
+
+    /* ---- 14. An Open naming another Mesh ID creates nothing ---------------
+     *
+     * 802.11s peers only inside one mesh profile. This Open used to be answered
+     * with our Open and Confirm and given a link, and the Confirm that followed
+     * a datapath peer: two open meshes with different Mesh IDs on one channel
+     * merged. Sections 14 to 21 each use addresses no other section does. */
+    printf("--- 14. an Open naming another Mesh ID is refused with Close(54) ---\n");
+    reset_node();
+    {
+        uint8_t x[6];
+        xaddr_(x, 0x14);
+        const uint32_t rx0 = g_warthog_mpm_rx, fo0 = g_warthog_mpm_foreign;
+        const uint32_t ct0 = g_warthog_mpm_close_tx, ns0 = g_warthog_mpm_no_slot;
+        simnode_outbox_clear();
+        CHECK(rx_mpm_as(x, UMAC_MESH_MPM_ACTION_OPEN, 0x1111, 0, 0, OTHERID, sizeof(OTHERID), false),
+              "an Open naming the mesh \"othermesh\" is delivered");
+        CHECK(g_warthog_mpm_rx == rx0 + 1 && g_warthog_mpm_foreign == fo0 + 1,
+              "it is counted as received and as foreign (rx +%u, foreign +%u)",
+              (unsigned)(g_warthog_mpm_rx - rx0), (unsigned)(g_warthog_mpm_foreign - fo0));
+        CHECK(refused_54_(x, 0x1111),
+              "and answered with one Close(54) citing its link id: no Open, no Confirm, no link");
+        CHECK(g_warthog_mpm_close_tx == ct0 + 1 && g_warthog_mpm_no_slot == ns0,
+              "the Close is counted in close_tx, and no_slot is left alone (+%u, %u -> %u)",
+              (unsigned)(g_warthog_mpm_close_tx - ct0), (unsigned)ns0,
+              (unsigned)g_warthog_mpm_no_slot);
+        CHECK(umac_datapath_mesh_peer_count() == 0, "no datapath peer (count=%u)",
+              umac_datapath_mesh_peer_count());
+        simnode_outbox_clear();
+        rx_mpm(x, UMAC_MESH_MPM_ACTION_OPEN, 0x1112, 0, 0, 0);
+        CHECK(mpm_count(UMAC_MESH_MPM_ACTION_OPEN) == 1 &&
+              mpm_count(UMAC_MESH_MPM_ACTION_CONFIRM) == 1,
+              "the same sender on our Mesh ID is then answered with one Open and one Confirm: "
+              "the refusal left nothing behind (%u, %u)",
+              mpm_count(UMAC_MESH_MPM_ACTION_OPEN), mpm_count(UMAC_MESH_MPM_ACTION_CONFIRM));
+    }
+
+    /* ---- 15. Our Mesh ID with another authentication protocol ------------ */
+    printf("--- 15. our Mesh ID with the SAE profile is another mesh profile ---\n");
+    reset_node();
+    {
+        uint8_t x[6];
+        xaddr_(x, 0x15);
+        const uint32_t fo0 = g_warthog_mpm_foreign;
+        simnode_outbox_clear();
+        rx_mpm_as(x, UMAC_MESH_MPM_ACTION_OPEN, 0x1511, 0, 0, MESHID, sizeof(MESHID), true);
+        CHECK(g_warthog_mpm_foreign == fo0 + 1,
+              "an Open naming our Mesh ID and authentication protocol 1 is counted as foreign (+%u)",
+              (unsigned)(g_warthog_mpm_foreign - fo0));
+        CHECK(refused_54_(x, 0x1511), "and refused with one Close(54), no link");
+    }
+
+    /* ---- 16. An Open with a mesh element missing or malformed ------------ */
+    printf("--- 16. an Open with a mesh element missing or malformed is refused ---\n");
+    reset_node();
+    {
+        static const uint8_t CFG[9] = { UMAC_MESH_EID_MESH_CONFIG, 0x07, 0x01, 0x01, 0x00,
+                                        0x01, 0x00, 0x00, 0x01 };
+        static const char *const what[4] = {
+            "(a) a Mesh Configuration and no Mesh ID",
+            "(b) our Mesh ID and no Mesh Configuration",
+            "(c) a 33-octet Mesh ID beginning with ours, then the Mesh Configuration",
+            "(d) a zero-length Mesh ID, then the Mesh Configuration",
+        };
+        uint8_t ies[4][48];
+        uint16_t len[4];
+        memcpy(ies[0], CFG, sizeof(CFG));
+        len[0] = (uint16_t)sizeof(CFG);
+        ies[1][0] = UMAC_MESH_EID_MESH_ID;
+        ies[1][1] = (uint8_t)sizeof(MESHID);
+        memcpy(&ies[1][2], MESHID, sizeof(MESHID));
+        len[1] = (uint16_t)(2u + sizeof(MESHID));
+        ies[2][0] = UMAC_MESH_EID_MESH_ID;
+        ies[2][1] = 33;
+        memset(&ies[2][2], 'x', 33);
+        memcpy(&ies[2][2], MESHID, sizeof(MESHID));
+        memcpy(&ies[2][35], CFG, sizeof(CFG));
+        len[2] = (uint16_t)(35u + sizeof(CFG));
+        ies[3][0] = UMAC_MESH_EID_MESH_ID;
+        ies[3][1] = 0;
+        memcpy(&ies[3][2], CFG, sizeof(CFG));
+        len[3] = (uint16_t)(2u + sizeof(CFG));
+        for (unsigned i = 0; i < 4; i++)
+        {
+            uint8_t x[6];
+            const uint16_t llid = (uint16_t)(0x1610 + i);
+            xaddr_(x, (uint8_t)(0x60 + i));
+            const uint32_t fo0 = g_warthog_mpm_foreign;
+            simnode_outbox_clear();
+            rx_open_ies(x, ies[i], len[i], llid);
+            CHECK(g_warthog_mpm_foreign == fo0 + 1 && refused_54_(x, llid),
+                  "%s: counted as foreign (+%u) and refused with one Close(54), no link", what[i],
+                  (unsigned)(g_warthog_mpm_foreign - fo0));
+        }
+
+        /* (e) ends inside the Mesh ID element and has no Peer Management element. */
+        static const uint8_t cut[9] = { UMAC_MESH_MPM_CATEGORY, UMAC_MESH_MPM_ACTION_OPEN, 0, 0,
+                                        UMAC_MESH_EID_MESH_ID, 0x07, 's', 'i', 'm' };
+        uint8_t x[6];
+        xaddr_(x, 0x64);
+        const uint32_t fo0 = g_warthog_mpm_foreign, pf0 = g_warthog_mpm_parse_fail;
+        simnode_outbox_clear();
+        rx_mgmt(FC_ACTION, x, cut, (uint16_t)sizeof(cut));
+        CHECK(g_warthog_mpm_foreign == fo0 + 1 && g_warthog_mpm_parse_fail == pf0 + 1,
+              "(e) an Open cut inside its Mesh ID element: counted as foreign and as a parse "
+              "failure (+%u, +%u)", (unsigned)(g_warthog_mpm_foreign - fo0),
+              (unsigned)(g_warthog_mpm_parse_fail - pf0));
+        CHECK(simnode_outbox_count() == 0 && umac_mesh_note_s1g_beacon(x),
+              "and answered with no frame at all, there being no link id to cite; no link "
+              "(%u frames)", simnode_outbox_count());
+    }
+
+    /* ---- 17. A Confirm naming another mesh ------------------------------- */
+    printf("--- 17. a Confirm naming another mesh neither creates nor establishes a link ---\n");
+    reset_node();
+    {
+        uint8_t x[6];
+        xaddr_(x, 0x17);
+        uint32_t fo0 = g_warthog_mpm_foreign;
+        simnode_outbox_clear();
+        rx_mpm_as(x, UMAC_MESH_MPM_ACTION_CONFIRM, 0x1711, 0x2222, 1, OTHERID, sizeof(OTHERID), false);
+        CHECK(g_warthog_mpm_foreign == fo0 + 1 && simnode_outbox_count() == 0,
+              "(a) a stranger's Confirm naming another mesh is counted and answered with nothing "
+              "(+%u, %u frames)", (unsigned)(g_warthog_mpm_foreign - fo0), simnode_outbox_count());
+        CHECK(umac_mesh_note_s1g_beacon(x) && umac_datapath_mesh_peer_count() == 0,
+              "it made no link, as an unsolicited Confirm used to, and no datapath peer (count=%u)",
+              umac_datapath_mesh_peer_count());
+
+        simnode_outbox_clear();
+        prod_(A);
+        uint16_t ours = 0;
+        CHECK(mpm_ids(mpm_nth(UMAC_MESH_MPM_ACTION_OPEN, 0), &ours, NULL) && ours != 0,
+              "(b) we open toward A with llid 0x%04x", ours);
+        fo0 = g_warthog_mpm_foreign;
+        simnode_outbox_clear();
+        rx_mpm_as(A, UMAC_MESH_MPM_ACTION_CONFIRM, 0x1722, ours, 1, OTHERID, sizeof(OTHERID), false);
+        CHECK(g_warthog_mpm_foreign == fo0 + 1 && simnode_outbox_count() == 0,
+              "a Confirm from A echoing that llid but naming another mesh is counted and answered "
+              "with nothing (+%u, %u frames)", (unsigned)(g_warthog_mpm_foreign - fo0),
+              simnode_outbox_count());
+        CHECK(g_warthog_mpm_estab == 0 && umac_datapath_mesh_peer_count() == 0,
+              "and does not establish the link (estab=%u, count=%u)",
+              (unsigned)g_warthog_mpm_estab, umac_datapath_mesh_peer_count());
+        simnode_outbox_clear();
+        rx_mpm(A, UMAC_MESH_MPM_ACTION_OPEN, 0x1722, 0, 0, 0);
+        uint16_t again = 0;
+        CHECK(mpm_ids(mpm_nth(UMAC_MESH_MPM_ACTION_CONFIRM, 0), &again, NULL) && again == ours,
+              "A's Open on our mesh is answered with a Confirm carrying the same llid: the link "
+              "was not disturbed (0x%04x vs 0x%04x)", again, ours);
+        rx_mpm(A, UMAC_MESH_MPM_ACTION_CONFIRM, 0x1722, ours, 0, 1);
+        CHECK(umac_datapath_mesh_peer_count() == 1,
+              "and A's Confirm on our mesh establishes it (count=%u)",
+              umac_datapath_mesh_peer_count());
+    }
+
+    /* ---- 18. Foreign Opens take no link and evict nobody ----------------- */
+    printf("--- 18. foreign Opens take none of the four links and evict nobody ---\n");
+    reset_node();
+    {
+        const uint32_t ns0 = g_warthog_mpm_no_slot;
+        unsigned refused = 0;
+        for (unsigned i = 0; i < 5; i++)
+        {
+            uint8_t x[6];
+            const uint16_t llid = (uint16_t)(0x1810 + i);
+            xaddr_(x, (uint8_t)(0x80 + i));
+            simnode_outbox_clear();
+            rx_mpm_as(x, UMAC_MESH_MPM_ACTION_OPEN, llid, 0, 0, OTHERID, sizeof(OTHERID), false);
+            refused += refused_54_(x, llid);
+        }
+        CHECK(refused == 5 && g_warthog_mpm_no_slot == ns0,
+              "(a) five strangers' foreign Opens are each refused with Close(54), and none is "
+              "counted in no_slot (%u refused, no_slot %u -> %u)", refused, (unsigned)ns0,
+              (unsigned)g_warthog_mpm_no_slot);
+        CHECK(peer_up(A, 0x18a0) != 0 && peer_up(B, 0x18b0) != 0 && peer_up(C, 0x18c0) != 0 &&
+              peer_up(D, 0x18d0) != 0 && umac_datapath_mesh_peer_count() == 4,
+              "and all four links are left for real peers: A, B, C and D reach ESTAB (count=%u)",
+              umac_datapath_mesh_peer_count());
+    }
+    reset_node();
+    {
+        CHECK(peer_up(A, 0x18a1) != 0 && peer_up(B, 0x18b1) != 0 && peer_up(C, 0x18c1) != 0,
+              "(b) A, B and C are established");
+        prod_(P);
+        CHECK(strstr((const char *)g_warthog_mpm_links, "000050") != NULL,
+              "P's probe request drew our Open: it holds the fourth link, unanswered: %s",
+              (const char *)g_warthog_mpm_links);
+        simnode_outbox_clear();
+        rx_mpm_as(E, UMAC_MESH_MPM_ACTION_OPEN, 0x18e1, 0, 0, OTHERID, sizeof(OTHERID), false);
+        unsigned to_p = 0;
+        for (unsigned i = 0; mpm_nth(UMAC_MESH_MPM_ACTION_CLOSE, i) != NULL; i++)
+        {
+            to_p += (memcmp(frame_da(mpm_nth(UMAC_MESH_MPM_ACTION_CLOSE, i)), P, 6) == 0);
+        }
+        CHECK(to_p == 0 && refused_54_(E, 0x18e1),
+              "a foreign Open from E: one Close(54) to E, and no Close to P (%u)", to_p);
+        prod_(P);
+        char entry[64] = "";
+        const char *at = strstr((const char *)g_warthog_mpm_links, "000050");
+        if (at != NULL)
+        {
+            size_t n = strcspn(at, ";");
+            if (n >= sizeof(entry)) { n = sizeof(entry) - 1u; }
+            memcpy(entry, at, n);
+            entry[n] = '\0';
+        }
+        CHECK(strstr(entry, "opens=2") != NULL,
+              "P keeps its link, and its next probe request draws our second Open on it: %s",
+              (const char *)g_warthog_mpm_links);
+    }
+
+    /* ---- 19. A foreign Open from a peer's own address --------------------- */
+    printf("--- 19. a foreign Open from a peer's address neither ends nor refreshes its link ---\n");
+    reset_node();
+    {
+        CHECK(peer_up(A, 0x1911) != 0 && umac_datapath_mesh_peer_count() == 1, "A is established");
+        simnode_advance_ms(20000);
+        const uint32_t fo0 = g_warthog_mpm_foreign, ex0 = g_warthog_mpm_expired;
+        simnode_outbox_clear();
+        rx_mpm_as(A, UMAC_MESH_MPM_ACTION_OPEN, 0x1999, 0, 0, OTHERID, sizeof(OTHERID), false);
+        CHECK(g_warthog_mpm_foreign == fo0 + 1 && umac_datapath_mesh_peer_count() == 1,
+              "20 s on, an Open from A's address with a new llid and another Mesh ID is counted "
+              "and the link stays up (+%u, count=%u)", (unsigned)(g_warthog_mpm_foreign - fo0),
+              umac_datapath_mesh_peer_count());
+        CHECK(simnode_outbox_count() == 0,
+              "a sender we hold a link with is sent nothing: a peer in ESTAB takes any Close as "
+              "the end of the link (%u frames)", simnode_outbox_count());
+        simnode_advance_ms(11000);
+        simnode_tick();
+        CHECK(umac_datapath_mesh_peer_count() == 0 && g_warthog_mpm_expired == ex0 + 1,
+              "nor was it a sign of life: A expires 31 s after its last matching frame "
+              "(count=%u, expired +%u)", umac_datapath_mesh_peer_count(),
+              (unsigned)(g_warthog_mpm_expired - ex0));
+    }
+
+    /* ---- 20. A stranger's Close(53) --------------------------------------- */
+    printf("--- 20. a stranger's Close(53) takes no hold-off entry ---\n");
+    reset_node();
+    {
+        const uint32_t cr0 = g_warthog_mpm_close_rx;
+        for (unsigned i = 0; i < 4; i++)
+        {
+            uint8_t x[6];
+            xaddr_(x, (uint8_t)(0xa0 + i));
+            rx_mpm(x, UMAC_MESH_MPM_ACTION_CLOSE, 0x9000, 0, 53, 0);
+        }
+        CHECK(g_warthog_mpm_close_rx == cr0 + 4 && g_warthog_mpm_close_reason == 53,
+              "four strangers each send Close(53): each is counted and the reason recorded "
+              "(close_rx +%u, reason %u)", (unsigned)(g_warthog_mpm_close_rx - cr0),
+              (unsigned)g_warthog_mpm_close_reason);
+        simnode_outbox_clear();
+        prod_(E);
+        CHECK(mpm_count(UMAC_MESH_MPM_ACTION_OPEN) == 1,
+              "and nobody is held off by them: E's probe request still draws our Open (%u); "
+              "with the four hold-off entries taken it drew none",
+              mpm_count(UMAC_MESH_MPM_ACTION_OPEN));
+    }
+
+    /* ---- 21. Probe requests that do not name our mesh --------------------
+     *
+     * simnode_rx() copies each frame into a packet of its exact length, so the
+     * cut ones end where the firmware's walks must stop. The node is reset for
+     * each: an Open drawn by one must not fill the link table for the next. */
+    printf("--- 21. a probe request that does not name our mesh is answered and draws no Open ---\n");
+    reset_node();
+    {
+        static const struct { uint8_t ies[13]; uint8_t len; uint32_t other; const char *what; } pr[] = {
+            { { 0x00, 0x00 }, 2, 0, "(a) a wildcard probe request, a scanner's" },
+            { { 0x00, 0x00, 0x72, 0x09, 'o', 't', 'h', 'e', 'r', 'm', 'e', 's', 'h' }, 13, 1,
+              "(b) one naming the mesh \"othermesh\"" },
+            { { 0x00, 0x00, 0x72, 0x20, 'o', 't' }, 6, 0,
+              "(c) one whose Mesh ID length runs past the end" },
+            { { 0x00, 0x00, 0x72 }, 3, 0, "(d) one cut inside an element header" },
+            { { 0x72, 0x07, 's', 'i', 'm', 'n', 'o', 'd' }, 8, 0,
+              "(e) one naming our mesh, cut one octet short" },
+        };
+        for (unsigned i = 0; i < sizeof(pr) / sizeof(pr[0]); i++)
+        {
+            uint8_t x[6];
+            xaddr_(x, (uint8_t)(0xb0 + i));
+            const uint32_t po0 = g_warthog_prq_other;
+            reset_node();
+            rx_mgmt(FC_PROBE_REQ, x, pr[i].ies, pr[i].len);
+            CHECK(count_fc_to(FC_PROBE_RSP, x) == 1 && mpm_count(UMAC_MESH_MPM_ACTION_OPEN) == 0 &&
+                  umac_mesh_note_s1g_beacon(x),
+                  "%s: one probe response, no Open, no link (%u, %u)", pr[i].what,
+                  count_fc_to(FC_PROBE_RSP, x), mpm_count(UMAC_MESH_MPM_ACTION_OPEN));
+            CHECK(g_warthog_prq_other == po0 + pr[i].other,
+                  "    and prq_other counts it %u time(s) (+%u)", (unsigned)pr[i].other,
+                  (unsigned)(g_warthog_prq_other - po0));
+        }
+
+        CHECK(peer_up(A, 0x2111) != 0 && umac_datapath_mesh_peer_count() == 1, "A is established");
+        simnode_advance_ms(20000);
+        simnode_outbox_clear();
+        rx_mgmt(FC_PROBE_REQ, A, pr[0].ies, pr[0].len);
+        rx_mgmt(FC_PROBE_REQ, A, pr[1].ies, pr[1].len);
+        CHECK(count_fc_to(FC_PROBE_RSP, A) == 2 && umac_datapath_mesh_peer_count() == 1,
+              "20 s on, (a) and (b) from A's own address are each answered (%u)",
+              count_fc_to(FC_PROBE_RSP, A));
+        simnode_advance_ms(11000);
+        simnode_tick();
+        CHECK(umac_datapath_mesh_peer_count() == 0,
+              "and did not refresh A's link: it expires 31 s after its last matching frame "
+              "(count=%u)", umac_datapath_mesh_peer_count());
+    }
+    printf("--- 13. nothing fell through into code the simulator does not model ---\n");
 
     /* ---- 13. Nothing fell through into code the simulator does not model  */
     CHECK(simnode_sta_mode_hits() == 0,

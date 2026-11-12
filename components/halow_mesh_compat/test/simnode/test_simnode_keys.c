@@ -90,6 +90,11 @@
  *     key, so TID 0 PN 9 after TID 5 PN 10 was dropped as a replay (reason 5); each TID
  *     now has its own, and a lower PN on the same TID is still refused. Unicast and group,
  *     chip-decrypted on every build, host CCMP where it is compiled in.
+ * (36) a re-peer request (what AT+MESHSEC= sets on a non-SAE build) reaching the service
+ *     on an SAE mesh removes nothing: hostap's stations, their keys and the chip's records
+ *     stay. It used to delete every datapath peer while hostap kept each in ESTAB and
+ *     refused to add it again (measured on air 2026-11-10: every link dead until a reset).
+ *     A keyed non-SAE mesh is still torn down by the same request (pin).
  * Built with host CCMP (as warthog-mesh-sae-swccmp, the only SAE build batman runs on):
  * (34) batman mode's frames against a wizard node: a peer's group ELP under its MGTK is
  *     opened by host CCMP and reaches the batman hook with the TA as its source, a replay
@@ -2175,6 +2180,49 @@ static void t_host_ccmp_skips_others_unicast(void)
 }
 #endif
 
+/* ---- 36. the re-peer request is for a non-SAE mesh only -------------------- */
+
+extern volatile uint32_t g_warthog_mesh_repeer_req;
+
+static void t_repeer_request_spares_sae(void)
+{
+    printf("--- a re-peer request: SAE stations stay (hostap's), a non-SAE mesh re-peers ---\n");
+    fresh(/*sae=*/true, /*grp_std=*/false, /*secure=*/true);
+    (void)simnode_set_key(BC, K_OWN_MGTK, OWN_MGTK_ID, false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    (void)simnode_set_key(A, K_A_MTK, 0, true);
+    (void)simnode_set_key(C, K_C_MTK, 0, true);
+    simnode_tick(); /* whatever a tick does by itself is done before the baseline */
+    const unsigned stas0 = simnode_chipstate()->stas, keys0 = simnode_chipstate()->keys;
+    const struct umac_sta_data *a0 = umac_datapath_mesh_find_peer(A);
+    const struct umac_sta_data *c0 = umac_datapath_mesh_find_peer(C);
+
+    g_warthog_mesh_repeer_req = 1;
+    simnode_tick();
+    CHECK(g_warthog_mesh_repeer_req == 0, "SAE: the event loop takes the request off");
+    CHECK(umac_datapath_mesh_peer_count() == 2u,
+          "(red) SAE: both stations hostap added are still there (count=%u)",
+          (unsigned)umac_datapath_mesh_peer_count());
+    CHECK(a0 != NULL && c0 != NULL && umac_datapath_mesh_find_peer(A) == a0 &&
+              umac_datapath_mesh_find_peer(C) == c0,
+          "(red) SAE: the same two records, not new ones");
+    CHECK(umac_datapath_mesh_peer_estab(A) && umac_datapath_mesh_peer_estab(C),
+          "(red) SAE: both links still count as keyed");
+    CHECK(simnode_chipstate()->stas == stas0 && simnode_chipstate()->keys == keys0,
+          "(pin) SAE: the chip holds the stations and keys it held (%u/%u, was %u/%u)",
+          simnode_chipstate()->stas, simnode_chipstate()->keys, stas0, keys0);
+
+    fresh(/*sae=*/false, /*grp_std=*/false, /*secure=*/true);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    g_warthog_mesh_repeer_req = 1;
+    simnode_tick();
+    CHECK(g_warthog_mesh_repeer_req == 0 && umac_datapath_mesh_peer_count() == 0u,
+          "(pin) keyed non-SAE mesh: the same request still tears every link down (count=%u)",
+          (unsigned)umac_datapath_mesh_peer_count());
+}
+
 int main(void)
 {
     printf("=== simnode keys: the SAE key lifecycle through the real datapath ===\n");
@@ -2223,6 +2271,7 @@ int main(void)
     t_repeer_starts_from_advertised_rsc();
     t_decrypted_unicast_off_pairwise_key();
     t_replay_counter_per_tid();
+    t_repeer_request_spares_sae();
 #ifdef WARTHOG_MESH_HOST_CCMP
     t_batman_sae_host_ccmp();
     t_host_ccmp_skips_others_unicast();

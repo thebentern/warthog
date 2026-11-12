@@ -1,0 +1,187 @@
+## 3.0.0
+
+### Breaking changes
+
+- esp_tinyusb: Removed DCD Slave/IRQ mode. Only Buffer DMA mode is supported.
+- esp_tinyusb: Dropped support for ESP-IDF versions older than v5.3. ESP-IDF v5.3 or later is now required
+- esp_tinyusb: Suspend and resume TinyUSB callbacks (`tud_suspend_cb`, `tud_resume_cb`) are now always registered inside esp_tinyusb. Kconfig options `CONFIG_TINYUSB_SUSPEND_CALLBACK` and `CONFIG_TINYUSB_RESUME_CALLBACK` were removed. Applications must handle `TINYUSB_EVENT_SUSPENDED` and `TINYUSB_EVENT_RESUMED` via the device event callback and must not define `tud_suspend_cb()` or `tud_resume_cb()`.
+- esp_tinyusb: Removed `CONFIG_TINYUSB_DESC_SERIAL_STRING`. The default USB serial number is now generated at runtime from the chip eFuse base MAC as 12 uppercase hexadecimal characters. Provide a custom serial number in the string descriptor array passed to `tinyusb_driver_install()`. A NULL entry at the `iSerialNumber` index uses the MAC serial number.
+- esp_tinyusb: Each release now ships TinyUSB as a git submodule with a fixed version. This release uses TinyUSB 0.21.0~2. Independent TinyUSB version selection is no longer supported.
+- esp_tinyusb: Removed already deprecated header files `tusb_cdc_acm.h`, `tusb_console.h` and `tusb_msc_storage.h`, the compatibility APIs they exposed, and the MSC event field `tinyusb_msc_event_t::mount_changed_data`
+- For more details, refer to the [Espressif's Addition to TinyUSB Migration guide v3](../../docs/device/migration-guides/v3/tinyusb.md)
+
+### Added
+
+- esp_tinyusb: Added Kconfig option `CONFIG_TINYUSB_DWC2_PTI_ENABLE` to enable DWC2 Periodic Transfer Interrupt (PTI) for isochronous endpoints
+- MSC: Added optional asynchronous storage IO, `CONFIG_TINYUSB_MSC_ASYNC_IO`. Storage reads and writes run in a worker task, so the other USB classes are serviced while the medium is busy, and failed writes are reported to the USB host. The worker task is configured in `tinyusb_msc_driver_config_t::async_io_task`.
+
+## 2.4.0
+
+- esp_tinyusb: Fixed missing IAD declaration (bDeviceClass/bDeviceSubClass/bDeviceProtocol) in the default device and qualifier descriptors for NCM and ECM/RNDIS
+- esp_tinyusb: `CONFIG_TINYUSB_DESC_SERIAL_STRING` can now be left empty to derive the USB serial number string from the chip's eFuse base MAC at runtime, guaranteeing a unique serial number per device
+- MSC: Added generic block device storage support (IDF >= 6.0.4). This is an additive feature; `tinyusb_msc_new_storage_spiflash` and `tinyusb_msc_new_storage_sdmmc` remain unchanged.
+
+## 2.3.0
+
+- MSC: Use `esp_vfs_fat_register` instead of the deprecated `esp_vfs_fat_register_cfg` for ESP-IDF v6.0 and higher
+- esp_tinyusb: Added support for exposing already-mounted VFS/FATFS paths through Media Transfer Protocol
+- esp_tinyusb: Added power management lock to control automatic light sleep entry based on Device events
+- esp_tinyusb: Added USB Peripheral light sleep wake-up source integration to the esp_tinyusb (only available for USB HS ports)
+
+## 2.2.1
+
+- esp_tinyusb: Add an explicit `tinyusb` dependency when the IDF component manager is disabled
+
+## 2.2.0
+
+- esp_tinyusb: Added ESP32-S31 support
+
+## 2.1.1
+
+- esp_tinyusb: Fixed VBUS monitoring feature on ESP32-P4 USB OTG 2.0 (HS)
+- Vendor class: Add configuration options for TX/RX buffers
+- NCM: Fixed compatibility with iOS
+
+## 2.1.0
+
+- Added configurable Suspend/Resume device event support using TinyUSB callbacks `tud_suspend_cb` and `tud_resume_cb`
+
+## 2.0.1~1
+
+- esp_tinyusb: Claim forward compatibility with TinyUSB 0.19
+- CDC: Added support for new VFS API (for esp-idf v5.4 and higher)
+
+## 2.0.1
+
+- esp_tinyusb: Added ESP32-H4 support
+- esp_tinyusb: Fixed an assertion failure on the GetOtherSpeedDescriptor() request for ESP32-P4 when the OTG1.1 port is used
+- MSC: Added dynamic member and storage operation multitask protection
+- MSC: Used `esp_vfs_fat_register_cfg` function prototype for esp-idf v5.3 and higher
+
+## 2.0.0
+
+- esp_tinyusb: Added USB Compliance Verification results
+- CDC-ACM: Added a configurable parameter for the endpoint DMA buffer
+
+### Breaking changes
+
+- esp_tinyusb: External PHY is no longer initialized automatically. If an external PHY is required, it must be explicitly initialized by the user with configuration parameter `phy.skip_setup = true`
+- esp_tinyusb: Added run-time configuration for peripheral port selection, task settings, and descriptors. For more details, refer to the [Espressif's Addition to TinyUSB Mirgation guide v2](../../docs/device/migration-guides/v2/tinyusb.md)
+- esp_tinyusb: Added USB Device event callback to handle different USB Device events. For the list of supported USB Device events, refer to to [Espressif's Addition to TinyUSB - README](../esp_tinyusb/README.md)
+- esp_tinyusb: Removed configuration option to handle TinyUSB events outside of this driver
+- NCM: Added possibility to deinit the driver
+- NCM: Updated public API; refer to the [NCM Class Migration guide v2](../../docs/device/migration-guides/v2/tinyusb_ncm.md)
+- MSC: Removed dedicated callbacks; introduced a single callback with an event ID for each storage
+- MSC: Added storage format support
+- MSC: Added dual storage support (SPI/Flash and SD/MMC)
+- MSC: Updated public API; refer to the [MSC Class Migration guide v2](../../docs/device/migration-guides/v2/tinyusb_msc.md)
+- Console: Updated public API; refer to the [Console Class Migration guide v2](../../docs/device/migration-guides/v2/tinyusb_console.md)
+- CDC-ACM: Updated public API; refer to the [CDC-ACM Class Migration guide v2](../../docs/device/migration-guides/v2/tinyusb_cdc_acm.md)
+
+## 1.7.6~1
+
+- esp_tinyusb: Added documentation to README.md
+
+## 1.7.6
+
+- MSC: Fixed the possibility to use SD/MMC storage with large capacity (more than 4 GB)
+
+## 1.7.5
+
+- esp_tinyusb: Provide forward compatibility with IDF 6.0
+
+## 1.7.4~1
+
+- esp_tinyusb: Claim forward compatibility with IDF 6.0
+
+## 1.7.4
+
+- MSC: WL Sector runtime check during spiflash init (fix for build time error check)
+
+## 1.7.3 [yanked]
+
+- MSC: Improved transfer speed to SD cards and SPI flash
+
+## 1.7.2
+
+- esp_tinyusb: Fixed crash on logging from ISR
+- PHY: Fixed crash with external_phy=true configuration
+
+## 1.7.1
+
+- NCM: Changed default NTB config to decrease DRAM memory usage (fix for DRAM overflow on ESP32S2)
+
+## 1.7.0 [yanked]
+
+- NCM: Added possibility to configure NCM Transfer Blocks (NTB) via menuconfig
+- esp_tinyusb: Added option to select TinyUSB peripheral on esp32p4 via menuconfig (USB_PHY_SUPPORTS_P4_OTG11 in esp-idf is required)
+- esp_tinyusb: Fixed uninstall tinyusb driver with not default task configuration
+
+## 1.6.0
+
+- CDC-ACM: Fixed memory leak on deinit
+- esp_tinyusb: Added Teardown
+
+## 1.5.0
+
+- esp_tinyusb: Added DMA mode option to tinyusb DCD DWC2 configuration
+- esp_tinyusb: Changed the default affinity mask of the task to CPU1
+
+## 1.4.5
+
+- CDC-ACM: Fixed memory leak at VFS unregister
+- Vendor specific: Provided default configuration
+
+## 1.4.4
+
+- esp_tinyusb: Added HighSpeed and Qualifier device descriptors in tinyusb configuration
+- CDC-ACM: Removed MIN() definition if already defined
+- MSC: Fixed EP size selecting in default configuration descriptor
+
+## 1.4.3
+
+- esp_tinyusb: Added ESP32P4 support (HS only)
+
+## 1.4.2
+
+- MSC: Fixed maximum files open
+- Added uninstall function
+
+## 1.4.0
+
+- MSC: Fixed integer overflows
+- CDC-ACM: Removed intermediate RX ringbuffer
+- CDC-ACM: Increased default FIFO size to 512 bytes
+- CDC-ACM: Fixed Virtual File System binding
+
+## 1.3.0
+
+- Added NCM extension
+
+## 1.2.1 - 1.2.2
+
+- Minor bugfixes
+
+## 1.2.0
+
+- Added MSC extension for accessing SPI Flash on memory card https://github.com/espressif/idf-extra-components/commit/a8c00d7707ba4ceeb0970c023d702c7768dba3dc
+
+## 1.1.0
+
+- Added support for NCM, ECM/RNDIS, DFU and Bluetooth TinyUSB drivers https://github.com/espressif/idf-extra-components/commit/79f35c9b047b583080f93a63310e2ee7d82ef17b
+
+## 1.0.4
+
+- Cleaned up string descriptors handling https://github.com/espressif/idf-extra-components/commit/046cc4b02f524d5c7e3e56480a473cfe844dc3d6
+
+## 1.0.2 - 1.0.3
+
+- Minor bugfixes
+
+## 1.0.1
+
+- CDC-ACM: Return ESP_OK if there is nothing to flush https://github.com/espressif/idf-extra-components/commit/388ff32eb09aa572d98c54cb355f1912ce42707c
+
+## 1.0.0
+
+- Initial version based on [esp-idf v4.4.3](https://github.com/espressif/esp-idf/tree/v4.4.3/components/tinyusb)

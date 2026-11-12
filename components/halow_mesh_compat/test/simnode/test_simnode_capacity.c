@@ -87,7 +87,8 @@
  *     S1G beacons are answered once per 10 s and never opened; a weak
  *     neighbour's own Open is still answered; a handshake started at -70 is
  *     still retransmitted after the signal drops to -90; a scanner's wildcard
- *     probe requests, weak or strong, count nowhere and each still draws an Open.
+ *     probe requests, weak or strong, count nowhere, and each is answered with a
+ *     probe response and draws no Open.
  * 12. SAE: an Open System Authentication (seq 1) from a held-off neighbour
  *     neither offers it nor ends its hold-off; umac_mesh_sae_failed(NULL) frees
  *     nothing; floors of -1 and -254 are on at their own value and admit the
@@ -97,7 +98,9 @@
  *     30 s, and its own Commit ends that; NULL frees nothing. The floor counters
  *     take only frames naming our mesh: a probe response naming another mesh
  *     and a held-off neighbour's Commit count neither way, while probe
- *     responses naming ours count each way.
+ *     responses naming ours count each way. A probe response naming another mesh
+ *     is not offered to hostap and counts in `foreign`; an access point's is
+ *     neither offered nor counted.
  * 13. SAE: hostap creates a station from an Open only on a cached PMKSA, and only
  *     for a sender it holds no station for, so an Open from a neighbour with no
  *     slot is refused before hostap while it is held off (plink_fail or sae_fail,
@@ -133,6 +136,7 @@ extern volatile uint32_t g_warthog_sae_fail, g_warthog_sae_offer_held;
 extern volatile int32_t g_warthog_mesh_rssi_floor;
 extern volatile uint32_t g_warthog_mesh_rssi_skip, g_warthog_mesh_rssi_pass;
 extern volatile uint32_t g_warthog_prq_named;
+extern volatile uint32_t g_warthog_mpm_foreign;
 /* What hostap's mesh_auth_timer calls when SAE with a station times out. */
 void umac_mesh_sae_failed(const uint8_t *addr);
 /* What hostap's mesh_mpm_fsm_restart calls for a station that never reached ESTAB. */
@@ -1249,7 +1253,7 @@ int main(void)
           "and a handshake under way is still retransmitted after the signal drops to -90");
     s_rssi = -60;
 
-    /* An open mesh counts no wildcard probe request, weak or strong; each draws an Open. */
+    /* An open mesh counts no wildcard probe request, weak or strong, and opens toward none. */
     reset_node();
     sk0 = g_warthog_mesh_rssi_skip;
     ps0 = g_warthog_mesh_rssi_pass;
@@ -1267,9 +1271,9 @@ int main(void)
           "open: a scanner's wildcard probes, at -85 and -50 dBm, count nowhere (+%u/+%u/+%u)",
           (unsigned)(g_warthog_mesh_rssi_skip - sk0), (unsigned)(g_warthog_mesh_rssi_pass - ps0),
           (unsigned)(g_warthog_prq_named - named1));
-    CHECK(count_to(FC_ACTION, sc1, UMAC_MESH_MPM_ACTION_OPEN) == 1 &&
-          count_to(FC_ACTION, sc2, UMAC_MESH_MPM_ACTION_OPEN) == 1,
-          "and each still draws an Open, as before the floor");
+    CHECK(count_to(FC_ACTION, sc1, -1) == 0 && count_to(FC_ACTION, sc2, -1) == 0 &&
+          count_to(FC_PROBE_RSP, sc1, -1) == 1 && count_to(FC_PROBE_RSP, sc2, -1) == 1,
+          "and each is answered with a probe response and draws no Open: it named no mesh");
 
     /* ---- 12. SAE hold-offs and the floor at their edges ------------------- */
     printf("--- 12. SAE hold-offs, the floor's range ends, and what the floor counts ---\n");
@@ -1373,6 +1377,8 @@ int main(void)
         nbr_(o1, 0xf1); nbr_(o2, 0xf2); nbr_(m1, 0xf3); nbr_(m2, 0xf4); nbr_(h1, 0xf5);
         sk0 = g_warthog_mesh_rssi_skip;
         ps0 = g_warthog_mesh_rssi_pass;
+        const uint32_t fo0 = g_warthog_mpm_foreign;
+        simnode_stub_reset(); /* the Commit above left one hit; reset_node() keeps the stubs */
         s_rssi = -85;
         rx_probe_rsp_id(o1, OTHER, (uint8_t)sizeof(OTHER));
         s_rssi = -60;
@@ -1380,6 +1386,20 @@ int main(void)
         CHECK(g_warthog_mesh_rssi_skip == sk0 && g_warthog_mesh_rssi_pass == ps0,
               "SAE: another mesh's probe responses, weak or strong, count neither way (+%u/+%u)",
               (unsigned)(g_warthog_mesh_rssi_skip - sk0), (unsigned)(g_warthog_mesh_rssi_pass - ps0));
+        CHECK(simnode_stub_hits("umac_supp_mesh_new_peer") == 0 && g_warthog_mpm_foreign == fo0 + 2,
+              "SAE: and neither is offered to hostap; each counts as another mesh (+%u foreign)",
+              (unsigned)(g_warthog_mpm_foreign - fo0));
+        {
+            /* An access point answering our wildcard-SSID probe: an SSID, no Mesh ID. */
+            uint8_t ap[6];
+            uint8_t body[FIXED + 6] = { 0 };
+            static const uint8_t ssid[6] = { 0, 4, 'h', 'o', 'm', 'e' };
+            nbr_(ap, 0xf6);
+            memcpy(body + FIXED, ssid, sizeof(ssid));
+            rx_mgmt(FC_PROBE_RSP, ap, body, (uint16_t)sizeof(body));
+            CHECK(simnode_stub_hits("umac_supp_mesh_new_peer") == 0 && g_warthog_mpm_foreign == fo0 + 2,
+                  "SAE: an access point's probe response is neither offered nor counted as a mesh");
+        }
         umac_mesh_sae_failed(h1);
         rx_sae_auth(h1, 1);
         umac_mesh_sae_failed(h1);

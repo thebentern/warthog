@@ -245,5 +245,7 @@ outward: [Troubleshooting](Troubleshooting) has the symptom → cause table.
   for ATAK-style traffic you should do anyway.
 - **Bridge at L2, by default.** Clients are NAT'd, so a mesh node cannot
   initiate a connection *to* a phone behind a warthog. Phone-initiated flows
-  are fine. `AT+MESHBRIDGE=1` puts the clients on the mesh at layer 2 instead;
-  that mode builds but has not carried a packet on a board.
+  are fine. `AT+MESHBRIDGE=1` puts the clients on the mesh at layer 2 instead,
+  against a node without `bat0`: measured on air on 2026-11-10 and 2026-11-11 with a
+  host on USB; a client on the Wi-Fi AP port is not measured
+  ([Mesh Mode](Mesh-Mode#bridge-mode)).

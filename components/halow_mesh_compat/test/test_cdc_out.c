@@ -3,7 +3,7 @@
  * AT output into the CDC TX FIFO: main/cdc_out.c, compiled straight out of main/.
  * The fake FIFO keeps MIN(n, room) of 512 B per call, as esp_tinyusb's
  * tinyusb_cdcacm_write_queue does; the fake host reads only while the writer waits.
- * Another task (the log mirror, +MCAST, +MPING) is modelled by a no-wait write
+ * Another task (the log mirror, +MCAST) is modelled by a no-wait write
  * made from inside the waiting writer's sleep, which is when it runs on the device.
  */
 #include "cdc_out.h"

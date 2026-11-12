@@ -78,16 +78,21 @@ mesh, so every node on it must speak batman.
 
 Measured from the `warthog-mesh-sae-swccmp-on` build (2026-09-21): app image
 1,967,408 B in a 4 MiB factory partition — **2.12 MB flash free (53.1%)** — and
-a **~170 KiB** DRAM heap arena. No PSRAM.
+a **~170 KiB** DRAM heap arena. No PSRAM. (Since 2026-11 the first megabyte of
+the module's PSRAM is a separate heap for batman's tables and for frame copies
+queued to and from USB; see `wiki/Batman-Mode.md`, Limits.)
 
 | Option | Effort | Flash | RAM | Notes |
 |---|---|---|---|---|
 | HWMP forwarding | ~600–1,200 LOC, 2–6 weeks | small | small | reuses the mesh port already in the build; range reflects two independent estimates |
-| BATMAN_V member (built) | ~3,500 LOC engine + ~1,800 LOC port and morselib | 31.7 KB code (engine 24.6 KB, port 7.2 KB; `warthog-us`, 2026-09-28) | 363 B static (port 239 B, bat0 addressing 124 B) and 28 B of RTC memory (kept sequence numbers); ≈ 58 KB heap only while batman runs, plus up to 16 received frames lwIP has not read (≈ 24 KB, at most ≈ 33 KB) | flash (`.text` and `.literal` of the batman objects; 3.8 KB of constants besides) and static RAM from the build map; heap computed from the Xtensa object sizes: engine 32.5 KB, RX/TX frame slots 15.7 KB, render buffer 4 KB, 6 KB task stack; the received frames replace the radio receive buffers lwIP holds with batman off. Measured on `warthog-mesh-sae-swccmp` (2026-09-29/30): about 53 KB heap free right after boot; with 3–4 SAE peers, host CCMP and batman, 22–31 KB free, minimum 10.9–20 KB, largest block 8.7–15 KB |
+| BATMAN_V member (built) | ~3,500 LOC engine + ~1,800 LOC port and morselib | 31.7 KB code (engine 24.6 KB, port 7.2 KB; `warthog-us`, 2026-09-28) | 363 B static (port 239 B, bat0 addressing 124 B) and 28 B of RTC memory (kept sequence numbers); ≈ 58 KB heap only while batman runs (since 2026-11, 52 KB of it in the PSRAM heap), plus up to 16 received frames lwIP has not read (≈ 24 KB, at most ≈ 33 KB) | flash (`.text` and `.literal` of the batman objects; 3.8 KB of constants besides) and static RAM from the build map; heap computed from the Xtensa object sizes: engine 32.5 KB, RX/TX frame slots 15.7 KB, render buffer 4 KB, 6 KB task stack; the received frames replace the radio receive buffers lwIP holds with batman off. Measured on `warthog-mesh-sae-swccmp` (2026-09-29/30): about 53 KB heap free right after boot; with 3–4 SAE peers, host CCMP and batman, 22–31 KB free, minimum 10.9–20 KB, largest block 8.7–15 KB |
 
-**Flash is not the constraint for either option.** RAM is tight on the
-host-CCMP build in batman mode: the lowest free heap measured was 10.9 KB, with
-an 8.7 KB largest block.
+**Flash is not the constraint for either option.** Until 2026-11 RAM was tight
+on the host-CCMP build in batman mode (lowest free heap measured 10.9 KB,
+largest block 8.7 KB, 2026-09-29). Since then batman's 52 KB of tables are in
+the PSRAM heap and internal RAM measured 82 KB free with bat0's address,
+low-water mark 72 to 84 KB across 20 boots (2026-11-10 and 2026-11-11;
+`wiki/Batman-Mode.md`, Limits).
 
 ## Why HWMP forwarding, not batman-adv
 
@@ -248,8 +253,10 @@ reaching us.
   unknown destination. In bridge mode the tethered hosts are proxied endpoints
   with their own MACs.
 
-Mesh gate announcement is not implemented. None of the AE paths has been on a
-radio against a bridged peer; all are host-tested only.
+Mesh gate announcement is not implemented. Bridge mode ran on air on
+2026-11-10 and 2026-11-11 against two OpenMANET 1.8.0 peers without `bat0` (a tethered host's DHCP, unicast and broadcasts;
+`wiki/Mesh-Mode.md`, Bridge mode). The `AT+MESHFWD=1` shapes are host-tested
+only, apart from unicast relay over pinned paths (2026-10-02).
 
 DHCP on the mesh (`AT+MESHDHCP`, default on) removes the *addressing* half of
 the bridged-peer requirement. A Warthog carries traffic with a peer that keeps

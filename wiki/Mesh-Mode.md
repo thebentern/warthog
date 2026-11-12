@@ -23,6 +23,24 @@ node in the mesh.** A mismatch produces no peers; after about 20 s without one
 the node logs a `NOT PEERED` error listing these values, repeated about every
 60 s, and `AT+MESHCFG?` reports them too.
 
+A node never opens a peering toward a node naming another mesh ID, and accepts
+no Open or Confirm that names another mesh ID or Mesh Configuration profile, on
+an open mesh and under SAE. One case remains: an open node still sends Opens
+toward a SAE node that shares its mesh ID (Encryption, SAE/AMPE, below).
+`prq_other` in `AT+PRSPSTAT?` counts the other mesh's probe requests and
+`foreign` in `AT+MPMSTAT?` the peering frames refused; the no-peers report does
+not read them and can still say nothing is audible. Firmware before this
+change (v0.1.0 included) did not check this on an open mesh; measured on the
+image built from this tree before the fix, two boards on different mesh IDs
+peered within about ten seconds. Measured on 2026-11-10 and 2026-11-11: two updated
+open-mesh boards on different mesh IDs stayed unpeered for over six minutes
+(`AT+MPMSTAT?` `open_tx=0 conf_tx=0 conf_rx=0 estab=0`), and on one mesh ID
+they peered within 20 to 40 s; beside a neighbour still on the old firmware and
+another mesh ID, the updated board counted `foreign=35` with `close_tx=35` in a
+minute and never opened or confirmed (the neighbour logged `close_reason=54`).
+The station image run as a mesh (`AT+MESHEN=1`) behaves the same. Under SAE a
+board moved to another mesh ID was never counted as a peer over three minutes.
+
 Default mesh channel per region (`AT+REGION`; none stored: US):
 
 | Region | Channel | Frequency | Bandwidth | Classes (global/S1G) |
@@ -336,24 +354,78 @@ node set up by its mesh wizard keeps its DHCP server and applications on
 `br-ahwlan` behind `bat0`, which a Warthog reaches only as a batman member
 ([Batman Mode](Batman-Mode)).
 
-What it costs: the USB and AP DHCP servers stop, so a tethered host gets an
-address only if the mesh has a DHCP server (on a warthog-only mesh, use a
-static or link-local address); NAT and the Meshtastic multicast repeater are
-off, because the bridge floods L2 multicast itself; and the node needs
-`CONFIG_ESP_NETIF_BRIDGE_EN`, which the shipped `sdkconfig.defaults` now sets.
-An image built without it logs the fact and stays in NAT mode rather than
-pretending — and so does a bridge that fails to build for any other reason:
-the mesh netif then takes its own address, so the node still has L3 over the
-mesh. Nothing is torn down until the bridge is whole, and the setting is read
-once at boot, so a node never waits on a bridge that is not coming.
+What it costs: the USB and AP DHCP servers stop and both netifs lose their
+addresses (a bridge port carries none: `AT+STATUS?` shows `ip=0.0.0.0` for a
+bridged `+USB:` and `+AP:`, the bridge's address on `+HALOW:` and
+`+DNS: offered=none(bridge)`), so a tethered host gets an address only if the
+mesh has a DHCP server (on a warthog-only mesh, use a static or link-local
+address); NAT and the Meshtastic multicast repeater are off (`AT+MUDP?` reads
+all zeros and `AT+HEAP?` `napt ... on=0`), because the bridge floods L2
+multicast itself (`AT+MESHCFG?` `l2=bridge multicast=all(bridged)`). A host's
+frames reach the mesh only once the node has a peer (`AT+MESHBRIDGE?`
+`mesh_link=1`).
+
+The bridge is built at boot, whole or not at all, and only when mesh mode is
+running. With `AT+MESHEN=0` (the station image's default), a mesh that did not
+start, an AP whose netif did not come up, a port that refuses to join or an
+image without `CONFIG_ESP_NETIF_BRIDGE_EN` (the shipped `sdkconfig.defaults`
+sets it), the node stays in NAT mode as with `AT+MESHBRIDGE=0`: DHCP servers,
+NAT and the repeater all run, `AT+MESHCFG?` says `l2=no(NAT;bridge-failed)` and
+`AT+MESHBRIDGE?` gives the reason. A node never waits on a bridge that is not
+coming. While a mesh boot is still deciding, the USB network link of a host attached at
+boot is held down until the bridge is built or the node has fallen back to NAT
+(console: `host attached; network link held until the bridge is decided`, then
+`bridge decided; raising the network link`), so the host cannot take a
+`192.168.4.x` lease from the node's own DHCP server in the first seconds after
+boot. With the hold in place (measured 2026-11-11, one Warthog on an SAE mesh
+image): the bridge had the mesh's lease 7 s after boot and the tethered Mac had
+its own lease from the mesh's DHCP server at 16 s, never a `192.168.4.x` one;
+in NAT mode the Mac took `192.168.4.2` as before. Only a Mac was tried.
+
+Limits that hold (by design; measured where it says so):
+
+- Whether hosts hear the mesh's broadcasts depends on the image.
+  `AT+MESHBRIDGE?` `grp_rx=1` means this node can open other nodes' standard
+  group frames, which is how a Linux node sends every broadcast (ARP requests,
+  mDNS, CoT). It is 1 on an open mesh, on `warthog-mesh-sae-meshvif` (the chip
+  holds each peer's group key), and on a swccmp image once host CCMP is armed
+  (`-swccmp-on`, or `AT+SWCCMP=1` after each boot). With `grp_rx=0`, which the
+  node also logs at boot, tethered hosts hear no broadcast from a Linux peer.
+- A Warthog left in NAT mode cannot open a connection to a host behind a
+  bridged Warthog: its broadcast ARP does not reach the host, so the host must
+  speak first (measured: 0 of 3).
+- A bridge-only node does not relay for other nodes (`AT+MESHFWD` stays
+  separate). A bridged node whose only peer is another bridged Warthog
+  therefore gets no DHCP lease until it peers with a node that has a DHCP
+  server (measured: the `10.77.x.y` fallback for 45 s, then the lease).
+- 32 remote hosts in all, 8 per mesh node.
 
 **How much of this is verified.** The address logic — which frames get
 Address Extension, which mesh node a host sits behind, what a receiver
 delivers — is the same freestanding code the simulator drives (scenario 4:
-hosts behind opposite ends reach each other with their real addresses). The
-lwIP bridge itself and its interaction with the USB and AP drivers are
-compiled and reasoned, not run. Until a board is on the bench this is a mode
-that builds, not one that has carried a packet.
+hosts behind opposite ends reach each other with their real addresses).
+lwIP's bridge is host-tested (`make lwip-bridge`).
+
+Measured on air on 2026-11-10 and 2026-11-11, on images built from this tree:
+two Warthogs on SAE mesh images beside two OpenMANET 1.8.0 Pis (mesh
+`halowmesh`, a DHCP server at `10.41.254.1`), with a Mac on the boards' USB
+ports.
+
+| | Result |
+|---|---|
+| Start | `+MESHBRIDGE: 1 running=1 reason=ok ports=usb,ap,mesh` one second after the console returned, `mesh_link=1` at about 4 s, `grp_rx=1` |
+| Addresses | the bridge took the mesh's DHCP lease, the same address the node had in NAT mode, 21 to 48 s after boot; the Mac took its own lease from the mesh's DHCP server (`10.41.0.103`, server and router `10.41.254.1`) 24 to 57 s after boot |
+| Status | `AT+STATUS?`: `+HALOW` with the bridge's address, `+USB: ip=0.0.0.0`, `+AP: ip=0.0.0.0`, `+DNS: offered=none(bridge)`; `AT+MESHCFG?` `l2=bridge multicast=all(bridged)`; `AT+MUDP?` all zeros; `AT+HEAP?` `napt ... on=0` |
+| Unicast from the Mac | the gateway at 1000 bytes 10/10, at 1472 bytes unfragmented 10/10, at 3000 bytes fragmented 5/5; the node itself 5/5 (also at 3000 bytes); another Warthog 10/10; HTTP 200 from a Pi in 0.1 s |
+| Multicast, one Warthog bridged and one in NAT mode | `AT+MCAST` / `AT+MSEND` between the two nodes, both ways |
+| Multicast and broadcast, both Warthogs bridged | a host's own multicast (`239.0.0.69:4403`) sent out of the Mac's interface on one board arrived on its interface on the other with the host's own source address, 10/10 both ways; a host's broadcast likewise, and it also reached the Pis' wired LAN; a node's `AT+MSEND` reached the host behind the other bridge |
+| Three-minute soak, pings from both hosts | no reset; `heap_free` about 105 KB (NAT mode: 90 to 95 KB), `heap_min` 87.6 to 88.3 KB; `tiT` at least 1416 bytes of stack free; `drop_nomem=0` |
+| Mesh off | a station image with `AT+MESHBRIDGE=1` stored: `+MESHBRIDGE: 1 running=0 reason=mesh-off ports=none`, `l2=no(NAT;bridge-failed)`, and NAT, DHCP and the console as with the setting at 0 (before the fix: the host lost its lease and `AT+MPING` crashed the board) |
+| A port refused | a bench build that refuses the last port after the others had joined: `reason=port-refused`, NAT as usual (lease `192.168.4.2`, pings at every size) |
+
+Not measured: the Wi-Fi AP as a bridge port with a client on it, a phone,
+losing every peer while bridged, the Pis' side (their proxy tables), and the
+USB link hold at boot.
 
 ## Batman mode
 
@@ -484,7 +556,10 @@ replayed into it once until the MGTK changes; the swccmp builds close that.
 A SAE node ignores open-mesh nodes sharing the Mesh ID (and vice versa) — the
 Mesh Configuration's Authentication Protocol Identifier must match before a
 candidate is even offered to the supplicant. The two security worlds coexist
-on air without disturbing each other.
+on air, with two exceptions, both from probe requests, which carry no Mesh
+Configuration: an open node still sends Opens toward a SAE node that shares its
+Mesh ID, and a SAE node still offers a same-ID open node's probe requests to
+its supplicant, which spends a slot and an SAE attempt on it.
 
 A SAE node's beacons and probe responses carry the RSN element its peering
 frames carry (hostap's: RSN version 1, CCMP-128, AKM SAE); an open node's carry
@@ -516,7 +591,13 @@ Run open only against a node set to `encryption='none'` (see the
 The setting persists in NVS. A `.factory.bin` written at `0x0` erases that
 partition, so a node flashed that way is keyed again; `pio run -t upload` keeps
 it ([Flashing](Flashing#from-a-release-bundle)). It has no effect on a SAE
-build, which never installs the hardcoded key.
+build, which never installs the hardcoded key. There `AT+MESHSEC=` stores the
+value, answers `stored; no effect on this SAE build (keys come from AMPE)` and
+leaves every link up: measured on 2026-11-10 and 2026-11-11 with three SAE
+peers, the count stayed at 3 through `=1`, `=0`, `=1` and pings passed.
+Firmware v0.1.0 dropped every link there until a reset. On a non-SAE build
+only a new value re-peers; sending the value already set answers
+`stored; already set, no re-peer requested`.
 
 ## How paths work, and why it matters
 
@@ -566,8 +647,9 @@ open mesh one peering link per peer.
   toward a neighbour from its beacons when their Mesh Configuration clears
   bit 0 or names another authentication protocol, and answers that
   neighbour's S1G beacons at most once per 10 s (at most 8 such answers in
-  any 10 s). A probe request carries no Mesh Configuration, so a
-  neighbour's probe requests still draw Opens, repeated on its beacons until
+  any 10 s). A probe request that names another mesh ID, or none (a
+  scanner), draws no Open. One that names ours carries no Mesh Configuration
+  and still draws an Open, repeated on the neighbour's beacons until
   it answers or 8 go unanswered; a full neighbour's Close(53) holds them off
   for 30 s. An Open from another node takes the link of a neighbour that has
   answered none of Warthog's Opens, and that neighbour is sent Close reason
@@ -617,7 +699,7 @@ open mesh one peering link per peer.
   Warthog measures the signal at its own receiver, so the two gates agree only
   on a roughly symmetric link. On an open mesh a link below the floor forms
   only when the other side initiates:
-  its own Open is answered, and its probe requests draw Warthog's Open, so two
+  its own Open is answered, and its probe requests naming the mesh draw Warthog's Open, so two
   Warthogs below the floor still peer. Under SAE, between two Warthogs, such a
   link needs the floor lowered on both ends (`AT+MESHRSSI=0` turns it off).
   `skipped` in `AT+MESHRSSI?` counts refusals of frames that name our mesh;

@@ -10,6 +10,7 @@
 #include "bat_port.h"
 #include "boot_guard.h"
 #include "cfg.h"
+#include "ext_ram.h"
 #include "halow.h"
 #include "hang_guard.h"
 #include "mudp.h"
@@ -54,6 +55,13 @@ void app_main(void)
     ESP_ERROR_CHECK(err);
 
     ESP_ERROR_CHECK(warthog_cfg_init());
+
+    /* The PSRAM heap, before the first buffer that may live there (batman's tables, USB frame copies).
+     * Not in safe mode: after crash boots the board runs as it did before the PSRAM was used. Not with
+     * AT+EXTRAM=0 stored: a board whose PSRAM is suspect stays off it. */
+    if (!safe && warthog_cfg_get_ext_ram() != 0) {
+        (void)warthog_ext_ram_init();
+    }
     struct warthog_rg_stored rg;
     warthog_cfg_get_region(&rg);
     ESP_LOGI(TAG, "Warthog %s booting (stored region %s)", WARTHOG_VERSION,
@@ -96,25 +104,33 @@ void app_main(void)
 
     /* Let the USB-OTG inrush settle before the Wi-Fi AP radio powers on. */
     vTaskDelay(pdMS_TO_TICKS(750));
-    (void)warthog_wifi_ap_start();
+    esp_netif_t *ap = warthog_wifi_ap_start();
 
     /* Bridge mode replaces NAT and the multicast repeater with one L2 segment.
      * Batman mode refuses bridge at the setter; this only guards a stale NVS pair. */
     if (warthog_halow_radio_up() && warthog_cfg_get_mesh_bridge() && !warthog_bat_port_running()) {
         uint8_t mesh_mac[6] = { 0 };
         mmwlan_get_mac_addr(mesh_mac);
-        esp_err_t be = warthog_mesh_bridge_start(mmhalow_get_netif(), mesh_mac);
+        esp_err_t be = warthog_mesh_bridge_start(mmhalow_get_netif(), ap, mesh_mac);
         if (be != ESP_OK) {
             ESP_LOGE(TAG, "bridge mode requested but not started (%s); NAT mode", esp_err_to_name(be));
         }
+    } else {
+        warthog_mesh_bridge_none(); /* no start will come: the mesh netif must not wait for one */
     }
     ESP_ERROR_CHECK(warthog_nat_start());
+    warthog_usb_net_link_release(); /* bridge or NAT is decided: a host held at attach gets its link now */
     /* Multicast repeater: bridges 239.0.0.69:4403 (Meshtastic's UDP transport)
      * between the USB, Wi-Fi AP and HaLow-mesh netifs. lwIP does not forward
      * multicast between netifs, so without this a Meshtastic node on the AP
      * side never reaches the mesh. */
     (void)warthog_mudp_start();
     (void)warthog_at_start();
+#ifdef WARTHOG_USBDIAG
+    /* Bench builds only (main/usbdiag.c, tools/bench/README.md "The H6 tests"). */
+    extern void warthog_usbdiag_start(void);
+    warthog_usbdiag_start();
+#endif
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(WARTHOG_HANG_TICK_MS));

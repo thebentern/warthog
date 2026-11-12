@@ -48,8 +48,9 @@ bool umac_mesh_sae_active(void);
 /** Our mesh address, from mesh start (zero before). */
 const uint8_t *umac_mesh_own_addr(void);
 
-/** Offer a SAE candidate heard at @p rssi to hostap; a new peer is skipped at or
- *  below the RSSI floor, while held off after a failed SAE, or when the table is full. */
+/** Offer a SAE candidate heard at @p rssi to hostap. Nobody is offered whose @p ies do not
+ *  name our mesh; a new peer is also skipped at or below the RSSI floor, while held off
+ *  after a failed SAE, or when the table is full. */
 void umac_mesh_offer_sae_candidate(const uint8_t *addr, const uint8_t *ies, size_t ies_len,
                                    int16_t rssi);
 
@@ -78,6 +79,17 @@ bool umac_mesh_reannounce_due(const uint8_t *sa);
  *  answered? At most once per MPM_FULL_REANNOUNCE_MS per address, and to at
  *  most MPM_MAX_QUIET addresses in any such period. */
 bool umac_mesh_unopenable_answer_due(const uint8_t *sa);
+
+/** Open mesh: open a peering toward @p ta, heard at @p rssi (umac_mesh.c has the rules).
+ *  @p floored: a first Open needs @p rssi above the floor. @p named: the frame named our mesh;
+ *  when it did not, only the housekeeping runs. */
+void umac_mesh_maybe_initiate_mpm(const uint8_t *ta, int16_t rssi, bool floored, bool named);
+
+/** A probe request's elements from @p ta: recorded for AT+PRQRX?, counted when they name our
+ *  mesh or another one and, under SAE, offered to hostap when they name ours.
+ *  @returns whether they named our mesh. */
+bool umac_mesh_handle_probe_req_discovery(const uint8_t *ta, const uint8_t *ies,
+                                          uint32_t ies_len, int16_t rssi);
 
 /** Forget every peer link; the next beacon re-runs the peering. */
 void umac_mesh_reset_links(void);

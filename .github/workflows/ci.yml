@@ -84,7 +84,7 @@ jobs:
             ~/.platformio/.cache
             ~/.platformio/packages
             ~/.platformio/platforms
-          key: pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml', 'components/halow/idf_component.yml') }}
+          key: pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml', 'components/halow/idf_component.yml', 'components/esp_tinyusb/idf_component.yml') }}
           restore-keys: |
             pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-
 
@@ -113,16 +113,23 @@ jobs:
           make -C components/halow_mesh_compat/test lwip-napt LWIP_NAPT_REQUIRED=1
           make -C components/halow_mesh_compat/test clean lwip-napt SAN=1 LWIP_NAPT_REQUIRED=1
 
+      # IDF's own lwIP bridge, netif/bridgeif.c, as AT+MESHBRIDGE=1 builds it (lwip_bridge.mk), from the
+      # same package: ports, flooding, learning, DHCP on the bridge and the ping-reply trap.
+      - name: Host tests (IDF lwIP, the bridge of AT+MESHBRIDGE=1)
+        run: |
+          make -C components/halow_mesh_compat/test lwip-bridge LWIP_BRIDGE_REQUIRED=1
+          make -C components/halow_mesh_compat/test clean lwip-bridge SAN=1 LWIP_BRIDGE_REQUIRED=1
+
       # TinyUSB's own NCM and ECM class drivers with main/usbnet_core.c (usbnet.mk): one owner of the
-      # USB network class. Built from the TinyUSB 0.21.0~2 that esp_tinyusb 3.0.0 bundles, in the
-      # managed_components/ the build just fetched.
+      # USB network class. Built from the TinyUSB 0.21.0~2 that esp_tinyusb 3.0.0 bundles, vendored in
+      # components/esp_tinyusb (the sources the firmware links).
       - name: Host tests (TinyUSB NCM/ECM, USB network class)
         run: |
           make -C components/halow_mesh_compat/test usbnet USBNET_REQUIRED=1
           make -C components/halow_mesh_compat/test clean usbnet SAN=1 USBNET_REQUIRED=1
 
-      # lwip-napt against IDF 5.5.6's esp-lwip pin, fetched on its own (the build's IDF is 5.5.6 too). The path goes
-      # to make, not the environment: the glue guard below reads IDF_LWIP from there.
+      # lwip-napt and lwip-bridge against IDF 5.5.6's esp-lwip pin, fetched on its own (the build's IDF is 5.5.6 too).
+      # The path goes to make, not the environment: the glue guard below reads IDF_LWIP from there.
       - name: Host tests (esp-lwip c6f2f878, IDF 5.5.6's lwIP)
         run: |
           d="$RUNNER_TEMP/lwip-c6f2f878"
@@ -131,6 +138,8 @@ jobs:
           git -C "$d/lwip" checkout -q FETCH_HEAD
           make -C components/halow_mesh_compat/test clean lwip-napt IDF_LWIP="$d" LWIP_NAPT_REQUIRED=1
           make -C components/halow_mesh_compat/test clean lwip-napt IDF_LWIP="$d" LWIP_NAPT_REQUIRED=1 SAN=1
+          make -C components/halow_mesh_compat/test clean lwip-bridge IDF_LWIP="$d" LWIP_BRIDGE_REQUIRED=1
+          make -C components/halow_mesh_compat/test clean lwip-bridge IDF_LWIP="$d" LWIP_BRIDGE_REQUIRED=1 SAN=1
 
       # warthog-station compiles the mesh sources too (mesh is a runtime switch). This
       # env adds the code behind its own flags: the RX tap and the USB devloop helpers.
@@ -147,7 +156,8 @@ jobs:
         run: pio run -e warthog-mesh-sae-swccmp
 
       # The glue guard over the generated sdkconfig.warthog-* files, strict: guards 70, 71, 73, 75 and 76 fail
-      # without the IDF lwIP, esp_system and TinyUSB sources or the generated sdkconfigs they compare.
+      # without the IDF lwIP, esp_system and TinyUSB sources or the generated sdkconfigs they compare, and guard 87
+      # fails on a build directory still configured with the managed esp_tinyusb.
       - name: Glue guard (generated sdkconfigs)
         env:
           GLUEGUARD_UPSTREAM_REQUIRED: 1
@@ -291,7 +301,7 @@ jobs:
             ~/.platformio/.cache
             ~/.platformio/packages
             ~/.platformio/platforms
-          key: pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml', 'components/halow/idf_component.yml') }}
+          key: pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml', 'components/halow/idf_component.yml', 'components/esp_tinyusb/idf_component.yml') }}
           restore-keys: |
             pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-
 

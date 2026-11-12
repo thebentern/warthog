@@ -87,6 +87,10 @@ struct node {
     int (*tx_probe)(void);
     uint8_t (*peer_count)(void);
     volatile uint32_t *hold, *hold_tx, *hold_drop, *perr_tx;
+    void (*set_mesh_id)(const uint8_t *, uint8_t);
+    void (*reset_links)(void);
+    bool (*no_link)(const uint8_t *);    /* umac_mesh_note_s1g_beacon: true = no MPM link */
+    volatile uint32_t *open_tx, *conf_tx, *prsp_tx, *foreign, *prq_other;
 };
 
 static struct node nd[NODES];
@@ -156,6 +160,14 @@ static void open_nodes(void)
         BIND(i, hold_tx, "g_warthog_fwd_hold_tx");
         BIND(i, hold_drop, "g_warthog_fwd_hold_drop");
         BIND(i, perr_tx, "g_warthog_fwd_perr_tx");
+        BIND(i, set_mesh_id, "simnode_set_mesh_id");
+        BIND(i, reset_links, "umac_mesh_reset_links");
+        BIND(i, no_link, "umac_mesh_note_s1g_beacon");
+        BIND(i, open_tx, "g_warthog_mpm_open_tx");
+        BIND(i, conf_tx, "g_warthog_mpm_conf_tx");
+        BIND(i, prsp_tx, "g_warthog_prsp_tx");
+        BIND(i, foreign, "g_warthog_mpm_foreign");
+        BIND(i, prq_other, "g_warthog_prq_other");
     }
     *(void **)(&fw_parse_frame) = need_sym(nd[A].lib, "umac_mesh_fwd_parse_frame");
     *(void **)(&hwmp_parse_preq) = need_sym(nd[A].lib, "umac_mesh_hwmp_parse_preq");
@@ -953,6 +965,84 @@ static void scenario_weak_link_peers(void)
     air_rssi = -60;
 }
 
+/**
+ * 9. Two open nodes with different Mesh IDs hear and answer each other's probe requests and
+ * never peer: no Open, no Confirm, no link, no datapath peer, nothing refused because nothing
+ * was asked. Before the fix both reached ESTAB in the first round.
+ */
+static void scenario_other_mesh_id(void)
+{
+    printf("--- 9: two open nodes with different Mesh IDs never peer ---\n");
+    static const uint8_t ida[] = { 'm', 'e', 's', 'h', '-', 'a' };
+    static const uint8_t idw[] = { 'm', 'e', 's', 'h', '-', 'w' };
+    nd[A].set_mesh_id(ida, (uint8_t)sizeof(ida));
+    nd[W].set_mesh_id(idw, (uint8_t)sizeof(idw));
+    mesh_restart(/*fwd=*/false, false, false, false);
+    for (int i = 0; i < NODES; i++) { nd[i].reset_links(); }
+    in_range[A][W] = in_range[W][A] = true;
+    air_reset();
+
+    const uint32_t ao = *nd[A].open_tx, wo = *nd[W].open_tx, ac = *nd[A].conf_tx, wc = *nd[W].conf_tx;
+    const uint32_t ap = *nd[A].prsp_tx, wp = *nd[W].prsp_tx, af = *nd[A].foreign, wf = *nd[W].foreign;
+    const uint32_t aq = *nd[A].prq_other, wq = *nd[W].prq_other;
+    bool settled = true;
+    for (int r = 0; r < 20; r++)
+    {
+        (void)nd[A].tx_probe();
+        nd[A].pump();
+        (void)nd[W].tx_probe();
+        nd[W].pump();
+        settled = settled && air_settle() != 0;
+        air_advance(2000);
+    }
+    CHECK(settled, "every round settles");
+    CHECK(*nd[A].prsp_tx - ap == 20 && *nd[W].prsp_tx - wp == 20,
+          "each heard and answered the other's 20 probe requests (%u / %u)",
+          (unsigned)(*nd[A].prsp_tx - ap), (unsigned)(*nd[W].prsp_tx - wp));
+    CHECK(*nd[A].prq_other - aq == 20 && *nd[W].prq_other - wq == 20,
+          "and counted each as naming another mesh (%u / %u)",
+          (unsigned)(*nd[A].prq_other - aq), (unsigned)(*nd[W].prq_other - wq));
+    CHECK(*nd[A].open_tx == ao && *nd[W].open_tx == wo && *nd[A].conf_tx == ac && *nd[W].conf_tx == wc,
+          "neither sent an Open or a Confirm");
+    CHECK(*nd[A].foreign == af && *nd[W].foreign == wf, "so there was nothing to refuse");
+    CHECK(nd[A].peer_count() == 0 && nd[W].peer_count() == 0 && nd[A].no_link(nd[W].mac) &&
+              nd[W].no_link(nd[A].mac),
+          "no datapath peer and no MPM link on either side");
+    CHECK(nd[A].host_rx_count() == 0 && nd[W].host_rx_count() == 0, "and nothing reached either host");
+
+    /* W moves to A's mesh: nothing was left behind that stops them peering. */
+    nd[W].set_mesh_id(ida, (uint8_t)sizeof(ida));
+    nd[W].stop();
+    CHECK(nd[W].start(nd[W].mac), "W restarts on A's Mesh ID");
+    nd[W].gates(false, false, false, false);
+    nd[W].reset_links();
+    air_reset();
+    (void)nd[W].tx_probe();
+    nd[W].pump();
+    CHECK(air_settle() != 0 && nd[A].peer_count() == 1 && nd[W].peer_count() == 1,
+          "on one Mesh ID they peer from one probe request (%u / %u)",
+          (unsigned)nd[A].peer_count(), (unsigned)nd[W].peer_count());
+    nd[A].set_mesh_id(NULL, 0);
+    nd[W].set_mesh_id(NULL, 0);
+}
+
+/** 10. The control for 9: on one Mesh ID, at -60 dBm, one probe request peers them. */
+static void scenario_same_mesh_id_peers(void)
+{
+    printf("--- 10: two open nodes on one Mesh ID peer from one probe request ---\n");
+    mesh_restart(/*fwd=*/false, false, false, false);
+    for (int i = 0; i < NODES; i++) { nd[i].reset_links(); }
+    in_range[A][W] = in_range[W][A] = true;
+    air_reset();
+    const uint32_t af = *nd[A].foreign, wf = *nd[W].foreign;
+    (void)nd[W].tx_probe();
+    nd[W].pump();
+    CHECK(air_settle() != 0 && nd[A].peer_count() == 1 && nd[W].peer_count() == 1,
+          "both ends are established (%u / %u)", (unsigned)nd[A].peer_count(),
+          (unsigned)nd[W].peer_count());
+    CHECK(*nd[A].foreign == af && *nd[W].foreign == wf, "and nothing was refused on the way");
+}
+
 int main(int argc, char **argv)
 {
     static char dir[512];
@@ -990,6 +1080,8 @@ int main(int argc, char **argv)
     scenario_leaf_node_not_host();
     scenario_relay_discovers();
     scenario_weak_link_peers();
+    scenario_other_mesh_id();
+    scenario_same_mesh_id_peers();
 
     for (int i = 0; i < NODES; i++) { nd[i].stop(); }
 

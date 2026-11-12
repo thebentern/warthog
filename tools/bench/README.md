@@ -24,7 +24,57 @@ Two things it encodes, both learned the hard way:
   a time, with a settle gap.
 
 Boards also drop off USB on their own occasionally; a ~20 s power-off recovers
-them.
+them. One cause, fixed in images that carry the H6 fix, was opening and closing
+the console port while the USB network carries traffic
+(`docs/test-sweep-2026-11-10.md`, "The USB function stops when the console port
+is opened and closed under network load"; `wiki/Troubleshooting.md`, "The board
+drops off USB").
+
+## The H6 tests
+
+To rerun after any change to `components/esp_tinyusb`. The tools are in `h6/`;
+build the two host programs once with `make -C h6` (needs libusb-1.0). Boards
+are named by USB serial. The scripts were moved here from a session scratch
+directory on 2026-11-11 and rewritten to stand alone; the bench was unplugged
+before these copies could be run against a board, so expect to fix small things
+on first use. The numbers below were measured with the originals.
+
+1. Port opens under load, on an ordinary image:
+
+       python3 h6/usb_console_load.py reopen 240 <dest-ip> <usb-serial>...
+
+   Pushes 1.5 Mbit/s of UDP and ten 1400-byte pings a second through each
+   board's USB network interface to `<dest-ip>`, and opens and closes each
+   console port once a second, sending nothing. Pass: `RESULT pass`. Without
+   the slave mode define the whole USB function stops within two minutes and
+   needs a power cycle.
+2. Command sessions under the same load:
+
+       python3 h6/usb_console_load.py commands 70 <dest-ip> <usb-serial>...
+
+   Opens each port once a second, sends `AT+ASSERT?`, `AT+HEAP?` and
+   `AT+STATUS?`, reads the replies and closes it. Without the one packet cap in
+   `tusb.c` the console goes silent (network still up) in roughly one run in
+   10 to 25, so a few clean runs prove nothing.
+3. The fast version of 2, the one to judge a change with. It needs a bench
+   image, built into its own directory so the normal build is left alone:
+
+       PLATFORMIO_BUILD_DIR=/tmp/warthog-h6bench PLATFORMIO_BUILD_FLAGS='-DWARTHOG_USBDIAG=1 -DWARTHOG_USBDIAG_SPAM=1 -DWARTHOG_USBDIAG_DEST=\"<host ip>\"' pio run -e warthog-mesh-sae-meshvif
+       python3 h6/usb_stress.py <usb-serial> 200 bad
+
+   `main/usbdiag.c` (compiled to nothing without the flag) writes a 90-byte
+   line to the console every tick from core 1, and the script holds the port
+   open while `h6/usbctl` sends about 2,000 control requests a second that the
+   board refuses. Pass: output keeps arriving for 200 s. Without the cap it
+   stops within 150 s, usually within 20 s. The modes `getcoding` and `none`
+   are controls and pass either way.
+
+A console that has gone silent comes back with `h6/usbprobe reset <usb-serial>`
+(a port reset; the board does not reboot). The bench image also streams the
+USB controller's registers to UDP port 5005 at `<host ip>` over the HaLow side,
+four times a second, so a board whose USB has stopped can still be read:
+`python3 h6/usb_diag_listen.py <outfile> <seconds>` logs it and explains the
+fields. Do not flash a bench image on a board you are handing back.
 
 ## What passing looks like
 

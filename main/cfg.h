@@ -167,5 +167,10 @@ esp_err_t warthog_cfg_clear_mesh_chan(void);
  * partition. The only thing that reformats a regnvs NVS refused at boot. */
 esp_err_t warthog_cfg_set_region(const char *cc);
 
+/* AT+EXTRAM: 1 = use the board's PSRAM (default), 0 = leave it unused, for a board whose PSRAM is
+ * suspect (main/ext_ram.c). Next boot. */
+uint8_t   warthog_cfg_get_ext_ram(void);
+esp_err_t warthog_cfg_set_ext_ram(uint8_t on);
+
 /* Wipe the "warthog" namespace of the default NVS partition; the region (regnvs) is not in it. */
 esp_err_t warthog_cfg_erase(void);

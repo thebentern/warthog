@@ -144,6 +144,29 @@ bool umac_mesh_ies_set_accepting(uint8_t *ies, uint16_t len, bool accepting);
 bool umac_mesh_ies_peer_openable(const uint8_t *ies, uint32_t len, bool sae);
 
 /**
+ * Does a received Mesh Peering Open or Confirm (@p body from its category octet) carry OUR mesh
+ * profile: this Mesh ID, and a Mesh Configuration naming our path selection protocol and metric,
+ * congestion control, synchronisation method and authentication protocol (@p sae)? The five
+ * octets hostap's matches_local() and mac80211's mesh_matches_local() compare; Formation Info
+ * and Capability are not part of the profile.
+ *
+ * False when either element is absent, the Mesh ID differs in length or content (zero-length
+ * and over-long ones included), the Mesh Configuration has fewer than its seven octets, or a
+ * length octet runs past @p len first. Element order does not matter. Not for a Close: hostap's
+ * and mac80211's carry no Mesh Configuration.
+ */
+bool umac_mesh_ies_mpm_matches(const uint8_t *body, uint32_t len, const uint8_t *mesh_id,
+                               uint8_t mesh_id_len, bool sae);
+
+/**
+ * Do these IEs carry a Mesh ID element naming another mesh than @p mesh_id? False for a
+ * wildcard (zero-length) one, when none is present, or when a length octet runs past @p len
+ * before one is reached. The first Mesh ID element decides.
+ */
+bool umac_mesh_ies_other_mesh_id(const uint8_t *ies, uint32_t len, const uint8_t *mesh_id,
+                                 uint8_t mesh_id_len);
+
+/**
  * Build a Mesh Peering action-frame body (everything after the 802.11 header).
  *
  * Link-id perspective: @p llid is OUR id, @p plid is our view of the peer's id
@@ -174,6 +197,9 @@ uint16_t umac_mesh_ies_build_mpm_body(uint8_t *out, uint16_t out_len, uint8_t ac
  * a full table tells the peer its request was cancelled, so it retries at
  * once instead of backing off. */
 #define UMAC_MESH_REASON_MAX_PEERS 53
+/** 802.11 reason code 54, MESH-CONFIGURATION-POLICY-VIOLATION (Linux WLAN_REASON_MESH_CONFIG):
+ *  the Open named another mesh profile. */
+#define UMAC_MESH_REASON_CONFIG 54
 
 /**
  * Read the sender's link id (first Peer Management IE link-id field).

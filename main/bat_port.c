@@ -16,6 +16,7 @@
 #include "esp_netif_net_stack.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "ext_ram.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -181,7 +182,7 @@ static void bat_port_deliver(void *user, const uint8_t *frame, size_t len)
         s_cnt.deliver_cap++;
         return;
     }
-    uint8_t *p = malloc(len);
+    uint8_t *p = warthog_ext_malloc(len); /* PSRAM first: lwIP may hold 16 of these */
     if (p == NULL) {
         atomic_fetch_sub(&s_deliver_out, 1);
         s_cnt.deliver_nomem++;
@@ -464,6 +465,13 @@ esp_err_t warthog_bat_port_start(void)
         }
         return ESP_OK;
     }
+    if (warthog_ext_ram_state() != WARTHOG_EXT_RAM_OK) {
+        /* 52 KB of tables and up to 16 frame copies in internal RAM leave it short under traffic. */
+        s_reason = BAT_MODE_NO_PSRAM;
+        ESP_LOGE(TAG, "AT+MESHBATMAN=1 is stored but batman needs the PSRAM heap (AT+HEAP? psram state=): "
+                      "ordinary leaf");
+        return ESP_OK;
+    }
 
     s_netif = mmhalow_get_netif();
     uint8_t factory[6] = { 0 };
@@ -474,10 +482,14 @@ esp_err_t warthog_bat_port_start(void)
     }
     (void)esp_read_mac(factory, ESP_MAC_EFUSE_FACTORY);
 
-    s_bat = calloc(1, bat_ctx_size());
-    s_rx_slot = malloc((size_t)BAT_PORT_RX_SLOTS * BAT_MAX_LINK_FRAME);
-    s_tx_slot = malloc((size_t)BAT_PORT_TX_SLOTS * BAT_PORT_TX_SLOT_LEN);
-    s_render_buf = malloc(BAT_RENDER_BUF);
+    /* 52 KB only tasks touch (engine, tcpip, event loop, AT): the PSRAM heap. */
+    s_bat = warthog_ext_malloc(bat_ctx_size());
+    if (s_bat != NULL) {
+        memset(s_bat, 0, bat_ctx_size());
+    }
+    s_rx_slot = warthog_ext_malloc((size_t)BAT_PORT_RX_SLOTS * BAT_MAX_LINK_FRAME);
+    s_tx_slot = warthog_ext_malloc((size_t)BAT_PORT_TX_SLOTS * BAT_PORT_TX_SLOT_LEN);
+    s_render_buf = warthog_ext_malloc(BAT_RENDER_BUF);
     s_links = calloc(1, sizeof(*s_links));
     s_free_rx = xQueueCreate(BAT_PORT_RX_SLOTS, sizeof(uint8_t));
     s_free_tx = xQueueCreate(BAT_PORT_TX_SLOTS, sizeof(uint8_t));

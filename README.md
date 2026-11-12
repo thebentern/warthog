@@ -84,7 +84,7 @@ USB and Wi-Fi clients are on separate subnets, routed through **NAT by default**
 Broadcast discovery such as mDNS and SSDP does not cross them. Multicast is not
 forwarded except for the Meshtastic UDP repeater. Inbound connections to a
 client need explicit forwarding. Experimental mesh bridge mode
-(`AT+MESHBRIDGE=1`) puts clients on the mesh's L2 segment instead.
+(`AT+MESHBRIDGE=1`, mesh mode only) puts clients on the mesh's L2 segment instead.
 See [NAT and bridge mode](docs/firmware-reference.md#nat-default-and-bridge-mode).
 
 ## Operating modes

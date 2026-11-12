@@ -22,3 +22,8 @@ void warthog_mesh_diag_windowed(struct warthog_mesh_diag_in *in);
 #include <stddef.h>
 /* The AT+MESHBATMAN? bat0 line (bat_mode_bat0_line) as of the last probe tick. */
 int warthog_mesh_bat0_line(char *buf, size_t len);
+
+#include <stdbool.h>
+/* mmwlan_mesh_enable() succeeded and the probe task polls the mesh's addressing: what AT+MESHBRIDGE=1
+ * needs before it starts. False on a station boot (AT+MESHEN=0) and when the mesh did not start. */
+bool warthog_mesh_running(void);
