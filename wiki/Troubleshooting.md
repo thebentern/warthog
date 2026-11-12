@@ -22,6 +22,27 @@ the channel cannot be set, or `BSS_CONFIG` or `MESH_CONFIG` cannot be sent.
 `AT+CHIPRESTART?` counts restarts and what did not go back
 ([Mesh Mode](Mesh-Mode#chip-restarts)).
 
+Then memory. `AT+HEAP?` reads internal RAM, the PSRAM heap, failed allocations
+and lwIP's NAT table. `internal min` near zero or `alloc_fail` above 0 means
+the board has run short: note the mode (`AT+MESHCFG?`), the peer count and
+`last_caps`. Before the PSRAM was used, batman mode with three peers ran
+internal RAM down to 3.5 to 12.8 KB free (low-water mark 56 bytes), panicked in
+about one boot of nine and restarted the HaLow chip 23 times in ten minutes
+(`docs/test-sweep-2026-11-10.md`, H2); an image from then answers `AT+HEAP?`
+as an unknown command, whatever `AT+VERSION?` says. Measured on 2026-11-10 and 2026-11-11
+with batman's tables in PSRAM: 82 KB free, 20 boots without a panic, a 15 min
+soak with 0 chip restarts and `alloc_fail=0`. `napt ... on=0 refused=<n>` with
+`refused` above 0 means NAT is off for want of a free block; it comes on by
+itself when there is one (`on=0 refused=0` is normal in bridge mode, which has
+no NAT). `psram state=` other than `ok` leaves the USB frame copies in internal
+RAM and, on a mesh boot, keeps batman mode from starting (`AT+MESHBATMAN?`
+`reason=no-psram`; safe mode starts no mesh and reads `mesh-off` or `off`).
+`AT+EXTRAM=0` does the same on purpose, to test a board whose PSRAM is
+suspect; it is not an operating mode: a plain leaf with `0` stored counted
+`alloc_fail=11668` and one assert under two minutes of overload. Safe mode
+never uses the PSRAM (`psram state=off`; host pings 150/150 there). A board
+whose PSRAM does not answer at all is not measured.
+
 ## The board drops off USB
 
 An `MMOSAL_ASSERT` in the HaLow stack ends in the ESP-IDF panic handler, from
@@ -45,6 +66,18 @@ otherwise keep running as the last boot left it), and commands that need the
 chip are not expected to work. `AT+RESET` or a power cycle leaves safe mode; a
 normal boot clears the count once it has been up 60 s with the watchdog off.
 Safe mode and the USB retries are not measured on air.
+
+A separate defect, in images built from `93cdec9` (2026-11-04) up to the H6
+fix: the console and the USB network can both stop while the board keeps
+running on the mesh, and only a power cycle brings USB back. What triggers it
+is opening and closing the console port while the USB network carries
+traffic. It was in the USB device controller driver that esp_tinyusb 3.0.0
+uses (DMA mode), not in the rest of the firmware. Images with the fix build
+that driver in slave mode from a vendored copy of the component, and send
+console output one USB packet at a time; on an image without the fix, keep one console session open, or do not
+poll the console while tethered traffic flows
+(`docs/test-sweep-2026-11-10.md`, "The USB function stops when the console port
+is opened and closed under network load").
 
 ### After a panic
 
@@ -154,6 +187,9 @@ the least of every instance. The health check and the whole chip restart run on
 failure path left. Measured on 2026-11-04 after three restarts:
 `evtloop` 19596 free, `drv_min` 760; after every read command, `warthog_at`
 1136 of 5120, ESP-IDF's `wifi` task 4212, `warthog_led` 1116 of 3072.
+On 2026-11-10 and 2026-11-11, after batman and NAT load runs, at worst: `tiT` 1328 to
+1516, `warthog_nat` 1008 to 1232, `main` 916 to 1292, `drv_min` 568 to 800,
+`evtloop_min` 19396 to 19596.
 The stack canary (`CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY`) checks the
 lowest 16 bytes of a task's stack each time it is switched out and panics on an
 overflow, so after a run read `AT+ASSERT?` `reset=` and `AT+COREDUMP?` too.
@@ -276,6 +312,29 @@ with 0% loss; `+USBNET` read `rx` above `rx_xfer` (the host packed blocks),
 and ECM drivers (`make -C components/halow_mesh_compat/test usbnet`, which the
 CI runs after its build).
 
+## Bridge mode: the host has no address, or nothing can reach it
+
+Read `AT+MESHBRIDGE?` first ([Mesh Mode](Mesh-Mode#bridge-mode)).
+
+- **The host still gets `192.168.4.2`** and `AT+MESHCFG?` says
+  `l2=no(NAT;bridge-failed)`: the bridge was not built and the node runs NAT.
+  `reason=mesh-off`: bridge mode needs mesh mode (`AT+MESHEN=1`, `AT+RESET`).
+  `reason=not-armed` or `not-started`: the stored setting read differently
+  twice at boot; `AT+RESET`. Any other reason names the step that refused.
+- **`running=1` and the host has no lease**: with `mesh_link=0` the node has no
+  peer yet (`AT+MESHCFG?`); with `mesh_link=1` and `+HALOW: ip=10.77.x.y` no
+  DHCP server is reachable: the mesh has none, or the node's only peer is
+  another bridge-only Warthog, which does not relay (measured: the lease came
+  45 s later, once a node with a DHCP server had peered). Leases took 24 to
+  57 s after boot on the bench.
+- **The host has a lease and can reach out, but hears no broadcast from the
+  mesh** (no ARP request, no mDNS): `grp_rx=0`. This image cannot open other
+  nodes' group frames. Use `warthog-mesh-sae-meshvif`, or a swccmp image with
+  `AT+SWCCMP=1`.
+- **A Warthog in NAT mode cannot reach the host**: its ARP does not reach a
+  host behind a bridge (measured: 0 of 3). The host must speak first, or bridge
+  that Warthog too.
+
 ## Mesh: no peers at all
 
 ```
@@ -288,6 +347,20 @@ or operating class do not match. Every one of them must be identical across the
 mesh, and a mismatch produces no error — just silence. A peer in beaconless
 mode sends no beacons and reads the same; `AT+MESHCFG?` names that case when
 its probe requests name our mesh.
+
+Nodes on different mesh IDs never peer, on open and SAE meshes alike. The
+station image's default ID is `warthog-mesh-test` and the mesh images' is
+`halowmesh`: set `AT+MESHID=` on one of them. To see a mismatch from the node,
+read `AT+PRSPSTAT?` twice a few seconds apart: `prq_other` climbing while
+`prq_named` does not means probe requests on this channel name another mesh
+ID. Only a peer that sends probe requests moves it (another Warthog, or a
+beaconless node); a Linux node beacons and does not probe, and on another mesh
+ID it moves no counter. The no-peers report does not read `prq_other` and can
+still say nothing is audible. `foreign=` climbing in `AT+MPMSTAT?` on an open
+mesh means Opens or Confirms are being refused for another mesh ID or Mesh
+Configuration profile. The measured case is a node on another mesh ID running
+firmware from before this check (v0.1.0 included), which still opens toward
+every node it hears.
 
 ## Mesh: peer seen but never establishes
 
@@ -537,6 +610,10 @@ Keyed Warthog against an unencrypted peer. Peering is unaffected because it
 happens in management frames; only data dies. `AT+MESHSEC=0` for an open peer
 (an OpenMANET node only if an operator set `encryption='none'`; its mesh
 wizard configures SAE).
+
+This is a non-SAE build fault: on an SAE build the setting has no effect, and
+the command's reply says so. On firmware v0.1.0, sending it to an SAE build
+dropped every link until `AT+RESET`.
 
 ## Mesh: frames arrive but nothing is delivered
 

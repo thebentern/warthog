@@ -63,7 +63,7 @@ jobs:
             ~/.platformio/.cache
             ~/.platformio/packages
             ~/.platformio/platforms
-          key: pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml', 'components/halow/idf_component.yml') }}
+          key: pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-${{ hashFiles('platformio.ini', 'main/idf_component.yml', 'components/halow/idf_component.yml', 'components/esp_tinyusb/idf_component.yml') }}
           restore-keys: |
             pio-${{ runner.os }}-${{ env.PIO_PLATFORM }}-${{ env.PIO_VERSION }}-
 

@@ -581,3 +581,49 @@ bool umac_mesh_ies_peer_openable(const uint8_t *ies, uint32_t len, bool sae)
     return cfg[4] == (sae ? MESH_AUTH_SAE : MESH_AUTH_NONE) &&
            (cfg[6] & MESH_CAPABILITY_ACCEPTING) != 0u;
 }
+
+bool umac_mesh_ies_mpm_matches(const uint8_t *body, uint32_t len, const uint8_t *mesh_id,
+                               uint8_t mesh_id_len, bool sae)
+{
+    if (body == NULL || mesh_id == NULL || mesh_id_len == 0u || len < 2u)
+    {
+        return false;
+    }
+    /* Past the fixed fields, which differ per action: where the link-id parsers start too. */
+    const uint32_t off = mpm_ie_offset_(body[1]);
+    if (len < off)
+    {
+        return false;
+    }
+    const uint8_t *cfg = mesh_config_in_(body + off, len - off);
+    return cfg != NULL && mesh_id_in_elements_(body, len, off, mesh_id, mesh_id_len) &&
+           cfg[0] == MESH_PATH_PROTO_ID && cfg[1] == MESH_PATH_METRIC_ID &&
+           cfg[2] == MESH_CONGESTION_NONE && cfg[3] == MESH_SYNC_NEIGHBOR &&
+           cfg[4] == (sae ? MESH_AUTH_SAE : MESH_AUTH_NONE);
+}
+
+bool umac_mesh_ies_other_mesh_id(const uint8_t *ies, uint32_t len, const uint8_t *mesh_id,
+                                 uint8_t mesh_id_len)
+{
+    if (ies == NULL || mesh_id == NULL || mesh_id_len == 0u)
+    {
+        return false;
+    }
+    uint32_t off = 0;
+    while (off + 2u <= len)
+    {
+        uint8_t eid = ies[off];
+        uint8_t elen = ies[off + 1];
+        if (off + 2u + (uint32_t)elen > len)
+        {
+            return false; /* truncated element -- do not read past the buffer */
+        }
+        if (eid == UMAC_MESH_EID_MESH_ID)
+        {
+            return elen != 0u &&
+                   (elen != mesh_id_len || memcmp(&ies[off + 2u], mesh_id, elen) != 0);
+        }
+        off += 2u + (uint32_t)elen;
+    }
+    return false;
+}

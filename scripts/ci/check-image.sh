@@ -3,7 +3,9 @@
 #
 # Usage: scripts/ci/check-image.sh ENV...
 #   BUILD_DIR (default: .pio/build in the repo), PLATFORMIO_CORE_DIR (default: ~/.platformio),
-#   ESPTOOL (default: the core's penv esptool). partitions.bin must hash to scripts/ci/pins.env's PARTITIONS_SHA256.
+#   ESPTOOL (default: the core's penv esptool), NM (default: the core's xtensa-esp32s3-elf-nm).
+#   partitions.bin must hash to scripts/ci/pins.env's PARTITIONS_SHA256. firmware.elf must hold TinyUSB's
+#   slave (IRQ) mode DWC2 device driver and not its Buffer DMA one (docs/test-sweep-2026-11-10.md, H6).
 #   Exit 0 ok, 1 failed, 2 usage (no ENV, or an empty or malformed one) or setup error.
 
 set -u
@@ -25,6 +27,8 @@ if [ -z "${ESPTOOL:-}" ]; then
   done
 fi
 [ -n "${ESPTOOL:-}" ] && [ -x "$ESPTOOL" ] || { echo "error: no esptool (set ESPTOOL or PLATFORMIO_CORE_DIR)" >&2; exit 2; }
+NM=${NM:-$CORE/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-nm}
+[ -x "$NM" ] || { echo "error: no nm at $NM (set NM or PLATFORMIO_CORE_DIR)" >&2; exit 2; }
 PSHA=$(sed -n 's/^PARTITIONS_SHA256=\([0-9a-f]\{64\}\)$/\1/p' "$ROOT/scripts/ci/pins.env" 2>/dev/null | head -n 1)
 [ -n "$PSHA" ] || { echo "error: no PARTITIONS_SHA256=<sha256> in $ROOT/scripts/ci/pins.env" >&2; exit 2; }
 
@@ -52,7 +56,7 @@ fail=0
 for e in "$@"; do
   d="$BUILD/$e"
   efail=0
-  for f in firmware.bin firmware.factory.bin bootloader.bin partitions.bin; do
+  for f in firmware.bin firmware.factory.bin bootloader.bin partitions.bin firmware.elf; do
     [ -f "$d/$f" ] || bad "no $d/$f"
   done
   if [ "$efail" = 1 ]; then fail=1; continue; fi
@@ -84,10 +88,21 @@ for e in "$@"; do
     fi
   done
 
+  # dcd_dwc2.c's static functions, as CFG_TUD_DWC2_DMA_ENABLE (components/esp_tinyusb/include/tusb_config.h)
+  # compiles them: 0 gives the slave mode receive-FIFO and IN handlers, 1 the DMA ones.
+  syms=$("$NM" "$d/firmware.elf" 2>/dev/null | awk '{print $NF}')
+  usb=slave
+  for f in handle_rxflvl_irq handle_epin_slave; do
+    printf '%s\n' "$syms" | grep -qx "$f" || { bad "firmware.elf has no $f: TinyUSB's DWC2 driver is not built in slave mode (H6)"; usb=; }
+  done
+  for f in dma_setup_prepare handle_epin_dma handle_epout_dma; do
+    printf '%s\n' "$syms" | grep -qx "$f" && { bad "firmware.elf has $f: TinyUSB's DWC2 driver is built in Buffer DMA mode (H6)"; usb=; }
+  done
+
   sum=$(sha256 "$pt")
   [ "$sum" = "$PSHA" ] || bad "partitions.bin sha256 is $sum, want $PSHA (pins.env)"
   if [ "$efail" = 0 ]; then
-    echo "ok   $e: factory = 0x10000 + $nfw B, bootloader $nbl B, DIO/80m/8MB, partitions $(echo "$sum" | cut -c1-12)"
+    echo "ok   $e: factory = 0x10000 + $nfw B, bootloader $nbl B, DIO/80m/8MB, partitions $(echo "$sum" | cut -c1-12), USB DWC2 in $usb mode"
   else
     fail=1
   fi

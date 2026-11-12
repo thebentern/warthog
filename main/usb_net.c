@@ -21,11 +21,13 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
+#include "ext_ram.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "hang_guard.h"
 #include "led.h"
+#include "mesh_bridge.h"
 #include "device/usbd_pvt.h"          /* usbd_defer_func, usbd_edpt_busy */
 #include "esp_timer.h"
 #include "tinyusb.h"
@@ -363,7 +365,7 @@ uint32_t warthog_usb_net_pongs(void) { return s_pongs; }
 static void un_lock_(void) { portENTER_CRITICAL(&s_usbnet_mux); }
 static void un_unlock_(void) { portEXIT_CRITICAL(&s_usbnet_mux); }
 static uint32_t un_now_ms_(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
-static void *un_alloc_(size_t n) { return malloc(n); }
+static void *un_alloc_(size_t n) { return warthog_ext_malloc(n); } /* frame copies: PSRAM first */
 static void un_free_(void *p) { free(p); }
 
 /* ethernetif_input frees the frame on every failure, so it is never freed here. */
@@ -431,13 +433,41 @@ static esp_err_t l2_transmit(void *h, void *buffer, size_t len)
     return usbnet_tx(&s_usbnet, buffer, len) == 0 ? ESP_OK : ESP_FAIL;
 }
 
+/* Bridge mode (AT+MESHBRIDGE=1): a host that enumerates before app_main has built the bridge would take a
+ * 192.168.4.x lease from this node's own DHCP server, which the bridge then stops (iOS never asks again).
+ * The link stays down until app_main has decided; warthog_usb_net_link_release raises it. Both flags are
+ * read and written by the TinyUSB task only: the event callback and the deferred release run there. */
+static bool s_link_held, s_link_decided;
+static void un_link_release_(void *arg)
+{
+    (void)arg;
+    s_link_decided = true;
+    if (s_link_held && tud_mounted()) {
+        ESP_LOGI(TAG, "bridge decided; raising the network link");
+        tud_network_link_state(0, true);
+    }
+    s_link_held = false;
+}
+
+void warthog_usb_net_link_release(void)
+{
+    if (tud_inited()) {
+        usbd_defer_func(un_link_release_, NULL, false);
+    }
+}
+
 static void on_tinyusb_event(tinyusb_event_t *event, void *arg)
 {
     (void)arg;
     switch (event->id) {
     case TINYUSB_EVENT_ATTACHED:
-        ESP_LOGI(TAG, "host attached; raising the network link");
         warthog_led_set_usb(true);
+        if (!s_link_decided && warthog_mesh_bridge_pending()) {
+            ESP_LOGI(TAG, "host attached; network link held until the bridge is decided");
+            s_link_held = true;
+            break;
+        }
+        ESP_LOGI(TAG, "host attached; raising the network link");
         /* esp_tinyusb owns tud_mount_cb/tud_umount_cb, so the link is raised
          * from its event hook instead. The netif and DHCP server are already
          * running by now -- warthog_usb_net_start() brings them up before
@@ -448,6 +478,7 @@ static void on_tinyusb_event(tinyusb_event_t *event, void *arg)
     case TINYUSB_EVENT_DETACHED:
         ESP_LOGI(TAG, "host detached; dropping the network link");
         warthog_led_set_usb(false);
+        s_link_held = false;
         tud_network_link_state(0, false);
         usbnet_flush(&s_usbnet);
         break;

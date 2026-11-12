@@ -160,13 +160,15 @@
         <option value="0">Open — use this for OpenMANET / OpenWrt</option>
         <option value="1">Keyed — warthog-to-warthog only, NOT real encryption</option>
       </select>
-      <p class="hint">Applies immediately and persists; the node re-peers within ~2&nbsp;s.
+      <p class="hint">Applies immediately and persists; the node re-peers within ~2&nbsp;s when the value changes.
       This switch belongs to the <b>open mesh build</b> and its legacy shared key —
       a constant compiled into every warthog, so anyone holding the firmware holds
       the key. <b>For real security flash the encrypted mesh variant instead</b>:
       SAE authentication and AMPE per-link keys, no runtime switch needed (the
       passphrase defaults to a build-time value; <code>AT+MESHPASS</code> changes it,
-      next boot). It has no effect on the encrypted build.</p>
+      next boot). It has no effect on the encrypted build, and Save does not send it to a
+      board running the encrypted mesh, or to one whose mesh state cannot be read:
+      firmware v0.1.0 dropped every mesh link there until a reboot.</p>
       <div class="row"><button id="meshsecSave" class="secondary" disabled>Save mesh setting</button></div>
     </div>
 
@@ -536,6 +538,12 @@ $("dnsSave").addEventListener("click", async () => {
   report("DNS", await at(`AT+DNS=${v}`));
 });
 $("meshsecSave").addEventListener("click", async () => {
+  // An SAE mesh never uses this setting, and firmware v0.1.0 drops every SAE link when it is sent.
+  // Without an answer nothing says the mesh is not SAE: nothing is sent.
+  const peers = await at("AT+MPMPEERS?");
+  if (!peers.ok) return csay("Mesh: not sent. Could not read the mesh state.", "err");
+  const sae = /\bsae=[12]\b/.test(peers.lines.join(" "));
+  if (sae) return csay("Mesh: not sent. This board runs the encrypted (SAE) mesh, which does not use this setting.", "warn");
   report("Mesh", await at(`AT+MESHSEC=${$("meshsec").value}`));
 });
 $("reboot").addEventListener("click", async () => {

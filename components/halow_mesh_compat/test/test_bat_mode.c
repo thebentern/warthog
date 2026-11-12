@@ -120,6 +120,7 @@ static void t_reason_text(void)
         { BAT_MODE_FWD, "fwd" }, { BAT_MODE_BRIDGE, "bridge" },
         { BAT_MODE_NO_GROUP_RX, "sae-no-host-ccmp" }, { BAT_MODE_NOMEM, "nomem" },
         { BAT_MODE_INIT_FAIL, "init-failed" }, { BAT_MODE_MESH_FAILED, "mesh-failed" },
+        { BAT_MODE_NO_PSRAM, "no-psram" },
     };
     for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
         CHECK(strcmp(bat_mode_reason_text(k[i].r), k[i].t) == 0, "reason %d reads '%s' (got '%s')",

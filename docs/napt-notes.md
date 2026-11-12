@@ -67,6 +67,8 @@ Acquired the underlying `struct netif *` via `esp_netif_get_netif_impl()` (decla
 
 A polling supervisor task re-enforces the state every 2 s — `esp_netif`'s priority-driven default-netif auto-reselection can revert our explicit `set_default_netif()` whenever the wrong-direction `IP_EVENT_STA_GOT_IP` event fires on another netif, and `ip_napt_enable_netif()` is idempotent so retries are cheap.
 
+The supervisor's first pass makes the enable at boot, before the uplink has an address. lwIP allocates its two NAPT tables inside the first `ip_napt_enable_netif()` and asserts when either allocation fails (`ip4_napt.c`; two boards reset there on 2026-11-10), so `nat.c` first asks for one free block of internal RAM that holds both with 4 KB to spare: 512 sessions, 16,896 B of tables, a 20,992 B block. Without one nothing is enabled, an error is logged and the next pass asks again; `AT+HEAP?` reads `napt entries=512 bytes=16896 on=<0|1> refused=<n>`. Measured on 2026-11-10 and 2026-11-11: `on=1 refused=0` before the uplink had an address. In bridge mode there is no NAT and `on=0 refused=0` is normal. The check and lwIP's allocation are not one step: with internal RAM nearly exhausted (`AT+EXTRAM=0` or safe mode under load) another allocation can still come between them.
+
 ## Verification
 
 `tick` log after the fix should show:

@@ -32,10 +32,10 @@
 #include "soc/rtc_cntl_reg.h"   /* RTC_CNTL_OPTIONS0_REG for AT+RESET */
 #include "esp_attr.h"   /* RTC_NOINIT_ATTR */
 #include "esp_core_dump.h" /* AT+COREDUMP? crash forensics */
+#include "esp_heap_caps.h" /* AT+HEAP? */
 #include "soc/soc.h"            /* REG_WRITE */
 #include "tinyusb_cdc_acm.h"
 #include "tusb.h"
-#include "ping/ping_sock.h"
 #include "mmwlan_mesh.h"
 #include "mmwlan_cap.h"     /* AT+RXCAP, AT+TXCAP */
 #include "mmosal.h"
@@ -45,14 +45,17 @@
 #include "dlmode.h"         /* AT+DLMODE */
 #include "hang_guard.h"     /* AT+HANG?, AT+HANGTEST */
 #include "mudp.h"
+#include "ext_ram.h"        /* AT+HEAP?, AT+EXTRAM */
+#include "nat.h"            /* AT+HEAP? napt */
 #include "mesh_bridge.h"
 #include "nat_frag.h"       /* AT+MTU? ip_reass */
 #include "lwip/inet.h"
+#include "lwip/ip4.h"       /* AT+MPING: ip4_route */
 #include "lwip/sockets.h"
 #include "esp_timer.h"
+#include "esp_random.h"     /* AT+MPING: the echo id */
 #include "lwip/netif.h"
 #include <errno.h>
-#include "freertos/semphr.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -211,12 +214,20 @@ static void status_region_line_(void)
     cdc_write(line);
 }
 
+/* The netif holding the node's HaLow-side address: the bridge while it runs (the mesh netif is then
+ * one of its ports and has none), else the mesh/station netif. */
+static esp_netif_t *halow_l3_netif_(void)
+{
+    return warthog_mesh_bridge_active() ? warthog_mesh_bridge_netif()
+                                        : esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+}
+
 static void cmd_status(void)
 {
     char buf[320]; /* +USBNET: at most 312 */
 
-    /* HaLow STA netif (driven by morsemicro/halow, key WIFI_STA_DEF) */
-    esp_netif_t *halow = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    /* HaLow STA or mesh netif (driven by morsemicro/halow, key WIFI_STA_DEF), or the bridge over it */
+    esp_netif_t *halow = halow_l3_netif_();
     esp_netif_ip_info_t halow_ip = {0};
     if (halow) {
         esp_netif_get_ip_info(halow, &halow_ip);
@@ -260,7 +271,8 @@ static void cmd_status(void)
     /* DNS handed to downstream clients via DHCP option 6 */
     char dns_str[16] = {0};
     warthog_cfg_get_dns(dns_str, sizeof(dns_str));
-    snprintf(buf, sizeof(buf), "+DNS: offered=%s\r\n", dns_str);
+    /* A bridge serves no DHCP: its hosts take the mesh DHCP server's resolver. */
+    snprintf(buf, sizeof(buf), "+DNS: offered=%s\r\n", warthog_mesh_bridge_active() ? "none(bridge)" : dns_str);
     cdc_write(buf);
 
     status_region_line_();
@@ -646,6 +658,9 @@ volatile uint16_t g_warthog_prq_len = 0;
 volatile uint8_t g_warthog_prq_ta[6] = { 0 };
 volatile uint32_t g_warthog_prq_named = 0;
 volatile uint32_t g_warthog_prq_offer = 0;
+/* Probe requests carrying a Mesh ID element that names another mesh: a node on another
+ * mesh ID is in range (AT+PRSPSTAT? prq_other). */
+volatile uint32_t g_warthog_prq_other = 0;
 /* AMPE interop forensics: last SELF_PROTECTED (category 15) action body we
  * transmitted (exactly what hostap's AMPE MIC covers) and the last one we
  * received raw off the air (AT+PLINKTX? / AT+PLINKRX?). */
@@ -709,6 +724,9 @@ volatile uint16_t g_warthog_mpm_dump_full = 0;  /* true body length */
 volatile uint32_t g_warthog_mpm_close_reason = 0;
 /* 1 once a peer's Confirm echoed our llid -- warthog-side ESTAB indicator. */
 volatile uint32_t g_warthog_mpm_estab = 0;
+/* Mesh Peering Opens and Confirms refused for naming another Mesh ID or Mesh Configuration
+ * (open mesh), and probe responses naming another Mesh ID kept from hostap (SAE). */
+volatile uint32_t g_warthog_mpm_foreign = 0;
 /* umac_datapath_mesh_add_peer() failures at ESTAB (table full / no memory). */
 volatile uint32_t g_warthog_mesh_peer_add_fail = 0;
 /* mmdrv_update_sta_state() failures when registering a mesh peer with the chip. */
@@ -749,7 +767,8 @@ volatile int32_t g_warthog_mesh_chan_st = 0;
  * -- but the chip STA registration that also fixes delivery landed in the same
  * change, so which of the two actually opened the gate was never isolated.
  * AT+MESHSEC= flips this at runtime and re-peers, so the two can be told apart
- * on hardware. */
+ * on hardware. On a non-SAE mesh only: an SAE mesh stores it and never acts on
+ * it (AMPE keys every link). */
 volatile uint32_t g_warthog_mesh_secure = 1;
 /* Forwarding and bridge gates, seeded from NVS in mesh.c before the mesh starts. */
 volatile uint32_t g_warthog_mesh_fwd = 0, g_warthog_mesh_bridge = 0, g_warthog_mesh_grp = 0;
@@ -1221,15 +1240,16 @@ static void cmd_bcnstat(void)
 /* AT+PRSPSTAT? — mesh probe-request/response counters. */
 static void cmd_prspstat(void)
 {
-    char buf[144];
+    char buf[176];
     snprintf(buf, sizeof(buf),
              "+PRSPSTAT: req_rx=%lu rsp_tx=%lu rsp_fail=%lu last_da=%02x:%02x:%02x:%02x:%02x:%02x"
-             " prq_named=%lu prq_offer=%lu\r\n",
+             " prq_named=%lu prq_offer=%lu prq_other=%lu\r\n",
              (unsigned long)g_warthog_prsp_rx, (unsigned long)g_warthog_prsp_tx,
              (unsigned long)g_warthog_prsp_fail,
              g_warthog_prsp_last_da[0], g_warthog_prsp_last_da[1], g_warthog_prsp_last_da[2],
              g_warthog_prsp_last_da[3], g_warthog_prsp_last_da[4], g_warthog_prsp_last_da[5],
-             (unsigned long)g_warthog_prq_named, (unsigned long)g_warthog_prq_offer);
+             (unsigned long)g_warthog_prq_named, (unsigned long)g_warthog_prq_offer,
+             (unsigned long)g_warthog_prq_other);
     cdc_write(buf);
     reply_ok();
 }
@@ -1240,12 +1260,13 @@ static void cmd_mpmstat(void)
     char buf[240];
     snprintf(buf, sizeof(buf),
              "+MPMSTAT: rx=%lu open_tx=%lu conf_tx=%lu conf_rx=%lu close_rx=%lu "
-             "parse_fail=%lu llid=%lu plid=%lu close_reason=%lu estab=%lu\r\n",
+             "parse_fail=%lu llid=%lu plid=%lu close_reason=%lu estab=%lu foreign=%lu\r\n",
              (unsigned long)g_warthog_mpm_rx, (unsigned long)g_warthog_mpm_open_tx,
              (unsigned long)g_warthog_mpm_conf_tx, (unsigned long)g_warthog_mpm_conf_rx,
              (unsigned long)g_warthog_mpm_close_rx, (unsigned long)g_warthog_mpm_parse_fail,
              (unsigned long)g_warthog_mpm_our_llid, (unsigned long)g_warthog_mpm_our_plid,
-             (unsigned long)g_warthog_mpm_close_reason, (unsigned long)g_warthog_mpm_estab);
+             (unsigned long)g_warthog_mpm_close_reason, (unsigned long)g_warthog_mpm_estab,
+             (unsigned long)g_warthog_mpm_foreign);
     cdc_write(buf);
     reply_ok();
 }
@@ -1278,48 +1299,84 @@ static void cmd_mpmdump(void)
     reply_ok();
 }
 
-/* AT+MPING=<ipv4>[,<count>] -- ICMP echo over the HaLow netif.
+/* AT+MPING=<ipv4>[,<count>] -- ICMP echo from the node itself, IPv4.
  *
  * The end-to-end proof for the mesh data plane: a reply means an IP packet
  * left this board as a 4-address mesh data frame, was carried by the vendor
  * datapath, decoded on the peer, answered by its lwIP, and came back the same
- * way. Blocks for up to count x 1 s; runs on the AT task, which is fine for a
- * diagnostic. Reports per-reply RTT and a summary. */
-typedef struct {
-    SemaphoreHandle_t done;
-    uint32_t sent, recv;
-    uint32_t last_rtt_ms;
-    char line[96];
-} mping_ctx_t;
+ * way. One probe a second, each given a second; per-reply RTT and a summary.
+ *
+ * All of it runs here, on the AT task, on one raw ICMP socket opened and
+ * closed inside the command: no second task and no callback, so nothing is
+ * left to run after the OK. (IDF's esp_ping was used before. Its receive loop
+ * restarts the timeout on every ICMP packet the board receives, so a host
+ * pinging the board kept the session past the command, and its end callback
+ * then gave a semaphore the command had deleted.) */
+#define MPING_DATA_LEN 32u                  /* echo payload */
+#define MPING_PKT_LEN (8u + MPING_DATA_LEN) /* ICMP header and payload */
+#define MPING_RX_LEN 68u                    /* the longest IPv4 header (60) and the ICMP header */
+#define MPING_TIMEOUT_MS 1000               /* a probe's wait, and the time from one probe to the next */
+#define MPING_POLL_MS 10                    /* the longest one recvfrom waits */
+#define MPING_DRAIN_MAX 16                  /* lwIP queues 6 packets on a raw socket (DEFAULT_RAW_RECVMBOX_SIZE) */
+/* Under one tick lwIP's receive would not wait at all, and the loops below would spin to their deadlines. */
+_Static_assert(pdMS_TO_TICKS(MPING_POLL_MS) > 0, "MPING_POLL_MS is shorter than a tick");
 
-static void mping_on_success(esp_ping_handle_t h, void *args)
+/* An echo request of MPING_PKT_LEN octets, id and seq in network order, checksum filled.
+ * libc only: the glue guard compiles and runs it. */
+static void mping_build_(uint8_t *pkt, uint16_t id, uint16_t seq)
 {
-    mping_ctx_t *c = (mping_ctx_t *)args;
-    uint32_t rtt = 0; uint16_t seq = 0; ip_addr_t target;
-    esp_ping_get_profile(h, ESP_PING_PROF_TIMEGAP, &rtt, sizeof(rtt));
-    esp_ping_get_profile(h, ESP_PING_PROF_SEQNO, &seq, sizeof(seq));
-    esp_ping_get_profile(h, ESP_PING_PROF_IPADDR, &target, sizeof(target));
-    c->recv++; c->last_rtt_ms = rtt;
-    snprintf(c->line, sizeof(c->line), "+MPING: reply from %s seq=%u time=%lums\r\n",
-             ipaddr_ntoa(&target), (unsigned)seq, (unsigned long)rtt);
-    cdc_write_nowait(c->line); /* esp_ping task: a wait would delay the next ping */
+    memset(pkt, 0, 8);
+    pkt[0] = 8; /* echo request */
+    pkt[4] = (uint8_t)(id >> 8);
+    pkt[5] = (uint8_t)id;
+    pkt[6] = (uint8_t)(seq >> 8);
+    pkt[7] = (uint8_t)seq;
+    for (unsigned i = 0; i < MPING_DATA_LEN; i++) {
+        pkt[8 + i] = (uint8_t)('A' + i);
+    }
+    uint32_t sum = 0;
+    for (unsigned i = 0; i < MPING_PKT_LEN; i += 2) {
+        sum += ((uint32_t)pkt[i] << 8) | pkt[i + 1];
+    }
+    sum = (sum & 0xffffu) + (sum >> 16);
+    sum = (sum & 0xffffu) + (sum >> 16);
+    const uint16_t ck = (uint16_t)~sum;
+    pkt[2] = (uint8_t)(ck >> 8);
+    pkt[3] = (uint8_t)ck;
 }
 
-static void mping_on_timeout(esp_ping_handle_t h, void *args)
+/* Whether @p pkt, an IPv4 packet as a raw socket hands it over (IP header first), is the echo
+ * reply to our probe. The socket sees every ICMP packet the board receives: echo requests to
+ * the board, other pingers' replies, errors. libc only: the glue guard compiles and runs it. */
+static bool mping_is_reply_(const uint8_t *pkt, size_t len, uint16_t id, uint16_t seq)
 {
-    mping_ctx_t *c = (mping_ctx_t *)args;
-    uint16_t seq = 0;
-    esp_ping_get_profile(h, ESP_PING_PROF_SEQNO, &seq, sizeof(seq));
-    snprintf(c->line, sizeof(c->line), "+MPING: seq=%u timeout\r\n", (unsigned)seq);
-    cdc_write_nowait(c->line);
+    if (len < 20 || (pkt[0] >> 4) != 4) {
+        return false;
+    }
+    const size_t ihl = (size_t)(pkt[0] & 0x0f) * 4;
+    if (ihl < 20 || len < ihl + 8 || pkt[9] != 1) { /* protocol 1: ICMP */
+        return false;
+    }
+    const uint8_t *icmp = pkt + ihl;
+    return icmp[0] == 0 && icmp[1] == 0 && /* echo reply, code 0 */
+           icmp[4] == (uint8_t)(id >> 8) && icmp[5] == (uint8_t)id &&
+           icmp[6] == (uint8_t)(seq >> 8) && icmp[7] == (uint8_t)seq;
 }
 
-static void mping_on_end(esp_ping_handle_t h, void *args)
+struct mping_route {
+    ip4_addr_t dst;
+    bool ok;
+};
+
+/* On lwIP's thread (esp_netif_tcpip_exec): lwIP has a route to dst, through a netif it holds and
+ * can send on. A netif brought up and made default without being added has no output function,
+ * and a packet routed to it jumps to address 0. */
+static esp_err_t mping_route_(void *arg)
 {
-    mping_ctx_t *c = (mping_ctx_t *)args;
-    esp_ping_get_profile(h, ESP_PING_PROF_REQUEST, &c->sent, sizeof(c->sent));
-    esp_ping_get_profile(h, ESP_PING_PROF_REPLY, &c->recv, sizeof(c->recv));
-    xSemaphoreGive(c->done);
+    struct mping_route *r = arg;
+    const struct netif *n = ip4_route(&r->dst);
+    r->ok = n != NULL && n->output != NULL && netif_get_by_index(netif_get_index(n)) == n;
+    return ESP_OK;
 }
 
 static void cmd_mping(char *args)
@@ -1330,45 +1387,108 @@ static void cmd_mping(char *args)
     if (count < 1 || count > 20) count = 4;
     char *ip_s = trim(args);
 
-    ip_addr_t target;
-    if (!ipaddr_aton(ip_s, &target)) {
+    struct mping_route route = { .ok = false };
+    char ip[IP4ADDR_STRLEN_MAX] = "";
+    char line[96];
+    if (!ip4addr_aton(ip_s, &route.dst)) {
         reply_error("usage: AT+MPING=<ipv4>[,<count 1-20>]");
         return;
     }
+    if (esp_netif_tcpip_exec(mping_route_, &route) != ESP_OK || !route.ok) {
+        (void)ip4addr_ntoa_r(&route.dst, ip, sizeof(ip));
+        snprintf(line, sizeof(line), "no route to %s", ip);
+        reply_error(line);
+        return;
+    }
 
-    static mping_ctx_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.done = xSemaphoreCreateBinary();
-
-    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
-    cfg.target_addr = target;
-    cfg.count = (uint32_t)count;
-    cfg.interval_ms = 1000;
-    cfg.timeout_ms = 1000;
-    cfg.data_size = 32;
-
-    esp_ping_callbacks_t cbs = {
-        .on_ping_success = mping_on_success,
-        .on_ping_timeout = mping_on_timeout,
-        .on_ping_end = mping_on_end,
-        .cb_args = &ctx,
-    };
-    esp_ping_handle_t h;
-    if (esp_ping_new_session(&cfg, &cbs, &h) != ESP_OK) {
-        vSemaphoreDelete(ctx.done);
+    /* One short receive timeout for the whole command: no recvfrom below waits longer, so every
+     * wait reads the clock again within MPING_POLL_MS, whatever else arrives on the socket. */
+    const int s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    const struct timeval tv = { .tv_sec = 0, .tv_usec = MPING_POLL_MS * 1000 };
+    if (s < 0 || setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+        if (s >= 0) {
+            close(s);
+        }
         reply_error("ping session");
         return;
     }
-    esp_ping_start(h);
-    xSemaphoreTake(ctx.done, pdMS_TO_TICKS((count + 2) * 1100));
-    esp_ping_delete_session(h);
-    vSemaphoreDelete(ctx.done);
 
-    char buf[96];
-    snprintf(buf, sizeof(buf), "+MPING: %lu sent, %lu received, %lu%% loss\r\n",
-             (unsigned long)ctx.sent, (unsigned long)ctx.recv,
-             ctx.sent ? (unsigned long)(100 * (ctx.sent - ctx.recv) / ctx.sent) : 100UL);
-    cdc_write(buf);
+    /* A new id each command, so the last one's late reply cannot pass for this one's. Random, not
+     * counted up from 1: NAPT hands an echo reply to a tethered host's ping that has the same id. */
+    static uint16_t s_last_id; /* AT task only */
+    uint16_t id = (uint16_t)esp_random();
+    if (id == s_last_id) {
+        id++;
+    }
+    s_last_id = id;
+
+    const struct sockaddr_in to = { .sin_family = AF_INET, .sin_addr.s_addr = route.dst.addr };
+    uint8_t tx[MPING_PKT_LEN], rx[MPING_RX_LEN];
+    uint32_t sent = 0, recvd = 0;
+    for (int seq = 1; seq <= count; seq++) {
+        /* Drop what queued up while nothing read the socket (a console write that waited, the end
+         * of the gap): it holds six packets, and the reply needs one of the slots. */
+        for (int i = 0; i < MPING_DRAIN_MAX; i++) {
+            if (recvfrom(s, rx, sizeof(rx), MSG_DONTWAIT, NULL, NULL) <= 0) {
+                break;
+            }
+        }
+        mping_build_(tx, id, (uint16_t)seq);
+        /* The next probe is due MPING_TIMEOUT_MS after this one starts, however long lwIP takes
+         * over the send: it can wait a second for the radio and then fail. */
+        const int64_t t_next = esp_timer_get_time() + (int64_t)MPING_TIMEOUT_MS * 1000;
+        const bool tx_ok = sendto(s, tx, sizeof(tx), 0, (const struct sockaddr *)&to, sizeof(to)) ==
+                           (ssize_t)sizeof(tx);
+        const int64_t t_tx = esp_timer_get_time();
+        const int64_t t_end = t_tx + (int64_t)MPING_TIMEOUT_MS * 1000;
+        int64_t now = t_tx;
+        bool got = false;
+        if (tx_ok) {
+            sent++;
+        }
+        /* The deadline is absolute: ICMP that is not our reply (a host pinging the board) is
+         * dropped here and the clock read again, so it cannot hold the probe open. */
+        while (tx_ok && !got && now < t_end) {
+            const int n = (int)recvfrom(s, rx, sizeof(rx), 0, NULL, NULL);
+            if (n < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
+                break; /* the socket failed: a lost probe, not a loop that never sleeps */
+            }
+            now = esp_timer_get_time();
+            got = n > 0 && mping_is_reply_(rx, (size_t)n, id, (uint16_t)seq);
+        }
+        if (got) {
+            ip4_addr_t src;
+            memcpy(&src, rx + 12, sizeof(src)); /* the IPv4 header's source address */
+            (void)ip4addr_ntoa_r(&src, ip, sizeof(ip));
+            recvd++;
+            snprintf(line, sizeof(line), "+MPING: reply from %s seq=%u time=%lums\r\n", ip, (unsigned)seq,
+                     (unsigned long)((now - t_tx) / 1000));
+        } else {
+            snprintf(line, sizeof(line), "+MPING: seq=%u timeout\r\n", (unsigned)seq);
+        }
+        cdc_write(line);
+        /* Until the next probe is due, keep reading: lwIP copies every ICMP datagram the board
+         * receives into this socket, whole and six deep, and holds each one until it is read. */
+        while (seq < count) {
+            const int64_t left_us = t_next - esp_timer_get_time();
+            if (left_us <= 0) {
+                break;
+            }
+            if (left_us >= (int64_t)MPING_POLL_MS * 1000 &&
+                (recvfrom(s, rx, sizeof(rx), 0, NULL, NULL) >= 0 || errno == EWOULDBLOCK || errno == EAGAIN)) {
+                continue;
+            }
+            /* Less than one receive timeout left, or the socket failed: sleep the rest. */
+            vTaskDelay(pdMS_TO_TICKS((uint32_t)((left_us + 999) / 1000)));
+            break;
+        }
+    }
+    close(s); /* before the summary: nothing of this command is left when the OK goes out */
+
+    snprintf(line, sizeof(line), "+MPING: %lu sent, %lu received, %lu%% loss\r\n",
+             (unsigned long)sent, (unsigned long)recvd,
+             sent ? (unsigned long)(100 * (sent - recvd) / sent) : 100UL);
+    cdc_write(line);
     reply_ok();
 }
 
@@ -1620,7 +1740,7 @@ static void cmd_meshcfg(void)
         .fwd = g_warthog_mesh_fwd != 0,
         /* The live bridge, not the stored flag: a failed start falls back to NAT. */
         .bridge_active = warthog_mesh_bridge_active(),
-        .bridge_stored = g_warthog_mesh_bridge != 0,
+        .bridge_stored = warthog_mesh_bridge_failed(),
         .bat_running = warthog_bat_port_running(),
         .bat_stored = warthog_cfg_get_mesh_batman() != 0,
         .bat_reason = bat_mode_reason_text((enum bat_mode_reason)warthog_bat_port_reason()),
@@ -2422,6 +2542,88 @@ static void cmd_stacks(void)
     reply_ok();
 }
 
+/* AT+HEAP?: internal RAM (free now, least ever free, largest free block, size), the PSRAM heap (the
+ * same without the least: IDF keeps none for a heap added after boot), allocations refused since the
+ * console started, and NAT's table. The least is IDF's low-water mark per heap region, summed. */
+static volatile uint32_t s_heap_fail_n, s_heap_fail_size, s_heap_fail_caps;
+
+/* Inside the allocator that just failed, on any task or interrupt handler: counts only. Two
+ * failures at once on two cores can lose one count. */
+static void IRAM_ATTR heap_fail_cb_(size_t size, uint32_t caps, const char *fn)
+{
+    (void)fn;
+    s_heap_fail_n = s_heap_fail_n + 1u;
+    s_heap_fail_size = (uint32_t)size;
+    s_heap_fail_caps = caps;
+}
+
+struct heapstat {
+    uint32_t in_free, in_min, in_largest, in_total;
+    uint32_t ext_state, ext_free, ext_largest, ext_total;
+    uint32_t fail_n, fail_size, fail_caps;
+    uint32_t napt_entries, napt_bytes, napt_on, napt_refused;
+};
+
+/* enum warthog_ext_ram, in its order. The glue guard runs it. */
+static const char *ext_ram_text_(uint32_t state)
+{
+    static const char *const t[] = { "off", "none", "ok", "bad" };
+    return state < sizeof(t) / sizeof(t[0]) ? t[state] : "?";
+}
+
+/* The glue guard runs it. */
+static int heap_lines_(char *buf, size_t len, const struct heapstat *s)
+{
+    return snprintf(buf, len,
+                    "+HEAP: internal free=%lu min=%lu largest=%lu total=%lu\r\n"
+                    "+HEAP: psram state=%s free=%lu largest=%lu total=%lu\r\n"
+                    "+HEAP: alloc_fail=%lu last_size=%lu last_caps=0x%lx\r\n"
+                    "+HEAP: napt entries=%lu bytes=%lu on=%lu refused=%lu\r\n",
+                    (unsigned long)s->in_free, (unsigned long)s->in_min, (unsigned long)s->in_largest,
+                    (unsigned long)s->in_total, ext_ram_text_(s->ext_state), (unsigned long)s->ext_free,
+                    (unsigned long)s->ext_largest, (unsigned long)s->ext_total, (unsigned long)s->fail_n,
+                    (unsigned long)s->fail_size, (unsigned long)s->fail_caps, (unsigned long)s->napt_entries,
+                    (unsigned long)s->napt_bytes, (unsigned long)s->napt_on, (unsigned long)s->napt_refused);
+}
+
+static void cmd_heap(void)
+{
+    const uint32_t in = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT; /* what pvPortMalloc and malloc draw on */
+    struct warthog_napt_stat napt;
+    warthog_nat_napt_stat(&napt);
+    const struct heapstat s = {
+        .in_free = (uint32_t)heap_caps_get_free_size(in),
+        .in_min = (uint32_t)heap_caps_get_minimum_free_size(in),
+        .in_largest = (uint32_t)heap_caps_get_largest_free_block(in),
+        .in_total = (uint32_t)heap_caps_get_total_size(in),
+        .ext_state = (uint32_t)warthog_ext_ram_state(),
+        .ext_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+        .ext_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+        .ext_total = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
+        .fail_n = s_heap_fail_n,
+        .fail_size = s_heap_fail_size,
+        .fail_caps = s_heap_fail_caps,
+        .napt_entries = napt.entries,
+        .napt_bytes = napt.bytes,
+        .napt_on = napt.on,
+        .napt_refused = napt.refused,
+    };
+    static char buf[352]; /* AT task only; 315 at its longest */
+    heap_lines_(buf, sizeof(buf), &s);
+    cdc_write(buf);
+    reply_ok();
+}
+
+/* AT+EXTRAM?: the stored switch, what this boot did with the PSRAM, and how long its test took. */
+static void cmd_extram_query(void)
+{
+    char line[64];
+    snprintf(line, sizeof(line), "+EXTRAM: %u state=%s test_ms=%lu\r\n", (unsigned)warthog_cfg_get_ext_ram(),
+             ext_ram_text_((uint32_t)warthog_ext_ram_state()), (unsigned long)warthog_ext_ram_test_ms());
+    cdc_write(line);
+    reply_ok();
+}
+
 /* AT+TXRATE: the rate override (mmwlan_ate_override_rate_control), RAM only; -1 none. */
 static int s_txrate_mcs = -1, s_txrate_bw = -1;
 
@@ -2593,7 +2795,7 @@ static void cmd_mcast_set(char *args)
     /* Must join AFTER the mesh netif has its 10.77.x.y address, which only
      * happens on first ESTAB; an IGMP join pinned to an address no netif owns
      * fails. */
-    esp_netif_t *halow = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_t *halow = halow_l3_netif_();
     esp_netif_ip_info_t ip = {0};
     if (!halow || esp_netif_get_ip_info(halow, &ip) != ESP_OK || ip.ip.addr == 0) {
         reply_error("halow netif not up (no ESTAB yet)"); return;
@@ -2761,21 +2963,42 @@ static void cmd_meshsec(char *args)
         reply_error("usage: AT+MESHSEC=<0 open|1 keyed>");
         return;
     }
-    g_warthog_mesh_secure = (a[0] == '1') ? 1u : 0u;
+    const uint32_t want = (a[0] == '1') ? 1u : 0u;
     /* Persist. Forgetting this across a reboot brings the node back peering
      * perfectly and carrying no data against an unencrypted peer, with nothing
-     * in any log to explain it. */
-    if (warthog_cfg_set_mesh_secure((uint8_t)g_warthog_mesh_secure) != ESP_OK)
+     * in any log to explain it. Before the live flag: a failed write changes
+     * nothing. */
+    if (warthog_cfg_set_mesh_secure((uint8_t)want) != ESP_OK)
     {
         reply_error("nvs write");
         return;
     }
-    /* Re-peer, or the change only applies to peers added from here on. Restart
-     * the peer's mesh too: a node holding an ESTAB link ignores a new Open. */
-    g_warthog_mesh_repeer_req = 1;
+    const bool changed = (want != g_warthog_mesh_secure);
+    g_warthog_mesh_secure = want;
+    const char *what = want ? "keyed" : "open";
     char buf[96];
-    snprintf(buf, sizeof(buf), "+MESHSEC: %s, stored, re-peering (~2s)\r\n",
-             g_warthog_mesh_secure ? "keyed" : "open");
+    if (warthog_bat_port_sae_build())
+    {
+        /* An SAE mesh never acts on this (AMPE keys every link) and its stations are hostap's:
+         * a re-peer would delete them behind its back, and it never re-adds one it holds. */
+        snprintf(buf, sizeof(buf),
+                 "+MESHSEC: %s, stored; no effect on this SAE build (keys come from AMPE)\r\n",
+                 what);
+    }
+    else if (!changed)
+    {
+        /* The live value was already this: its peers were added under it, or the re-peer
+         * that will re-add them is still pending. Another would only drop good links. */
+        snprintf(buf, sizeof(buf), "+MESHSEC: %s, stored; already set, no re-peer requested\r\n",
+                 what);
+    }
+    else
+    {
+        /* Re-peer, or the change only applies to peers added from here on. Restart
+         * the peer's mesh too: a node holding an ESTAB link ignores a new Open. */
+        g_warthog_mesh_repeer_req = 1;
+        snprintf(buf, sizeof(buf), "+MESHSEC: %s, stored, re-peering (~2s)\r\n", what);
+    }
     cdc_write(buf);
     reply_ok();
 }
@@ -3522,8 +3745,11 @@ static void dispatch(char *line)
             reply_ok();
         } else { reply_error("usage: AT+MESHBRIDGE=<0|1>"); }
     } else if (strcasecmp(verb, "MESHBRIDGE") == 0 && terminator == '?') {
-        char line[64];
-        snprintf(line, sizeof(line), "+MESHBRIDGE: %u\r\n", (unsigned)warthog_cfg_get_mesh_bridge());
+        static char line[160]; /* AT task only; off its stack */
+        int w = snprintf(line, sizeof(line), "+MESHBRIDGE: %u ", (unsigned)warthog_cfg_get_mesh_bridge());
+        /* The status returns what it wrote, so the line end always lands inside the buffer. */
+        w += warthog_mesh_bridge_status(line + w, sizeof(line) - 2 - (size_t)w);
+        memcpy(line + w, "\r\n", 3);
         cdc_write(line);
         reply_ok();
     } else if (strcasecmp(verb, "MESHDHCP") == 0 && terminator == '=') {
@@ -3870,6 +4096,21 @@ static void dispatch(char *line)
         cmd_cap_query(MMWLAN_CAP_TX);
     } else if (strcasecmp(verb, "STACKS") == 0 && terminator == '?') {
         cmd_stacks();
+    } else if (strcasecmp(verb, "HEAP") == 0 && terminator == '?') {
+        cmd_heap();
+    } else if (strcasecmp(verb, "EXTRAM") == 0 && terminator == '=') {
+        const char *a = trim(args);
+        if (strcmp(a, "0") != 0 && strcmp(a, "1") != 0) {
+            reply_error("usage: AT+EXTRAM=<0 leave the PSRAM unused|1 use it (default)>");
+        } else if (warthog_cfg_set_ext_ram((uint8_t)(a[0] - '0')) != ESP_OK) {
+            reply_error("nvs write failed");
+        } else {
+            cdc_write(a[0] == '1' ? "+EXTRAM: 1, stored; takes effect on next boot (AT+RESET)\r\n"
+                                  : "+EXTRAM: 0, stored; takes effect on next boot (AT+RESET)\r\n");
+            reply_ok();
+        }
+    } else if (strcasecmp(verb, "EXTRAM") == 0 && terminator == '?') {
+        cmd_extram_query();
     } else if (strcasecmp(verb, "TXRATE") == 0 && terminator == '=') {
         int mcs = -1, bw = -1;
         if (!txrate_parse_(trim(args), &mcs, &bw)) {
@@ -3978,6 +4219,7 @@ static void at_task(void *arg)
 
 esp_err_t warthog_at_start(void)
 {
+    (void)heap_caps_register_failed_alloc_callback(heap_fail_cb_); /* AT+HEAP? alloc_fail, from here on */
     /* AT+MESHCFG? leaves ~116 B of 4 KB on the IDF 5.5.6 build (AT+STACKS?), so 5 KB. */
     BaseType_t ok = xTaskCreatePinnedToCore(at_task, "warthog_at", 5120, NULL,
                                             tskIDLE_PRIORITY + 2, NULL, 0);

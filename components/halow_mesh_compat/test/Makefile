@@ -55,6 +55,8 @@ $(SIMNODE_TESTS): CFLAGS += -DWARTHOG_MESH_SAE=1
 include bat.mk
 # IDF's own lwIP with main/nat_frag.c: IP fragments, reassembly and NAPT.
 include lwip_napt.mk
+# IDF's own lwIP bridge (netif/bridgeif.c) as AT+MESHBRIDGE=1 builds it; shares lwip_napt.mk's package lookup.
+include lwip_bridge.mk
 # TinyUSB's own NCM/ECM class drivers with main/usbnet_core.c: one owner of the USB network class.
 include usbnet.mk
 FW           := ../../halow/components/mm-iot-sdk/framework
@@ -122,7 +124,7 @@ MESHIES := $(SDKMESH)/umac_mesh_ies.c
 MESHHDRS := $(wildcard $(SDKMESH)/*.h)
 
 .PHONY: all clean linkcheck freestanding region-bcf glueguard simnode-seamed flasher
-all: $(TESTS) linkcheck freestanding region-bcf glueguard flasher bat-freestanding bat-nostatic bat-registered simnode-seamed lwip-napt usbnet
+all: $(TESTS) linkcheck freestanding region-bcf glueguard flasher bat-freestanding bat-nostatic bat-registered simnode-seamed lwip-napt lwip-bridge usbnet
 	@echo "=== running host tests ==="
 	@fail=0; for t in $(TESTS); do echo "--- $$t ---"; ./$$t || fail=1; done; \
 	  if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
@@ -674,5 +676,5 @@ linkcheck: linkcheck_main.c $(DOT11AH) $(COMPAT)
 	@echo "link OK: dot11ah layer is self-contained"
 
 clean:
-	rm -f $(TESTS) $(LWIP_NAPT_TESTS) $(USBNET_TESTS) linkcheck_all libsimnode*.dylib libsimnode*.so test_chipvif_glue.fns test_chipvif_glue.fns.tmp test_sdio_start.fns test_sdio_start.fns.tmp test_cmd_status.fns test_cmd_status.fns.tmp
+	rm -f $(TESTS) $(LWIP_NAPT_TESTS) $(LWIP_BRIDGE_TESTS) $(USBNET_TESTS) linkcheck_all libsimnode*.dylib libsimnode*.so test_chipvif_glue.fns test_chipvif_glue.fns.tmp test_sdio_start.fns test_sdio_start.fns.tmp test_cmd_status.fns test_cmd_status.fns.tmp
 	rm -rf *.dSYM

@@ -8,8 +8,8 @@
  * The RX dispatch is the substantive part, and it owns two things the vendor
  * path cannot do:
  *   - PROBE_REQ is answered here: a peer in beaconless mode discovers by
- *     probing. On an open mesh receiving a probe also triggers our own peering
- *     Open, as a beacon does.
+ *     probing. On an open mesh a probe request naming our mesh also triggers
+ *     our own peering Open, as a beacon does.
  *   - ACTION category 15 (SELF_PROTECTED, i.e. Mesh Peering) is handled
  *     directly rather than through umac_datapath_process_rx_action_frame's
  *     supplicant fan-out, which expects hostap's mesh_mpm_action_rx and is
@@ -86,9 +86,6 @@ bool umac_mesh_peering_incomplete(const uint8_t *sa);
 extern volatile uint8_t g_warthog_s1g_bcn_sa[6];
 int umac_mesh_tx_probe_response(const uint8_t *da);
 void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len);
-void umac_mesh_maybe_initiate_mpm(const uint8_t *ta, int16_t rssi, bool floored);
-void umac_mesh_handle_probe_req_discovery(const uint8_t *ta, const uint8_t *ies,
-                                          uint32_t ies_len, int16_t rssi);
 
 /* --- RX management frame dispatch ---------------------------------------- */
 
@@ -182,25 +179,29 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
             const uint8_t *ta = dot11_get_ta(header);
             g_warthog_prsp_rx++;
             (void)umac_mesh_tx_probe_response(ta);
-            /* Also OPEN toward them: warthog<->warthog has no other initiator.
-             * Not under SAE -- there hostap's MPM owns the link, and two state
-             * machines opening the same peering race each other's link ids.
-             * Not floored: a weak warthog-only link forms from these probes. */
-            if (!umac_mesh_sae_active())
-            {
-                umac_mesh_maybe_initiate_mpm(ta, rssi, false);
-            }
-            /* Under SAE, a probe request naming our mesh is a beaconless
-             * peer announcing itself (its only advertisement) -- offer it to
+            /* Does it name our mesh? Under SAE such a request is a beaconless
+             * peer announcing itself (its only advertisement) -- offered to
              * hostap as a candidate. See umac_mesh_handle_probe_req_discovery. */
+            bool named = false;
             {
                 const uint8_t *pframe = (const uint8_t *)mmpkt_get_data_start(rxbufview);
                 uint32_t plen = mmpkt_get_data_length(rxbufview);
                 const uint32_t phdr = sizeof(struct dot11_hdr);
                 if (plen > phdr)
                 {
-                    umac_mesh_handle_probe_req_discovery(ta, pframe + phdr, plen - phdr, rssi);
+                    named = umac_mesh_handle_probe_req_discovery(ta, pframe + phdr, plen - phdr,
+                                                                 rssi);
                 }
+            }
+            /* Also OPEN toward them: warthog<->warthog has no other initiator.
+             * Not under SAE -- there hostap's MPM owns the link, and two state
+             * machines opening the same peering race each other's link ids.
+             * Not floored: a weak warthog-only link forms from these probes.
+             * Only toward a request that named our mesh: a scanner's, or another
+             * mesh's, gets that call's housekeeping and no Open. */
+            if (!umac_mesh_sae_active())
+            {
+                umac_mesh_maybe_initiate_mpm(ta, rssi, false, named);
             }
             break;
         }
@@ -226,7 +227,7 @@ static void process_rx_mgmt_frame_mesh(struct umac_data *umacd,
                 if (!umac_mesh_sae_active() &&
                     umac_mesh_ies_peer_openable(bframe + bhdr + 12u, blen - bhdr - 12u, false))
                 {
-                    umac_mesh_maybe_initiate_mpm(ta, rssi, true);
+                    umac_mesh_maybe_initiate_mpm(ta, rssi, true, true);
                 }
             }
             break;
@@ -3376,8 +3377,13 @@ void umac_datapath_mesh_service_rekey(void)
         /* Tear every link down, host and chip, and re-arm the peering. Used to
          * A/B the data-plane protection setting without a reflash. */
         g_warthog_mesh_repeer_req = 0;
-        umac_datapath_mesh_del_peer(NULL);
-        umac_mesh_reset_links();
+        /* Not under SAE: the stations are hostap's, which is not told they went, keeps
+         * each in ESTAB and never re-adds one it holds: every link dead until a reboot. */
+        if (!umac_mesh_sae_active())
+        {
+            umac_datapath_mesh_del_peer(NULL);
+            umac_mesh_reset_links();
+        }
     }
 
     uint32_t req = g_warthog_rekey_req;
@@ -3474,7 +3480,7 @@ void umac_mesh_handle_s1g_beacon(struct mmpktview *rxbufview)
         }
         else if (accepts)
         {
-            umac_mesh_maybe_initiate_mpm(sa, rssi, true); /* refuses, and counts, a weak one */
+            umac_mesh_maybe_initiate_mpm(sa, rssi, true, true); /* refuses, and counts, a weak one */
         }
     }
     else if (umac_mesh_reannounce_due(sa))
@@ -3488,6 +3494,6 @@ void umac_mesh_handle_s1g_beacon(struct mmpktview *rxbufview)
         /* Known peer, handshake unfinished: retransmit the Open only. NOT the
          * probe response -- that is what restarts the peer's FSM. */
         g_warthog_s1g_bcn_retry++;
-        umac_mesh_maybe_initiate_mpm(sa, rssi, true);
+        umac_mesh_maybe_initiate_mpm(sa, rssi, true, true);
     }
 }

@@ -1,6 +1,7 @@
 /* IP fragments through IDF's own lwIP (esp-lwip from the PlatformIO ESP-IDF package the firmware
  * links: ip4.c, ip4_frag.c, ip4_napt.c, icmp.c, udp.c), built for the host and wired as main/nat.c
- * wires it: NAPT on the USB and AP netifs, HaLow (or bat0) the default route without it. Each case
+ * wires it: NAPT on the USB and AP netifs, enabled before the outside has an address, HaLow (or bat0)
+ * the default route without it. Each case
  * cuts a whole datagram as its sender would, feeds the fragments to ip4_input as the firmware's
  * drivers hand them over (a PBUF_REF pbuf over a radio RX block or a batman delivery, as
  * esp_pbuf_allocate makes it) and reassembles what lwIP sends out of each netif. tcpip_inpkt is the
@@ -727,6 +728,45 @@ static void flood(void)
           HOOK ? " (10 heap copies, IP_REASS_MAX_PBUFS)" : "");
 }
 
+/* The table holds IP_NAPT_MAX sessions (lwip/lwip_napt.h's own: 512, for one USB host and four AP
+ * clients). One more makes lwIP drop the session idle longest, and is itself translated. */
+static void table_full(void)
+{
+    u8_t b[64], u[8 + 4];
+    u16_t first = 0, last = 0, l, dl;
+    unsigned made = 0;
+    tick(1900); /* every earlier session has timed out, an open TCP one after 30 min */
+    for (unsigned i = 0; i <= IP_NAPT_MAX; i++) {
+        clear();
+        now_ms += 1; /* so "idle longest" has one answer; IP_NAPT_MAX + 1 ms in all, under UDP's 2 s */
+        l = udp_build(u, (u16_t)(20000 + i), 5353, 4, HOST, PI);
+        dl = ip_build(b, HOST, PI, IP_PROTO_UDP, (u16_t)(0x2000 + i), u, l);
+        inject(b, dl, &usb);
+        last = napted_port(); /* 0 unless exactly one packet left by HaLow */
+        if (last == 0 || ((const struct ip_hdr *)cap_halow.pkt[0].b)->src.addr != WH) {
+            break;
+        }
+        if (i == 0) {
+            first = last;
+        }
+        made++;
+    }
+    CHECK(made == (unsigned)IP_NAPT_MAX + 1u, "host -> Pi, %u UDP sessions in a row: every one NAPTed (%u were)",
+          (unsigned)IP_NAPT_MAX + 1u, made);
+    clear();
+    l = udp_build(u, 5353, lwip_ntohs(first), 4, PI, WH);
+    dl = ip_build(b, PI, WH, IP_PROTO_UDP, 0x2f00, u, l);
+    inject(b, dl, &halow);
+    CHECK(cap_usb.n == 0, "the table full: the session idle longest was dropped to make room");
+    clear();
+    l = udp_build(u, 5353, lwip_ntohs(last), 4, PI, WH);
+    dl = ip_build(b, PI, WH, IP_PROTO_UDP, 0x2f01, u, l);
+    inject(b, dl, &halow);
+    CHECK(cap_usb.n == 1 && ((const struct ip_hdr *)cap_usb.pkt[0].b)->dest.addr == HOST,
+          "and the newest session is translated back to the host");
+    tick(5);
+}
+
 int main(void)
 {
     HOST = A(192, 168, 4, 2);
@@ -769,9 +809,38 @@ int main(void)
     CHECK(live_allocs == base0 && drv_out == 0, "NAPT off: every lwIP allocation (%ld outstanding) and driver buffer (%d) returned",
           live_allocs - base0, drv_out);
 
-    /* main/nat.c: NAPT on the inside netifs; HaLow the default route. */
-    ip_napt_enable_netif(&usb, 1);
-    ip_napt_enable_netif(&ap, 1);
+    /* main/nat.c: NAPT on the inside netifs from boot, before HaLow (or bat0) has an address; HaLow
+     * the default route once it has one. The first enable takes lwIP's two tables. */
+    {
+        ip4_addr_t none, wh;
+        ip4_addr_set_zero(&none);
+        wh.addr = WH;
+        netif_set_ipaddr(&halow, &none);
+        const long b0 = live_bytes, n0 = live_allocs;
+        max_alloc = 0;
+        ip_napt_enable_netif(&usb, 1);
+        const long rest = live_bytes - b0 - max_alloc; /* the port map and one lwIP timer */
+        CHECK(max_alloc == (long)IP_NAPT_MAX * 32 && rest >= (long)IP_PORTMAP_MAX * 16 &&
+              rest < (long)IP_PORTMAP_MAX * 16 + 64 && live_allocs - n0 == 3,
+              "the first NAPT enable allocates %d x 32 and %d x 16 bytes, the sizes main/nat.c asks the heap for "
+              "(%ld, then %ld, in %ld blocks)", (int)IP_NAPT_MAX, (int)IP_PORTMAP_MAX, max_alloc, rest,
+              live_allocs - n0);
+        ip_napt_enable_netif(&ap, 1);
+        CHECK(live_allocs - n0 == 3, "the second netif's enable allocates nothing");
+
+        /* Source port 50100 is inside lwIP's NAPT port range, so a session would keep it as its mapped port. */
+        clear();
+        u16_t ul = udp_build(l4, 50100, 5353, 20, HOST, PI);
+        u16_t ud = ip_build(dg, HOST, PI, IP_PROTO_UDP, 0x1f0, l4, ul);
+        inject(dg, ud, &usb);
+        CHECK(nothing_out(), "NAPT on, HaLow at 0.0.0.0: host -> Pi UDP goes nowhere (no route)");
+        netif_set_ipaddr(&halow, &wh);
+        clear();
+        ul = udp_build(l4, 5353, 50100, 20, PI, WH);
+        ud = ip_build(dg, PI, WH, IP_PROTO_UDP, 0x1f1, l4, ul);
+        inject(dg, ud, &halow);
+        CHECK(cap_usb.n == 0, "and it made no session: the Pi's packet to that port is not sent to the host");
+    }
     tick(2);
     const long base = live_allocs;
 
@@ -785,6 +854,7 @@ int main(void)
     group_frag(A(224, 0, 0, 1), "224.0.0.1", 0x812);
     group_frag(A(192, 168, 4, 255), "the USB subnet's broadcast, in on HaLow", 0x813);
     flood();
+    table_full();
 
     /* Between two NAPT netifs (USB host to AP host) NAPT does nothing: fragments go as they came. */
     clear();

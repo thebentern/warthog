@@ -1901,6 +1901,125 @@ static void t_leaf_proxy_sweep(void)
           "2^31 ms after its expiry, H2 does not come back behind A");
 }
 
+/* ---- bridge mode (AT+MESHBRIDGE=1, forwarding off): a tethered host's DHCP exchange ----
+ *
+ * The frames lwIP's bridge hands the mesh netif, and takes from it, when a host behind us asks the
+ * mesh's DHCP server for a lease (main/mesh_bridge.c): the host's broadcast leaves as one AE-2
+ * replica per peer naming the host; the server's unicast answer is delivered to the host's own MAC,
+ * so the bridge's FDB finds its port; the host's unicast names both ends; a peer's standard
+ * broadcast for a host behind it is delivered as that host's; and our own broadcast for the host,
+ * reflected by a relay, is never delivered (the bridge would learn the host on the mesh port). */
+static void t_bridge_host_dhcp_shapes(void)
+{
+    printf("--- bridge mode: a host behind us asks the mesh for a lease ---\n");
+    fresh(/*fwd=*/false, /*bridge=*/true, /*grp_std=*/false);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    uint8_t frame[256];
+
+    /* 1. The host's DISCOVER: a broadcast whose 802.3 source is the host. */
+    CHECK(simnode_host_tx(BC, H, PAY, sizeof(PAY)), "the bridge hands down host H's broadcast");
+    CHECK(simnode_outbox_count() == 2, "two peers, two replicas (got %u)", simnode_outbox_count());
+    const struct simnode_frame *fa = frame_to(A);
+    const struct simnode_frame *fc = frame_to(C);
+    const bool whole = fa != NULL && fc != NULL && fa->len == 58u + sizeof(PAY) && fc->len == fa->len;
+    CHECK(whole, "one for each peer, each with an 18-octet Mesh Control");
+    if (whole) {
+        CHECK(MAC_EQ(&fa->bytes[4], A) && MAC_EQ(&fa->bytes[16], A) && MAC_EQ(&fc->bytes[4], C) &&
+                  MAC_EQ(&fc->bytes[16], C), "[4]/[16] addr1 and addr3 are that peer");
+        CHECK(MAC_EQ(&fa->bytes[24], W) && MAC_EQ(&fc->bytes[24], W),
+              "[24] addr4 = us: the mesh source is the node, not the host");
+        CHECK(fa->bytes[32] == UMAC_MESH_CTRL_AE_A5A6 && fc->bytes[32] == UMAC_MESH_CTRL_AE_A5A6,
+              "[32] AE mode 2 (got %02x, %02x)", fa->bytes[32], fc->bytes[32]);
+        CHECK(MAC_EQ(&fa->bytes[38], BC) && MAC_EQ(&fc->bytes[38], BC),
+              "[38] AE address 1 = the broadcast address the host sent to");
+        CHECK(MAC_EQ(&fa->bytes[44], H) && MAC_EQ(&fc->bytes[44], H),
+              "[44] AE address 2 = H: a peer learns the host behind us from it");
+        CHECK(rd32le(&fa->bytes[34]) == rd32le(&fc->bytes[34]),
+              "both replicas carry one sequence number (%lu / %lu)",
+              (unsigned long)rd32le(&fa->bytes[34]), (unsigned long)rd32le(&fc->bytes[34]));
+    }
+
+    /* 2. The server's OFFER: a unicast from H2 behind A to H behind us. */
+    simnode_outbox_clear();
+    simnode_host_rx_clear();
+    struct umac_mesh_ctrl mc = { .flags = UMAC_MESH_CTRL_AE_A5A6, .ttl = 31, .seq = 8000 };
+    memcpy(mc.eaddr1, H, 6);
+    memcpy(mc.eaddr2, H2, 6);
+    uint16_t n = mk_uni(frame, W, A, W, A, &mc, PAY, sizeof(PAY));
+    CHECK(simnode_rx(frame, n, -60), "A sends H2's answer, addressed to H behind us");
+    CHECK(simnode_host_rx_count() == 1 && simnode_outbox_count() == 0,
+          "delivered once, nothing on air (%u delivered, %u on air)", simnode_host_rx_count(),
+          simnode_outbox_count());
+    const struct simnode_hostrx *r = simnode_host_rx_get(0);
+    CHECK(r != NULL && MAC_EQ(r->da, H) && MAC_EQ(r->sa, H2),
+          "to the bridge with DA = H and SA = H2: its FDB sends it out of the host's port");
+
+    /* 3. The host's unicast to the server it has now heard from. */
+    simnode_outbox_clear();
+    CHECK(simnode_host_tx(H2, H, PAY, sizeof(PAY)), "host H sends to H2");
+    CHECK(simnode_outbox_count() == 1, "one frame (got %u)", simnode_outbox_count());
+    const struct simnode_frame *f = simnode_outbox_get(0);
+    CHECK(f != NULL && f->len == 58u + sizeof(PAY) && MAC_EQ(&f->bytes[4], A) && MAC_EQ(&f->bytes[16], A) &&
+              MAC_EQ(&f->bytes[24], W) && f->bytes[32] == UMAC_MESH_CTRL_AE_A5A6 && MAC_EQ(&f->bytes[38], H2) &&
+              MAC_EQ(&f->bytes[44], H),
+          "to A, the node H2 was learned behind, AE 2 naming H2 and H");
+
+    /* 4. A peer's standard broadcast for a host behind it: what a Linux node sends. */
+    simnode_outbox_clear();
+    simnode_host_rx_clear();
+    struct umac_mesh_ctrl mg = { .flags = UMAC_MESH_CTRL_AE_A4, .ttl = 31, .seq = 8001 };
+    memcpy(mg.eaddr1, H2, 6);
+    n = mk_grp(frame, BC, A, A, &mg, PAY, sizeof(PAY));
+    CHECK(simnode_rx(frame, n, -60), "A broadcasts for H2 as a standard group frame (AE 1)");
+    r = simnode_host_rx_get(0);
+    CHECK(simnode_host_rx_count() == 1 && r != NULL && MAC_EQ(r->da, BC) && MAC_EQ(r->sa, H2),
+          "delivered as a broadcast from H2 (%u delivered)", simnode_host_rx_count());
+    CHECK(simnode_outbox_count() == 0, "and not relayed: a bridge without AT+MESHFWD never relays (got %u)",
+          simnode_outbox_count());
+
+    /* 5. Our own broadcast for H coming back from a relay, in either shape. */
+    simnode_outbox_clear();
+    simnode_host_rx_clear();
+    struct umac_mesh_ctrl mo = { .flags = UMAC_MESH_CTRL_AE_A5A6, .ttl = 30, .seq = 8002 };
+    memcpy(mo.eaddr1, BC, 6);
+    memcpy(mo.eaddr2, H, 6);
+    n = mk_uni(frame, W, C, W, W, &mo, PAY, sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    CHECK(simnode_host_rx_count() == 0 && simnode_outbox_count() == 0,
+          "our own replica for H, relayed back by C, is not delivered (%u delivered, %u on air)",
+          simnode_host_rx_count(), simnode_outbox_count());
+    struct umac_mesh_ctrl ms = { .flags = UMAC_MESH_CTRL_AE_A4, .ttl = 30, .seq = 8003 };
+    memcpy(ms.eaddr1, H, 6);
+    n = mk_grp(frame, BC, C, W, &ms, PAY, sizeof(PAY));
+    (void)simnode_rx(frame, n, -60);
+    CHECK(simnode_host_rx_count() == 0 && simnode_outbox_count() == 0,
+          "nor is our own standard group frame for H, re-flooded by C (%u delivered, %u on air)",
+          simnode_host_rx_count(), simnode_outbox_count());
+
+    /* 6. AT+MESHGRP=1: the host's broadcast is one standard group frame, the host in AE 1. */
+    fresh(/*fwd=*/false, /*bridge=*/true, /*grp_std=*/true);
+    (void)simnode_add_peer(A);
+    (void)simnode_add_peer(C);
+    CHECK(simnode_host_tx(BC, H, PAY, sizeof(PAY)), "AT+MESHGRP=1: the bridge hands down host H's broadcast");
+    CHECK(simnode_outbox_count() == 1, "one transmission for both peers (got %u)", simnode_outbox_count());
+    f = simnode_outbox_get(0);
+    if (f != NULL && f->len != 46u + sizeof(PAY)) { hexdump("frame", f->bytes, f->len); }
+    CHECK(f != NULL && f->len == 46u + sizeof(PAY),
+          "24 MAC + 2 QoS + 12 Mesh Control (AE 1) + 8 SNAP + %u payload = %u bytes (got %u)",
+          (unsigned)sizeof(PAY), (unsigned)(46u + sizeof(PAY)), f != NULL ? f->len : 0u);
+    if (f != NULL && f->len == 46u + sizeof(PAY)) {
+        CHECK(f->bytes[0] == 0x88 && f->bytes[1] == 0x02, "[0..1] a 3-address group frame (got %02x%02x)",
+              f->bytes[1], f->bytes[0]);
+        CHECK(MAC_EQ(&f->bytes[4], BC) && MAC_EQ(&f->bytes[10], W) && MAC_EQ(&f->bytes[16], W),
+              "[4] the group address, [10] and [16] us: transmitter and mesh source");
+        CHECK(f->bytes[26] == UMAC_MESH_CTRL_AE_A4, "[26] AE mode 1 (got %02x)", f->bytes[26]);
+        CHECK(MAC_EQ(&f->bytes[32], H), "[32] AE address 1 = H, the host the broadcast is from");
+        CHECK(memcmp(&f->bytes[38], SNAP_IPV4, sizeof(SNAP_IPV4)) == 0 &&
+                  memcmp(&f->bytes[46], PAY, sizeof(PAY)) == 0, "[38] SNAP, [46] the payload");
+    }
+}
+
 int main(void)
 {
     printf("=== simnode datapath: the real TX and RX path, header construction "
@@ -1929,6 +2048,7 @@ int main(void)
     t_rx_group_deliver_and_forward();
     t_rx_replica_normalise();
     t_rx_proxied_endpoints();
+    t_bridge_host_dhcp_shapes();
     t_rx_drops();
     t_rx_not_ours();
     t_rx_mgmt_not_ours();

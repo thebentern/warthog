@@ -110,6 +110,9 @@ extern volatile uint32_t g_warthog_mpm_estab;
 extern volatile uint32_t g_warthog_mpm_no_slot;
 extern volatile uint32_t g_warthog_mpm_expired;
 extern volatile uint32_t g_warthog_mpm_close_tx;
+/* Opens and Confirms refused for another mesh profile (open mesh); probe responses naming
+ * another Mesh ID, kept from hostap (SAE). AT+MPMSTAT? foreign=; storage in main/at.c. */
+extern volatile uint32_t g_warthog_mpm_foreign;
 extern volatile uint32_t g_warthog_hwmp_rx, g_warthog_hwmp_preq_rx, g_warthog_hwmp_preq_tx;
 extern volatile uint32_t g_warthog_hwmp_prep_tx, g_warthog_hwmp_parse_fail, g_warthog_hwmp_not_ours;
 extern volatile uint32_t g_warthog_hwmp_prep_rx, g_warthog_hwmp_rann_rx, g_warthog_hwmp_perr_rx;
@@ -1162,7 +1165,9 @@ static bool ies_name_our_mesh_(const uint8_t *ies, size_t len)
     return false;
 }
 
-void umac_mesh_handle_probe_req_discovery(const uint8_t *ta, const uint8_t *ies,
+/* @returns whether the request named our mesh: on an open mesh, what lets the caller open
+ * toward its sender. */
+bool umac_mesh_handle_probe_req_discovery(const uint8_t *ta, const uint8_t *ies,
                                           uint32_t ies_len, int16_t rssi)
 {
     extern volatile uint8_t g_warthog_prq_frame[96];
@@ -1170,6 +1175,7 @@ void umac_mesh_handle_probe_req_discovery(const uint8_t *ta, const uint8_t *ies,
     extern volatile uint8_t g_warthog_prq_ta[6];
     extern volatile uint32_t g_warthog_prq_named;
     extern volatile uint32_t g_warthog_prq_offer;
+    extern volatile uint32_t g_warthog_prq_other;
 
     uint32_t cap = ies_len > 96u ? 96u : ies_len;
     memcpy((void *)g_warthog_prq_frame, ies, cap);
@@ -1178,18 +1184,27 @@ void umac_mesh_handle_probe_req_discovery(const uint8_t *ta, const uint8_t *ies,
 
     if (!ies_name_our_mesh_(ies, ies_len))
     {
-        return;
+        /* A Mesh ID that is not ours: how a mesh-ID mismatch is heard (AT+PRSPSTAT?
+         * prq_other). A scanner's wildcard probe carries none and is not counted. */
+        if (s_mesh_args_valid &&
+            umac_mesh_ies_other_mesh_id(ies, ies_len, s_mesh_args.mesh_id,
+                                        s_mesh_args.mesh_id_len))
+        {
+            g_warthog_prq_other++;
+        }
+        return false;
     }
     /* Counted on an open mesh too: the no-peers diagnosis reads it as audible. */
     g_warthog_prq_named++;
     if (!umac_mesh_sae_active())
     {
-        return;
+        return true;
     }
     if (offer_synthetic_(ta, rssi, true))
     {
         g_warthog_prq_offer++;
     }
+    return true;
 }
 
 /* Offer @p ta with our own discovery IEs standing in for its advertisement,
@@ -2332,10 +2347,13 @@ void umac_mesh_handle_hwmp(const uint8_t *body, uint16_t len, const uint8_t *ta,
  * Driven off the peer's probe request (every 2 s), which doubles as the
  * retransmit timer -- MPM tolerates duplicate Opens.
  * @p floored: a first Open needs @p rssi above the floor. Beacons pass true; a
- * probe request passes false, so a weak warthog-only link still forms. */
+ * probe request passes false, so a weak warthog-only link still forms.
+ * @p named: the frame named our mesh. A probe request that did not gets the
+ * housekeeping below and nothing else: no link, no Open, and no liveness for a
+ * link its sender holds. */
 static bool rssi_admit_(int16_t rssi, bool named);
 
-void umac_mesh_maybe_initiate_mpm(const uint8_t *ta, int16_t rssi, bool floored)
+void umac_mesh_maybe_initiate_mpm(const uint8_t *ta, int16_t rssi, bool floored, bool named)
 {
     if (s_mesh_umacd == NULL || !s_mesh_args_valid || ta == NULL)
     {
@@ -2371,6 +2389,11 @@ void umac_mesh_maybe_initiate_mpm(const uint8_t *ta, int16_t rssi, bool floored)
         }
     }
 
+    /* A scanner's wildcard probe request, or another mesh's: nothing of ours starts on it. */
+    if (!named)
+    {
+        return;
+    }
     /* Held off (it said full, or no entry could note another refusal), or a beacon
      * heard only at the RSSI floor: start nothing. Its own Open still gets in. */
     if (mpm_table_find(&s_mpm, ta) == NULL &&
@@ -2437,6 +2460,25 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
     }
 
     g_warthog_mpm_rx++;
+    /* 802.11s peers only inside one mesh profile. An Open or Confirm naming another Mesh ID
+     * or Mesh Configuration creates nothing here and does not keep a link alive. (A Close is
+     * not tested: hostap's and mac80211's carry no Mesh Configuration, and it only removes.) */
+    if ((action == MPM_ACTION_OPEN || action == MPM_ACTION_CONFIRM) &&
+        (!s_mesh_args_valid ||
+         !umac_mesh_ies_mpm_matches(body, len, s_mesh_args.mesh_id, s_mesh_args.mesh_id_len,
+                                    s_mesh_args.security_type == MMWLAN_SAE)))
+    {
+        g_warthog_mpm_foreign++;
+        /* As mac80211's OPN_RJCT: tell a stranger why, citing its link id. A sender we hold
+         * a link with gets silence: a peer in ESTAB takes any Close as the end of the link. */
+        if (action == MPM_ACTION_OPEN && peer_llid != 0 && mpm_table_find(&s_mpm, ta) == NULL &&
+            mesh_tx_mpm_(ta, MPM_ACTION_CLOSE, 0, peer_llid, UMAC_MESH_REASON_CONFIG, 0) ==
+                MMWLAN_SUCCESS)
+        {
+            g_warthog_mpm_close_tx++;
+        }
+        return;
+    }
     {
         struct mpm_link *heard = mpm_table_find(&s_mpm, ta);
         if (heard != NULL)
@@ -2597,7 +2639,9 @@ void umac_mesh_handle_mpm(const uint8_t *ta, const uint8_t *body, uint32_t len)
         if (umac_mesh_ies_get_close_reason(body, len, &reason))
         {
             g_warthog_mpm_close_reason = reason;
-            if (reason == UMAC_MESH_REASON_MAX_PEERS)
+            /* Only a neighbour we opened toward can have refused us: there are four
+             * hold-off entries, and with all four live nobody new is opened toward. */
+            if (reason == UMAC_MESH_REASON_MAX_PEERS && mpm_table_find(&s_mpm, ta) != NULL)
             {
                 mpm_table_refuse(&s_mpm, ta, (uint32_t)mmosal_get_time_ms(),
                                  MPM_REFUSED_HOLDOFF_MS);
@@ -2746,8 +2790,8 @@ bool umac_mesh_sae_active(void)
  * Answer the first beacon from each linked peer, then stay quiet and let the
  * ordinary MPM path retransmit. A neighbour we will not open toward gets no
  * link from its beacons; umac_mesh_unopenable_answer_due() rate-limits its
- * answers instead. Its probe requests can still draw one, which another
- * node's Open then takes.
+ * answers instead. Its probe requests naming our mesh can still draw one,
+ * which another node's Open then takes.
  * Under SAE s_mpm stays empty, so every beacon is a "first sight", and each one
  * heard above the RSSI floor gets a probe response: that is how a full node's
  * slot-holders hear they are accepted.
@@ -2845,7 +2889,20 @@ static void offer_sae_(const uint8_t *addr, const uint8_t *ies, size_t ies_len, 
 void umac_mesh_offer_sae_candidate(const uint8_t *addr, const uint8_t *ies, size_t ies_len,
                                    int16_t rssi)
 {
-    offer_sae_(addr, ies, ies_len, rssi, ies_name_our_mesh_(ies, ies_len));
+    /* Another mesh's node is no candidate: hostap would spend a station, a slot and an SAE
+     * attempt on it, and its own MPM refuses the peering anyway (matches_local). Counted
+     * only when it names another mesh: an access point's answer carries no Mesh ID. */
+    if (!ies_name_our_mesh_(ies, ies_len))
+    {
+        if (s_mesh_args_valid &&
+            umac_mesh_ies_other_mesh_id(ies, (uint32_t)ies_len, s_mesh_args.mesh_id,
+                                        s_mesh_args.mesh_id_len))
+        {
+            g_warthog_mpm_foreign++;
+        }
+        return;
+    }
+    offer_sae_(addr, ies, ies_len, rssi, true);
 }
 
 /* Free @p addr's slot and hold it off, so a neighbour that never finishes
