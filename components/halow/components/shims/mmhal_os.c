@@ -37,6 +37,16 @@ void mmhal_init(void)
      * hardware configuration. */
     warthog_chip_hold_reset();
 
+#if CONFIG_MM_POWER_ENABLE >= 0
+    const gpio_config_t power = {
+        .pin_bit_mask = 1ull << CONFIG_MM_POWER_ENABLE,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    /* Bring up the supply with RESET_N low before the WLAN transport starts. */
+    gpio_set_level(CONFIG_MM_POWER_ENABLE, 1);
+    gpio_config(&power);
+#endif
+
     /* Initialise the gpio ISR handler service. This allows per-pin GPIO interrupt handlers and is
      * what is used to register all the wlan related interrupt. */
     gpio_install_isr_service(0);

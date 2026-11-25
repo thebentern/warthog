@@ -5,12 +5,11 @@ this hardware are power, DNS, or a mismatch that produces no error at all.
 
 ## The board resets at random
 
-Almost always power. The Seeed HaLow add-on feeds the radio PA from USB VBUS
-through ~20 µF, and the PA's turn-on inrush collapses the rail. Fit a
-470–1000 µF low-ESR capacitor across the XIAO's 5V and GND pads.
-
-Rule this out before debugging anything else — it presents as firmware
-instability.
+On a XIAO with the Seeed HaLow add-on, check power first. The add-on feeds the
+radio PA from USB VBUS through about 20 µF, and the turn-on current can bring
+down the rail. Fit a 470–1000 µF low-ESR capacitor across the XIAO's 5V and
+GND pads. On a RadioCore RC32-68, confirm you flashed the image for its band.
+[Board environments](Quick-Start#3-choose-a-build)
 
 In mesh mode a HaLow chip restart (a failed chip health check) reloads the
 chip and puts the mesh back instead of resetting the board: measured on air on
@@ -204,6 +203,8 @@ overflow, so after a run read `AT+ASSERT?` `reset=` and `AT+COREDUMP?` too.
 
 ## Console works, HaLow is silent
 
+Example from a XIAO with an invalid stored region.
+
 ```
 AT+REGION?
 +REGION: running=none next_boot=none stored=invalid('u$')
@@ -213,7 +214,8 @@ AT+REGION?
 
 `radio held:` means the HaLow chip is kept in reset: the stored region is not a
 valid code, or is not offered by this image. USB, the AP and the console run.
-Store an offered country with `AT+REGION=<CC>`, then `AT+RESET`. With mesh on,
+Store a region from the board's `allowed=` list with `AT+REGION=<CC>`, then
+`AT+RESET`. With mesh on,
 `radio held: mesh is on and the region has no default mesh channel` needs
 `AT+MESHCHAN=` set to a row of the region's table, or `AT+MESHEN=0`.
 
@@ -233,8 +235,9 @@ last attempt's `mmwlan_status`. The boot console (USB-Serial-JTAG, before the
 hand-off to USB-OTG) shows `mmwlan_boot attempt <n>/3 failed - <status>` and
 `radio down: the chip did not boot`.
 
-- A chip that never answers fails every attempt: check that the add-on is
-  seated and the capacitor fitted ([above](#the-board-resets-at-random)).
+- A chip that never answers fails every attempt. Confirm the environment is
+  for your hardware. On the XIAO, check that the add-on is seated and the
+  capacitor fitted. [Board environments](Quick-Start#3-choose-a-build)
 - `AT+RESET` tries again; a power cycle also resets the chip from power-on.
 - `boot_attempts=1` with `boot_status=4` (`CHANNEL_LIST_NOT_SET`) or `2`
   (`INVALID_ARGUMENT`) is not a chip fault and is not retried: read
@@ -638,7 +641,7 @@ in `AT+SWCCMP?`.
 | Reading | Meaning |
 |---|---|
 | `delivered` flat in `AT+DATASTAT?` while traffic runs | Real. It counts every data frame handed to the network stack, on every delivery path; flat means none is. |
-| `rx_data=0` in `AT+DATASTAT?` | Expected on `warthog-station`, which lacks `WARTHOG_MESH_RX_TAP`. On `warthog-mesh-smoke` and the `warthog-mesh-sae*` builds it counts every data frame the chip hands up and climbs with traffic. |
+| `rx_data=0` in `AT+DATASTAT?` | Expected on the station builds for the XIAO and RadioCore. The `warthog-mesh-*` builds enable `WARTHOG_MESH_RX_TAP`, which counts every data frame the chip hands up. |
 | `parse_fail` climbing on `AT+HWMPSTAT?` | Real. Investigate with `AT+HWMPDUMP?`. |
 
 ## Build fails on the first build after a HaLow component update

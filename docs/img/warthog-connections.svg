@@ -55,7 +55,7 @@
   <text x="600" y="295" text-anchor="middle" font-size="13">MM6108 · HaLow</text>
   <path d="M676 290h27v-21 M703 269v-29" class="wire" stroke="#67b8f0" stroke-width="3"/>
   <text x="600" y="343" text-anchor="middle" font-size="26" font-weight="750">Warthog</text>
-  <text x="600" y="369" text-anchor="middle" class="sub">XIAO ESP32-S3 + HaLow module</text>
+  <text x="600" y="369" text-anchor="middle" class="sub">ESP32-S3 + Wi-Fi HaLow</text>
   <text x="600" y="400" text-anchor="middle" font-size="13" fill="#92c9a5" style="fill:#92c9a5">USB + Wi-Fi together · NAT by default</text>
   <!-- Access point -->
   <rect x="904" y="65" width="256" height="188" rx="12" fill="#233244" stroke="#465b72"/>

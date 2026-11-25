@@ -15,7 +15,8 @@ macOS, Linux, Windows 10+ and iOS/iPadOS all bind with an in-box driver.
 
 ## What the host sees
 
-Warthog presents **CDC-NCM** (CDC-ECM in the `warthog-station-ecm` build) and serves DHCP on it.
+The XIAO and RadioCore station builds present **CDC-NCM** and serve DHCP on it.
+The XIAO also has a CDC-ECM build, `warthog-station-ecm`.
 
 | | |
 |---|---|

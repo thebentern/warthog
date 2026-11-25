@@ -4,8 +4,12 @@ Bring-up flow for a fresh board. Each step has a clear pass signal — stop and 
 
 ## 1. Build + flash
 
+Select the station environment for your board and enter download mode.
+[Board environments and buttons](Quick-Start#3-choose-a-build)
+
 ```bash
-pio run -e warthog-station -t upload    # hold BOOT, tap RESET, release BOOT first
+warthog_env=warthog-heltec-rc32-68  # Example for the 915 MHz RadioCore
+pio run -e "$warthog_env" -t upload
 ```
 
 ## 2. USB-Serial-JTAG boot logs (~1 s window before USB-OTG takes over)
@@ -20,7 +24,9 @@ scripts/watch.sh
 
 `watch.sh` automatically reattaches to the new `/dev/cu.usbmodemXXXX` port.
 
-✅ Expected: stable port (no cycling back to the JTAG `usbmodem101`). LED enters the HaLow-state pattern with a 100 ms wink every 2 s once macOS opens the CDC.
+✅ Expected: a stable port. On the XIAO, the LED enters the HaLow-state pattern
+with a 100 ms wink every 2 s once macOS opens the CDC. On the RadioCore, check
+the radio state with `AT+RADIO?`.
 
 ## 4. USB Ethernet adapter
 
@@ -77,9 +83,11 @@ curl -s -o /dev/null -w "%{http_code}\n" https://example.com   # proves DNS too
 
 ⚠️ If `ping` works but `curl` hangs, the DHCP-DNS option isn't reaching the host — see [Troubleshooting](Troubleshooting#the-link-is-up-but-nothing-routes).
 
-## 9. Mesh (mesh build only, needs a second node)
+## 9. Open mesh (needs a second node)
 
-Flash `warthog-mesh-smoke` to two boards, or one board plus an OpenMANET node.
+Use boards with a shared HaLow band and match the region, mesh ID and channel.
+On a station build, set `AT+MESHEN=1`. On each Warthog set `AT+MESHSEC=0` and
+reboot. The XIAO can also use `warthog-mesh-smoke`, which boots into mesh mode.
 After ~30 s:
 
 ```
@@ -98,7 +106,7 @@ wizard runs SAE and needs `warthog-mesh-sae-swccmp-meshvif` (or `-swccmp`) in ba
 mode (`AT+MESHBATMAN=1`) and its mesh ID and passphrase; `warthog-mesh-sae` (step 10) peers with it
 but cannot open its group frames. See [OpenMANET Gateway](OpenMANET-Gateway).
 
-## 10. Encrypted mesh — SAE/AMPE (two boards)
+## 10. Encrypted mesh — SAE/AMPE (two XIAO boards)
 
 Flash `warthog-mesh-sae` to two boards (same build → same passphrase). After
 ~30 s, on either board:

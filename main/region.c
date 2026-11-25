@@ -5,9 +5,10 @@
 
 #include "mbin.h"
 
-/* Default mesh row per country (chan, bw): 2 MHz, in band, no warning row, no BCF edge entry. */
+/* Default mesh row per country (chan, bw): in band, no warning row, no BCF edge entry. */
 static const struct { char cc[3]; uint8_t chan, bw; } k_default[] = {
-    { "AU", 41, 2 }, { "JP", 2, 2 }, { "KR", 10, 2 }, { "NZ", 38, 2 }, { "US", 42, 2 },
+    { "AU", 41, 2 }, { "CA", 42, 2 }, { "EU", 5, 1 }, { "JP", 2, 2 },
+    { "KR", 10, 2 }, { "NZ", 38, 2 }, { "US", 42, 2 },
 };
 
 /* mmregdb.c's rows marked "Warning: regulatory requirements may not be met" (chan, bw). */

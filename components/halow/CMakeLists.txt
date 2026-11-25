@@ -22,10 +22,13 @@ idf_component_register(
 )
 
 if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    if(NOT "${CONFIG_WARTHOG_DEFAULT_REGION}" MATCHES "^[A-Z][A-Z]$")
+        message(FATAL_ERROR "warthog: CONFIG_WARTHOG_DEFAULT_REGION must be a two-letter code")
+    endif()
     if(NOT "${CONFIG_WARTHOG_HW_REGIONS}" MATCHES "^[A-Z][A-Z](,[A-Z][A-Z])*$" OR
-       NOT ",${CONFIG_WARTHOG_HW_REGIONS}," MATCHES ",US,")
+       NOT ",${CONFIG_WARTHOG_HW_REGIONS}," MATCHES ",${CONFIG_WARTHOG_DEFAULT_REGION},")
         message(FATAL_ERROR "warthog: CONFIG_WARTHOG_HW_REGIONS must be a comma list of two-letter codes "
-                            "including US (the no-region default), not '${CONFIG_WARTHOG_HW_REGIONS}'")
+                            "including the default ${CONFIG_WARTHOG_DEFAULT_REGION}, not '${CONFIG_WARTHOG_HW_REGIONS}'")
     endif()
     if(NOT CONFIG_WARTHOG_HW_BAND_LO_KHZ LESS CONFIG_WARTHOG_HW_BAND_HI_KHZ)
         message(FATAL_ERROR "warthog: CONFIG_WARTHOG_HW_BAND_LO_KHZ must be below CONFIG_WARTHOG_HW_BAND_HI_KHZ")

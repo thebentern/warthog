@@ -16,12 +16,12 @@ SDK and a host-side test suite for the parts that can be tested without a radio.
 
 ## Building every environment
 
-Nine device environments; CI builds every env platformio.ini defines. Build them all before sending a change —
-it is easy to break an env you are not using, because build flags differ between
-them:
+CI builds every environment in `platformio.ini`. Build them all before sending
+a change because board settings and build flags differ.
 
 ```bash
 for e in warthog-station warthog-station-ecm \
+         warthog-heltec-rc32-68 warthog-heltec-rc32-68-868 \
          warthog-mesh-smoke warthog-mesh-sae warthog-mesh-sae-nochipkey warthog-mesh-sae-swccmp \
          warthog-mesh-sae-swccmp-on warthog-mesh-sae-swccmp-meshvif warthog-mesh-sae-meshvif; do
   pio run -e $e || echo "FAILED: $e"

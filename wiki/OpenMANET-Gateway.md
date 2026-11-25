@@ -46,14 +46,16 @@ the Pi sent it. `parse_fail=0` means every frame was understood.
 
 ## Setup — warthog
 
-**1. Build and flash the mesh image.** It always boots into mesh (any other
-image: `AT+MESHEN=1`, then `AT+RESET`):
+**1. Build and flash the firmware for your board.** On the XIAO, the mesh
+image boots into mesh mode.
 
 ```bash
 pio run -e warthog-mesh-smoke -t upload
 ```
 
-Hold **BOOT**, tap **RESET**, release BOOT before uploading; tap RESET after.
+For an open mesh on the RadioCore, upload the build for your band and set
+`AT+MESHEN=1`. Follow step 2 before rebooting. Use a XIAO mesh build for an
+SAE mesh. [Board environments and buttons](Quick-Start#3-choose-a-build)
 
 **2. Match the peer's encryption.** OpenMANET's LuCI mesh wizard configures SAE
 (mesh ID `openmanet`, passphrase `changeme123` unless changed); a node runs an

@@ -8,13 +8,13 @@ or [Quick Start](../wiki/Quick-Start.md).
 
 - **USB CDC-NCM** Ethernet adapter, in-box on macOS, Linux, Windows 10+ and iOS/iPadOS (CDC-ECM build: `warthog-station-ecm`)
 - **2.4 GHz Wi-Fi AP** for clients that are not wired
-- **HaLow uplink** on a Morse Micro MM6108 (Quectel FGH100M-H): station mode to an AP, or an **802.11s mesh** peer
-- **Mesh security:** SAE authentication and AMPE per-link keys
-- **[OpenMANET](#openmanet) / OpenWrt interop**, including membership of a batman-adv `bat0` (`AT+MESHBATMAN=1`)
+- **HaLow uplink** on a Morse Micro MM6108 in a Seeed Quectel FGH100M-H add-on or Heltec RadioCore RC32-68. It joins an AP in station mode or an **802.11s mesh** as a peer.
+- **Mesh security** with SAE authentication and AMPE per-link keys in the XIAO SAE builds
+- **OpenMANET / OpenWrt interop**, including membership of a batman-adv `bat0` with the XIAO host CCMP build. [OpenMANET setup](#openmanet)
 - **NAT** between every surface by default; **L2 bridge mode** (`AT+MESHBRIDGE=1`, experimental)
 - **802.11s forwarding** (`AT+MESHFWD=1`, experimental)
 - **USB CDC-ACM console** with ESP-IDF logs and an **AT command** interface; settings persist in NVS
-- One image for every supported region: `AT+REGION=<CC>` (AU, JP, KR, NZ or US on the FGH100M-H) picks the country's channel list, power and duty limits at boot; a board with none set runs as US
+- `AT+REGION=<CC>` picks the channel list, power and duty limits at boot. Each hardware profile defines its supported regions and default.
 - ESP-IDF 5.5, TinyUSB, `morsemicro/halow`
 
 Not supported: per-transmitter group keys in the chip (except on
@@ -24,27 +24,32 @@ avoidance, Windows RNDIS, a web UI.
 
 ## Builds
 
-| Env | Purpose |
-|---|---|
-| `warthog-station` | Station uplink by default; `AT+MESHEN=1` runs the mesh instead; region from `AT+REGION` |
-| `warthog-station-ecm` | CDC-ECM instead of CDC-NCM, for a host that binds ECM only |
-| `warthog-mesh-smoke` | Mesh without SAE |
-| `warthog-mesh-sae` | SAE/AMPE, keys in the chip |
-| `warthog-mesh-sae-meshvif` | SAE/AMPE, keys in the chip, MESH chip interface — for OpenMANET |
-| `warthog-mesh-sae-swccmp` | SAE/AMPE, host software CCMP (`AT+SWCCMP=1` or batman mode) |
-| `warthog-mesh-sae-swccmp-on` | As `-swccmp`, with host CCMP on at boot |
-| `warthog-mesh-sae-swccmp-meshvif` | SAE/AMPE, host CCMP, MESH chip interface — for OpenMANET in batman mode |
-| `warthog-mesh-sae-nochipkey` | Host-CCMP receive probe; not a shipping build |
+| Env | Hardware | Purpose |
+|---|---|---|
+| `warthog-station` | XIAO + Seeed HaLow add-on | Station with optional open mesh |
+| `warthog-station-ecm` | XIAO + Seeed HaLow add-on | Station with CDC-ECM USB Ethernet |
+| `warthog-heltec-rc32-68` | RadioCore RC32-68, 915 MHz (ZC-390-1) | Station with optional open mesh |
+| `warthog-heltec-rc32-68-868` | RadioCore RC32-68, 868 MHz (ZC-389-1) | Station with optional open mesh |
+| `warthog-mesh-smoke` | XIAO + Seeed HaLow add-on | Mesh without SAE |
+| `warthog-mesh-sae` | XIAO + Seeed HaLow add-on | SAE/AMPE, keys in the chip |
+| `warthog-mesh-sae-meshvif` | XIAO + Seeed HaLow add-on | SAE/AMPE, keys in the chip, MESH chip interface for OpenMANET |
+| `warthog-mesh-sae-swccmp` | XIAO + Seeed HaLow add-on | SAE/AMPE, host software CCMP (`AT+SWCCMP=1` or batman mode) |
+| `warthog-mesh-sae-swccmp-on` | XIAO + Seeed HaLow add-on | As `-swccmp`, with host CCMP on at boot |
+| `warthog-mesh-sae-swccmp-meshvif` | XIAO + Seeed HaLow add-on | SAE/AMPE, host CCMP, MESH chip interface for OpenMANET in batman mode |
+| `warthog-mesh-sae-nochipkey` | XIAO + Seeed HaLow add-on | Host CCMP receive probe |
 
-Regions (`AT+REGION=`), each country's channels within the module's 902–928 MHz:
-AU 915.5–927.5 MHz, JP 920.5–927.5 MHz, KR 917.5–928 MHz, NZ 915–928 MHz,
-US 902–928 MHz; unset = US. No other country is offered.
+The XIAO image offers AU, JP, KR, NZ and US. The 915 MHz RadioCore image also
+offers CA. Both default to US and limit channels to 902–928 MHz. The 868 MHz
+RadioCore image offers and defaults to EU, with 1 MHz channels in its
+863–870 MHz band. Build and upload the RadioCore image for your SKU from source.
+[RadioCore setup](../README.md#heltec-radiocore-rc32-68)
 
 ## Flashing
 
-**Release bundles**, the station image plus `mesh-smoke`, `mesh-sae-meshvif` and
-`mesh-sae-swccmp-meshvif`, and one region image per country, are on the
-[releases page](https://github.com/thebentern/warthog/releases):
+### XIAO release bundles
+
+Download the XIAO station and mesh factory images and XIAO region images from
+GitHub Releases. [Release downloads](https://github.com/thebentern/warthog/releases)
 
 | File | Purpose |
 |------|---------|
@@ -67,21 +72,30 @@ up on build defaults; the region, in its own partition at `0x420000`, is kept.
 Without `--region` the board keeps its stored region. To keep settings, write the
 bootloader, partitions and app images at `0x0`, `0x8000` and `0x10000` instead.
 
-**Reflashing a running board** needs no buttons: `AT+DLMODE` re-enumerates it as
-the ROM port (`303a:0009`). Flash that and leave with a watchdog reset
-([Flashing](../wiki/Flashing.md#reflashing-a-running-board)):
+### RadioCore source builds
+
+Build and upload the PlatformIO environment for your RadioCore's band. Enter
+download mode by holding **USER**, tapping **R**, and releasing **USER**. Tap **R**
+after the upload. [RadioCore setup](../README.md#heltec-radiocore-rc32-68)
+
+### Reflashing a running board
+
+Send `AT+DLMODE` to enter ROM download mode. Flash at the ROM port and leave with
+a watchdog reset. Select the build directory for your hardware before running
+the command. [Flashing guide](../wiki/Flashing.md#reflashing-a-running-board)
 
 ```bash
+build_dir=.pio/build/warthog-station
 python -m esptool --chip esp32s3 --port /dev/cu.usbmodemXXXX --baud 921600 \
   --before no-reset --after watchdog-reset write-flash \
-  0x0 .pio/build/warthog-station/bootloader.bin \
-  0x8000 .pio/build/warthog-station/partitions.bin \
-  0x10000 .pio/build/warthog-station/firmware.bin
+  0x0 "$build_dir/bootloader.bin" \
+  0x8000 "$build_dir/partitions.bin" \
+  0x10000 "$build_dir/firmware.bin"
 ```
 
 Writing `firmware.factory.bin` at `0x0` instead erases settings.
 
-`pio device monitor -e warthog-station` opens the console.
+Run `pio device monitor -e <environment>` with the same environment to open the console.
 
 ## Configuration
 
@@ -531,7 +545,8 @@ The firmware blobs are redistributed complete and unmodified, as the Binary
 Distribution Licence permits, solely for use with hardware containing a Morse
 Micro HaLow chip. The FGH100M-H BCF is a byte copy of the one Morse Micro
 publishes in the registry package `morsemicro/firmware` 2.10.4-esp32-1 (540 B,
-sha256 `9553cadb…f54f765`). Forks must keep them unmodified, with the
+sha256 `9553cadb…f54f765`). The RadioCore uses Heltec's published 3.3 V HC01 V2
+BCF. Forks must keep them unmodified, with the
 `LICENSES/` directory and morse-firmware's `LICENSE` files. The GPL does not
 apply to them.
 
@@ -540,9 +555,8 @@ apply to them.
 The regulatory country is set at runtime: `AT+REGION=<CC>` then `AT+RESET`, or
 chosen when flashing. It selects the Morse regulatory table (channels, EIRP, duty
 cycle) and the module's BCF section; only countries the module is rated for are
-offered (AU, JP, KR, NZ, US), with channels cut to its 902–928 MHz band. A board
-with nothing stored runs as US; one whose stored region cannot be used keeps its
-radio off. **Set the country you operate in**; another country's channel plan is
-likely illegal where you are.
+offered, with channels limited to its rated band. A board with nothing stored
+uses the hardware profile's default region. A board whose stored region cannot
+be used keeps its radio off. **Set the region where you operate.**
 You are responsible for operating within local rules, including duty-cycle and
 transmit-power limits. Warthog is an experimental project.
