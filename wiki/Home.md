@@ -60,7 +60,8 @@ run mesh.
 
 The RC32-68 has an ESP32-S3R8 and an HC01 Wi-Fi HaLow module on the board.
 Connect an antenna for the 915 MHz or 868 MHz model and use a USB-C data cable.
-Build the firmware for your model. [Quick Start](Quick-Start#3-choose-a-build) · [Heltec specifications](https://heltec.org/project/rc32/)
+Select your model in the web flasher or build its firmware with PlatformIO.
+[Flashing](Flashing#from-a-browser) · [Heltec specifications](https://heltec.org/project/rc32/)
 
 ## Licence
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Flash a Warthog release `.factory.bin` onto a XIAO ESP32-S3.
+# Flash a Warthog release `.factory.bin` onto the matching XIAO or RadioCore.
 #
 # Usage:
 #   ./flash.sh [--region CC] warthog-vX.Y.Z-VARIANT.factory.bin [PORT]
@@ -7,8 +7,8 @@
 # --region CC also writes warthog-*-region-CC.bin, found beside the .factory.bin, to the
 # region partition (0x420000). Without it the board keeps its stored region.
 #
-# Before running: hold the XIAO's BOOT button, tap RESET, release BOOT. USB-OTG
-# de-enumerates and the bootloader presents a serial port for esptool.
+# Enter download mode before running this script. On XIAO, hold BOOT, tap
+# RESET, then release BOOT. On RadioCore, hold USER, tap R, then release USER.
 
 set -euo pipefail
 
@@ -26,7 +26,7 @@ if [[ "${1:-}" == "--region" ]]; then
     [[ $# -ge 2 ]] || usage
     REGION=$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]')
     shift 2
-    [[ "$REGION" =~ ^[A-Z]{2}$ ]] || { echo "error: --region takes a two-letter country code" >&2; exit 2; }
+    [[ "$REGION" =~ ^[A-Z]{2}$ ]] || { echo "error: --region takes a two-letter region code" >&2; exit 2; }
 fi
 
 BIN="${1:-}"
@@ -38,12 +38,24 @@ fi
 
 REGION_BIN=""
 if [[ -n "$REGION" ]]; then
+    supported_regions=""
+    case "${BIN##*/}" in
+        warthog-*-heltec-rc32-68-868.factory.bin) supported_regions="EU" ;;
+        warthog-*-heltec-rc32-68.factory.bin) supported_regions="AU CA JP KR NZ US" ;;
+        warthog-*-station.factory.bin|warthog-*-mesh-smoke.factory.bin|\
+        warthog-*-mesh-sae-meshvif.factory.bin|warthog-*-mesh-sae-swccmp-meshvif.factory.bin)
+            supported_regions="AU JP KR NZ US" ;;
+    esac
+    if [[ -n "$supported_regions" && " $supported_regions " != *" $REGION "* ]]; then
+        echo "error: $REGION is unavailable for ${BIN##*/}. Supported regions: $supported_regions" >&2
+        exit 2
+    fi
     shopt -s nullglob
     found=("$(dirname "$BIN")"/warthog-*-region-"$REGION".bin)
     shopt -u nullglob
     if [[ ${#found[@]} -ne 1 ]]; then
         echo "error: want exactly one warthog-*-region-$REGION.bin beside $BIN, found ${#found[@]}" >&2
-        echo "       (the release bundle has one per offered country; AT+REGION? lists them)" >&2
+        echo "       (the release bundle contains the region images; AT+REGION? lists the board's regions)" >&2
         exit 2
     fi
     REGION_BIN="${found[0]}"
@@ -61,7 +73,8 @@ if [[ -z "$PORT" ]]; then
     done
 fi
 if [[ -z "$PORT" ]]; then
-    echo "error: no serial port found. Hold BOOT + tap RESET on the XIAO, then retry." >&2
+    echo "error: no serial port found. Enter download mode and retry." >&2
+    echo "       XIAO: hold BOOT, tap RESET, release BOOT. RadioCore: hold USER, tap R, release USER." >&2
     echo "       Or pass an explicit port: $0 $BIN /dev/cu.usbmodemXXXX" >&2
     exit 1
 fi
@@ -81,6 +94,6 @@ if [[ -n "$REGION_BIN" ]]; then
 else
     echo "warthog: flashing $BIN -> $PORT"
     "$ESPTOOL" --chip esp32s3 --port "$PORT" --baud 460800 write_flash 0x0 "$BIN"
-    echo "warthog: region not written; the board keeps its stored region (none: US until AT+REGION=<CC>)"
+    echo "warthog: the board keeps its stored region and uses the firmware default if none is stored."
 fi
-echo "warthog: done. Tap RESET on the XIAO to boot the new firmware."
+echo "warthog: done. Tap RESET on the XIAO or R on the RadioCore to boot."

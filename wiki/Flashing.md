@@ -1,15 +1,23 @@
 # Flashing
 
-For the **XIAO**, choose a release image in the web flasher using Chrome, Edge
-or Opera. For the **RadioCore RC32-68**, build and upload the image for your
-frequency band. [Web flasher](https://thebentern.github.io/warthog/) ·
-[From source](#from-source)
+## From a browser
 
-The web flasher's Configure tab also works with a running board. Flashing a
-`.factory.bin` at `0x0` clears stored settings and keeps the region in its
-separate partition. Selecting a region image writes it at `0x420000`.
+Open the web flasher in desktop Chrome, Edge or Opera.
+[Web flasher](https://thebentern.github.io/warthog/)
 
-## Why the usual auto-reset does not work
+1. Choose the **Seeed XIAO ESP32-S3 with the HaLow add-on** or the **Heltec
+   RadioCore RC32-68** in your board's 915 MHz or 868 MHz band.
+2. Select firmware from a release that includes your board. If you have a
+   local build, load its `.pio/build/<environment>/firmware.factory.bin`
+   with the matching board selected. [Build from source](Quick-Start#3-choose-a-build)
+3. Enter [download mode](#enter-download-mode), connect and flash. Tap
+   **RESET** on the XIAO or **R** on the RadioCore to boot.
+
+The **Configure** tab connects to a running board. Writing a `.factory.bin`
+at `0x0` clears stored settings and keeps the region in its separate partition.
+When a region image is available, you can select it to write it at `0x420000`.
+
+## Enter download mode
 
 The Warthog firmware runs its console and USB network on USB-OTG (TinyUSB)
 rather than the built-in USB-Serial-JTAG, so `esptool` cannot pull the board
@@ -38,16 +46,18 @@ the stored settings and the region.
 
 ## From a release bundle
 
-XIAO releases carry a station image, the mesh images, a region image per
-supported country and a POSIX flasher.
+Pick the factory image for your board and band. When the release includes
+RadioCore, the 915 MHz image ends in `-heltec-rc32-68.factory.bin` and the
+868 MHz image ends in `-heltec-rc32-68-868.factory.bin`.
 
 ```bash
 ./flash.sh --region US warthog-vX.Y.Z-station.factory.bin
 ```
 
-`--region <CC>` also writes `warthog-vX.Y.Z-region-<CC>.bin`, found beside the
-factory image, at `0x420000` in the same write. Without it the board keeps its
-stored region.
+The example installs the XIAO station firmware. If the release provides the
+region image for your board, `--region <CC>` writes
+`warthog-vX.Y.Z-region-<CC>.bin` at `0x420000` in the same write. Without
+`--region`, the board keeps its stored region.
 
 A `.factory.bin` written at `0x0` is `0xFF` from `0x9000` to `0xFFFF`, which
 covers the NVS partition. It erases every stored setting (HaLow credentials, AP,
@@ -139,7 +149,7 @@ hub browns them out. Requires `uhubctl`. It writes
 
 ## Recovering a board that will not enumerate
 
-Use the [button sequence for your board](#why-the-usual-auto-reset-does-not-work)
+Use the [button sequence for your board](#enter-download-mode)
 to enter download mode and check it appears as a ROM device.
 
 ```bash

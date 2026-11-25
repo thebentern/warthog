@@ -21,9 +21,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The station image and the 802.11s mesh images, all region-agnostic (AT+REGION).
+        # XIAO station and mesh images plus one image per RadioCore band.
         # Each entry is the suffix of a pio env (warthog-<suffix>) and of the release asset name.
-        variant: [station, mesh-smoke, mesh-sae-meshvif, mesh-sae-swccmp-meshvif]
+        variant: [station, mesh-smoke, mesh-sae-meshvif, mesh-sae-swccmp-meshvif, heltec-rc32-68, heltec-rc32-68-868]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -106,8 +106,8 @@ jobs:
           ( cd dist && sha256sum ${STEM}* > "${STEM}.SHA256SUMS" )
           ls -la dist/
 
-      # One regnvs image per country the station build offers (CONFIG_WARTHOG_HW_REGIONS), for the
-      # web flasher and flash.sh --region; each is checked to hold exactly warthog/region=<CC>.
+      # The station bundle carries one shared regnvs image per region offered by any board.
+      # Each image is checked to hold exactly warthog/region=<CC>.
       - name: Region NVS images
         if: matrix.variant == 'station'
         run: |
@@ -116,7 +116,8 @@ jobs:
           python -m venv "$RUNNER_TEMP/nvsgen"
           "$RUNNER_TEMP/nvsgen/bin/pip" install "esp-idf-nvs-partition-gen==0.3.0"
           TAG="${RELEASE_NAME}"
-          PYTHON="$RUNNER_TEMP/nvsgen/bin/python" scripts/region-images.sh "$TAG" dist
+          PYTHON="$RUNNER_TEMP/nvsgen/bin/python" scripts/region-images.sh "$TAG" dist \
+            sdkconfig.warthog-station sdkconfig.heltec-rc32-68 sdkconfig.heltec-rc32-68-868
           ( cd dist && sha256sum warthog-${TAG}-region-*.bin > "warthog-${TAG}-region.SHA256SUMS" )
           ls -la dist/
 

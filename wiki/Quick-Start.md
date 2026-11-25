@@ -1,7 +1,7 @@
 # Quick Start
 
-From an unflashed board to a working link. Budget twenty minutes the first time,
-most of it toolchain install.
+From an unflashed board to a working link. Use the web flasher if a release
+includes your board. For a local build, follow the toolchain steps below.
 
 ## 1. Prepare the board
 
@@ -14,6 +14,9 @@ most of it toolchain install.
 Use a USB data cable for either board.
 
 ## 2. Install the toolchain
+
+If you plan to install a release in the browser, continue to
+[Choose a build](#3-choose-a-build).
 
 ```bash
 pip install platformio==6.2.0
@@ -41,8 +44,9 @@ If an existing checkout fails its first build after a HaLow component update, se
 
 ## 3. Choose a build
 
-Use the station environment for your board. Each environment defines its
-supported regions and the default for a board with no region stored.
+Match the hardware and frequency band in the web flasher, or use the station
+environment for a source build. Each build defines its supported regions and
+the default for a board with no region stored.
 
 | Board | Station environment | Regions | Default |
 |---|---|---|---|
@@ -66,8 +70,13 @@ buttons or send `AT+DLMODE` on a board already running Warthog.
 - **XIAO** — hold **BOOT**, tap **RESET**, then release **BOOT**.
 - **RadioCore** — hold **USER**, tap **R**, then release **USER**.
 
-Set `warthog_env` to your board's environment from the table, then build and
-upload.
+In the web flasher, choose your board and a release that includes its firmware,
+or load a matching local `.pio/build/<environment>/firmware.factory.bin`.
+Choose **Connect**, select the serial port, then choose **Flash**.
+[Web flasher](https://thebentern.github.io/warthog/)
+
+To upload with PlatformIO, set `warthog_env` to the matching environment and
+run the following command.
 
 ```bash
 warthog_env=warthog-heltec-rc32-68  # Example for the 915 MHz RadioCore

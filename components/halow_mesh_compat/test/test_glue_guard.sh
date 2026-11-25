@@ -6590,8 +6590,8 @@ fi
 #      CI build warthog-station; platformio.ini, the workflows, the scripts and the flasher name no retired
 #      env, and every pio -e in README, wiki and docs is an env platformio.ini defines. The release body is
 #      the annotated tag's message (checkout v7 fetches the tag object by ref; then body_path: notes.md). The
-#      station leg, and CI after its station build, make the region images with scripts/region-images.sh from
-#      CONFIG_WARTHOG_HW_REGIONS under one exact generator pin, named as the flasher and flash.sh find them.
+#      station leg, and CI after its station build, make shared region images with scripts/region-images.sh
+#      from all three board profiles under one exact generator pin, named as the flasher and flash.sh find them.
 why75f=""
 R75=../../../.github/workflows/release.yml
 C75=../../../.github/workflows/ci.yml
@@ -6627,17 +6627,20 @@ awk '/- name: Release notes from the tag message/ {n=NR} /- name: Publish GitHub
 pin75=$(grep -ho '"esp-idf-nvs-partition-gen==[0-9][0-9.]*"' "$R75" "$C75" | sort -u)
 [ "$(printf '%s\n' "$pin75" | grep -c .)" = 1 ] && [ "$(grep -c 'esp-idf-nvs-partition-gen' "$R75")" = 1 ] && \
   [ "$(grep -c 'esp-idf-nvs-partition-gen' "$C75")" = 1 ] || why75f="${why75f:-release.yml and ci.yml do not install one exact esp-idf-nvs-partition-gen}"
-awk '/- name: Region NVS images/ {on=1} on && /if: matrix.variant == .station./ {i=1}
-  on && /scripts\/region-images.sh "\$TAG" dist$/ {r=1} on && /- name: Upload/ {exit} END {exit (i && r) ? 0 : 1}' "$R75" || \
-  why75f="${why75f:-the station leg does not make the region images into dist}"
-awk '/run: pio run -e warthog-station$/ {b=NR} /scripts\/region-images.sh / {r=NR} END {exit (b && r > b) ? 0 : 1}' "$C75" || \
-  why75f="${why75f:-CI does not make the region images after the station build}"
-grep -q "^HW=\$(sed -n 's/^CONFIG_WARTHOG_HW_REGIONS=" "$RI75" && grep -qF 'BIN="$OUT/warthog-${TAG}-region-${CC}.bin"' "$RI75" || \
+profiles75='sdkconfig.warthog-station sdkconfig.heltec-rc32-68 sdkconfig.heltec-rc32-68-868'
+awk -v profiles="$profiles75" '/- name: Region NVS images/ {on=1} on && /if: matrix.variant == .station./ {i=1}
+  on && /scripts\/region-images.sh "\$TAG" dist / {r=NR} on && r && index($0, profiles) {p=NR}
+  on && /- name: Upload/ {exit} END {exit (i && r && p == r+1) ? 0 : 1}' "$R75" || \
+  why75f="${why75f:-the station release leg does not bundle the region images for all board profiles}"
+awk -v profiles="$profiles75" '/run: pio run -e warthog-station$/ {b=NR} /scripts\/region-images.sh / {r=NR}
+  r && index($0, profiles) {p=NR} END {exit (b && r > b && p == r+1) ? 0 : 1}' "$C75" || \
+  why75f="${why75f:-CI does not make the region images for all board profiles after the station build}"
+grep -q "^[[:space:]]*HW=\$(sed -n 's/^CONFIG_WARTHOG_HW_REGIONS=" "$RI75" && grep -qF 'BIN="$OUT/warthog-${TAG}-region-${CC}.bin"' "$RI75" || \
   why75f="${why75f:-region-images.sh does not name warthog-<tag>-region-<CC>.bin for each CONFIG_WARTHOG_HW_REGIONS code}"
 grep -qF 'pre = `warthog-${rel?.tag_name}-region-`' "$WF75" && grep -qF '/warthog-*-region-"$REGION".bin' "$FS75" || \
   why75f="${why75f:-the flasher or flash.sh does not look for warthog-<tag>-region-<CC>.bin}"
 if [ -z "$why75f" ]; then
-  ok "one variant list in release.yml and the flasher (v0.1.0's us and au kept), each a pio env; warthog-station is the default and CI's; no retired env named, every documented pio -e real; the release body is the tag message; region images from the HW list under one pinned generator, named as the flasher and flash.sh find them"
+  ok "one variant list in release.yml and the flasher (v0.1.0's us and au kept), each a pio env; warthog-station is the default and CI's; no retired env named, every documented pio -e real; the release body is the tag message; shared region images from all board profiles under one pinned generator, named as the flasher and flash.sh find them"
 else
   bad "variants and release: $why75f"
 fi

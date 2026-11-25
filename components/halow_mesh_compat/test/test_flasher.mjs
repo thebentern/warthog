@@ -8,8 +8,9 @@
 // usage: node test_flasher.mjs <index.html> <scratch .mjs path>
 import { readFileSync, writeFileSync } from "node:fs";
 const [, , html, outMod] = process.argv;
-const src = readFileSync(html, "utf8").match(/<script type="module">([\s\S]*?)<\/script>/)[1];
-const ids = [...readFileSync(html, "utf8").matchAll(/id="([^"]+)"/g)].map((m) => m[1]);
+const page = readFileSync(html, "utf8");
+const src = page.match(/<script type="module">([\s\S]*?)<\/script>/)[1];
+const ids = [...page.matchAll(/id="([^"]+)"/g)].map((m) => m[1]);
 let mod = src.replace(/^import \{ ESPLoader, Transport \} from .*$/m, "const { ESPLoader, Transport } = globalThis.__esptool;");
 mod += `\nglobalThis.__t = { fillRegion, regionAssets, regionSource, populateVariants, populateRegions, doFlash, agnostic,
   setLoader: (l) => { loader = l; transport = { disconnect: async () => {} }; }, setWriter: (w) => { cwriter = w; }, feed: (s) => { cbuf += s; },
@@ -20,7 +21,7 @@ class El {
   constructor(id, tag) { this.id = id; this.tag = tag; this.children = []; this._sel = -1; this._v = ""; this.hidden = false; this.disabled = false;
     this.textContent = ""; this.files = null; this.listeners = {}; this.classList = { toggle() {} }; this.style = {}; this.dataset = {}; this.className = ""; }
   get value() { if (this.tag !== "select") return this._v; const o = this.children[this._sel]; return o ? o.value : ""; }
-  set value(v) { if (this.tag !== "select") { this._v = v; return; } this._sel = this.children.findIndex((o) => o.value === String(v)); }
+  set value(v) { if (this.tag !== "select") { this._v = v; if (this.id === "localBin" && v === "") this.files = null; return; } this._sel = this.children.findIndex((o) => o.value === String(v)); }
   get options() { return this.children; }
   set innerHTML(v) { this.children = []; this._sel = -1; for (const m of String(v).matchAll(/<option(?: value="([^"]*)")?>([^<]*)<\/option>/g)) this.appendChild(Object.assign(new El("", "option"), { value: m[1] ?? m[2], textContent: m[2] })); }
   appendChild(c) { this.children.push(c); if (this.tag === "select" && this._sel < 0 && !c.disabled) this._sel = this.children.length - 1; return c; }
@@ -28,29 +29,50 @@ class El {
   async fire(t) { for (const f of this.listeners[t] || []) await f(); }
 }
 const els = {};
-const selects = new Set(["release", "variant", "regionPre", "region", "meshsec", "apChan"]);
+const selects = new Set(["board", "release", "variant", "regionPre", "region", "meshsec", "apChan"]);
 for (const id of ids) els[id] = new El(id, selects.has(id) ? "select" : "div");
+els.board.innerHTML = page.match(/<select id="board">([\s\S]*?)<\/select>/)[1];
 globalThis.document = { getElementById: (id) => els[id] || (els[id] = new El(id, "div")), querySelectorAll: () => [], createElement: (t) => new El("", t) };
+globalThis.location = new URL("https://thebentern.github.io/warthog/");
 globalThis.confirm = () => true;
 const logLines = () => els.log.children.map((c) => c.textContent);
 
-const factory = "x".repeat(2179184);
+const factorySize = 2179184;
+function factoryImage(flashHeader) {
+  const bytes = new Uint8Array(factorySize);
+  bytes.set([0xe9, 3, 2, flashHeader]);
+  bytes.set([0xaa, 0x50], 0x8000);
+  bytes[0x10000] = 0xe9;
+  return bytes.buffer;
+}
 const asset = (name, size) => ({ name, size, browser_download_url: `https://dl/${name}` });
-const variantAssets = (tag, keys) => keys.flatMap((k) => [asset(`warthog-${tag}-${k}.factory.bin`, 2179184), asset(`warthog-${tag}-${k}.bin`, 2100000)]);
+const variantAssets = (tag, keys) => keys.map((k) => asset(`warthog-${tag}-${k}.factory.bin`, factorySize));
 const newRel = { tag_name: "v0.2.0", prerelease: false, draft: false,
-  assets: [...variantAssets("v0.2.0", ["station", "mesh-smoke", "mesh-sae-meshvif", "mesh-sae-swccmp-meshvif"]),
-           ...["AU", "JP", "KR", "NZ", "US"].map((c) => asset(`warthog-v0.2.0-region-${c}.bin`, 12288)), asset("flash.sh", 1500), asset("SHA256SUMS.txt", 3000)] };
+  assets: [...variantAssets("v0.2.0", ["station", "mesh-smoke", "mesh-sae-meshvif", "mesh-sae-swccmp-meshvif", "heltec-rc32-68", "heltec-rc32-68-868"]),
+           ...["AU", "CA", "EU", "JP", "KR", "NZ", "US"].map((c) => asset(`warthog-v0.2.0-region-${c}.bin`, 12288))] };
 const oldRel = { tag_name: "v0.1.0", prerelease: false, draft: false,
   assets: [...variantAssets("v0.1.0", ["au", "mesh-sae-meshvif", "mesh-sae-swccmp-meshvif", "mesh-smoke", "us"]), asset("flash.sh", 1356)] };
 let regionBytes = 12288;
+const downloads = [];
 globalThis.fetch = async (url) => {
-  if (url.startsWith("https://api.github.com/")) return { ok: true, json: async () => [newRel, oldRel] };
-  const name = url.slice("https://dl/".length);
-  const n = name.includes("-region-") ? regionBytes : 2179184;
-  return { ok: true, arrayBuffer: async () => new Uint8Array(n).fill(name.includes("-region-") ? 0x41 : 0x42).buffer };
+  if (url.endsWith("/firmware/releases.json")) return { ok: true, json: async () => [newRel, oldRel] };
+  if (!url.startsWith("https://thebentern.github.io/warthog/firmware/")) throw new Error(`unexpected download ${url}`);
+  const name = url.split("/").pop();
+  downloads.push(name);
+  return { ok: true, arrayBuffer: async () => name.includes("-region-") ? new Uint8Array(regionBytes).buffer
+    : factoryImage(name.includes("heltec-rc32-68") ? 0x4f : 0x3f) };
 };
-Object.defineProperty(globalThis, "navigator", { value: { serial: {} }, configurable: true });
-globalThis.__esptool = { ESPLoader: class {}, Transport: class {} };
+let bootMode, detectedKiB = 16384, disconnected = 0;
+Object.defineProperty(globalThis, "navigator", { value: { serial: { async requestPort() {
+  return { getInfo: () => ({ usbVendorId: 0x303a, usbProductId: 0x1001 }) };
+} } }, configurable: true });
+globalThis.__esptool = {
+  ESPLoader: class {
+    async main(mode) { bootMode = mode; return "ESP32-S3"; }
+    async getFlashSize() { return detectedKiB; }
+  },
+  Transport: class { async disconnect() { disconnected++; } },
+};
 
 let fails = 0, oks = 0;
 const check = (c, msg) => { if (c) { oks++; console.log("ok   " + msg); } else { fails++; console.log("FAIL " + msg); } };
@@ -62,14 +84,16 @@ const optText = (id) => els[id].children.map((o) => `${o.value}=${o.textContent}
 // Releases and variants.
 check(els.release.value === "v0.2.0", "the newest release is selected first");
 check(JSON.stringify(els.variant.children.map((o) => o.value)) === '["station","mesh-sae-meshvif","mesh-sae-swccmp-meshvif","mesh-smoke"]', "v0.2.0 lists station and the three mesh images");
-check(els.variant.children.every((o) => !o.textContent.includes("US band")), "v0.2.0 mesh labels carry no (US band)");
+check(optText("variant").includes("mesh-sae-swccmp-meshvif=OpenMANET (batman)"), "build picker identifies the OpenMANET wizard build");
 check(!els.regionPreBox.hidden && JSON.stringify(els.regionPre.children.map((o) => o.value)) === '["","AU","JP","KR","NZ","US"]', "v0.2.0 offers keep + its five region images");
 check(els.regionPre.value === "", "the region select starts on keep");
 els.release.value = "v0.1.0"; await els.release.fire("change");
 check(JSON.stringify(els.variant.children.map((o) => o.value)) === '["mesh-sae-meshvif","mesh-sae-swccmp-meshvif","mesh-smoke","us","au"]', "v0.1.0 lists its mesh images and the us and au images");
-check(els.variant.children.filter((o) => o.value.startsWith("mesh")).every((o) => o.textContent.endsWith("(US band)")), "v0.1.0 mesh labels say (US band)");
+check(els.buildInfo.textContent.includes("fixed US region") && els.variant.children.every((o) => o.textContent.length < 28), "v0.1.0 shows its mesh region in help instead of repeating it in the menu");
+els.variant.value = "mesh-sae-swccmp-meshvif"; await els.variant.fire("change");
+check(els.buildInfo.textContent.includes("LuCI mesh wizard") && els.buildInfo.textContent.includes("AT+MESHBATMAN=1") && els.buildInfo.textContent.includes("AT+SWCCMP=1"), "OpenMANET build explains the wizard setup and plain SAE alternative");
 check(els.regionPreBox.hidden, "v0.1.0 has no region images: the region select is hidden");
-els.localBin.files = [{ name: "firmware.factory.bin", size: 2179184, arrayBuffer: async () => new Uint8Array(2179184).buffer }];
+els.localBin.files = [{ name: "firmware.factory.bin", size: factorySize, arrayBuffer: async () => factoryImage(0x3f) }];
 await els.localBin.fire("change");
 check(!els.regionPreBox.hidden && t.regionSource()?.tag_name === "v0.2.0", "a local .bin takes region images from the newest release that has them");
 els.localBin.files = null; await els.localBin.fire("change");
@@ -91,8 +115,42 @@ check(logLines().includes("Region AU written."), "station, AU: says the region w
 els.regionPre.value = "US";
 check(await flash(true) === `["erase",[[0,2179184],[${0x420000},12288]]]`, "station, erase + US: erase, then factory and the US image");
 regionBytes = 4096;
-check(await flash(false) === "[]" && logLines().some((l) => l.includes("is 4096 bytes, not 12288")), "a region image of the wrong size is refused before writing");
+check(await flash(false) === "[]" && logLines().some((l) => l.includes("is 4096 bytes, expected 12288")), "a region image of the wrong size is refused before writing");
 regionBytes = 12288;
+
+// Both RadioCore bands use the same ROM transport and different release and region assets.
+els.board.value = "heltec-rc32-68"; await els.board.fire("change");
+check(optText("release").length === 1 && optText("variant").join() === "heltec-rc32-68=Station", "915 MHz offers its own release image and hides older XIAO releases");
+check(els.regionPre.children.map((o) => o.value).join() === ",AU,CA,JP,KR,NZ,US", "915 MHz offers Canada and filters out EU");
+check(els.bootHold.textContent === "USER" && els.flashReset.textContent === "R", "RadioCore shows its own button sequence");
+detectedKiB = 8192;
+await els.connect.fire("click");
+check(els.flash.disabled && disconnected === 1, "a hardware flash-size mismatch closes the port before allowing a write");
+detectedKiB = 16384;
+await els.connect.fire("click");
+check(!els.flash.disabled && bootMode === "no_reset", "RadioCore connects via USB-Serial/JTAG in download mode");
+els.regionPre.value = "CA";
+check(await flash(false) === `[[[0,${factorySize}],[${0x420000},12288]]]` && downloads.at(-2).endsWith("heltec-rc32-68.factory.bin") && downloads.at(-1).endsWith("region-CA.bin"), "915 MHz flashes its station image and CA region from the mirror");
+check(logLines().includes("Done. Tap R on the board."), "RadioCore prompts for the correct reboot button");
+
+els.localBin.files = [{ name: "firmware.factory.bin", size: factorySize, arrayBuffer: async () => factoryImage(0x3f) }];
+await els.localBin.fire("change");
+check(await flash(true) === "[]" && logLines().some((l) => l.includes("16 MB flash")), "a XIAO image on the RadioCore profile is refused before erase");
+els.board.value = "heltec-rc32-68-868"; await els.board.fire("change");
+check(!els.localBin.files && els.regionPre.value === "" && els.regionPre.children.map((o) => o.value).join() === ",EU", "changing to 868 MHz clears the local image and only offers its EU region");
+els.regionPre.value = "EU";
+check(await flash(true) === `["erase",[[0,${factorySize}],[${0x420000},12288]]]` && downloads.at(-2).endsWith("heltec-rc32-68-868.factory.bin") && downloads.at(-1).endsWith("region-EU.bin"), "868 MHz erase and flash uses its station and EU images");
+els.localBin.files = [{ name: "warthog-v0.2.0-heltec-rc32-68.factory.bin", size: factorySize, arrayBuffer: async () => factoryImage(0x4f) }];
+await els.localBin.fire("change");
+check(await flash(true) === "[]" && logLines().some((l) => l.includes("selected board and band")), "a named 915 MHz image is refused on the 868 MHz profile");
+newRel.assets = newRel.assets.filter((a) => !a.name.includes("heltec-rc32-68-868"));
+await els.board.fire("change");
+check(els.release.disabled && !els.release.value, "no compatible release leaves the local RadioCore image option available");
+els.localBin.files = [{ name: "firmware.factory.bin", size: factorySize, arrayBuffer: async () => factoryImage(0x4f) }];
+await els.localBin.fire("change");
+els.regionPre.value = "";
+const beforeLocal = downloads.length;
+check(await flash(false) === `[[[0,${factorySize}]]]` && downloads.length === beforeLocal, "a local RadioCore factory image flashes without downloading a release asset");
 
 // Configure tab: AT+REGION? parsing.
 const R = (ok, ...lines) => ({ ok, lines });
