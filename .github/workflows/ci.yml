@@ -99,12 +99,13 @@ jobs:
           pio run -e warthog-station-ecm
           "$PLATFORMIO_CORE_DIR"/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-nm -S .pio/build/warthog-station-ecm/firmware.elf | grep ' 0000009a [dr] s_desc_fs_config$'
 
-      # release.yml's region images, from the station build's sdkconfig with the same pinned generator.
+      # Generate release.yml's shared region images from all three board profiles.
       - name: Region NVS images
         run: |
           python -m venv "$RUNNER_TEMP/nvsgen"
           "$RUNNER_TEMP/nvsgen/bin/pip" install "esp-idf-nvs-partition-gen==0.3.0"
-          PYTHON="$RUNNER_TEMP/nvsgen/bin/python" scripts/region-images.sh ci "$RUNNER_TEMP/region"
+          PYTHON="$RUNNER_TEMP/nvsgen/bin/python" scripts/region-images.sh ci "$RUNNER_TEMP/region" \
+            sdkconfig.warthog-station sdkconfig.heltec-rc32-68 sdkconfig.heltec-rc32-68-868
 
       # IDF's own lwIP with main/nat_frag.c (lwip_napt.mk): IP fragments, reassembly and NAPT. The
       # host tests above skip it, since it builds from the ESP-IDF package the build just fetched.
@@ -261,7 +262,7 @@ jobs:
           print("variants=" + json.dumps(rest))
           EOF
 
-  # Every env outside BUILD_JOB_ENVS: release.yml's two meshvif images and the envs nothing ships.
+  # Every env outside BUILD_JOB_ENVS, including the release meshvif and RadioCore images.
   # Builds and the post-build checks; the host tests run in build.
   variants:
     needs: envs

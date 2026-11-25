@@ -42,6 +42,7 @@
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:0 16px } @media (max-width:560px) { .grid { grid-template-columns:1fr } }
   .kv { font-family:var(--mono); font-size:13px; white-space:pre-wrap; background:#0b0f14; border:1px solid var(--line); border-radius:8px; padding:12px; margin-top:10px; min-height:44px }
   .hint { color:var(--dim); font-size:12.5px; margin:4px 0 0 }
+  #assetInfo { overflow-wrap:anywhere }
 </style>
 </head>
 <body>
@@ -60,18 +61,23 @@
   </div>
 
   <div class="card">
-    <h2>1 · XIAO firmware</h2>
-    <p class="hint">This tab installs firmware for the Seeed XIAO ESP32-S3 with the Seeed HaLow add-on. Build and upload RadioCore firmware for your board's band, then use the Configure tab. <a href="https://github.com/thebentern/warthog/blob/main/README.md#heltec-radiocore-rc32-68">RadioCore setup</a></p>
+    <h2>1 · Firmware</h2>
+    <label for="board">Board</label>
+    <select id="board">
+      <option value="xiao">Seeed XIAO ESP32-S3 + HaLow</option>
+      <option value="heltec-rc32-68">Heltec RadioCore RC32-68 (915 MHz)</option>
+      <option value="heltec-rc32-68-868">Heltec RadioCore RC32-68 (868 MHz)</option>
+    </select>
     <label for="release">Release</label>
     <select id="release"><option>Loading releases…</option></select>
     <label for="variant">Build</label>
-    <select id="variant"></select>
-    <p class="dim" id="assetInfo" style="margin:10px 0 0;font-size:13px"></p>
-    <div class="row">
-      <label for="localBin" class="dim" style="margin:0">or</label>
-      <input type="file" id="localBin" accept=".bin" style="font-size:13px">
-    </div>
-    <p class="hint">Load a XIAO <code>.factory.bin</code> you built yourself from <code>.pio/build/warthog-&lt;env&gt;/firmware.factory.bin</code>. The flasher writes it to <code>0x0</code>.</p>
+    <select id="variant" aria-describedby="buildInfo"></select>
+    <p class="hint" id="buildInfo" aria-live="polite"></p>
+    <p class="hint" id="assetInfo" hidden></p>
+    <a class="hint" id="assetDownload" hidden>Download factory image</a>
+    <label for="localBin">Local factory image</label>
+    <input type="file" id="localBin" accept=".bin" aria-describedby="localHint" style="font-size:13px">
+    <p class="hint" id="localHint">Choose a <code>.factory.bin</code> for the selected board and band. <a href="https://github.com/thebentern/warthog#development">Build from source</a></p>
     <div id="regionPreBox" hidden>
       <label for="regionPre">Regulatory region</label>
       <select id="regionPre"></select>
@@ -80,13 +86,13 @@
   </div>
 
   <div class="card">
-    <h2>2 · Put the XIAO in download mode</h2>
+    <h2>2 · Put the board in download mode</h2>
     <ol class="steps">
-      <li>Hold <kbd>BOOT</kbd></li>
-      <li>Tap <kbd>RESET</kbd></li>
-      <li>Release <kbd>BOOT</kbd></li>
+      <li>Hold <kbd id="bootHold">BOOT</kbd></li>
+      <li>Tap <kbd id="downloadReset">RESET</kbd></li>
+      <li>Release <kbd id="bootRelease">BOOT</kbd></li>
     </ol>
-    <p class="dim" style="margin:8px 0 0;font-size:13px">It then enumerates as an Espressif ROM device (<code>303a:0009</code>) and stays there until flashed or reset. If it is already running warthog you can also send <code>AT+DLMODE</code> over the console.</p>
+    <p class="hint">A board already running Warthog can also enter download mode with <code>AT+DLMODE</code>.</p>
   </div>
 
   <div class="card">
@@ -99,7 +105,7 @@
     </div>
     <div class="prog"><div id="bar"></div></div>
     <pre id="log"></pre>
-    <p class="dim" style="font-size:13px;margin:10px 0 0">Tap <kbd>RESET</kbd> when it finishes. Both buttons write the factory image, which wipes stored settings (HaLow and AP credentials, DNS, mesh) but not the region; <b>Erase &amp; flash</b> also wipes the region and writes the one chosen above.</p>
+    <p class="dim" style="font-size:13px;margin:10px 0 0">Tap <kbd id="flashReset">RESET</kbd> when it finishes. Flashing a factory image clears saved settings and keeps the region. <b>Erase &amp; flash</b> also clears the region and writes the one selected above, if available.</p>
   </div>
 
   </section>
@@ -184,7 +190,7 @@
   </section>
 
   <p class="foot">
-    The XIAO flasher writes the <code>.factory.bin</code> at <code>0x0</code> and the selected region image at <code>0x420000</code>.
+    The flasher writes the <code>.factory.bin</code> at <code>0x0</code> and the selected region image at <code>0x420000</code>.
     <a href="https://github.com/thebentern/warthog">Source</a> · <a href="https://github.com/thebentern/warthog/wiki/Flashing">Flashing guide</a>
   </p>
 </main>
@@ -193,6 +199,8 @@
 import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.5.4/bundle.js";
 
 const REPO = "thebentern/warthog";
+const FIRMWARE_BASE = new URL("firmware/", location.protocol === "file:"
+  ? "https://thebentern.github.io/warthog/" : location.href).href;
 const $ = (id) => document.getElementById(id);
 const log = $("log");
 const say = (msg, cls = "") => { const l = document.createElement("div"); if (cls) l.className = cls; l.textContent = msg; log.appendChild(l); log.scrollTop = log.scrollHeight; };
@@ -206,50 +214,65 @@ const REGION_LABELS = {
   CA: "CA — Canada, 902–928 MHz", EU: "EU — European Union, 863–870 MHz",
   NZ: "NZ — New Zealand, 915–928 MHz", US: "US — United States, 902–928 MHz",
 };
+const BOARDS = {
+  xiao: { boot: "BOOT", reset: "RESET", flashMiB: 8, regions: ["AU", "JP", "KR", "NZ", "US"] },
+  "heltec-rc32-68": { boot: "USER", reset: "R", flashMiB: 16, regions: ["AU", "CA", "JP", "KR", "NZ", "US"] },
+  "heltec-rc32-68-868": { boot: "USER", reset: "R", flashMiB: 16, regions: ["EU"] },
+};
 // Asset keys, warthog-<tag>-<key>.factory.bin. usBand: before the station image, a mesh image was US-only.
 const VARIANTS = [
-  { key: "station", label: "Station uplink — set the region below" },
-  { key: "mesh-sae-meshvif",        label: "Mesh, encrypted — 802.11s + SAE/AMPE, keys in the chip", usBand: true },
-  { key: "mesh-sae-swccmp-meshvif", label: "Mesh, encrypted, batman-capable — host CCMP; send AT+SWCCMP=1 after each boot", usBand: true },
-  { key: "mesh-smoke", label: "Mesh, no SAE — 802.11s; data plane keyed with a built-in constant until set to Open", usBand: true },
+  { key: "station", label: "Station", help: "Connect to a HaLow access point." },
+  { key: "mesh-sae-meshvif", label: "Encrypted mesh", usBand: true,
+    help: "For plain 802.11s SAE meshes, including OpenMANET with no bat0 interface. The radio holds the keys." },
+  { key: "mesh-sae-swccmp-meshvif", label: "OpenMANET (batman)", usBand: true,
+    help: "Use this build with the OpenMANET LuCI mesh wizard. Set AT+MESHBATMAN=1 and reboot. For plain SAE mesh, run AT+SWCCMP=1 after each boot." },
+  { key: "mesh-smoke", label: "Mesh without SAE", usBand: true,
+    help: "For OpenMANET configured with open mesh security, set AT+MESHSEC=0. This build starts with a public shared key." },
+  { key: "heltec-rc32-68", board: "heltec-rc32-68", label: "Station",
+    help: "Connect to a HaLow access point. The default region is US. For an open OpenMANET mesh, set AT+MESHEN=1 and AT+MESHSEC=0, then reboot." },
+  { key: "heltec-rc32-68-868", board: "heltec-rc32-68-868", label: "Station",
+    help: "Connect to a HaLow access point. The default region is EU. For an open OpenMANET mesh, set AT+MESHEN=1 and AT+MESHSEC=0, then reboot." },
   // v0.1.0's per-region station images.
-  { key: "us", label: "US station uplink — 902–928 MHz (v0.1.0 per-region image)" },
-  { key: "au", label: "AU station uplink (v0.1.0 per-region image)" },
+  { key: "us", label: "Station (US)", help: "Fixed US region." },
+  { key: "au", label: "Station (AU)", help: "Fixed Australian region." },
 ];
 
-if (!("serial" in navigator)) {
-  $("unsupported").hidden = false;
-  $("connect").disabled = true;
-}
+const serialSupported = "serial" in navigator;
+$("unsupported").hidden = serialSupported;
+let transport, loader, connecting = false, flashing = false;
+const board = () => BOARDS[$("board").value];
+const boardVariants = () => VARIANTS.filter((v) => (v.board ?? "xiao") === $("board").value);
+const selectedVariant = () => boardVariants().find((v) => v.key === $("variant").value);
+const localFile = () => $("localBin").files?.[0];
 
 // ---- releases -----------------------------------------------------------
 let releases = [];
+let mirrored = false;
 async function loadReleases() {
-  try {
-    const r = await fetch(`https://api.github.com/repos/${REPO}/releases?per_page=20`, { headers: { Accept: "application/vnd.github+json" } });
-    if (!r.ok) throw new Error(`GitHub API ${r.status}`);
-    releases = (await r.json()).filter((x) => !x.draft);
-  } catch (e) {
-    say(`Could not list releases: ${e.message}`, "err");
-    if (String(e.message).includes("403")) {
-      say("GitHub's unauthenticated API limit is 60 requests/hour per IP. Wait, or use \u201cLoad a .bin file\u201d below.", "warn");
+  for (const url of [`${FIRMWARE_BASE}releases.json`, `https://api.github.com/repos/${REPO}/releases?per_page=20`]) {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) continue;
+      releases = (await r.json()).filter((release) => !release.draft);
+      mirrored = url.startsWith(FIRMWARE_BASE);
+      break;
+    } catch {
+      // A local checkout can still show GitHub's release download links.
     }
-    releases = [];
   }
+  populateReleases();
+}
+function populateReleases() {
+  const variants = boardVariants();
+  const matches = releases.filter((release) => variants.some((v) => assetFor(release, v.key)));
   const sel = $("release");
+  const previous = sel.value;
   sel.innerHTML = "";
-  if (!releases.length) {
-    sel.innerHTML = `<option value="">— none available —</option>`;
-    say("No releases to list. Use \u201cLoad a .bin file\u201d below to flash a local build.", "warn");
-    $("variant").innerHTML = "";
-    return;
+  if (!matches.length) sel.appendChild(option("", "No releases available"));
+  for (const rel of matches) {
+    sel.appendChild(option(rel.tag_name, `${rel.tag_name}${rel.prerelease ? " (pre-release)" : ""}`));
   }
-  for (const rel of releases) {
-    const o = document.createElement("option");
-    o.value = rel.tag_name;
-    o.textContent = `${rel.tag_name}${rel.prerelease ? "  (pre-release)" : ""}`;
-    sel.appendChild(o);
-  }
+  if (matches.some((release) => release.tag_name === previous)) sel.value = previous;
   populateVariants();
 }
 function currentRelease() { return releases.find((r) => r.tag_name === $("release").value); }
@@ -257,18 +280,20 @@ function assetFor(rel, key) {
   return rel?.assets?.find((a) => a.name === `warthog-${rel.tag_name}-${key}.factory.bin`);
 }
 const agnostic = (rel) => !!assetFor(rel, "station");
-// The release's region images by country code.
+const selectedAsset = () => assetFor(currentRelease(), selectedVariant()?.key);
+// Only offer region images supported by the selected board.
 function regionAssets(rel) {
   const out = new Map(), pre = `warthog-${rel?.tag_name}-region-`;
   for (const a of rel?.assets ?? []) {
     const cc = a.name.startsWith(pre) && a.name.endsWith(".bin") ? a.name.slice(pre.length, -4) : "";
-    if (/^[A-Z]{2}$/.test(cc)) out.set(cc, a);
+    if (board().regions.includes(cc)) out.set(cc, a);
   }
   return out;
 }
 // Where region images come from: the selected release, or for a local .bin the newest release that has them.
 function regionSource() {
-  if ($("localBin")?.files?.[0]) return releases.find((r) => regionAssets(r).size) || null;
+  if (!mirrored) return null;
+  if (localFile()) return releases.find((r) => regionAssets(r).size) || null;
   const rel = currentRelease();
   return rel && regionAssets(rel).size ? rel : null;
 }
@@ -285,46 +310,97 @@ function populateRegions() {
 function populateVariants() {
   const rel = currentRelease();
   const sel = $("variant"); sel.innerHTML = "";
-  for (const v of VARIANTS) {
-    const a = assetFor(rel, v.key);
-    if (!a) continue;              // only offer what the release actually shipped
-    sel.appendChild(option(v.key, v.usBand && !agnostic(rel) ? `${v.label} (US band)` : v.label));
+  for (const v of boardVariants()) {
+    if (assetFor(rel, v.key)) sel.appendChild(option(v.key, v.label));
   }
+  if (!sel.options.length) sel.appendChild(option("", "No builds available"));
   describeAsset();
   populateRegions();
 }
 function describeAsset() {
-  const local = $("localBin")?.files?.[0];
-  if (local) { $("assetInfo").textContent = `${local.name} · ${(local.size / 1024).toFixed(0)} KB · local file, written to 0x0`; return; }
-  const rel = currentRelease(); const a = assetFor(rel, $("variant").value);
-  $("assetInfo").textContent = a ? `${a.name} · ${(a.size / 1024).toFixed(0)} KB · written to 0x0` : "";
+  const local = localFile();
+  const variant = selectedVariant();
+  const asset = selectedAsset();
+  const legacy = variant?.usBand && !agnostic(currentRelease()) ? " This release uses the fixed US region." : "";
+  if (local) $("buildInfo").textContent = "Using the local file.";
+  else if (!asset) $("buildInfo").textContent = "Load a local factory image to flash this board.";
+  else $("buildInfo").textContent = variant.help + legacy + (mirrored ? "" : " Download the factory image and open it below.");
+  const file = local || asset;
+  $("assetInfo").hidden = !file;
+  $("assetInfo").textContent = file ? `${file.name} · ${(file.size / 1024).toFixed(0)} KB` : "";
+  $("assetDownload").hidden = !asset || Boolean(local) || mirrored;
+  if (asset) $("assetDownload").href = asset.browser_download_url;
+  updateControls();
 }
+function updateControls() {
+  const busy = connecting || flashing;
+  const local = Boolean(localFile());
+  const ready = Boolean(loader && !busy && (local || (mirrored && selectedAsset())));
+  $("board").disabled = busy;
+  $("release").disabled = busy || local || !currentRelease();
+  $("variant").disabled = busy || local || !selectedAsset();
+  $("localBin").disabled = busy;
+  $("regionPre").disabled = busy;
+  $("connect").disabled = !serialSupported || busy || Boolean(loader);
+  $("flash").disabled = !ready;
+  $("erase").disabled = !ready;
+}
+function showBoardButtons() {
+  $("bootHold").textContent = $("bootRelease").textContent = board().boot;
+  $("downloadReset").textContent = $("flashReset").textContent = board().reset;
+}
+$("board").addEventListener("change", async () => {
+  $("localBin").value = "";
+  $("regionPre").value = "";
+  showBoardButtons();
+  connecting = true;
+  populateReleases();
+  await disconnectFlasher();
+  connecting = false;
+  updateControls();
+});
 $("release").addEventListener("change", populateVariants);
 $("variant").addEventListener("change", describeAsset);
 $("localBin").addEventListener("change", () => { describeAsset(); populateRegions(); });
+showBoardButtons();
+updateControls();
 loadReleases();
 
 // ---- serial + esptool -----------------------------------------------------
-let device, transport, loader, chip;
+async function disconnectFlasher() {
+  const port = transport;
+  transport = undefined;
+  loader = undefined;
+  $("port").textContent = "";
+  try { await port?.disconnect(); } catch {}
+}
 
 $("connect").addEventListener("click", async () => {
+  connecting = true;
+  updateControls();
   try {
     // Filter to Espressif so the picker is not a wall of unrelated ports.
-    device = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x303a }] });
+    const device = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x303a }] });
     transport = new Transport(device, true);
-    loader = new ESPLoader({ transport, baudrate: 921600, terminal: { clean() {}, writeLine: (s) => say(s, "dim"), write: (s) => say(s, "dim") } });
+    const candidate = new ESPLoader({ transport, baudrate: 921600, terminal: { clean() {}, writeLine: (s) => say(s, "dim"), write: (s) => say(s, "dim") } });
     say("Connecting… (board must already be in download mode)");
-    chip = await loader.main();      // syncs with the ROM; no reset strobe needed or possible here
+    const chip = await candidate.main("no_reset");
+    if (!chip.startsWith("ESP32-S3")) throw new Error(`Expected an ESP32-S3, found ${chip}`);
+    const detectedKiB = await candidate.getFlashSize();
+    if (detectedKiB && detectedKiB !== board().flashMiB * 1024) {
+      throw new Error(`This board has ${detectedKiB / 1024} MB of flash. Select the matching board above.`);
+    }
+    loader = candidate;
     say(`Connected: ${chip}`, "ok");
     const info = device.getInfo();
     $("port").textContent = `USB ${info.usbVendorId?.toString(16)}:${info.usbProductId?.toString(16)}`;
-    if (info.usbProductId !== 0x0009) {
-      say(`Note: PID 0x${info.usbProductId?.toString(16)} is not the ROM bootloader (0x0009). If flashing fails, redo the BOOT/RESET step.`, "warn");
-    }
-    $("flash").disabled = false; $("erase").disabled = false; $("connect").disabled = true;
   } catch (e) {
+    await disconnectFlasher();
     say(`Connect failed: ${e.message}`, "err");
-    say("Is the board in download mode? Hold BOOT, tap RESET, release BOOT, then Connect again.", "warn");
+    say(`Hold ${board().boot}, tap ${board().reset}, release ${board().boot}, then Connect again.`, "warn");
+  } finally {
+    connecting = false;
+    updateControls();
   }
 });
 
@@ -333,37 +409,54 @@ function binStr(buf) {
   let s = ""; for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
   return s;
 }
-async function download(a) {
+async function download(rel, a) {
   say(`Downloading ${a.name}…`);
-  // browser_download_url redirects to a CORS-enabled objects host, so a plain fetch works.
-  const r = await fetch(a.browser_download_url);
+  const r = await fetch(`${FIRMWARE_BASE}${encodeURIComponent(rel.tag_name)}/${encodeURIComponent(a.name)}`);
   if (!r.ok) throw new Error(`download failed: ${r.status}`);
   const buf = new Uint8Array(await r.arrayBuffer());
+  if (buf.length !== a.size) throw new Error(`${a.name} is ${buf.length} bytes, expected ${a.size}`);
   say(`Downloaded ${(buf.length / 1024).toFixed(0)} KB`, "ok");
-  return binStr(buf);
+  return buf;
 }
 async function fetchAsset() {
-  const local = $("localBin").files?.[0];
+  const local = localFile();
+  let bytes;
   if (local) {
+    const namedBoard = local.name.match(/-(heltec-rc32-68(?:-868)?)\.factory\.bin$/)?.[1];
+    if (namedBoard && namedBoard !== $("board").value) {
+      throw new Error("The RadioCore image filename does not match the selected board and band.");
+    }
     say(`Using local file ${local.name} (${(local.size / 1024).toFixed(0)} KB)`);
-    return binStr(new Uint8Array(await local.arrayBuffer()));
+    bytes = new Uint8Array(await local.arrayBuffer());
+  } else {
+    const asset = selectedAsset();
+    if (!mirrored || !asset) throw new Error("Select a release build or load a local factory image.");
+    bytes = await download(currentRelease(), asset);
   }
-  const rel = currentRelease(); const a = assetFor(rel, $("variant").value);
-  if (!a) throw new Error("no firmware selected — pick a release build or load a .bin file");
-  return download(a);
+  // A factory image includes the bootloader, partition table and app at these flash offsets.
+  if (bytes[0] !== 0xe9 || bytes[0x8000] !== 0xaa || bytes[0x8001] !== 0x50 || bytes[0x10000] !== 0xe9) {
+    throw new Error("Choose a Warthog factory image with the .factory.bin extension.");
+  }
+  if (2 ** (bytes[3] >> 4) !== board().flashMiB) {
+    throw new Error(`The factory image must be built for ${board().flashMiB} MB flash on the selected board.`);
+  }
+  return binStr(bytes);
 }
 async function fetchRegion(src, cc) {
   const a = regionAssets(src).get(cc);
   if (!a) throw new Error(`${src.tag_name} has no ${cc} region image`);
-  const data = await download(a);
+  const data = await download(src, a);
   if (data.length !== REGNVS_SIZE) throw new Error(`${a.name} is ${data.length} bytes, not ${REGNVS_SIZE}`);
-  return data;
+  return binStr(data);
 }
 
 async function doFlash(erase) {
+  if (!loader || connecting || flashing) return;
   const src = regionSource(), cc = src ? $("regionPre").value : "";
   if (erase && src && !cc) { say("Erase & flash wipes the region: choose a country first.", "err"); return; }
-  $("flash").disabled = true; $("erase").disabled = true; bar(0);
+  flashing = true;
+  updateControls();
+  bar(0);
   try {
     const data = await fetchAsset();
     const fileArray = [{ data, address: 0x0 }];
@@ -380,18 +473,20 @@ async function doFlash(erase) {
       reportProgress: (i, written, total) => bar(((i + written / total) / fileArray.length) * 100),
     });
     bar(100);
-    say("Done. Tap RESET on the board.", "ok");
+    say(`Done. Tap ${board().reset} on the board.`, "ok");
     if (cc) say(`Region ${cc} written.`, "ok");
-    else if ($("localBin").files?.[0] || agnostic(currentRelease())) {
+    else if (localFile() || agnostic(currentRelease()) || selectedVariant()?.board) {
       say(erase ? "Erase cleared the stored region. The board uses the firmware's default until you set a region on the Configure tab."
                 : "No region written: the board keeps its stored region if present. Otherwise it uses the firmware's default.", "warn");
     }
     say("The console reappears as /dev/cu.usbmodem* (macOS) or /dev/ttyACM* (Linux) once it boots.", "dim");
-    try { await transport.disconnect(); } catch {}
-    $("connect").disabled = false;
+    await disconnectFlasher();
   } catch (e) {
     say(`Flash failed: ${e.message}`, "err");
-    $("flash").disabled = false; $("erase").disabled = false;
+    if (!localFile() && selectedAsset()) $("assetDownload").hidden = false;
+  } finally {
+    flashing = false;
+    updateControls();
   }
 }
 $("flash").addEventListener("click", () => doFlash(false));
@@ -505,7 +600,7 @@ $("cfgConnect").addEventListener("click", async () => {
     await cfgOpen();
     const info = cport.getInfo();
     $("cfgPort").textContent = `USB ${info.usbVendorId?.toString(16)}:${info.usbProductId?.toString(16)}`;
-    if (info.usbProductId === 0x0009) { csay("That is the ROM bootloader, not the firmware. Tap RESET and reconnect.", "warn"); await cport.close(); return; }
+    if (info.usbProductId === 0x0009) { csay("The board is in download mode. Tap RESET on XIAO or R on RadioCore, then reconnect.", "warn"); await cport.close(); return; }
     const r = await at("AT");
     if (!r.ok) { csay("No AT response. The console shares the port with a second CDC interface on some hosts — try the other one.", "err"); return; }
     setCfgEnabled(true);

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Region images for the regnvs partition: warthog-TAG-region-CC.bin, one per country the build offers.
+# Region images for the regnvs partition: warthog-TAG-region-CC.bin, one per distinct region.
 #
-# Usage: scripts/region-images.sh TAG OUTDIR [SDKCONFIG]
-#   SDKCONFIG defaults to sdkconfig.warthog-station, which a station build writes.
+# Usage: scripts/region-images.sh TAG OUTDIR [SDKCONFIG...]
+#   Without config arguments, use sdkconfig.warthog-station, which a station build writes.
 # Needs esp-idf-nvs-partition-gen on $PYTHON (release.yml and ci.yml pin it) and IDF's nvs_tool.py.
 
 set -euo pipefail
 
-TAG="${1:?usage: $0 TAG OUTDIR [SDKCONFIG]}"
-OUT="${2:?usage: $0 TAG OUTDIR [SDKCONFIG]}"
-CFG="${3:-sdkconfig.warthog-station}"
+TAG="${1:?usage: $0 TAG OUTDIR [SDKCONFIG...]}"
+OUT="${2:?usage: $0 TAG OUTDIR [SDKCONFIG...]}"
+shift 2
+if [[ "$#" = 0 ]]; then set -- sdkconfig.warthog-station; fi
 PY="${PYTHON:-python3}"
 # PlatformIO's core dir as pio reads it: a leading ~ expanded, a relative one made absolute.
 core=${PLATFORMIO_CORE_DIR:-$HOME/.platformio}
@@ -18,14 +19,20 @@ NVS_TOOL="${NVS_TOOL:-$core/packages/framework-espidf/components/nvs_flash/nvs_p
 # regnvs's size in partitions.csv (12K).
 SIZE=0x3000
 
-HW=$(sed -n 's/^CONFIG_WARTHOG_HW_REGIONS="\([A-Z,]*\)"$/\1/p' "$CFG")
-[[ "$HW" =~ ^[A-Z]{2}(,[A-Z]{2})*$ ]] || { echo "error: no CONFIG_WARTHOG_HW_REGIONS in $CFG" >&2; exit 1; }
+regions=()
+for CFG in "$@"; do
+    HW=$(sed -n 's/^CONFIG_WARTHOG_HW_REGIONS="\([A-Z,]*\)"$/\1/p' "$CFG")
+    [[ "$HW" =~ ^[A-Z]{2}(,[A-Z]{2})*$ ]] || { echo "error: no CONFIG_WARTHOG_HW_REGIONS in $CFG" >&2; exit 1; }
+    for CC in ${HW//,/ }; do
+        [[ " ${regions[*]-} " == *" $CC "* ]] || regions+=("$CC")
+    done
+done
 [[ -f "$NVS_TOOL" ]] || { echo "error: $NVS_TOOL not found (a pio build installs it)" >&2; exit 1; }
 
 mkdir -p "$OUT"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-for CC in ${HW//,/ }; do
+for CC in "${regions[@]}"; do
     BIN="$OUT/warthog-${TAG}-region-${CC}.bin"
     printf 'key,type,encoding,value\nwarthog,namespace,,\nregion,data,string,%s\n' "$CC" > "$WORK/region.csv"
     "$PY" -m esp_idf_nvs_partition_gen generate "$WORK/region.csv" "$BIN" "$SIZE" > "$WORK/gen.log" ||

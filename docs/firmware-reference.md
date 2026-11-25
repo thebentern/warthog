@@ -41,15 +41,25 @@ avoidance, Windows RNDIS, a web UI.
 The XIAO image offers AU, JP, KR, NZ and US. The 915 MHz RadioCore image also
 offers CA. Both default to US and limit channels to 902–928 MHz. The 868 MHz
 RadioCore image offers and defaults to EU, with 1 MHz channels in its
-863–870 MHz band. Build and upload the RadioCore image for your SKU from source.
+863–870 MHz band. Select the firmware for your RadioCore's band when flashing.
 [RadioCore setup](../README.md#heltec-radiocore-rc32-68)
 
 ## Flashing
 
-### XIAO release bundles
+### In a browser
 
-Download the XIAO station and mesh factory images and XIAO region images from
-GitHub Releases. [Release downloads](https://github.com/thebentern/warthog/releases)
+Select the XIAO or the RadioCore RC32-68 frequency band in the web flasher.
+Choose a release that includes the selected board, or load a matching local
+`.pio/build/<environment>/firmware.factory.bin`. Use the buttons for your
+board to enter download mode and reboot after flashing.
+[Web flasher](https://thebentern.github.io/warthog/) · [Flashing guide](../wiki/Flashing.md#from-a-browser)
+
+### Release bundles
+
+Each release includes firmware for the boards it lists. XIAO releases may
+include station and mesh builds. Choose the 915 MHz or 868 MHz station image
+that matches your RadioCore when your release includes it.
+[Release downloads](https://github.com/thebentern/warthog/releases)
 
 | File | Purpose |
 |------|---------|
@@ -72,11 +82,13 @@ up on build defaults; the region, in its own partition at `0x420000`, is kept.
 Without `--region` the board keeps its stored region. To keep settings, write the
 bootloader, partitions and app images at `0x0`, `0x8000` and `0x10000` instead.
 
-### RadioCore source builds
+### From source
 
-Build and upload the PlatformIO environment for your RadioCore's band. Enter
-download mode by holding **USER**, tapping **R**, and releasing **USER**. Tap **R**
-after the upload. [RadioCore setup](../README.md#heltec-radiocore-rc32-68)
+Use `pio run -e <environment>` to build a factory image for the board in the
+table above, or add `-t upload` to flash directly. To enter download mode on
+the XIAO, hold **BOOT**, tap **RESET**, then release **BOOT**. On the RadioCore,
+hold **USER**, tap **R**, then release **USER**. After uploading, tap **RESET**
+on the XIAO or **R** on the RadioCore. [Source setup](../README.md#development)
 
 ### Reflashing a running board
 

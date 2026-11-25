@@ -11,9 +11,9 @@ at the same time. The uplink joins a HaLow access point or an 802.11s mesh.
 
 _About $30 in parts; prices are approximate and vary by supplier._
 
-[Flash a XIAO in your browser](https://thebentern.github.io/warthog/) ·
-[Download XIAO releases](https://github.com/thebentern/warthog/releases) ·
-[Build and flash a RadioCore](#heltec-radiocore-rc32-68) ·
+[Flash in your browser](https://thebentern.github.io/warthog/) ·
+[Download releases](https://github.com/thebentern/warthog/releases) ·
+[Build from source](#development) ·
 [Read the guides](https://github.com/thebentern/warthog/wiki)
 
 ## Hardware
@@ -51,29 +51,28 @@ HaLow connector and use a USB-C data cable. [Heltec RC32 specifications](https:/
 | 915 MHz (ZC-390-1) | `warthog-heltec-rc32-68` | AU, CA, JP, KR, NZ, US | US |
 | 868 MHz (ZC-389-1) | `warthog-heltec-rc32-68-868` | EU | EU |
 
-Install the [source build tools](#development) and choose the environment for
-your board's band. To enter download mode, hold **USER**, tap **R**, then release
-**USER**. [Heltec flashing instructions](https://heltec.org/faq/01a1aa6962ca70608c0a5fdf79ef72b3)
-
-```bash
-pio run -e warthog-heltec-rc32-68 -t upload
-```
-
-Use `warthog-heltec-rc32-68-868` in that command for the 868 MHz board. Tap **R**
-after uploading.
+Select the matching band in the web flasher or use its PlatformIO environment
+to build from source. [Quick start](#quick-start) · [Development](#development)
 
 ## Quick start
 
 For a first setup with a **HaLow access point**, use the station image for your
 board. For mesh or OpenMANET, see [Operating modes](#operating-modes).
 
-1. **Install the firmware for your board.**
+1. **Install the firmware for your board.** Connect the board over USB and open
+   the web flasher in desktop Chrome, Edge or Opera. Select your board and,
+   for the RadioCore, its band.
+   Choose the station firmware from a release that includes it. You can also
+   load the matching local `firmware.factory.bin`. [Web flasher](https://thebentern.github.io/warthog/) ·
+   [Build from source](#development)
 
-   - **XIAO with Seeed HaLow add-on.** Connect the board over USB. Hold **BOOT**,
-     tap **RESET**, then release **BOOT**. Open the [web flasher](https://thebentern.github.io/warthog/)
-     in desktop Chrome, Edge or Opera, select your region and install the
-     station image. Tap **RESET** when it finishes.
-   - **RadioCore RC32-68.** Build and upload the firmware for your band. [RadioCore flashing steps](#heltec-radiocore-rc32-68)
+   Enter download mode with the buttons on your board.
+
+   - **XIAO with Seeed HaLow add-on.** Hold **BOOT**, tap **RESET**, then release **BOOT**.
+   - **RadioCore RC32-68.** Hold **USER**, tap **R**, then release **USER**. [Heltec flashing instructions](https://heltec.org/faq/01a1aa6962ca70608c0a5fdf79ef72b3)
+
+   Choose **Connect**, select the serial port, then choose **Flash**. Tap
+   **RESET** on the XIAO or **R** on the RadioCore when flashing finishes.
 
 2. **Open the console.** Use the flasher's **Configure** tab, or a serial
    terminal at **115200, 8-N-1**. The console appears as `/dev/cu.usbmodem*`
@@ -94,8 +93,9 @@ AT+RESET
 
 The Wi-Fi AP ships with password `warthog-default`. Replace it before deployment.
 Settings persist across reboots. **Writing a factory image at `0x0` clears saved
-settings and keeps the region.** The XIAO web flasher's **Erase & flash** also
-clears the region and writes the one you select. [Flashing guide](wiki/Flashing.md)
+settings and keeps the region unless you select a replacement.** The web
+flasher's **Erase & flash** clears the region and writes a replacement if
+selected. [Flashing guide](wiki/Flashing.md)
 
 ![macOS receiving a USB Ethernet address and pinging Warthog](docs/img/usb-host.svg)
 
@@ -137,8 +137,8 @@ A Warthog is a **mesh leaf by default**: it connects its own clients without
 relaying traffic between other nodes. `AT+MESHFWD=1` enables experimental relay
 mode. Bridge mode is also experimental.
 
-OpenMANET's LuCI mesh wizard puts the radio in `bat0`. Use the XIAO batman
-build for that configuration. Both sides must match region, channel, bandwidth,
+OpenMANET's LuCI mesh wizard puts the radio in `bat0`. Choose **OpenMANET (batman)**
+in the XIAO web flasher for that configuration. Both sides must match region, channel, bandwidth,
 mesh ID and security mode. The XIAO has been tested with
 **OpenMANET 1.8.0** on a Raspberry Pi 4 and Seeed HaLow HAT, using batman-adv
 2025.4.
@@ -204,8 +204,9 @@ spaces. Use the PlatformIO environment for your device.
 | Heltec RadioCore RC32-68, 915 MHz | `warthog-heltec-rc32-68` |
 | Heltec RadioCore RC32-68, 868 MHz | `warthog-heltec-rc32-68-868` |
 
-To upload, enter download mode for your board and add `-t upload` to the build
-command. [Download mode and update options](wiki/Flashing.md)
+For browser flashing, load `.pio/build/<environment>/firmware.factory.bin`
+under the matching board choice. To upload with PlatformIO, enter download
+mode and add `-t upload` to the build command. [Flashing guide](wiki/Flashing.md)
 
 See [Quick Start](wiki/Quick-Start.md) for toolchain details and
 [Development](wiki/Development.md) for repository layout, all build variants
