@@ -7,7 +7,12 @@
 #include "mmwlan.h"
 
 /* The region a board with none stored runs. */
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#define WARTHOG_DEFAULT_REGION CONFIG_WARTHOG_DEFAULT_REGION
+#else
 #define WARTHOG_DEFAULT_REGION "US"
+#endif
 /* Rows a plan can hold: more than any regdb country has in the module's band. */
 #define WARTHOG_PLAN_MAX_ROWS 64
 

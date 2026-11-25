@@ -3,11 +3,15 @@
 From an unflashed board to a working link. Budget twenty minutes the first time,
 most of it toolchain install.
 
-## 1. Fit the capacitor
+## 1. Prepare the board
 
-Before anything else. The Seeed HaLow add-on browns the board out under PA load
-without extra bulk capacitance — 470–1000 µF, low ESR, across the XIAO's **5V**
-and **GND** pads. Skipping this produces resets that look like firmware bugs.
+- **Seeed XIAO ESP32-S3 with the Seeed HaLow add-on.** Fit a 470–1000 µF
+  low-ESR capacitor across the XIAO's **5V** and **GND** pads. The add-on can
+  otherwise brown out during radio startup. Connect a 900 MHz HaLow antenna.
+- **Heltec RadioCore RC32-68.** Connect a HaLow antenna for your board's band
+  (915 MHz or 868 MHz). [Heltec specifications](https://heltec.org/project/rc32/)
+
+Use a USB data cable for either board.
 
 ## 2. Install the toolchain
 
@@ -27,37 +31,30 @@ so the checkout path must not contain one. `scripts/ci/check-platform-pin.sh --i
 the penv's version. A penv that already holds another version, or one made by an older platform
 (`pioarduino-core` 6.1.19), keeps it: delete the penv directory and the next build recreates it.
 
-Component versions are pinned exactly. After pulling a change to `sdkconfig.defaults` or `sdkconfig.ecm`,
-run `rm -f sdkconfig.warthog-*`: an existing sdkconfig keeps every value it sets itself (a line with no
-`# default:` above it), the ones it took from them included.
+Component versions are pinned exactly. After pulling a change to
+`sdkconfig.defaults` or a board overlay, remove the affected generated
+`sdkconfig.warthog-*` files before rebuilding. Generated configs can keep
+values from earlier defaults.
 
 If an existing checkout fails its first build after a HaLow component update, see
 [Troubleshooting](Troubleshooting#build-fails-on-the-first-build-after-a-halow-component-update).
 
 ## 3. Choose a build
 
-One station image serves every region the module offers (AU, JP, KR, NZ, US):
+Use the station environment for your board. Each environment defines its
+supported regions and the default for a board with no region stored.
 
-```bash
-pio run -e warthog-station
-```
+| Board | Station environment | Regions | Default |
+|---|---|---|---|
+| Seeed XIAO ESP32-S3 + HaLow add-on | `warthog-station` | AU, JP, KR, NZ, US | US |
+| Heltec RadioCore RC32-68, 915 MHz (ZC-390-1) | `warthog-heltec-rc32-68` | AU, CA, JP, KR, NZ, US | US |
+| Heltec RadioCore RC32-68, 868 MHz (ZC-389-1) | `warthog-heltec-rc32-68-868` | EU | EU |
 
-The country is set at runtime: `AT+REGION=<CC>` ([step 6](#6-point-it-at-an-uplink)), or
-pick it in the web flasher. A board with none set runs as US.
+Set the region at runtime with `AT+REGION=<CC>`. [Step 6](#6-point-it-at-an-uplink)
 
-For a peer-to-peer mesh instead of a station uplink, build
-`warthog-mesh-smoke` and read [Mesh Mode](Mesh-Mode) first.
-
-> **The station build can join a mesh at runtime** — `AT+MESHEN=1`, then
-> `AT+RESET`. Mesh ID, passphrase and channel are set the same way
-> (`AT+MESHID=`, `AT+MESHPASS=`, `AT+MESHCHAN=`); all persist to NVS.
->
-> **With mesh on it uses its region's default mesh channel** (US: ch42,
-> 923.0 MHz, 2 MHz; the table is in [Mesh Mode](Mesh-Mode#building-for-mesh)).
-> To match a peer on another channel:
-> `AT+MESHCHAN=<chan>,<freq_hz>,<gclass>,<sclass>,<bw>`, then `AT+RESET`. The
-> set must be a row of the region's table; one that is not is refused with the
-> reason. `AT+MESHCFG?` reports what actually applied.
+For an open mesh, set `AT+MESHEN=1` and `AT+MESHSEC=0`, match your peers' mesh
+ID and channel, then run `AT+RESET`. The dedicated `warthog-mesh-*` builds are
+for the XIAO. [Mesh Mode](Mesh-Mode)
 
 ## 4. Flash
 
@@ -66,19 +63,24 @@ The Warthog firmware runs its console and USB network on USB-OTG (TinyUSB), so
 in download mode by hand (a board already running Warthog can take `AT+DLMODE`
 instead; see [Flashing](Flashing#reflashing-a-running-board)):
 
-**Hold BOOT → tap RESET → release BOOT**, then:
+- **XIAO** — hold **BOOT**, tap **RESET**, then release **BOOT**.
+- **RadioCore** — hold **USER**, tap **R**, then release **USER**.
+
+Set `env` to your board's environment from the table, then build and upload.
 
 ```bash
-pio run -e warthog-station -t upload
+env=warthog-heltec-rc32-68  # Example for the 915 MHz RadioCore
+pio run -e "$env" -t upload
 ```
 
-Tap **RESET** when it finishes. Full detail and the multi-board flasher in
-[Flashing](Flashing).
+Tap **RESET** on the XIAO or **R** on the RadioCore when it finishes.
+[Flashing](Flashing)
 
 ## 5. Confirm it booted
 
 A CDC-ACM console appears as `/dev/cu.usbmodem*` (macOS) or `/dev/ttyACM*`
-(Linux). Any terminal at 115200 8-N-1:
+(Linux). Open a terminal at 115200 8-N-1. This example shows a board using
+the US default.
 
 ```
 AT
@@ -102,9 +104,8 @@ If `AT` does not answer, see [Troubleshooting](Troubleshooting).
 
 ## 6. Point it at an uplink
 
-Set the country you operate in (`AT+REGION?` lists the offered ones; none set
-runs as US), then, for station mode, give it an access point. Both persist, so
-this survives reboots and does not need a rebuild:
+Use `AT+REGION?` to see what the firmware offers. Replace `US` below with the
+region where you operate. In station mode, enter the HaLow AP credentials.
 
 ```
 AT+REGION=US

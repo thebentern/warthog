@@ -13,6 +13,8 @@ sdkconfig.old
 sdkconfig.*
 !sdkconfig.defaults
 !sdkconfig.ecm
+!sdkconfig.heltec-rc32-68
+!sdkconfig.heltec-rc32-68-868
 
 # Per-developer overrides
 platformio_override.ini

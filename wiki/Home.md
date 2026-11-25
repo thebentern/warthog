@@ -1,7 +1,7 @@
 # Warthog
 
-Open-source firmware that turns an ESP32-S3 plus a Wi-Fi HaLow module into a
-long-range network bridge you can read, modify and reflash.
+Open-source firmware for a long-range Wi-Fi HaLow gateway. It runs on a Seeed
+XIAO ESP32-S3 with the Seeed HaLow add-on or a Heltec RadioCore RC32-68.
 
 Sub-GHz 802.11ah gives kilometre-class range at low power. Warthog puts three
 usable surfaces on top of it and an AT console in front of it, so you can
@@ -44,6 +44,8 @@ run mesh.
 
 ## Hardware
 
+### Seeed XIAO ESP32-S3
+
 - [Seeed Studio XIAO ESP32-S3](https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html)
 - [Seeed Studio Wi-Fi HaLow module for XIAO](https://www.seeedstudio.com/Wi-Fi-HaLow-Module-for-Seeed-Studio-XIAO-p-6262.html) (Quectel FGH100M-H / Morse Micro MM6108)
 - 900 MHz antenna, I-PEX → SMA
@@ -53,6 +55,12 @@ run mesh.
 > inrush browns out the ESP32-S3. Add a 470–1000 µF low-ESR capacitor across the
 > XIAO's 5V and GND pads. This is not optional and the failure looks like random
 > resets.
+
+### Heltec RadioCore RC32-68
+
+The RC32-68 has an ESP32-S3R8 and an HC01 Wi-Fi HaLow module on the board.
+Connect an antenna for the 915 MHz or 868 MHz model and use a USB-C data cable.
+Build the firmware for your model. [Quick Start](Quick-Start#3-choose-a-build) · [Heltec specifications](https://heltec.org/project/rc32/)
 
 ## Licence
 

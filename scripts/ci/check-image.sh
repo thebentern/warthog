@@ -75,10 +75,14 @@ for e in "$@"; do
   fi
   dd if="$fac" bs="$APP" skip=1 2>/dev/null | cmp -s - "$fw" || bad "factory [0x10000, end) is not firmware.bin"
 
-  # Header bytes 0, 2, 3: magic 0xE9, DIO (0x02), 8MB in the high nibble and 80m in the low (0x3F).
+  case "$e" in
+    warthog-heltec-rc32-68|warthog-heltec-rc32-68-868) flash_size=16MB; flash_header=4f ;;
+    *) flash_size=8MB; flash_header=3f ;;
+  esac
+  # Header bytes 0, 2, 3: magic 0xE9, DIO (0x02), flash size in the high nibble and 80 MHz in the low.
   for f in "$bl" "$fw"; do
     h=$(od -An -tx1 -N4 "$f" | tr -d ' \n')
-    case "$h" in e9??023f) ;; *) bad "${f##*/} header is ${h:-empty} (bytes 0-3), want e9 ?? 02 3f (DIO, 8MB, 80m)" ;; esac
+    case "$h" in e9??02"$flash_header") ;; *) bad "${f##*/} header is ${h:-empty} (bytes 0-3), want e9 ?? 02 $flash_header (DIO, $flash_size, 80m)" ;; esac
     out=$("$ESPTOOL" --chip esp32s3 image-info "$f" 2>&1)
     rc=$?
     if [ "$rc" != 0 ]; then
@@ -102,7 +106,7 @@ for e in "$@"; do
   sum=$(sha256 "$pt")
   [ "$sum" = "$PSHA" ] || bad "partitions.bin sha256 is $sum, want $PSHA (pins.env)"
   if [ "$efail" = 0 ]; then
-    echo "ok   $e: factory = 0x10000 + $nfw B, bootloader $nbl B, DIO/80m/8MB, partitions $(echo "$sum" | cut -c1-12), USB DWC2 in $usb mode"
+    echo "ok   $e: factory = 0x10000 + $nfw B, bootloader $nbl B, DIO/80m/$flash_size, partitions $(echo "$sum" | cut -c1-12), USB DWC2 in $usb mode"
   else
     fail=1
   fi

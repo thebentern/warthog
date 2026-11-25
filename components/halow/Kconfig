@@ -19,6 +19,12 @@ menu "Wi-Fi HaLow Connection Manager"
         help
             Comma list of two-letter codes; AT+REGION offers those also in the regdb and the BCF.
 
+    config WARTHOG_DEFAULT_REGION
+        string "Region used at boot when none is stored"
+        default "US"
+        help
+            Two-letter code from WARTHOG_HW_REGIONS. Stored AT+REGION values take precedence.
+
     config WARTHOG_HW_BAND_LO_KHZ
         int "Lowest frequency the module is rated for (kHz)"
         default 902000

@@ -590,6 +590,7 @@ static void t_defaults(void)
     const struct warthog_region_ctx c = real_();
     static const struct { const char *cc; unsigned chan, bw, g, s; uint32_t hz; int eirp; } want[] = {
         { "US", 42, 2, 69, 2, 923000000, 36 },
+        { "CA", 42, 2, 69, 2, 923000000, 36 },
 #ifndef WANT_AU2020
         { "AU", 41, 2, 51, 23, 922500000, 30 },
 #endif
@@ -615,10 +616,15 @@ static void t_defaults(void)
         CHECK(warthog_region_default_row(&c, l) == rule_default_(&c, l),
               "%s's default is the 2 MHz row nearest the middle of its in-band span (lower on a tie)", ruled[i]);
     }
-    static const char *none[] = { "CA", "EU", "GB", "IN" };
-    for (unsigned i = 0; i < 4; i++) {
-        CHECK(warthog_region_default_row(&c, dom_(none[i])) == NULL, "%s has no default (never offered)", none[i]);
+    static const char *none[] = { "EU", "GB", "IN" };
+    for (unsigned i = 0; i < sizeof(none) / sizeof(none[0]); i++) {
+        CHECK(warthog_region_default_row(&c, dom_(none[i])) == NULL, "%s has no default in the XIAO band", none[i]);
     }
+    const struct warthog_region_ctx eu_band = ctx_("EU", NULL, 0, 863000, 870000);
+    const struct mmwlan_s1g_channel *eu = warthog_region_default_row(&eu_band, dom_("EU"));
+    CHECK(eu != NULL && eu == row_("EU", 5, 1) && eu->centre_freq_hz == 865500000 &&
+          eu->duty_cycle_sta == 280 && warthog_region_in_band(&eu_band, eu),
+          "EU default: ch5 865.5 MHz @ 1 MHz, in band with its 2.8%% duty limit");
     CHECK(warthog_region_default_row(&c, NULL) == NULL, "no list: no default");
     const struct warthog_region_ctx narrow = ctx_("US", k_region_bcf, sizeof(k_region_bcf), 902000, 922000);
     CHECK(warthog_region_default_row(&narrow, dom_("US")) == NULL, "a default outside the band is no default");

@@ -101,6 +101,10 @@ check(els.region.value === "AU" && !els.regionSave.disabled && els.region.childr
 check(els.regionHint.textContent === "Stored in its own partition; reflashing keeps it. A board with none set runs as US.", "stored AU: the hint");
 t.fillRegion(R(true, "+REGION: running=US next_boot=US stored=none", "+REGION: allowed=AU,JP,KR,NZ,US default=US"));
 check(els.region.value === "US", "nothing stored: the running US preselected");
+t.fillRegion(R(true, "+REGION: running=US next_boot=US stored=none", "+REGION: allowed=AU,CA,JP,KR,NZ,US default=US"));
+check(els.region.children.some((o) => o.value === "CA" && o.textContent.startsWith("CA — Canada")), "915 MHz RadioCore: Canada appears when the board offers it");
+t.fillRegion(R(true, "+REGION: running=EU next_boot=EU stored=none", "+REGION: allowed=EU default=EU"));
+check(els.region.value === "EU" && els.region.children.length === 1 && els.regionHint.textContent.endsWith("runs as EU."), "868 MHz RadioCore: EU is the only choice and the reported default");
 t.fillRegion(R(true, "+REGION: running=US next_boot=NZ stored=NZ", "+REGION: allowed=AU,JP,KR,NZ,US default=US"));
 check(els.region.value === "NZ" && els.regionHint.textContent.includes("Running US; NZ after reboot."), "stored NZ, not yet applied: NZ preselected, the hint says after reboot");
 t.fillRegion(R(true, "+REGION: running=none next_boot=none stored=invalid('u$')", "+REGION: allowed=AU,JP,KR,NZ,US default=US",

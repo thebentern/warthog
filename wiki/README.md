@@ -9,17 +9,20 @@ is the navigation on every page, `Home.md` is the landing page.
 
 ## Publishing
 
-GitHub wikis are unavailable on **private repositories on the Free plan**, so
-until this repo is public (or the plan changes) the wiki cannot be enabled and
-these pages live here only. `has_wiki` silently stays `false` if you try.
-
-Once it is available, enable the wiki in repository settings, create any page
-once through the web UI so the wiki repository exists, then:
+Publish the merged pages to the separate wiki repository. Keep this README in
+the main repository and copy the other Markdown files, including `_Sidebar.md`.
+[Live wiki](https://github.com/thebentern/warthog/wiki)
 
 ```bash
-git clone https://github.com/thebentern/warthog.wiki.git /tmp/warthog.wiki
-cp wiki/*.md /tmp/warthog.wiki/
-cd /tmp/warthog.wiki && git add -A && git commit -m "docs: sync wiki from main repo" && git push
+wiki_checkout=$(mktemp -d)
+git clone https://github.com/thebentern/warthog.wiki.git "$wiki_checkout"
+for page in wiki/*.md; do
+  [ "$page" = wiki/README.md ] || cp "$page" "$wiki_checkout/"
+done
+git -C "$wiki_checkout" diff --check
+git -C "$wiki_checkout" add -- '*.md'
+git -C "$wiki_checkout" commit -m "docs: sync wiki from main repo"
+git -C "$wiki_checkout" push
 ```
 
 ## Scope

@@ -6696,11 +6696,11 @@ else
 fi
 
 # 75h. The HW list and band are the module's, kept beside the BCF they pair with: sdkconfig.defaults
-#      pairs bcf_fgh100mhaamd.mbin (FGH100M-H, 902-928 MHz) with AU,JP,KR,NZ,US, CMake refuses a
-#      malformed list or one without US, and every generated sdkconfig.warthog-* carries the same
-#      BCF, list and band (PlatformIO keeps an old line over the defaults). test_region runs the
-#      list on the real BCF bytes, which make region-bcf compares with the SDK's own copy
-#      (morsefirmware/mm6108/bcfs), named so on region_bcf.h's line 2.
+#      pairs bcf_fgh100mhaamd.mbin (FGH100M-H, 902-928 MHz) with AU,JP,KR,NZ,US. CMake refuses a
+#      malformed list or one without the default region. Each generated sdkconfig.warthog-* must
+#      carry its board's BCF, list and band (PlatformIO keeps old lines over the defaults).
+#      test_region runs the XIAO list on the real BCF bytes, which make region-bcf compares with the
+#      SDK's own copy (morsefirmware/mm6108/bcfs), named so on region_bcf.h's line 2.
 why75h=""
 bcf75=$(sed -n 's/^CONFIG_MM_BCF_FILE=//p' "$DF75")
 case "$bcf75" in
@@ -6708,8 +6708,10 @@ case "$bcf75" in
                               why75h="bcf_fgh100mhaamd.mbin is not paired with AU,JP,KR,NZ,US at 902-928 MHz ($HW75, $LO75-$HI75)" ;;
   *) why75h="no HW list is reviewed for $bcf75" ;;
 esac
-grep -q 'MATCHES "^\[A-Z\]\[A-Z\](,\[A-Z\]\[A-Z\])\*\$"' ../../halow/CMakeLists.txt && grep -q 'MATCHES ",US,"' ../../halow/CMakeLists.txt || \
-  why75h="${why75h:-components/halow/CMakeLists.txt does not refuse a malformed HW list or one without US}"
+grep -qF '"${CONFIG_WARTHOG_DEFAULT_REGION}" MATCHES "^[A-Z][A-Z]$"' ../../halow/CMakeLists.txt &&
+  grep -qF 'MATCHES "^[A-Z][A-Z](,[A-Z][A-Z])*$"' ../../halow/CMakeLists.txt &&
+  grep -qF 'MATCHES ",${CONFIG_WARTHOG_DEFAULT_REGION},"' ../../halow/CMakeLists.txt || \
+  why75h="${why75h:-components/halow/CMakeLists.txt does not check the HW list and its default region}"
 awk '/^if\(NOT CMAKE_BUILD_EARLY_EXPANSION\)$/ {on=1; next} on && /^endif\(\)$/ {exit}
   on && /^    if\(NOT CONFIG_WARTHOG_HW_BAND_LO_KHZ LESS CONFIG_WARTHOG_HW_BAND_HI_KHZ\)$/ {b=1; next}
   b && /message\(FATAL_ERROR "warthog: CONFIG_WARTHOG_HW_BAND_LO_KHZ must be below CONFIG_WARTHOG_HW_BAND_HI_KHZ"\)/ {f=1}
@@ -6727,14 +6729,23 @@ for c75 in $(printf '%s' "$HW75" | tr -d '"' | tr ',' ' '); do
 done
 for g75 in ../../../sdkconfig.warthog-*; do
   [ -f "$g75" ] || continue
-  for k75 in "CONFIG_MM_BCF_FILE=$bcf75" "CONFIG_WARTHOG_HW_REGIONS=$HW75" "CONFIG_WARTHOG_HW_BAND_LO_KHZ=$LO75" "CONFIG_WARTHOG_HW_BAND_HI_KHZ=$HI75"; do
+  case "${g75##*/}" in
+    sdkconfig.warthog-heltec-rc32-68)
+      set -- 'CONFIG_MM_BCF_FILE="bcf_HC01_V2_3V3.mbin"' 'CONFIG_WARTHOG_HW_REGIONS="AU,CA,JP,KR,NZ,US"' \
+        CONFIG_WARTHOG_HW_BAND_LO_KHZ=902000 CONFIG_WARTHOG_HW_BAND_HI_KHZ=928000 'CONFIG_WARTHOG_DEFAULT_REGION="US"' ;;
+    sdkconfig.warthog-heltec-rc32-68-868)
+      set -- 'CONFIG_MM_BCF_FILE="bcf_HC01_V2_3V3.mbin"' 'CONFIG_WARTHOG_HW_REGIONS="EU"' \
+        CONFIG_WARTHOG_HW_BAND_LO_KHZ=863000 CONFIG_WARTHOG_HW_BAND_HI_KHZ=870000 'CONFIG_WARTHOG_DEFAULT_REGION="EU"' ;;
+    *) set -- "CONFIG_MM_BCF_FILE=$bcf75" "CONFIG_WARTHOG_HW_REGIONS=$HW75" "CONFIG_WARTHOG_HW_BAND_LO_KHZ=$LO75" "CONFIG_WARTHOG_HW_BAND_HI_KHZ=$HI75" ;;
+  esac
+  for k75 in "$@"; do
     grep -qxF "$k75" "$g75" || { why75h="${why75h:-${g75##*/} lacks $k75 (PlatformIO keeps a generated sdkconfig: delete it)}"; break; }
   done
 done
 [ "$GG_STRICT" = 1 ] && [ -z "$(find ../../.. -maxdepth 1 -name 'sdkconfig.warthog-*' -type f)" ] && \
   why75h="${why75h:-GLUEGUARD_UPSTREAM_REQUIRED=1 and no generated sdkconfig.warthog-*}"
 if [ -z "$why75h" ]; then
-  ok "the HW list and band pair with the linked BCF (bcf_fgh100mhaamd.mbin: AU,JP,KR,NZ,US, 902-928 MHz) in sdkconfig.defaults and every generated sdkconfig; CMake refuses a list without US and an empty band; the AT reference and the flasher name every offered code"
+  ok "the supported regions and band match the BCF in the XIAO defaults and all generated sdkconfigs; CMake checks the default and band; the AT reference and flasher cover the XIAO regions"
 else
   bad "HW regions: $why75h"
 fi
@@ -6927,8 +6938,8 @@ else
   bad "the region context (halow.c warthog_region_ctx_get): $why75l"
 fi
 
-# 76. sdkconfig landing (scripts/ci/check-sdkconfig-landing.sh): every CONFIG_ line of sdkconfig.defaults, and of
-#     sdkconfig.ecm for an -ecm env, is in each generated sdkconfig.warthog-* of a platformio.ini env, as the
+# 76. sdkconfig landing (scripts/ci/check-sdkconfig-landing.sh): every CONFIG_ line of sdkconfig.defaults, with
+#     its environment's overlays applied, is in each generated sdkconfig.warthog-* of a platformio.ini env, as the
 #     value or as "is not set". An existing sdkconfig keeps the values it sets itself (configure loads the
 #     defaults first, then it), and a symbol Kconfig does not have lands nowhere; both build without a word.
 #     Under ECM, Kconfig hides sdkconfig.defaults' NCM symbols. No generated sdkconfig is ok, except under
@@ -6944,7 +6955,7 @@ if [ "$n76" = 0 ]; then
     ok "sdkconfig landing: none generated"
   fi
 elif o76=$(sh ../../../scripts/ci/check-sdkconfig-landing.sh 2>&1); then
-  ok "sdkconfig landing: sdkconfig.defaults (and sdkconfig.ecm for -ecm) landed in all $n76 generated sdkconfigs"
+  ok "sdkconfig landing: sdkconfig.defaults and environment overlays landed in all $n76 generated sdkconfigs"
 else
   f76=$(printf '%s\n' "$o76" | sed -n 's/^FAIL //p' | tr '\n' ';' | sed 's/;$//; s/;/; /g')
   bad "sdkconfig landing: ${f76:-$o76} (a stale generated sdkconfig: rm -f sdkconfig.warthog-* and rebuild; an existing sdkconfig keeps the values it sets itself: configure loads sdkconfig.defaults first, then it)"

@@ -60,7 +60,8 @@
   </div>
 
   <div class="card">
-    <h2>1 · Firmware</h2>
+    <h2>1 · XIAO firmware</h2>
+    <p class="hint">This tab installs firmware for the Seeed XIAO ESP32-S3 with the Seeed HaLow add-on. Build and upload RadioCore firmware for your board's band, then use the Configure tab. <a href="https://github.com/thebentern/warthog/blob/main/README.md#heltec-radiocore-rc32-68">RadioCore setup</a></p>
     <label for="release">Release</label>
     <select id="release"><option>Loading releases…</option></select>
     <label for="variant">Build</label>
@@ -70,17 +71,16 @@
       <label for="localBin" class="dim" style="margin:0">or</label>
       <input type="file" id="localBin" accept=".bin" style="font-size:13px">
     </div>
-    <p class="hint">Load a <code>.factory.bin</code> you built yourself — <code>.pio/build/warthog-&lt;env&gt;/firmware.factory.bin</code>. Written to <code>0x0</code>, same as a release asset.</p>
+    <p class="hint">Load a XIAO <code>.factory.bin</code> you built yourself from <code>.pio/build/warthog-&lt;env&gt;/firmware.factory.bin</code>. The flasher writes it to <code>0x0</code>.</p>
     <div id="regionPreBox" hidden>
       <label for="regionPre">Regulatory region</label>
       <select id="regionPre"></select>
-      <p class="hint" id="regionPreHint">Written to the board's region partition (<code>0x420000</code>) with the firmware. <b>Flash</b> otherwise keeps the stored region; <b>Erase &amp; flash</b> wipes it, so it needs a country. A board with none set runs as US.</p>
+      <p class="hint" id="regionPreHint">Written to the board's region partition (<code>0x420000</code>) with the firmware. <b>Flash</b> keeps the stored region if you leave this blank. <b>Erase &amp; flash</b> wipes the stored region and requires a selection when region images are available. The board uses the firmware's default if no region is stored.</p>
     </div>
   </div>
 
   <div class="card">
-    <h2>2 · Put the board in download mode</h2>
-    <p>The HaLow add-on drives USB-OTG, so the board <b>cannot</b> be reset into the bootloader over the wire. Do it by hand:</p>
+    <h2>2 · Put the XIAO in download mode</h2>
     <ol class="steps">
       <li>Hold <kbd>BOOT</kbd></li>
       <li>Tap <kbd>RESET</kbd></li>
@@ -118,7 +118,7 @@
 
     <div class="card">
       <h2>Regulatory region</h2>
-      <label for="region">Country</label>
+      <label for="region">Region</label>
       <select id="region"></select>
       <p class="hint" id="regionHint">Read from <code>AT+REGION?</code> once connected.</p>
       <div class="row"><button id="regionSave" class="secondary" disabled>Save region</button></div>
@@ -184,8 +184,7 @@
   </section>
 
   <p class="foot">
-    Same bytes as <code>scripts/flash.sh</code>: the <code>.factory.bin</code> written to <code>0x0</code>, plus the region image at <code>0x420000</code> when you choose one.
-    One image serves every region this module offers (AU, JP, KR, NZ, US); it is on you to be legal.
+    The XIAO flasher writes the <code>.factory.bin</code> at <code>0x0</code> and the selected region image at <code>0x420000</code>.
     <a href="https://github.com/thebentern/warthog">Source</a> · <a href="https://github.com/thebentern/warthog/wiki/Flashing">Flashing guide</a>
   </p>
 </main>
@@ -204,6 +203,7 @@ const REGNVS_OFFSET = 0x420000;
 const REGNVS_SIZE = 0x3000;
 const REGION_LABELS = {
   AU: "AU — Australia, 915.5–927.5 MHz", JP: "JP — Japan, 920.5–927.5 MHz", KR: "KR — South Korea, 917.5–928 MHz",
+  CA: "CA — Canada, 902–928 MHz", EU: "EU — European Union, 863–870 MHz",
   NZ: "NZ — New Zealand, 915–928 MHz", US: "US — United States, 902–928 MHz",
 };
 // Asset keys, warthog-<tag>-<key>.factory.bin. usBand: before the station image, a mesh image was US-only.
@@ -383,8 +383,8 @@ async function doFlash(erase) {
     say("Done. Tap RESET on the board.", "ok");
     if (cc) say(`Region ${cc} written.`, "ok");
     else if ($("localBin").files?.[0] || agnostic(currentRelease())) {
-      say(erase ? "Erase wiped the region and none was written: the board runs as US until you set one on the Configure tab."
-                : "No region written: the board keeps its stored region; one that never had one runs as US until set on the Configure tab.", "warn");
+      say(erase ? "Erase cleared the stored region. The board uses the firmware's default until you set a region on the Configure tab."
+                : "No region written: the board keeps its stored region if present. Otherwise it uses the firmware's default.", "warn");
     }
     say("The console reappears as /dev/cu.usbmodem* (macOS) or /dev/ttyACM* (Linux) once it boots.", "dim");
     try { await transport.disconnect(); } catch {}

@@ -9,10 +9,10 @@ deployments, convoys, anything that has to come up on its own.
 
 ## Building for mesh
 
-Mesh is mutually exclusive with station mode, but it is a runtime choice (the mesh envs force it on, so `AT+MESHEN=0` does nothing there):
-`AT+MESHEN=1` then `AT+RESET` turns it on for any build, `warthog-station`
-included. The mesh envs exist because they fix the identity at build time, so a
-bench of boards agrees with no configuration at all:
+The RadioCore and XIAO station builds enter mesh mode with `AT+MESHEN=1`
+followed by `AT+RESET`. Set `AT+MESHSEC=0` before rebooting to join an open
+mesh. The dedicated XIAO `warthog-mesh-*` builds start in mesh mode with a
+build-time identity.
 
 ```bash
 pio run -e warthog-mesh-smoke -t upload
@@ -41,12 +41,16 @@ minute and never opened or confirmed (the neighbour logged `close_reason=54`).
 The station image run as a mesh (`AT+MESHEN=1`) behaves the same. Under SAE a
 board moved to another mesh ID was never counted as a peer over three minutes.
 
-Default mesh channel per region (`AT+REGION`; none stored: US):
+The firmware chooses the default mesh channel from the region in use. With
+no region stored, the 868 MHz RadioCore uses EU. The XIAO and the 915 MHz
+RadioCore use US. [Regions by board](Quick-Start#3-choose-a-build)
 
 | Region | Channel | Frequency | Bandwidth | Classes (global/S1G) |
 |---|---|---|---|---|
 | US | 42 | 923.0 MHz | 2 MHz | 69/2 |
 | AU | 41 | 922.5 MHz | 2 MHz | 51/23 |
+| CA | 42 | 923.0 MHz | 2 MHz | 69/2 |
+| EU | 5 | 865.5 MHz | 1 MHz | 66/6 |
 | JP | 2 | 923.5 MHz | 2 MHz | 64/9 |
 | KR | 10 | 922.5 MHz | 2 MHz | 75/15 |
 | NZ | 38 | 921.0 MHz | 2 MHz | 69/27 |
@@ -448,7 +452,7 @@ build choice; the passphrase and the legacy shared key are runtime settings:
 | **SAE/AMPE** | `warthog-mesh-sae`; against OpenMANET `warthog-mesh-sae-swccmp`, or `warthog-mesh-sae-swccmp-meshvif` for a node's frames above its RTS threshold ([Limits](#limits)) | Real 802.11s security: SAE (Dragonfly, group 19) authentication and AMPE per-link key exchange. This is the mode to use. Of the builds in this row only the host-CCMP ones open a Linux node's group frames, which its path to the Warthog needs ([OpenMANET Interop](OpenMANET-Interop#management-frame-protection-peering-does-not-need-it-path-selection-does)). |
 | SAE/AMPE, chip crypto on a MESH chip interface | `warthog-mesh-sae-meshvif` | As `warthog-mesh-sae` (AMPE keys in the chip), on the MESH chip interface of `warthog-mesh-sae-swccmp-meshvif`, with each peer's MGTK in the chip at that peer's AID, as Linux installs it, so the chip opens a Linux node's group frames itself ([OpenMANET Interop](OpenMANET-Interop#group-frames-in-the-chip-warthog-mesh-sae-meshvif)). Measured on air on 2026-10-01: the Pis' group frames open in the chip and Pi to Warthog unicast passes both ways; before that change every Pi group frame was undecryptable. `AT+GTKPERSTA=0` returns it to that measured behaviour on the same flash. Batman mode is refused on it (`sae-no-host-ccmp`). |
 | Shared key | `warthog-mesh-smoke` + `AT+MESHSEC=1` | One hardcoded key baked into every image — obfuscation, not security. Kept for bring-up debugging only. |
-| Open | `warthog-mesh-smoke` + `AT+MESHSEC=0` | No keys. Interops with an open OpenMANET mesh. |
+| Open | Station build with `AT+MESHEN=1` and `AT+MESHSEC=0`, or XIAO `warthog-mesh-smoke` with `AT+MESHSEC=0` | No keys. Uses the security settings of an open OpenMANET mesh. |
 
 ### SAE/AMPE
 

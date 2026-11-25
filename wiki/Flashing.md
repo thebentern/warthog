@@ -1,11 +1,13 @@
 # Flashing
 
-> **Easiest route: the [web flasher](https://thebentern.github.io/warthog/).**
-> Chrome, Edge or Opera, nothing to install. Pick a release build or load a
-> `.bin` you built, do the BOOT/RESET dance, and flash. It also configures a
-> running board over the same cable. It writes a `.factory.bin` at `0x0`, which
-> erases the stored settings but keeps the region (its own partition), and the
-> region image you pick at `0x420000` ([below](#from-a-release-bundle)).
+For the **XIAO**, choose a release image in the web flasher using Chrome, Edge
+or Opera. For the **RadioCore RC32-68**, build and upload the image for your
+frequency band. [Web flasher](https://thebentern.github.io/warthog/) ·
+[From source](#from-source)
+
+The web flasher's Configure tab also works with a running board. Flashing a
+`.factory.bin` at `0x0` clears stored settings and keeps the region in its
+separate partition. Selecting a region image writes it at `0x420000`.
 
 ## Why the usual auto-reset does not work
 
@@ -14,24 +16,30 @@ rather than the built-in USB-Serial-JTAG, so `esptool` cannot pull the board
 into download mode over DTR/RTS. Every flash needs the button sequence, or
 `AT+DLMODE` on a running board ([below](#reflashing-a-running-board)):
 
-**Hold BOOT → tap RESET → release BOOT.**
+- **XIAO** — hold **BOOT**, tap **RESET**, then release **BOOT**.
+- **RadioCore** — hold **USER**, tap **R**, then release **USER**.
 
 The board then enumerates as a ROM device (USB `303a:0009`) and stays there
 until you flash or reset it.
 
 ## From source
 
+Select the environment for your board. [Quick Start](Quick-Start#3-choose-a-build)
+
 ```bash
-pio run -e warthog-station -t upload
-pio device monitor -e warthog-station
+env=warthog-station  # Example for the XIAO
+pio run -e "$env" -t upload
+pio device monitor -e "$env"
 ```
 
-Tap **RESET** when the write completes. The upload writes the bootloader,
-partition table and app separately and keeps the stored settings and the region.
+Tap **RESET** on the XIAO or **R** on the RadioCore when the write completes.
+The upload writes the bootloader, partition table and app separately and keeps
+the stored settings and the region.
 
 ## From a release bundle
 
-Releases carry one station image, the mesh images, a region image per country and a POSIX flasher:
+XIAO releases carry a station image, the mesh images, a region image per
+supported country and a POSIX flasher.
 
 ```bash
 ./flash.sh --region US warthog-vX.Y.Z-station.factory.bin
@@ -95,8 +103,8 @@ board found sitting in download mode. `tools/bench/flash.sh` resets with
 the RTC watchdog: a board that no reset takes out of download mode returns to
 the app 1800 s after the command (`AT+ASSERT?` `reset=DLMODE`). esptool does not
 stop that watchdog on the USB-OTG download port, so the whole session must end
-in a reset before it fires. For a longer session enter download mode with BOOT
-and RESET, which has no limit. The `warthog-mesh-*` builds (`WARTHOG_DEVLOOP`)
+in a reset before it fires. For a longer session use the board's buttons to
+enter download mode without a time limit. The `warthog-mesh-*` builds (`WARTHOG_DEVLOOP`)
 enter download mode the same way when the console is opened at 1200 baud.
 
 The `.factory.bin` write above erases the stored settings (not the region). To
@@ -131,7 +139,8 @@ hub browns them out. Requires `uhubctl`. It writes
 
 ## Recovering a board that will not enumerate
 
-Hold **BOOT**, tap **RESET**, release, and check it appears as a ROM device:
+Use the [button sequence for your board](#why-the-usual-auto-reset-does-not-work)
+to enter download mode and check it appears as a ROM device.
 
 ```bash
 uhubctl -l 0-1 | grep 303a:0009

@@ -7,11 +7,14 @@
 
 #include <stdatomic.h>
 
-static const char *TAG = "warthog.led";
-
 #ifndef WARTHOG_LED_GPIO
 #define WARTHOG_LED_GPIO 21
 #endif
+
+#if WARTHOG_LED_GPIO >= 0
+
+static const char *TAG = "warthog.led";
+
 #ifndef WARTHOG_LED_ACTIVE_LOW
 #define WARTHOG_LED_ACTIVE_LOW 1
 #endif
@@ -122,3 +125,22 @@ void warthog_led_set_usb(bool attached)
 {
     atomic_store(&s_usb_attached, attached);
 }
+
+#else
+
+esp_err_t warthog_led_start(void)
+{
+    return ESP_OK;
+}
+
+void warthog_led_set(warthog_led_state_t state)
+{
+    (void)state;
+}
+
+void warthog_led_set_usb(bool attached)
+{
+    (void)attached;
+}
+
+#endif

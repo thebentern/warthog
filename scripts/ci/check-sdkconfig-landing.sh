@@ -1,7 +1,6 @@
 #!/bin/sh
-# Fails unless every CONFIG_ line of sdkconfig.defaults (then sdkconfig.ecm for an -ecm env) landed in the
-# generated sdkconfig.<env>: an existing sdkconfig keeps the values it sets itself (configure loads
-# sdkconfig.defaults first, then it).
+# Fails unless sdkconfig.defaults and each environment's overlays landed in the generated sdkconfig.<env>.
+# An existing sdkconfig keeps the values it sets itself (configure loads the defaults first, then it).
 #
 # Usage: scripts/ci/check-sdkconfig-landing.sh [ENV...]
 #   No ENV: every sdkconfig.warthog-* of an [env:warthog-*] in platformio.ini. SDKCONFIG_DIR (default: the
@@ -14,9 +13,8 @@ unset CDPATH
 ROOT=$(cd "$(dirname "$0")/../.." && pwd -P)
 DIR="${SDKCONFIG_DIR:-$ROOT}"
 DEF="$ROOT/sdkconfig.defaults"
-ECM="$ROOT/sdkconfig.ecm"
 INI="$ROOT/platformio.ini"
-for f in "$DEF" "$ECM" "$INI"; do
+for f in "$DEF" "$INI"; do
   [ -f "$f" ] && [ -r "$f" ] || { echo "error: no readable $f" >&2; exit 2; }
 done
 
@@ -89,10 +87,17 @@ for e in $envs; do
     fail=1
     continue
   fi
+  set -- "$DEF"
   case "$e" in
-    *-ecm) out=$(check_env "$e" 2 "$DEF" "$ECM" "$g") ;;
-    *) out=$(check_env "$e" 1 "$DEF" "$g") ;;
+    *-ecm) set -- "$@" "$ROOT/sdkconfig.ecm" ;;
+    warthog-heltec-rc32-68) set -- "$@" "$ROOT/sdkconfig.heltec-rc32-68" ;;
+    warthog-heltec-rc32-68-868)
+      set -- "$@" "$ROOT/sdkconfig.heltec-rc32-68" "$ROOT/sdkconfig.heltec-rc32-68-868" ;;
   esac
+  for f in "$@"; do
+    [ -f "$f" ] && [ -r "$f" ] || { echo "error: no readable $f" >&2; exit 2; }
+  done
+  out=$(check_env "$e" "$#" "$@" "$g")
   rc=$?
   present="$present$(printf '%s\n' "$out" | sed -n 's/^PRESENT //p' | tr '\n' ' ')"
   miss=$(printf '%s\n' "$out" | sed -n 's/^MISS //p')
@@ -121,7 +126,7 @@ done
 
 if [ "$fail" = 0 ]; then echo "SDKCONFIG LANDING OK"
 else
-  [ -z "$missed" ] || echo "info for a stale sdkconfig.<env>: rm -f sdkconfig.warthog-* and rebuild (an existing sdkconfig keeps the values it sets itself: configure loads sdkconfig.defaults and sdkconfig.ecm first, then it)"
+  [ -z "$missed" ] || echo "info for a stale sdkconfig.<env>: remove the affected generated sdkconfig and rebuild (configure loads the defaults and overlays before the generated config)"
   echo "SDKCONFIG LANDING FAILED"
 fi
 exit "$fail"
