@@ -251,7 +251,7 @@ let mirrored = false;
 async function loadReleases() {
   for (const url of [`${FIRMWARE_BASE}releases.json`, `https://api.github.com/repos/${REPO}/releases?per_page=20`]) {
     try {
-      const r = await fetch(url);
+      const r = await fetch(url, { cache: "no-cache" });
       if (!r.ok) continue;
       releases = (await r.json()).filter((release) => !release.draft);
       mirrored = url.startsWith(FIRMWARE_BASE);
