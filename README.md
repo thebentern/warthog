@@ -14,7 +14,7 @@ _About $30 in parts; prices are approximate and vary by supplier._
 [Flash a XIAO in your browser](https://thebentern.github.io/warthog/) ·
 [Download XIAO releases](https://github.com/thebentern/warthog/releases) ·
 [Build and flash a RadioCore](#heltec-radiocore-rc32-68) ·
-[Read the guides](wiki/Home.md)
+[Read the guides](https://github.com/thebentern/warthog/wiki)
 
 ## Hardware
 

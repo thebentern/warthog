@@ -13,8 +13,8 @@ separate partition. Selecting a region image writes it at `0x420000`.
 
 The Warthog firmware runs its console and USB network on USB-OTG (TinyUSB)
 rather than the built-in USB-Serial-JTAG, so `esptool` cannot pull the board
-into download mode over DTR/RTS. Every flash needs the button sequence, or
-`AT+DLMODE` on a running board ([below](#reflashing-a-running-board)):
+into download mode over DTR/RTS. Use the board buttons or send `AT+DLMODE` on
+a running board. [Reflashing a running board](#reflashing-a-running-board)
 
 - **XIAO** — hold **BOOT**, tap **RESET**, then release **BOOT**.
 - **RadioCore** — hold **USER**, tap **R**, then release **USER**.
@@ -27,9 +27,9 @@ until you flash or reset it.
 Select the environment for your board. [Quick Start](Quick-Start#3-choose-a-build)
 
 ```bash
-env=warthog-station  # Example for the XIAO
-pio run -e "$env" -t upload
-pio device monitor -e "$env"
+warthog_env=warthog-station  # Example for the XIAO
+pio run -e "$warthog_env" -t upload
+pio device monitor -e "$warthog_env"
 ```
 
 Tap **RESET** on the XIAO or **R** on the RadioCore when the write completes.

@@ -8,8 +8,8 @@ Select the station environment for your board and enter download mode.
 [Board environments and buttons](Quick-Start#3-choose-a-build)
 
 ```bash
-env=warthog-heltec-rc32-68  # Example for the 915 MHz RadioCore
-pio run -e "$env" -t upload
+warthog_env=warthog-heltec-rc32-68  # Example for the 915 MHz RadioCore
+pio run -e "$warthog_env" -t upload
 ```
 
 ## 2. USB-Serial-JTAG boot logs (~1 s window before USB-OTG takes over)

@@ -59,18 +59,19 @@ for the XIAO. [Mesh Mode](Mesh-Mode)
 ## 4. Flash
 
 The Warthog firmware runs its console and USB network on USB-OTG (TinyUSB), so
-`esptool` cannot reset the board into download mode over DTR/RTS. Put the board
-in download mode by hand (a board already running Warthog can take `AT+DLMODE`
-instead; see [Flashing](Flashing#reflashing-a-running-board)):
+`esptool` cannot reset the board into download mode over DTR/RTS. Use the board
+buttons or send `AT+DLMODE` on a board already running Warthog.
+[Reflashing a running board](Flashing#reflashing-a-running-board)
 
 - **XIAO** — hold **BOOT**, tap **RESET**, then release **BOOT**.
 - **RadioCore** — hold **USER**, tap **R**, then release **USER**.
 
-Set `env` to your board's environment from the table, then build and upload.
+Set `warthog_env` to your board's environment from the table, then build and
+upload.
 
 ```bash
-env=warthog-heltec-rc32-68  # Example for the 915 MHz RadioCore
-pio run -e "$env" -t upload
+warthog_env=warthog-heltec-rc32-68  # Example for the 915 MHz RadioCore
+pio run -e "$warthog_env" -t upload
 ```
 
 Tap **RESET** on the XIAO or **R** on the RadioCore when it finishes.
